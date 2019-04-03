@@ -71,7 +71,9 @@ def Run2(startPageNum, endPageNum, isAppend=False, silent=True):
 
     # this 'index' variable is used for logging.
     index = 0
-
+    if not silent:
+        logFileName = SourceRootDirectoryName + 'datas/object2/run2log/log.txt'
+        logFile = open(logFileName, 'w')
     for url in urls:
         index += 1
 
@@ -104,13 +106,14 @@ def Run2(startPageNum, endPageNum, isAppend=False, silent=True):
             # Logging
             if not silent:
                 if validWrite:
-                    print("Complete\t: index = " + str(index))
+                    logFile.write('Complete\t: index = ' + str(index) + '\n')
                 else:
-                    print("Removed\t: index = " + str(index))
-                print('\t' + url)
+                    logFile.write('Removed\t\t: index = ' + str(index) + '\n')
+                logFile.write('\t' + url + '\n')
 
         except:
             # Logging
             if not silent:
-                print("Exception\t: index " + str(index))
-                print('\t' + url)
+                logFile.write('Exception\t: index = ' + str(index) + '\n')
+                logFile.write('\t' + url + '\n')
+    logFile.close()
