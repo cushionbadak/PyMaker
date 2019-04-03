@@ -18,6 +18,8 @@ Object2_Filename_Prefix = "Python_DOC_referPages."
 Object2_Filename_Postfix = ".txt"
 StackOverflow_URL_Prefix = "https://stackoverflow.com"
 
+Object2_LogfileName = "datas/object2/run2log/log.txt"
+
 FirstURLPrefix = "https://stackoverflow.com/questions/tagged/python?sort=newest&page="
 FirstUrlPostfix = "&pagesize=50"
 
@@ -57,7 +59,7 @@ def Run1(startPageNum, endPageNum, isAppend=True):
                 f1.write(href + '\n')
     f1.close()
 
-def Run2(startPageNum, endPageNum, isAppend=False, silent=True):
+def Run2(startPageNum, endPageNum, isAppend=False):
     # Read URL
     inputFileName = Object1_Filename_Gen(Object1_DirectoryName, startPageNum, endPageNum)
     with open(inputFileName, 'r') as inputFile:
@@ -71,49 +73,46 @@ def Run2(startPageNum, endPageNum, isAppend=False, silent=True):
 
     # this 'index' variable is used for logging.
     index = 0
-    if not silent:
-        logFileName = SourceRootDirectoryName + 'datas/object2/run2log/log.txt'
-        logFile = open(logFileName, 'w')
-    for url in urls:
-        index += 1
 
-        # SLEEP
-        time.sleep(1)
+    logFileName = SourceRootDirectoryName + Object2_LogfileName
+    with open(logFileName, 'w') as logFile:
+        for url in urls:
+            index += 1
 
-        try:
-            # if write success, validWrite turns on to True.
-            # variable 'validWrite' is for Logging purpose.
-            validWrite = False
+            # SLEEP
+            time.sleep(1)
 
-            page = urllib.request.urlopen(url)
-            soup = BeautifulSoup(page, features='html.parser')
+            try:
+                # if write success, validWrite turns on to True.
+                # variable 'validWrite' is for Logging purpose.
+                validWrite = False
 
-            # NOTE : This classification does not consider scores.
-            post_texts = soup.find_all('div', 'post-text')
-            comments = soup.find_all('span', 'comment-copy')
+                page = urllib.request.urlopen(url)
+                soup = BeautifulSoup(page, features='html.parser')
 
-            # Check whether the contents is valid.
-            if len(post_texts) != 1 and soup.find(PythonDocURL) != -1:
-                # Open File for writing.
-                outputFileName = Object2_Filename_Gen(Object2_DirectoryName, url)
-                with open(outputFileName, 'w') as outputFile:
-                    for post in post_texts:
-                        outputFile.write(str(post) + '\n')
-                    for comment in comments:
-                        outputFile.write(str(comment) + '\n')
-                    validWrite = True
+                # NOTE : This classification does not consider scores.
+                post_texts = soup.find_all('div', 'post-text')
+                comments = soup.find_all('span', 'comment-copy')
 
-            # Logging
-            if not silent:
+                # Check whether the contents is valid.
+                if len(post_texts) != 1 and soup.find(PythonDocURL) != -1:
+                    # Open File for writing.
+                    outputFileName = Object2_Filename_Gen(Object2_DirectoryName, url)
+                    with open(outputFileName, 'w') as outputFile:
+                        for post in post_texts:
+                            outputFile.write(str(post) + '\n')
+                        for comment in comments:
+                            outputFile.write(str(comment) + '\n')
+                        validWrite = True
+
+                # Logging
                 if validWrite:
                     logFile.write('Complete\t: index = ' + str(index) + '\n')
                 else:
                     logFile.write('Removed\t\t: index = ' + str(index) + '\n')
                 logFile.write('\t' + url + '\n')
 
-        except:
-            # Logging
-            if not silent:
+            except:
+                # Logging
                 logFile.write('Exception\t: index = ' + str(index) + '\n')
                 logFile.write('\t' + url + '\n')
-    logFile.close()

@@ -10,4 +10,4 @@ import time
 #    time.sleep(10)
 
 # Code for Ojbect2 within 5000 Question URLs.
-cso.Run2(1, 100, False, False)
+cso.Run2(1, 100, False)
