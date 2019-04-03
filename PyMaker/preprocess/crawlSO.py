@@ -26,22 +26,32 @@ FirstUrlPostfix = "&pagesize=50"
 
 PythonDocURL = "docs.python.org/3/"
 
+
 def Object1_Filename_Gen(prefix, startPageNum, endPageNum):
     return prefix + Object1_Filename_Prefix + str(startPageNum) + '_' + str(endPageNum) + Object1_Filename_Postfix
+
 
 def Extract_SO_QuestionName_from_URL(url):
     # source: https://stackoverflow.com/a/21360721
     try:
-        _, var2 = re.search(r"\/questions\/([0-9]+)\/([a-z0-9\-]+)", url).groups()
+        _, var2 = re.search(
+            r"\/questions\/([0-9]+)\/([a-z0-9\-]+)", url).groups()
     except:
         _, var2 = '00000000', 'na'
     return var2
 
-def Object2_Filename_Gen(prefix, url):
-    return prefix + Object2_Filename_Prefix + Extract_SO_QuestionName_from_URL(url) + Object2_Filename_Postfix
+
+def Object2_Filename_Gen(prefix, startPageNum, url):
+    return prefix + Object2_SubDirectoryName_Gen(startPageNum) + Object2_Filename_Prefix + Extract_SO_QuestionName_from_URL(url) + Object2_Filename_Postfix
+
+
+def Object2_SubDirectoryName_Gen(index):
+    return 'i' + str(index) + '/'
+
 
 def Object2_LogfileName_Gen(prefix, startNum):
     return prefix + Object2_LogfileName_Prefix + str(startNum) + Object2_LogfileName_Postfix
+
 
 def Run1(startPageNum, endPageNum, isAppend=True):
     if(isAppend):
@@ -49,28 +59,31 @@ def Run1(startPageNum, endPageNum, isAppend=True):
     else:
         fileOpenFlag = "w"
 
-    Object1_Filename = Object1_Filename_Gen(Object1_DirectoryName, startPageNum, endPageNum)
+    Object1_Filename = Object1_Filename_Gen(
+        Object1_DirectoryName, startPageNum, endPageNum)
     f1 = open(Object1_Filename, fileOpenFlag)
     for i in range(startPageNum, endPageNum + 1):
         urlName = FirstURLPrefix + str(i) + FirstUrlPostfix
         page = urllib.request.urlopen(urlName)
         soup = BeautifulSoup(page, features='html.parser')
         question_hyperlinks = soup.find_all('a', 'question-hyperlink')
-        
+
         for k in question_hyperlinks:
             href = k['href']
             if not 'https://' in href:
                 f1.write(href + '\n')
     f1.close()
 
+
 def Run2(startPageNum, endPageNum, isAppend=False):
     # Read URL
-    inputFileName = Object1_Filename_Gen(Object1_DirectoryName, startPageNum, endPageNum)
+    inputFileName = Object1_Filename_Gen(
+        Object1_DirectoryName, startPageNum, endPageNum)
     with open(inputFileName, 'r') as inputFile:
         urls = inputFile.readlines()
     urls = [(StackOverflow_URL_Prefix + x.strip()) for x in urls]
-    
-    # For each URL, if it is valid URL, scrap its valid 
+
+    # For each URL, if it is valid URL, scrap its valid
     # Condition of Valid URL:
     #   - one or more answers
     #   - its body contains a link to 'PythonDocURL'
@@ -78,7 +91,8 @@ def Run2(startPageNum, endPageNum, isAppend=False):
     # this 'index' variable is used for logging.
     index = 0
 
-    logFileName = Object2_LogfileName_Gen(SourceRootDirectoryName, startPageNum)
+    logFileName = Object2_LogfileName_Gen(
+        SourceRootDirectoryName, startPageNum)
     with open(logFileName, 'w') as logFile:
         for url in urls:
             index += 1
@@ -102,7 +116,8 @@ def Run2(startPageNum, endPageNum, isAppend=False):
                 # Check whether the contents is valid.
                 if len(post_texts) != 1 and soup.find(PythonDocURL) != -1:
                     # Open File for writing.
-                    outputFileName = Object2_Filename_Gen(Object2_DirectoryName, url)
+                    outputFileName = Object2_Filename_Gen(
+                        Object2_DirectoryName, startPageNum, url)
                     with open(outputFileName, 'w') as outputFile:
                         for post in post_texts:
                             outputFile.write(str(post) + '\n')
