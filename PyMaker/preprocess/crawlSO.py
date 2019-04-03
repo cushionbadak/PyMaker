@@ -82,6 +82,7 @@ def Run2(startPageNum, endPageNum, isAppend=False):
     with open(logFileName, 'w') as logFile:
         for url in urls:
             index += 1
+            logFile.flush()
 
             # SLEEP
             time.sleep(1)
@@ -108,6 +109,7 @@ def Run2(startPageNum, endPageNum, isAppend=False):
                         for comment in comments:
                             outputFile.write(str(comment) + '\n')
                         validWrite = True
+                        outputFile.flush()
 
                 # Logging
                 if validWrite:
