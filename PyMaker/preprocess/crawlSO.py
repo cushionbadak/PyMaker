@@ -18,7 +18,8 @@ Object2_Filename_Prefix = "Python_DOC_referPages."
 Object2_Filename_Postfix = ".txt"
 StackOverflow_URL_Prefix = "https://stackoverflow.com"
 
-Object2_LogfileName = "datas/object2/run2log/log.txt"
+Object2_LogfileName_Prefix = "datas/object2/run2log/log_"
+Object2_LogfileName_Postfix = ".txt"
 
 FirstURLPrefix = "https://stackoverflow.com/questions/tagged/python?sort=newest&page="
 FirstUrlPostfix = "&pagesize=50"
@@ -38,6 +39,9 @@ def Extract_SO_QuestionName_from_URL(url):
 
 def Object2_Filename_Gen(prefix, url):
     return prefix + Object2_Filename_Prefix + Extract_SO_QuestionName_from_URL(url) + Object2_Filename_Postfix
+
+def Object2_LogfileName_Gen(prefix, startNum):
+    return prefix + Object2_LogfileName_Prefix + str(startNum) + Object2_LogfileName_Postfix
 
 def Run1(startPageNum, endPageNum, isAppend=True):
     if(isAppend):
@@ -74,7 +78,7 @@ def Run2(startPageNum, endPageNum, isAppend=False):
     # this 'index' variable is used for logging.
     index = 0
 
-    logFileName = SourceRootDirectoryName + Object2_LogfileName
+    logFileName = Object2_LogfileName_Gen(SourceRootDirectoryName, startPageNum)
     with open(logFileName, 'w') as logFile:
         for url in urls:
             index += 1
