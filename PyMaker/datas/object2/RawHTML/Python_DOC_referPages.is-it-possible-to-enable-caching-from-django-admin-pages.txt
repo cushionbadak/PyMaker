@@ -1,0 +1,207 @@
+<div class="post-text" itemprop="text">
+<p><strong>[additional information]</strong></p>
+<p>I asked for a way to disable caching site-wide. <strong>This is probably overkill</strong>, because all I need is a way to be able to <strong>see the most recent version of a page</strong>, when either the database or the program to generate it has been modified.</p>
+<p>There is a strong consensus that <strong>modifying settings at runtime is a very bad idea</strong>.</p>
+<p>So, some ideas: <strong>clearing the cache</strong> could work, as would <strong>sending a flag</strong> to specify that I don't want to see a cached version, or specifying that <strong>requests from my IP address shouldn't see cached pages</strong>.</p>
+<p><strong>[original question]</strong></p>
+<p>I have a Django-based website at <a href="https://ozake.com" rel="nofollow noreferrer">ozake.com</a>, and I frequently rewrite parts of the programming or change page content.</p>
+<p>Each time I work on it, I <strong>modify settings.py to disable caching</strong> so I can see my modifications in real time.</p>
+<p>When I'm done, I re-enable caching.</p>
+<p>I am using <strong>file-based caching</strong>. Here is the relevant part of settings.py:</p>
+<pre><code>CACHES = {
+  'default': {'BACKEND':
+ #'BACKEND': 'django.core.cache.backends.dummy.DummyCache',
+  'BACKEND': 'django.core.cache.backends.filebased.FileBasedCache',
+  'LOCATION': '/var/www/mysite.com/cache',
+</code></pre>
+<p>When I work on the site I comment out the last two lines and uncomment the dummy cache line.</p>
+<p>This means SSH'ing into the site, modifying settings.py, working on the site, then re-modifying it.</p>
+<p><strong>Is there any way I can make this into a check box somewhere in /admin with admin.py?</strong></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you just want to invalidate the whole cache at will, you might create a trivial view which does that:</p>
+<p>file <code>views.py</code>:</p>
+<pre><code>from django.core.cache import cache
+from django.core.exceptions import PermissionDenied
+from django.http import HttpResponse
+from django.views.decorators.cache import never_cache
+
+@never_cache
+def clear_cache(request):
+    if not request.user.is_superuser:
+        raise PermissionDenied
+    cache.clear()
+    return HttpResponse('Cache has been cleared')
+</code></pre>
+<p>file <code>urls.py</code>:</p>
+<pre><code>from django.urls import path
+from . import views
+
+urlpatterns = [
+    ...
+    path('clear_cache/', views.clear_cache),
+]
+</code></pre>
+<p>then invoke it with your browser:</p>
+<pre><code>http://HOST/clear_cache
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Using a separate site for development is always a Very Good Thing.
+Still, having the possibility to easily disable caching on the production site might bring some additional benefits:</p>
+<ul>
+<li>to investigate subtle bugs related to caching</li>
+<li>to measure effective performance gain with real production data</li>
+</ul>
+<p>I do believe this can be successfully solved with a small amount of code providing a thin custom caching backend.</p>
+<p>Basically:</p>
+<ul>
+<li>Django instantiates a cache "default" object once at startup, treating it as a singleton, and uses it forever</li>
+<li>In our custom cache backend, we will keep an internal instance of two separates objects (a "dummy" and a "file based" cache) and expose only one of them throuh the required inteface methods</li>
+<li>This way, we are actually acting as a class proxy to either FileBasedCache or DummyCache</li>
+<li>We can easily control which object is active with a variable, thus switching the behaviour at run-time, with no need to restart Django</li>
+</ul>
+<p>The following POC has been checked in a small test project with positive results.</p>
+<p>First, write the "proxy" class which behaves either as FileBasedCache or DummyCache:</p>
+<p>file 'project/mycache.py':</p>
+<pre><code>from django.core.cache.backends.filebased import FileBasedCache
+from django.core.cache.backends.dummy import DummyCache
+from django.core.cache.backends.base import DEFAULT_TIMEOUT
+from constance import config
+
+
+class MyCache(DummyCache):
+
+    def __init__(self, *args, **kwargs):
+        self.dummy_cache = DummyCache(*args, **kwargs)
+        self.file_cache = FileBasedCache(*args, **kwargs)
+
+    def _active_cache(self):
+        """
+        Select either DummyCache or FileBasedCache based on configuration
+        """
+        return self.file_cache if config.CACHING_ENABLED else self.dummy_cache
+
+    def add(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
+        return self._active_cache().add(key, value, timeout, version)
+
+    def get(self, key, default=None, version=None):
+        return self._active_cache().get(key, default, version)
+
+    def set(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
+        self._active_cache().set(key, value, timeout, version)
+
+    def touch(self, key, timeout=DEFAULT_TIMEOUT, version=None):
+        return self._active_cache().touch(key, timeout, version)
+
+    def delete(self, key, version=None):
+        self._active_cache().delete(key, version)
+
+    def has_key(self, key, version=None):
+        return self._active_cache().has_key(key, version)
+
+    def clear(self):
+        self._active_cache().clear()
+</code></pre>
+<p>and reference it in project's settings as follows:</p>
+<pre><code>CACHES = {
+    'default': {
+        'BACKEND': 'project.mycache.MyCache',
+        'LOCATION': '/var/www/mysite.com/cache,
+    }
+}
+</code></pre>
+<p>Please note that the actual actions are delegated to one of the two internal objects, according to the current value of <strong>config.CACHING_ENABLED</strong>. No caching logic has been re-implemented in the proxy model.</p>
+<p>Finally, to control the switching flag from the admin (the easy part) define a boolean value 'CACHING_ENABLED' for <strong>django-constance</strong> (a popular app which provides an Admin interface to edit dynamic settings).</p>
+<p>Add this to the project's settings:</p>
+<pre><code>INSTALLED_APPS = [
+    ...
+    'constance',
+    'constance.backends.database',
+]
+
+CONSTANCE_BACKEND = 'constance.backends.database.DatabaseBackend'
+CONSTANCE_CONFIG = {
+    'CACHING_ENABLED': (True, 'Set to False to disable caching'),
+}
+</code></pre>
+<p>then:</p>
+<pre><code>pip install django-constance[database]
+python manage.py migrate
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can use the <a href="https://pypi.org/project/django-admin-caching/" rel="nofollow noreferrer">django-admin-caching</a> module. First to install it type this in your bash terminal:</p>
+<pre class="lang-sh prettyprint-override"><code>pip install django-admin-caching
+</code></pre>
+<p>After it is installed, you add this piece of code to your <code>settings.py</code> so that it auto-registers itself:</p>
+<pre class="lang-py prettyprint-override"><code>settings.INSTALLED_APPS = [
+   #...
+   'django_admin_caching',
+   #...
+]
+</code></pre>
+<p>This should enable caching on your django admin page.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>What I ended up doing:</p>
+<pre><code>from django.core.cache import cache
+
+def PageView(request):
+    ...
+    if request.GET.get('clear') == 'cache':
+        if request.user.is_superuser:
+            title = request.GET.get('flag') + ' ' + title 
+            cache.clear()
+    ...
+    return render(request, template, context)
+</code></pre>
+<p>So now I can go to <strong><a href="https://ozake.com/en/home?clear=cache&amp;flag=sdf" rel="nofollow noreferrer">https://ozake.com/en/home?clear=cache&amp;flag=sdf</a></strong></p>
+<p>And the cache will be cleared (if I am logged in to the admin pages).</p>
+<p>Two notes:</p>
+<ol>
+<li><p><em>This address</em> will be cached, so <strong>it is necessary to change the flag string</strong> each time, to clear the cache.</p></li>
+<li><p><strong>The flag is added to the page title</strong> so you can be sure you are seeing the most recent version.</p></li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<p>For the main request, you can use <a href="https://docs.djangoproject.com/en/2.1/ref/django-admin/#createcachetable" rel="nofollow noreferrer">cache-table</a>.</p>
+<p>An alternative is to use middleware comparing the IP that receives the request with your specific IP, that you can store in your settings. Something like this:</p>
+<pre><code>from django.http import HttpRequest
+def get_user_ip(request):
+    client_address = request.META['HTTPS_X_FORWARDED_FOR']
+    if your_ip == client_address:
+        save_user_ip()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>EDITED: okay, I spoke too soon. It seems that certain things in <code>settings.py</code> is evaluated and cached when you bring up the app. Despite the fact that changing <code>DEBUG</code> value works just fine, change the <code>CACHES</code> value will not have any effect. Tested this idea myself today as I don't use caches with my project. I guess just another example of <strong>You shouldn’t alter settings in your applications at runtime.</strong></p>
+<blockquote>
+<p>Without going into the debate whether you should do this or not on the fly, there is a way to access settings: <a href="https://docs.djangoproject.com/en/2.1/topics/settings/#altering-settings-at-runtime" rel="nofollow noreferrer">Django 2.1 Documentation: Altering settings at runtime</a></p>
+<p>You can manipulate <code>settings.CACHES</code> as a regular dictionary. Maybe create two buttons in the admin site to toggle the values. Make sure to secure the access to those functions.</p>
+<p>A functional but <strong>highly NOT recommended</strong> example for toggling DEBUG setting in view:</p>
+</blockquote>
+<pre class="lang-py prettyprint-override"><code>    @csrf_exempt
+    @login_required
+    @user_passes_test(lambda u: u.is_admin)
+    def toggle_debug(request):
+        from django.conf import settings
+        settings.DEBUG = not settings.DEBUG
+        return JsonResponse({"result": "DEBUG toggled. Current setting: {}".format(str(settings.DEBUG))})
+</code></pre>
+</div>
+<span class="comment-copy">I am starting to think that I need to just maintain a separate site for development.</span>
+<span class="comment-copy">maybe place a script (shell) on the machine where your site is deployed, on a certain action that script gets executed and modifies the settings file?</span>
+<span class="comment-copy">Maybe using django-constance to set a dynamic boolean flag from the admin, then create a custom cache backend which behaves like DummyCache or FileBasedCache according to the flag value ?</span>
+<span class="comment-copy">Long shot, but <a href="https://github.com/jazzband/django-configurations" rel="nofollow noreferrer">github.com/jazzband/django-configurations</a> gives you the opportunity to use environment variables as values in django settings. You could possibly create a button in the admin that changes the environment variable and restarts the server.</span>
+<span class="comment-copy">"I am starting to think that I need to just maintain a separate site for development."—You really, <i>really</i> should. Or, actually, you need to <a href="https://twitter.com/stahnma/status/634849376343429120" rel="nofollow noreferrer">maintain a separate site for <i>production</i>, since your current "production" site is really a development site</a>.</span>
+<span class="comment-copy">I will modify the solution slightly… the thought of having an unprotected address that  affects caching makes me shiver. The technique is just what I needed though. Thanks so much.</span>
+<span class="comment-copy">You're welcome ! As a side note: the view is already protected against unauthorized access - if the user issuing the request is not a superuser, an exception is thrown and no caching is affected at all</span>
+<span class="comment-copy">So I could just add this to the regular default view, and super users would always get the most recent version. I don't need the URL. It's funny how much simpler things can become when you have more knowledge.</span>
+<span class="comment-copy">I understand your point ... but while this might seem convenient, you also loose a little bit of control. First, please note that when the superuser goes to the "default page" all users are affected, since the cache is invalidated system-wide. Second, you always get cache invalidation every time you invoke the default view (and never when you work with other views) even when unnecessary. This sounds much like an uncontrolled side effect. Even if it's not a big deal in this case, it not the safest solution either ...</span>
+<span class="comment-copy">... I'm still convinced that a specific url for cache invalidation is more appropriate an effective. Open a new tab in the browser with that address, work with your site contents, and when you're done with editing refresh the "clear_cache page" ... it's that simple ;)</span>
+<span class="comment-copy">This looks like a solid solution but I don't have the time or expertise to put it to use right now. I'll come back to it when I'm further along in the overall project and need a more robust solution. I'm really very inexperienced at Django and anyone who looked at my project would probably cringe.</span>
+<span class="comment-copy">very wise indeed ;)</span>
+<span class="comment-copy">It looks like this is for caching the admin pages, not the main site. Am I mistaken?</span>
+<span class="comment-copy">Obviously, the flag being added to the title is specific to my CMS program.</span>
+<span class="comment-copy">This actually looks like what I am looking for. I am probably not experienced to see what is dangerous about it. I'd like to be REALLY CLEAR that this is for a personal site, not for other people, and that the stakes are incredibly low if the site gets hacked. I would NEVER use this technique in a real project.</span>

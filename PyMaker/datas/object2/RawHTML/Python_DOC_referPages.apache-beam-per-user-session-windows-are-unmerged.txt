@@ -1,0 +1,94 @@
+<div class="post-text" itemprop="text">
+<p>We have an app that has users; each user uses our app for something like 10-40 minutes per go and I would like to count the distribution/occurrences of events happing per-such-session, based on specific events having happened (e.g. "this user converted", "this user had a problem last session", "this user had a successful last session").</p>
+<p>(After this I'd like to count these higher-level events per day, but that's a separate question)</p>
+<p>For this I've been looking into session windows; but all <a href="https://beam.apache.org/documentation/programming-guide/#setting-your-pcollections-windowing-function" rel="nofollow noreferrer">docs</a> seem geared towards global session windows, but I'd like to create them per-user (which is also a natural partitioning).</p>
+<p>I'm having trouble finding docs (python preferred) on how to do this. Could you point me in the right direction?</p>
+<p>Or in other words: <strong>How do I create per-user per-session windows that can output more structured (enriched) events?</strong></p>
+<h2>What I have</h2>
+<pre><code>class DebugPrinter(beam.DoFn):
+  """Just prints the element with logging"""
+  def process(self, element, window=beam.DoFn.WindowParam):
+    _, x = element
+    logging.info("&gt;&gt;&gt; Received %s %s with window=%s", x['jsonPayload']['value'], x['timestamp'], window)
+    yield element
+
+def sum_by_event_type(user_session_events):
+  logging.debug("Received %i events: %s", len(user_session_events), user_session_events)
+  d = {}
+  for key, group in groupby(user_session_events, lambda e: e['jsonPayload']['value']):
+    d[key] = len(list(group))
+  logging.info("After counting: %s", d)
+  return d
+
+# ...
+
+by_user = valid \
+  | 'keyed_on_user_id'      &gt;&gt; beam.Map(lambda x: (x['jsonPayload']['userId'], x))
+
+session_gap = 5 * 60 # [s]; 5 minutes
+
+user_sessions = by_user \
+  | 'user_session_window'   &gt;&gt; beam.WindowInto(beam.window.Sessions(session_gap),
+                                               timestamp_combiner=beam.window.TimestampCombiner.OUTPUT_AT_EOW) \
+  | 'debug_printer'         &gt;&gt; beam.ParDo(DebugPrinter()) \
+  | beam.CombinePerKey(sum_by_event_type)
+</code></pre>
+<h2>What it outputs</h2>
+<pre><code>INFO:root:&gt;&gt;&gt; Received event_1 2019-03-12T08:54:29.200Z with window=[1552380869.2, 1552381169.2)
+INFO:root:&gt;&gt;&gt; Received event_2 2019-03-12T08:54:29.200Z with window=[1552380869.2, 1552381169.2)
+INFO:root:&gt;&gt;&gt; Received event_3 2019-03-12T08:54:30.400Z with window=[1552380870.4, 1552381170.4)
+INFO:root:&gt;&gt;&gt; Received event_4 2019-03-12T08:54:36.300Z with window=[1552380876.3, 1552381176.3)
+INFO:root:&gt;&gt;&gt; Received event_5 2019-03-12T08:54:38.100Z with window=[1552380878.1, 1552381178.1)
+</code></pre>
+<p>So as you can see; the Session() window doesn't expand the Window, but groups only very close events together... What's being done wrong?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can get it to work by adding a Group By Key transform after the windowing. You have assigned keys to the records but haven't actually grouped them together by key and session windowing (which works per-key) does not know that these events need to be merged together.</p>
+<p>To confirm this I did a reproducible example with some in-memory dummy data (to isolate Pub/Sub from the problem and be able to test it more quickly). All five events will have the same key or <code>user_id</code> but they will "arrive" sequentially 1, 2, 4 and 8 seconds apart from each other. As I use <code>session_gap</code> of 5 seconds I expect the first 4 elements to be merged into the same session. The 5th event will take 8 seconds after the 4th one so it has to be relegated to the next session (gap over 5s). Data is created like this:</p>
+<pre class="lang-py prettyprint-override"><code>data = [{'user_id': 'Thanos', 'value': 'event_{}'.format(event), 'timestamp': time.time() + 2**event} for event in range(5)]
+</code></pre>
+<p>We use <code>beam.Create(data)</code> to initialize the pipeline and <code>beam.window.TimestampedValue</code> to assign the "fake" timestamps. Again, we are just simulating streaming behavior with this. After that, we create the key-value pairs thanks to the <code>user_id</code> field, we window into <code>window.Sessions</code> and, we add the missing <code>beam.GroupByKey()</code> step. Finally, we log the results with a slightly modified version of <code>DebugPrinter</code>:. The pipeline now looks like this:</p>
+<pre class="lang-py prettyprint-override"><code>events = (p
+  | 'Create Events' &gt;&gt; beam.Create(data) \
+  | 'Add Timestamps' &gt;&gt; beam.Map(lambda x: beam.window.TimestampedValue(x, x['timestamp'])) \
+  | 'keyed_on_user_id'      &gt;&gt; beam.Map(lambda x: (x['user_id'], x))
+  | 'user_session_window'   &gt;&gt; beam.WindowInto(window.Sessions(session_gap),
+                                             timestamp_combiner=window.TimestampCombiner.OUTPUT_AT_EOW) \
+  | 'Group' &gt;&gt; beam.GroupByKey()
+  | 'debug_printer'         &gt;&gt; beam.ParDo(DebugPrinter()))
+</code></pre>
+<p>where <code>DebugPrinter</code> is:</p>
+<pre class="lang-py prettyprint-override"><code>class DebugPrinter(beam.DoFn):
+  """Just prints the element with logging"""
+  def process(self, element, window=beam.DoFn.WindowParam):
+    for x in element[1]:
+      logging.info("&gt;&gt;&gt; Received %s %s with window=%s", x['value'], x['timestamp'], window)
+
+    yield element
+</code></pre>
+<p>If we test this without grouping by key we get the same behavior:</p>
+<pre class="lang-py prettyprint-override"><code>INFO:root:&gt;&gt;&gt; Received event_0 1554117323.0 with window=[1554117323.0, 1554117328.0)
+INFO:root:&gt;&gt;&gt; Received event_1 1554117324.0 with window=[1554117324.0, 1554117329.0)
+INFO:root:&gt;&gt;&gt; Received event_2 1554117326.0 with window=[1554117326.0, 1554117331.0)
+INFO:root:&gt;&gt;&gt; Received event_3 1554117330.0 with window=[1554117330.0, 1554117335.0)
+INFO:root:&gt;&gt;&gt; Received event_4 1554117338.0 with window=[1554117338.0, 1554117343.0)
+</code></pre>
+<p>But after adding it, the windows now work as expected. Events 0 to 3 are merged together in an extended 12s session window. Event 4 belongs to a separate 5s session.</p>
+<pre class="lang-py prettyprint-override"><code>INFO:root:&gt;&gt;&gt; Received event_0 1554118377.37 with window=[1554118377.37, 1554118389.37)
+INFO:root:&gt;&gt;&gt; Received event_1 1554118378.37 with window=[1554118377.37, 1554118389.37)
+INFO:root:&gt;&gt;&gt; Received event_3 1554118384.37 with window=[1554118377.37, 1554118389.37)
+INFO:root:&gt;&gt;&gt; Received event_2 1554118380.37 with window=[1554118377.37, 1554118389.37)
+INFO:root:&gt;&gt;&gt; Received event_4 1554118392.37 with window=[1554118392.37, 1554118397.37)
+</code></pre>
+<p>Full code <a href="https://gist.github.com/gxercavins/199a91a49c90f9248d636f95e5b74e4b" rel="nofollow noreferrer">here</a></p>
+<p>Two additional things worth mentioning. The first one is that, even if running this locally in a single machine with the DirectRunner, records can come unordered (event_3 is processed before event_2 in my case). This is done on purpose to simulate distributed processing as documented <a href="https://beam.apache.org/documentation/runners/direct/" rel="nofollow noreferrer">here</a>.</p>
+<p>The last one is that if you get a stack trace like this:</p>
+<pre class="lang-py prettyprint-override"><code>TypeError: Cannot convert GlobalWindow to apache_beam.utils.windowed_value._IntervalWindowBase [while running 'Write Results/Write/WriteImpl/WriteBundles']
+</code></pre>
+<p>downgrade from 2.10.0/2.11.0 SDK to 2.9.0. See this <a href="https://stackoverflow.com/a/54791913/6121516">answer</a> for example.</p>
+</div>
+<span class="comment-copy">How about adding a ParDo before your windowing transform ? This ParDo would create Key Value pairs from the incoming stream where the Key would be the user Id . So we have a bunch of &lt;UserId-Value&gt; pairs that we feed into the window for aggregation [every x minutes] . You can then group by or combine the output of the window per key [user id]</span>
+<span class="comment-copy">It's already there I think; it's called <code>keyed_on_user_id</code>.</span>
+<span class="comment-copy">Please let me also know if you find this out. Thanks !</span>
+<span class="comment-copy">The Session window should group a series of consecutive events separated by a specified gap size, per key. You have given a 5 minute gap, so the values should be all the items for a key where either this is the first time a item is seen for this key or the last time a key was seen was more than 5 mins in the past. The values will be grouped until such time as 5 mins has passed with again no value being seen for that key.</span>
+<span class="comment-copy">But isn't the window then supposed to expand to encompass the latest values seen? Because the key (user id) has more than two events in that window.</span>

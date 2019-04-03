@@ -51,7 +51,7 @@ def Run1(startPageNum, endPageNum, isAppend=True):
 
     Object1_Filename = Object1_Filename_Gen(Object1_DirectoryName, startPageNum, endPageNum)
     f1 = open(Object1_Filename, fileOpenFlag)
-    for i in range(startPageNum, endPageNum):
+    for i in range(startPageNum, endPageNum + 1):
         urlName = FirstURLPrefix + str(i) + FirstUrlPostfix
         page = urllib.request.urlopen(urlName)
         soup = BeautifulSoup(page, features='html.parser')

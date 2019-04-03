@@ -1,0 +1,87 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to use prange in order to process multiple strings.
+As it is not possible to do this with a python list, I'm using a numpy array.</p>
+<p>With an array of floats, this function works :</p>
+<pre><code>from cython.parallel import prange
+cimport numpy as np
+from numpy cimport ndarray as ar
+
+cpdef func_float(ar[np.float64_t,cast=True] x, double alpha):
+    cdef int i
+    for i in prange(x.shape[0], nogil=True):
+        x[i] = alpha * x[i]
+    return x
+</code></pre>
+<p>When I try this simple one :</p>
+<pre><code>cpdef func_string(ar[np.str,cast=True] x):
+    cdef int i
+    for i in prange(x.shape[0], nogil=True):
+        x[i] = x[i] + str(i)
+    return x
+</code></pre>
+<p>I'm getting this</p>
+<pre><code>&gt;&gt; func_string(x = np.array(["apple","pear"],dtype=np.str))
+  File "processing.pyx", line 8, in processing.func_string
+    cpdef func_string(ar[np.str,cast=True] x):
+ValueError: Item size of buffer (20 bytes) does not match size of 'str object' (8 bytes)
+</code></pre>
+<p>I'm probably missing something and I can't find an alternative to str.
+Is there a way to properly use prange with an array of string ?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Beside the fact, that your code should fail when cythonized, because you try to create a Python-object (i.e. <code>str(i)</code>) without gil, your code isn't doing what you think it should do.</p>
+<p>In order to analyse what is going on, let's take a look at a much simple cython-version:</p>
+<pre><code>%%cython -2
+cimport numpy as np
+from numpy cimport ndarray as ar
+
+cpdef func_string(ar[np.str, cast=True] x):
+    print(len(x))
+</code></pre>
+<p>From your error message, one can deduct that you use Python 3 and the Cython-extension is built with (still default) <a href="https://stackoverflow.com/q/54900723/5769463"><code>language_level=2</code></a>, thus I'm using <code>-2</code> in the <code>%%cython</code>-magic cell.</p>
+<p>And now:</p>
+<pre><code>&gt;&gt;&gt; x = np.array(["apple", "pear"], dtype=np.str)
+&gt;&gt;&gt; func_string(x)    
+ValueError: Item size of buffer (20 bytes) does not match size of 'str object' (8 bytes)
+</code></pre>
+<p>What is going on?</p>
+<p><strong><code>x</code> is not what you think it is</strong></p>
+<p>First, let's take a look at <code>x</code>:</p>
+<pre><code>&gt;&gt;&gt; x.dtype
+&lt;U5
+</code></pre>
+<p>So <code>x</code> isn't a collection of unicode-objects. An element of <code>x</code> consist of 5 unicode-characters and those elements are stored contiguously in memory, one after another. What is important: The same information as in unicode-objects stored in a <strong>different</strong> memory layout.</p>
+<p>This is one of numpy's quirks and how <code>np.array</code> works: every element in the list is converted to an unicode-object, than the maximal size of the element is calculated and dtype (in this case <code>&lt;U5</code>) is calculated and used.</p>
+<p><strong><code>np.str</code> is interpreted differently in cython code (<code>ar[np.str] x</code>) (twice!)</strong></p>
+<p>First difference: in your Python3-code <code>np.str</code> is for <code>unicode</code>, but in your cython code, which is cythonized with <code>language_level=2</code>, <code>np.str</code> is for <code>bytes</code> (see <a href="https://docs.scipy.org/doc/numpy-1.13.0/reference/arrays.dtypes.html#specifying-and-constructing-data-types" rel="nofollow noreferrer">doc</a>).</p>
+<p>Second difference: seeing <code>np.str</code>, Cython will interpret it as array with Python-objects (maybe it should be seen as a Cython-bug) - it is almost the same as if <code>dtype</code> were <code>np.object</code> - actually the only difference to <code>np.object</code> are slightly different error messages.</p>
+<p>With this information we can understand the error message. During the runtime, the input-array is checked (before the first line of the function is executed!):</p>
+<ol>
+<li>expected is an array with python-objects, i.e. 8-byte pointers, i.e. array with element size of 8bytes</li>
+<li>received is an array with element size 5*4=20 bytes (one unicode-character is 4 bytes)</li>
+</ol>
+<p>thus the cast cannot be done and the observed exception is thrown.</p>
+<p><strong>you cannot change the size of an element in an <code>&lt;U..</code>-numpy-array</strong>:</p>
+<p>Now let's take a look at the following:</p>
+<pre><code>&gt;&gt;&gt; x = np.array(["apple", b"pear"], dtype=np.str)
+&gt;&gt;&gt; x[0] = x[0]+str(0)
+&gt;&gt;&gt; x[0]
+'apple'
+</code></pre>
+<p>the element didn't change, because the string <code>x[0]+str(0)</code> was truncated while written back to <code>x</code>-array: there is only place for 5 characters! It would work (to some degree, as long as resulting string has no more than 5 characters) with <code>"pear"</code> though:</p>
+<pre><code>&gt;&gt;&gt; x[1] = x[1]+str(1)
+&gt;&gt;&gt; x[1]
+'pear0' 
+</code></pre>
+<hr/>
+<p>Where does this all leave you?</p>
+<ul>
+<li>you probably want to use <code>bytes</code> and not <code>unicodes</code> (i.e. <code>dtype=np.bytes_</code>)</li>
+<li>given you don't know the element size of your numpy-array at the compile type, you should declare the input-array <code>x</code> as <code>ar x</code> in the signature and roll out the runtime checks, similar as done in the Cython's <a href="https://cython.readthedocs.io/en/latest/src/tutorial/numpy.html#adding-types" rel="nofollow noreferrer">"depricated" numpy-tutorial</a>.</li>
+<li>if changes should be done in-place, the elements in the input-array should be big enough for the resulting strings.</li>
+</ul>
+<p>All of the above, has nothing to do with <code>prange</code>. To use <code>prange</code> you cannot use <code>str(i)</code> because it operates on python-objects.</p>
+</div>
+<span class="comment-copy">Does this work if you change <code>prange</code> to <code>range</code>?</span>
+<span class="comment-copy">@DavidW I want to keep prange. Changing to range has no effect.</span>
+<span class="comment-copy">Which Python/Cython version are you using? I'm surprised your code compiled at all, because <code>str(i)</code> should create a Python-object which shouldn't be possible without gil.</span>

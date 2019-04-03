@@ -1,0 +1,135 @@
+<div class="post-text" itemprop="text">
+<p>I'm wrapping a C library which returns one of a finite number of error codes upon failure. When the error happens, I would like to add the error code as an attribute on the C exception, such that the Python code can retrieve it and map the error code to a human readable exception. Is this possible?</p>
+<p>For example I want to do this in the Python layer:</p>
+<pre><code>try:
+    call_my_library_func()
+except MyLibraryError as ex:
+    print("Error code was %s" % ex.code)
+</code></pre>
+<p>The closest I can get to, which I don't like, is by using <code>PyErr_SetObject</code></p>
+<pre><code>PyObject *tuple = PyTuple_New(2);
+PyTuple_SetItem(tuple, 0, PyUnicode_FromString("Helpful error message"));
+PyTuple_SetItem(tuple, 1, PyLong_FromLong(257));
+//PyErr_SetString(MyLibraryError, "Helpful error message\n");
+PyErr_SetObject(MyLibraryError, tuple);
+</code></pre>
+<p>Then I can do this:</p>
+<pre><code>try:
+    call_my_library_func()
+except MyLibraryError as ex:
+    message, code = ex.args[0], -1
+    if len(ex.args &gt; 1):
+        code = ex.args[1]
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The C API exception handling is largely written in terms of raising an exception by its class, its arguments (passed to the constructor) and its traceback, and therefore those it's probably best to follow that scheme. Your basic approach of passing a tuple as the arguments is probably the best option.</p>
+<p>However there are two options to make your exception class slightly more user-friendly on the Python side:</p>
+<ol>
+<li>You process the arguments in a custom <code>__init__</code> method to set a <code>code</code> attribute on the class.</li>
+<li>You define <code>code</code> as a property of your exception class that accesses <code>args[1]</code>.</li>
+</ol>
+<p>I've illustrated option 2, but I don't think there a huge reason to prefer one or the other.</p>
+<hr/>
+<p>To briefly explain the example code below: to define an exception using the C API you use <code>PyErr_NewException</code> which takes an optional base class and dictionary as its second and third arguments. The functions used (either <code>__init__</code> or the property definitions) should be part of the dictionary.</p>
+<p>To define the property definitions I've written the code in Python and used <code>PyRun_String</code> since it's easier to write in Python than C and because I doubt this code will be performance critical. The functions end up injected into the global dictionary passed to <code>PyRun_String</code>.</p>
+<p>C code:</p>
+<pre class="lang-c prettyprint-override"><code>#include &lt;Python.h&gt;
+
+PyObject* make_getter_code() {
+    const char* code = 
+    "def code(self):\n"
+    "  try:\n"
+    "    return self.args[1]\n"
+    "  except IndexError:\n"
+    "    return -1\n"
+    "code = property(code)\n"
+    "def message(self):\n"
+    "  try:\n"
+    "    return self.args[0]\n"
+    "  except IndexError:\n"
+    "    return ''\n"
+    "\n";
+
+    PyObject* d = PyDict_New();
+    PyDict_SetItemString(d, "__builtins__", PyEval_GetBuiltins());
+    PyObject* output = PyRun_String(code,Py_file_input,d,d);
+    if (output==NULL) {
+        Py_DECREF(d);
+        return NULL;
+    }
+    Py_DECREF(output);
+    PyDict_DelItemString(d,"__builtins__"); /* __builtins__ should not be an attribute of the exception */
+    return d;
+}
+
+static PyObject* MyLibraryError;
+
+static PyObject* my_library_function(PyObject* self) {
+    /* something's gone wrong */
+    PyObject *tuple = PyTuple_New(2);
+    PyTuple_SetItem(tuple, 0, PyUnicode_FromString("Helpful error message"));
+    PyTuple_SetItem(tuple, 1, PyLong_FromLong(257));
+    PyErr_SetObject(MyLibraryError, tuple);
+    return NULL;
+}
+
+static PyMethodDef methods[] = {
+    {"my_library_function",  my_library_function,  METH_NOARGS,
+     "raise an error."},
+    {NULL, NULL, 0, NULL}        /* Sentinel */
+};
+
+static struct PyModuleDef librarymodule = {
+    PyModuleDef_HEAD_INIT,
+    "library",   /* name of module */
+    NULL, /* module documentation, may be NULL */
+    -1,       /* size of per-interpreter state of the module,
+                 or -1 if the module keeps state in global variables. */
+    methods
+};
+
+PyMODINIT_FUNC
+PyInit_library(void) {
+    PyObject *m;
+    m = PyModule_Create(&amp;librarymodule);
+    if (m == NULL)
+        return NULL;
+
+    PyObject* exc_dict = make_getter_code();
+    if (exc_dict == NULL) {
+        return NULL;
+    }
+
+    MyLibraryError = PyErr_NewException("library.MyLibraryError", 
+                                        NULL, // use to pick base class
+                                        exc_dict);
+    PyModule_AddObject(m,"MyLibraryError",MyLibraryError);
+    return m;
+}
+</code></pre>
+<p>As an example of the more elegant Python interface, your Python code changes to:</p>
+<pre><code>try:
+    my_library_func()
+except MyLibraryError as ex:
+    message, code = ex.message, ex.code
+</code></pre>
+<hr/>
+<p><em>Addendum:</em> it is possible to set attributes on the currently set exception. The basic scheme would look like:</p>
+<pre class="lang-c prettyprint-override"><code>PyErr_SetString(...) /* raise the exception with an error message */
+PyObject *type, *value, *traceback;
+PyErr_Fetch(&amp;type, &amp;value, &amp;traceback); /* gets the values of the currently
+   set exception and clears it */
+PyObject_SetAttrString(value, "code", number);
+PyErr_Restore(type,value,traceback); /* Re-sets the exception now including
+   the error code */
+</code></pre>
+<p>This is missing any error checking. I think I still prefer my approach of putting the logic into the exception class, but this is how you would do the operation you asked about.</p>
+</div>
+<span class="comment-copy">Could you define the class <code>MyLibraryError</code> so that <code>MyLibraryError.code</code> is a property that returns <code>args[1]</code>?</span>
+<span class="comment-copy">@DavidW Currently <code>MyLibraryError</code> in this example is an exception defined in C. Do you suggest creating a Python Exception which subclasses this C exception, like <code>class MyPyLibraryError(LibraryError) @property def code() return getattr(self, 'code', -1)</code> ?</span>
+<span class="comment-copy">I was suggesting <code>class MyPyLibraryError(LibraryError) @property def code(self): return self.args[1] if len(self.args)&gt;=2 else -1</code>. If <code>MyLibraryError</code> is a class you've made then can create the property in C instead of making a Python subclass.</span>
+<span class="comment-copy">@DavidW Great, and then in Python I would do <code>try: call_my_library_func() except MyLibraryError as ex: raise MyPyLibraryError(*ex.args)</code> right -- and better yet add it as a decorator and apply it to all my my functions?</span>
+<span class="comment-copy">Not quite - in C you raise the <code>MyPyLibraryError</code> (using the tuple, like you're doing). In Python you just do <code>try: call_my_library_func() except MyPyLibraryError as ex: code = ex.code # ... and whatever else you want</code></span>
+<span class="comment-copy">Very cool. I did not know about <code>PyRun_String</code> or setting the dict during <code>PyErr_NewException</code>. Thanks.</span>
+<span class="comment-copy">I've added an edit that shows how you can directly do what you original asked about (set an attribute on the current exception) an therefore avoid messing around with custom classes. I'd personally still use the custom class though</span>

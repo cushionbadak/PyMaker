@@ -1,0 +1,110 @@
+<div class="post-text" itemprop="text">
+<p>I want to train a convolutional neural network to recognise between two types of classes.<br/>
+I also want to use the first, convolutional, layers of an already trained model like InceptionV3.<br/>
+However the training processes goes really slow. Do you have any suggestions what can I improve? I will not mention my CPU, RAM, all I care here is where are the bottlenecks and what can I improve to faster it (my images are already 229x299x3). </p>
+<pre><code>from keras.applications import InceptionV3
+from keras import layers
+from keras.models import Model
+from keras import optimizers
+from keras.preprocessing.image import ImageDataGenerator
+import numpy as np
+import os
+
+
+def generator(images_dir):
+    datagen = ImageDataGenerator(rescale=1. / 255)
+    gen = datagen.flow_from_directory(
+        images_dir,
+        target_size=(segment_size, segment_size),
+        batch_size=batch_size,
+        class_mode='categorical',
+        shuffle=True)
+    return gen
+
+
+def num_files_in_folder(folder):
+    count = 0
+    for subdir, dirs, files in os.walk(folder):
+        for file in files:
+            if not file.startswith("."):
+                count += 1
+    return count
+
+
+segment_size = 229
+batch_size = 32
+base_model = InceptionV3(weights='imagenet',
+                         include_top=False,
+                         input_shape=(segment_size, segment_size, 3))
+x = base_model.output
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.Dense(1024, activation='relu')(x)
+predictions = layers.Dense(2, activation='softmax')(x)
+
+model = Model(inputs=base_model.input, outputs=predictions)
+
+for layer in base_model.layers:
+    layer.trainable = False
+
+model.compile(optimizer=optimizers.SGD(lr=0.01, nesterov=True),
+              loss='categorical_crossentropy',
+              metrics=['acc'])
+
+train_dir = "/home/user/train"
+validation_dir = "/home/user/val"
+train_gen = generator(train_dir)
+val_gen = generator(validation_dir)
+steps_per_epoch = int(np.ceil(num_files_in_folder(train_dir) / batch_size))
+validation_steps = int(np.ceil(num_files_in_folder(validation_dir) / batch_size))
+
+history = model.fit_generator(
+    generator=train_gen,
+    steps_per_epoch=steps_per_epoch,
+    epochs=10,
+    validation_data=val_gen,
+    validation_steps=validation_steps,
+    use_multiprocessing=False,
+    verbose=1)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>First of all, I offer you to convert your data into TFRecords and avoid using <code>flow_from_directory</code>. <code>ImageDataGenerator</code> can be a good option for a quick prototyping, but TFRecords and corresponding TF infrastructure for them (queues/runners/readers) are really optimized for fast reading. By using <code>tf.data</code> API and especially <code>Dataset.prefetch()</code>, you can gain a substantial speedup. </p>
+<p>As in most cases the data read is the bottleneck, I could stop right here. But after that I would also try:</p>
+<ul>
+<li><a href="https://keras.io/utils/#multi_gpu_model" rel="nofollow noreferrer">multi_gpu</a> training</li>
+<li>using <a href="https://www.kaggle.com/danmoller/keras-training-with-float16-test-kernel-2" rel="nofollow noreferrer">float16</a> can be helpful, but <a href="https://stackoverflow.com/questions/49782579/float16-slower-than-float32-in-keras">tricky</a>.</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>I would try this with <code>tf.data.Dataset.from_tensor_slices</code>
+Suppose you have path to train set <code>train_path</code>. First you create dataset object from it. Also you can pass not path but paths <code>from_tensor_slices((image_path, labels_path))</code> or lists of filenames/labels. It can be handled with parse function later.</p>
+<pre><code>dataset = tf.data.Dataset.from_tensor_slices(image_path)
+</code></pre>
+<p>Then you can shuffle, batch, and map any parse function to this dataset. You can control how many examples will be preloaded with shuffle buffer. Repeat controls epoch count and better be left None, so it will repeat indefinitely. You can use either plain batch function or combine with </p>
+<pre><code>dataset = dataset.shuffle().repeat()
+dataset.apply(tf.data.experimental.map_and_batch(map_func=parse_func, batch_size,num_parallel_batches))
+</code></pre>
+<p>You need to define parse function to load actual data from filename</p>
+<pre><code>def parse_func(filename):
+    f = tf.read_file(filename)
+    img = tf.image.decode_image(f)
+    label = #get label from filename
+    return img, l
+</code></pre>
+<p>After applying this to dataset object it will contain batches of pairs image/label.</p>
+<p>Remember that batching goes on inside this pipeline, so you don't need to use batch in model.fit, but you need to pass number of epochs and steps per epoch. The latter can be a little tricky cause you can't do smth like len(dataset) so it should be calculated in advance.</p>
+<pre><code>model.fit(dataset, epochs, steps_per_epoch)
+</code></pre>
+<p>You can do the same for test dataset. You can also check it's contents with </p>
+<pre><code>iterator = dataset.make_one_shot_iterator()
+with tf.Session() as sess:
+    print(sess.run(iterator.get_next()))
+</code></pre>
+<p>This will output num_batches. </p>
+</div>
+<span class="comment-copy">Define 'goes really slow'.  Are you using CPU or GPU? If latter, what is the utilization rate?</span>
+<span class="comment-copy">Hi Sharky. I compare it with another implementation I have. There I extract features from the pre-trained model via <code>incepv3.predict(generator)</code> and then save them to a pickle file. After all this finishes, I run another Python script that via another generator reads the pickle files and passes the content to fitting my final model. This impl takes about 25 mins for the feature extraction and 2 mins for training. The code I pasted here works for more than 2 hour with same CPU for the same images, same num of epochs, etc.</span>
+<span class="comment-copy">As the answer suggests, you should use dataset api. I wouldn't start directly with tfrecords format, as it not always give an advantage and itself takes time to convert to. Do you have an option to use plain numpy arrays without pickle? why do  use it?</span>
+<span class="comment-copy">My data does not fit in memory. I could not find a way to read all SxSx3 images from the file system, provide them to <code>inceptV3.predict</code> and pass the result to my <code>model.fit_generator</code> with the need to load everything in memory.</span>
+<span class="comment-copy">How your initial data looks like? Is it one big numpy array? Or a directory of images?</span>
+<span class="comment-copy">Thanks for the answer Sharky. I implemented my algorithm using the TF data API but its extremely slow (5+ hours). I compare it to another of my implementations: instead of adding the pre-trained inceptionv3 model to my model I first call inceptionv3.predict() with all the my images (takes about 26 minutes). Then the feature vectors from the prediction I pass to my new model.fit (this model has only 3 layers), this takes about a minute). Total 27 minutes &lt; 5 hours.</span>
