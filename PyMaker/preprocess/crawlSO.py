@@ -1,6 +1,8 @@
 import urllib.request
 import time
 import re
+import os
+#import errno
 from bs4 import BeautifulSoup
 
 # Object1 : scrap python-related urls in stackoverflow
@@ -118,6 +120,11 @@ def Run2(startPageNum, endPageNum, isAppend=False):
                     # Open File for writing.
                     outputFileName = Object2_Filename_Gen(
                         Object2_DirectoryName, startPageNum, url)
+                    
+                    # Check whether the directory for output file does not exist.
+                    # Source: https://stackoverflow.com/a/12517490
+                    os.makedirs(os.path.dirname(filename), exist_ok=True)
+
                     with open(outputFileName, 'w') as outputFile:
                         for post in post_texts:
                             outputFile.write(str(post) + '\n')
