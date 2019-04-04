@@ -123,7 +123,7 @@ def Run2(startPageNum, endPageNum, isAppend=False):
                     
                     # Check whether the directory for output file does not exist.
                     # Source: https://stackoverflow.com/a/12517490
-                    os.makedirs(os.path.dirname(filename), exist_ok=True)
+                    os.makedirs(os.path.dirname(outputFileName), exist_ok=True)
 
                     with open(outputFileName, 'w') as outputFile:
                         for post in post_texts:
