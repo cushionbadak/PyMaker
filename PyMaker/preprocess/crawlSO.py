@@ -58,11 +58,12 @@ def Object2_LogfileName_Gen(prefix, startNum):
 def Object2_AnswerExists(soups):
     return len(soups) > 1
 
-
+#TODO : check when s.find() returns NoneType values.
 def Object2_IsPyDocSoups(soups):
     # Check whether the argument soups has the link to the python document.
     for s in soups:
-        if s.find(PythonDocURL) != -1:
+        sf = s.find(PythonDocURL)
+        if (sf is not None) and (sf != -1):
             return True
     return False
 
