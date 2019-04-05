@@ -62,7 +62,7 @@ def Object2_AnswerExists(soups):
 def Object2_IsPyDocSoups(soups):
     # Check whether the argument soups has the link to the python document.
     for s in soups:
-        if s.find_all(PythonDocURL):
+        if s.find(PythonDocURL) != -1:
             return True
     return False
 
