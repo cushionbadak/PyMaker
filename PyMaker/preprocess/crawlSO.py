@@ -55,6 +55,22 @@ def Object2_LogfileName_Gen(prefix, startNum):
     return prefix + Object2_LogfileName_Prefix + str(startNum) + Object2_LogfileName_Postfix
 
 
+def Object2_AnswerExists(soups):
+    return len(soups) > 1
+
+
+def Object2_IsPyDocSoups(soups):
+    # Check whether the argument soups has the link to the python document.
+    for s in soups:
+        if s.find_all(PythonDocURL):
+            return True
+    return False
+
+
+def Object2_IsValidSoups(post_soups, comment_soups):
+    return Object2_AnswerExists(post_soups) and (Object2_IsPyDocSoups(post_soups) or Object2_IsPyDocSoups(comment_soups))
+
+
 def Run1(startPageNum, endPageNum, isAppend=True):
     if(isAppend):
         fileOpenFlag = "a"
@@ -116,14 +132,14 @@ def Run2(startPageNum, endPageNum, isAppend=False):
                 comments = soup.find_all('span', 'comment-copy')
 
                 # Check whether the contents is valid.
-                if len(post_texts) != 1 and soup.find(PythonDocURL) != -1:
+                if Object2_IsValidSoups(post_texts, comments):
                     # Open File for writing.
                     outputFileName = Object2_Filename_Gen(
                         Object2_DirectoryName, startPageNum, url)
-                    
+
                     # Check whether the directory for output file does not exist.
                     # Source: https://stackoverflow.com/a/12517490
-                    os.makedirs(os.path.dirname(filename), exist_ok=True)
+                    os.makedirs(os.path.dirname(outputFile), exist_ok=True)
 
                     with open(outputFileName, 'w') as outputFile:
                         for post in post_texts:
