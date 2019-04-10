@@ -1,0 +1,279 @@
+<div class="post-text" itemprop="text">
+<p>I'm writing on a script that reads all lines from multiple files, reads in a number  at the beginning of each block and puts that number in front of every line of the block until the next number and so on. Afterwards it writes all read lines into a single .csv file.</p>
+<p>The files I am reading look like this:</p>
+<pre><code>13368:
+2385003,4,2004-07-08
+659432,3,2005-03-16
+13369:
+751812,2,2002-12-16
+2625420,2,2004-05-25
+</code></pre>
+<p>And the output file should look like this:</p>
+<pre><code>13368,2385003,4,2004-07-08
+13368,659432,3,2005-03-16
+13369,751812,2,2002-12-16
+13369,2625420,2,2004-05-25
+</code></pre>
+<p>Currently my script is this:</p>
+<pre><code>from asyncio import Semaphore, ensure_future, gather, run
+import time
+
+limit = 8
+
+async def read(file_list):
+    tasks = list()
+    result = None
+
+    sem = Semaphore(limit)
+
+    for file in file_list:
+        task = ensure_future(read_bounded(file,sem))
+        tasks.append(task)
+
+        result = await gather(*tasks)
+
+    return result
+
+async def read_bounded(file,sem):
+    async with sem:
+        return await read_one(file)
+
+async def read_one(filename):
+    result = list()
+    with open(filename) as file:
+        dataList=[]
+        content = file.read().split(":")
+        file.close()
+        j=1
+        filmid=content[0]
+        append=result.append
+        while j&lt;len(content):
+            for entry in content[j].split("\n"):
+                if len(entry)&gt;10:
+                    append("%s%s%s%s" % (filmid,",",entry,"\n"))
+                else:
+                    if len(entry)&gt;0:
+                        filmid=entry
+            j+=1
+    return result
+
+if __name__ == '__main__':
+    start=time.time()
+    write_append="w"
+    files = ['combined_data_1.txt', 'combined_data_2.txt', 'combined_data_3.txt', 'combined_data_4.txt']
+
+    res = run(read(files))
+
+    with open("output.csv",write_append) as outputFile:
+        for result in res:
+            outputFile.write(''.join(result))
+            outputFile.flush()
+    outputFile.close()
+    end=time.time()
+    print(end-start)
+</code></pre>
+<p>It has a runtime of about 135 Seconds (The 4 files that are read are each 500MB big and the output file has 2.3GB). Running the script takes about 10GB of RAM. I think this might be a problem.
+The biggest amount of time is needed to create the list of all lines, I think.
+I would like to reduce the runtime of this program, but I am new to python and not sure how to do this. Can you give me some advice?</p>
+<p>Thanks</p>
+<p>Edit:</p>
+<p>I measured the times for the following commands in cmd (I have only Windows installed on my Computer, so I used hopefully equivalent cmd-Commands):</p>
+<p><strong>sequential writing to NUL</strong></p>
+<pre><code>timecmd "type combined_data_1.txt combined_data_2.txt combined_data_3.txt combined_data_4.txt  &gt; NUL"
+
+combined_data_1.txt
+
+
+combined_data_2.txt
+
+
+combined_data_3.txt
+
+
+combined_data_4.txt
+
+command took 0:1:25.87 (85.87s total)
+</code></pre>
+<p><strong>sequential writing to file</strong></p>
+<pre><code>timecmd "type combined_data_1.txt combined_data_2.txt combined_data_3.txt combined_data_4.txt  &gt; test.csv"
+
+combined_data_1.txt
+combined_data_2.txt
+combined_data_3.txt
+combined_data_4.txt
+
+command took 0:2:42.93 (162.93s total)
+</code></pre>
+<p><strong>parallel</strong></p>
+<pre><code>timecmd "type combined_data_1.txt &gt; NUL &amp; type combined_data_2.txt &gt; NUL &amp; type combined_data_3.txt &gt;NUL &amp; type combined_data_4.txt  &gt; NUL"
+command took 0:1:25.51 (85.51s total)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>In this case you're not gaining anything by using <code>asyncio</code> for two reasons:</p>
+<ul>
+<li>asyncio is single-threaded and doesn't parallelize processing (and, in Python, <a href="https://en.wikipedia.org/wiki/Global_interpreter_lock" rel="nofollow noreferrer">neither can threads</a>)</li>
+<li>the IO calls access the file system, which asyncio doesn't cover - it is primarily about network IO</li>
+</ul>
+<p>The giveaway that you're not using asyncio correctly is the fact that your <code>read_one</code> coroutine doesn't contain a single <code>await</code>. That means that it never suspends execution, and that it will run to completion before ever yielding to another coroutine. Making it an ordinary function (and dropping asyncio altogether) would have the exact same result.</p>
+<p>Here is a rewritten version of the script with the following changes:</p>
+<ul>
+<li>byte IO throughout, for efficiency</li>
+<li>iterates through the file rather than loading all at once</li>
+<li>sequential code</li>
+</ul>
+<pre class="lang-py prettyprint-override"><code>import sys
+
+def process(in_filename, outfile):
+    with open(in_filename, 'rb') as r:
+        for line in r:
+            if line.endswith(b':\n'):
+                prefix = line[:-2]
+                continue
+            outfile.write(b'%s,%s' % (prefix, line))
+
+def main():
+    in_files = sys.argv[1:-1]
+    out_file = sys.argv[-1]
+    with open(out_file, 'wb') as out:
+        for fn in in_files:
+            process(fn, out)
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>On my machine and Python 3.7, this version performs at approximately 22 s/GiB, tested on four randomly generated files, of 550 MiB each. It has a negligible memory footprint because it never loads the whole file into memory.</p>
+<p>The script runs on Python 2.7 unchanged, where it clocks at 27 s/GiB. Pypy (6.0.0) runs it much faster, taking only 11 s/GiB.</p>
+<p>Using <code>concurrent.futures</code> in theory ought to allow processing in one thread while another is waiting for IO, but the result ends up being significantly <em>slower</em> than the simplest sequential approach.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You want to read 2 GiB and write 2 GiB with low elapsed time and low memory consumption.
+Parallelism, for core and for spindle, matters.
+Ideally you would tend to keep all of them busy.
+I assume you have at least four cores available.
+Chunking your I/O matters, to avoid excessive malloc'ing.</p>
+<p>Start with the simplest possible thing.
+Please make some measurements and update your question to include them.</p>
+<h1>sequential</h1>
+<p>Please make sequential timing measurements of</p>
+<pre><code>$ cat combined_data_[1234].csv &gt; /dev/null
+</code></pre>
+<p>and</p>
+<pre><code>$ cat combined_data_[1234].csv &gt; big.csv
+</code></pre>
+<p>I assume you will have low CPU utilization, and thus will be measuring read &amp; write I/O rates.</p>
+<h1>parallel</h1>
+<p>Please make parallel I/O measurements:</p>
+<pre><code>cat combined_data_1.csv &gt; /dev/null &amp;
+cat combined_data_2.csv &gt; /dev/null &amp;
+cat combined_data_3.csv &gt; /dev/null &amp;
+cat combined_data_4.csv &gt; /dev/null &amp;
+wait
+</code></pre>
+<p>This will let you know if overlapping reads offers a possibility for speedup.
+For example, putting the files on four different physical filesystems might allow this -- you'd be keeping four spindles busy.</p>
+<h1>async</h1>
+<p>Based on these timings, you may choose to ditch async I/O, and instead fork off four separate python interpreters.</p>
+<h1>logic</h1>
+<pre><code>        content = file.read().split(":")
+</code></pre>
+<p>This is where much of your large memory footprint comes from.
+Rather than slurping in the whole file at once, consider reading by lines, or in chunks.
+A generator might offer you a convenient API for that.</p>
+<p>EDIT:</p>
+<h1>compression</h1>
+<p>It appears that you are I/O bound -- you have idle cycles while waiting on the disk.
+If the final consumer of your output file is willing to do decompression, then
+consider using <a href="https://docs.python.org/3/library/gzip.html" rel="nofollow noreferrer">gzip</a>, <a href="https://docs.python.org/3/library/lzma.html" rel="nofollow noreferrer">xz/lzma</a>, or <a href="https://pypi.org/project/python-snappy/" rel="nofollow noreferrer">snappy</a>.
+The idea is that most of the elapsed time is spent on I/O, so you want to manipulate smaller files to do less I/O.
+This benefits your script when writing 2 GiB of output,
+and may also benefit the code that consumes that output.</p>
+<p>As a separate item, you might possibly arrange for the code that produces the four input files to produce compressed versions of them.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I have tried to solve your problem. I think this is very easy and simple way if don't have any prior knowledge of any special library.</p>
+<p>I just took 2 input files named <code>input.txt</code> &amp; <code>input2.txt</code> with following contents.</p>
+<p><strong>Note:</strong> All files are in same directory.</p>
+<blockquote>
+<p>input.txt</p>
+</blockquote>
+<pre><code>13368:
+2385003,4,2004-07-08
+659432,3,2005-03-16
+13369:
+751812,2,2002-12-16
+2625420,2,2004-05-25
+</code></pre>
+<blockquote>
+<p>input2.txt</p>
+</blockquote>
+<pre><code>13364:
+2385001,5,2004-06-08
+659435,1,2005-03-16
+13370:
+751811,2,2023-12-16
+2625220,2,2015-05-26
+</code></pre>
+<p>I have written the code in modular way so that you could easily import and use it in your project. Once you run the below code from terminal using <code>python3 csv_writer.py</code>, it will read all the files provided in list <code>file_names</code> and generate <code>output.csv</code> will the result that you're looking for.</p>
+<blockquote>
+<p>csv_writer.py</p>
+</blockquote>
+<pre><code># https://stackoverflow.com/questions/55226823/reduce-runtime-file-reading-string-manipulation-of-every-line-and-file-writing
+import re
+
+def read_file_and_get_output_lines(file_names):
+    output_lines = []
+
+    for file_name in file_names:
+        with open(file_name) as f:
+            lines = f.readlines()
+            for new_line in lines:
+                new_line = new_line.strip()
+
+                if not re.match(r'^\d+:$', new_line):
+                    output_line = [old_line]
+                    output_line.extend(new_line.split(","))
+                    output_lines.append(output_line)
+                else:
+                    old_line = new_line.rstrip(":")
+
+    return output_lines
+
+def write_lines_to_csv(output_lines, file_name):
+    with open(file_name, "w+") as f:
+        for arr in output_lines:
+            line = ",".join(arr)
+            f.write(line + '\n')
+
+if __name__ == "__main__":
+    file_names = [
+        "input.txt",
+        "input2.txt"
+    ]
+
+    output_lines = read_file_and_get_output_lines(file_names)
+    print(output_lines)
+    # [['13368', '2385003', '4', '2004-07-08'], ['13368', '659432', '3', '2005-03-16'], ['13369', '751812', '2', '2002-12-16'], ['13369', '2625420', '2', '2004-05-25'], ['13364', '2385001', '5', '2004-06-08'], ['13364', '659435', '1', '2005-03-16'], ['13370', '751811', '2', '2023-12-16'], ['13370', '2625220', '2', '2015-05-26']]
+
+    write_lines_to_csv(output_lines, "output.csv")
+</code></pre>
+<blockquote>
+<p>output.csv</p>
+</blockquote>
+<pre><code>13368,2385003,4,2004-07-08
+13368,659432,3,2005-03-16
+13369,751812,2,2002-12-16
+13369,2625420,2,2004-05-25
+13364,2385001,5,2004-06-08
+13364,659435,1,2005-03-16
+13370,751811,2,2023-12-16
+13370,2625220,2,2015-05-26
+</code></pre>
+</div>
+<span class="comment-copy">Thank you! This is nearly twice as fast. Is the reduction in runtime mainly because it is read in bytes or because of the iteration? I thought it would be faster to load in the whole file at once to reduce the number of accesses on the file</span>
+<span class="comment-copy">@Alex4224 I'm not sure which of the two helps more; I tried to make the code fast by having it do as little as possible. Loading the file at once doesn't speed things up because the number of accesses is amortized by io buffering anyway.</span>
+<span class="comment-copy">Thank you for your answer! I've included the time measurements in the question. I think that means, that running the script with async I/O does not offer any advantages for the overall runtime, right?</span>
+<span class="comment-copy">Yup, it looks like you're I/O bound, so there's limited savings to be had by tweaking code. I <i>do</i> recommend doing less I/O, perhaps via compression. Another avenue to explore is incremental updates, where you ignore ancient unchanged records. That might require new logic for the consuming code, though.</span>
+<span class="comment-copy">Thank you for your answer! Sadly, it did not reduce the runtime of the script. It actually took longer to execute.</span>
+<span class="comment-copy">Okay, what is current running time?</span>
+<span class="comment-copy">The current running time for my script was about 130s, your script took about 280s.</span>
