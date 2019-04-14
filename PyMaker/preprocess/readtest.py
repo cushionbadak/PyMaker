@@ -1,7 +1,11 @@
 import json
 
-with open("./Pymaker/datas/pythonDocListLibraryReference.txt", 'r') as f:
+with open("./Pymaker/datas/pythonDocToNumber.txt", 'r') as f:
     data = f.read()
-    data = data.replace("'", '\"')
-    links = json.loads(data)
+    links = eval(data)
     print(links["library/functions.html#abs"])
+
+with open("./Pymaker/datas/numberToPythonDoc.txt", 'r') as f:
+    data = f.read()
+    backlinks = eval(data)
+    print(backlinks[303])
