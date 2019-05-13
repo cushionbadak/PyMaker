@@ -37,7 +37,7 @@ def obj3_readfile(filename):
     contentstr = ''
     answerurls = []
     status = 0
-    with open(filepath, 'r') as f:
+    with open(filepath, 'r', encoding='utf-8') as f:
         for line in f:
             if status == 1:
                 if 'Answer URL' in line:
