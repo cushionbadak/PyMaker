@@ -1,6 +1,8 @@
 import torch
 import string
 
+from stringhash import str2bigramhashlist
+
 # No pre-trained word embedding
 # No negative sampling.
 # No subsampling.
@@ -9,7 +11,6 @@ import string
 # Constants and Hyperparameters
 _C = {}
 _C['HASH_BIT_SIZE'] = 20
-_C['ALPHA_NUM_WS'] = string.ascii_letters + string.digits + string.whitespace
 _C['DEBUG_MODE'] = True
 _C['LEARNING_RATE'] = 0.01
 
@@ -50,49 +51,6 @@ def get_gradient(input_hash, output_class, W_in, W_out):
     return loss, grad_in, grad_out
 
 
-def alphanumws_converter(c, replace=' '):
-    # c : character (length-1 string)
-
-    # Examples :
-    #   alphanumws_converter('a') => 'a'
-    #   alphanumws_converter('\n') => '\n'
-    #   alphanumws_converter('2') => '2'
-    #   alphanumws_converter(' ') => ' '
-    #   alphanumws_converter('_') => ' '
-    return c if c in _C['ALPHA_NUM_WS'] else replace
-
-
-def formatsplit(s):
-    # s : string (whole bunch of contents)
-    # output : string list
-
-    # Example using alphanumws_converter :
-    #   formatsplit('as3 ][3i] z-12 p.pow')
-    #   => ['as3', '3i', 'z', '12', 'p', 'pow']
-
-    # To change its' behavior, you should change alphanumws_converter to other function.
-    return ''.join(list(map(alphanumws_converter, s))).split()
-
-
-def stringhash(s):
-    # input : string
-    # output : int between [0, (2 ** HASH_BIT_SIZE) - 1]
-    return hash(s) & ((1 << _C['HASH_BIT_SIZE']) - 1)
-
-
-def bigramhash(w1, w2, concatstr=' '):
-    # w1 : string
-    # w2 : string
-    # output : int between [0, (2 ** HASH_BIT_SIZE) - 1]
-    return stringhash(w1 + concatstr + w2)
-
-
-def bigramhashlist(word_seq):
-    # word_seq : string list (string length should be greater than 1)
-    # output : int list (list of hashed bigram)
-    return [bigramhash(word_seq[i-1], word_seq[i]) for i in range(1, len(word_seq))]
-
-
 def train_one_content(input_string, output_classes, W_in, W_out, learning_rate=_C['LEARNING_RATE']):
     # INPUTS
     # input_string : string (all content)
@@ -106,7 +64,7 @@ def train_one_content(input_string, output_classes, W_in, W_out, learning_rate=_
     # W_out (learned)
 
     losses = []
-    inputhashlist = bigramhashlist(formatsplit(input_string))
+    inputhashlist = str2bigramhashlist(input_string)
     for output_class in output_classes:
         for h in inputhashlist:
             L, G_in, G_out = get_gradient(h, output_class, W_in, W_out)
@@ -115,7 +73,7 @@ def train_one_content(input_string, output_classes, W_in, W_out, learning_rate=_
             W_in[h] -= learning_rate * G_in.squeeze()
             W_out -= learning_rate * G_out
             losses.append(L.item())
-    
+
     avg_loss = sum(losses) / len(losses)
     return avg_loss, W_in, W_out
 
