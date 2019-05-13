@@ -1,7 +1,12 @@
+import os
 import torch
+from torch.serialization import save
+from torch.serialization import load
 import string
 
+from datasearch import *
 from stringhash import str2bigramhashlist
+
 
 # No pre-trained word embedding
 # No negative sampling.
@@ -10,9 +15,20 @@ from stringhash import str2bigramhashlist
 
 # Constants and Hyperparameters
 _C = {}
+_C['DEBUG_MODE'] = False
+_C['LAB_SERVER_USE'] = False
+_C['LAB_SERVER_USE_GPU_NUM'] = "00"
+# If ITER_COUNT_DEBUG_INFO_PERIOD <= 0, program will not print losses.
+_C['ITER_COUNT_DEBUG_INFO_PERIOD'] = 1
+# If TRAIN_CONTENTNUM_UPPER_LIMIT <= 0, program will learn for the whole training set.
+_C['TRAIN_CONTENTNUM_UPPER_LIMIT'] = 10
+
 _C['HASH_BIT_SIZE'] = 20
-_C['DEBUG_MODE'] = True
+_C['DIMENSION'] = 64
 _C['LEARNING_RATE'] = 0.01
+
+_C['W_IN_FILENAME'] = 'zerobase_learned_w_in.pt'
+_C['W_OUT_FILENAME'] = 'zerobase_learned_w_out.pt'
 
 
 def print_constants_to_str():
@@ -20,7 +36,7 @@ def print_constants_to_str():
     # output : string s
     s = ''
     for key in _C:
-        s += str(key) + '\t:' + str(_C[key]) + '\n'
+        s += str(key) + '\t: ' + str(_C[key]) + '\n'
     return s
 
 
@@ -65,22 +81,66 @@ def train_one_content(input_string, output_classes, W_in, W_out, learning_rate=_
 
     losses = []
     inputhashlist = str2bigramhashlist(input_string)
+    #print('PROFILING INFO : len(output_classes) * len(inputhashlist) = ' +
+          str(len(output_classes) * len(inputhashlist)))
     for output_class in output_classes:
         for h in inputhashlist:
             L, G_in, G_out = get_gradient(h, output_class, W_in, W_out)
-            losses.append()
             # I don't know why squeeze method needed, but I don't test whether it works well when squeeze method does not exist.
+            losses.append(L.item())
             W_in[h] -= learning_rate * G_in.squeeze()
             W_out -= learning_rate * G_out
-            losses.append(L.item())
 
-    avg_loss = sum(losses) / len(losses)
+    avg_loss = 0
+    if len(losses) != 0:
+        avg_loss = sum(losses) / len(losses)
+
     return avg_loss, W_in, W_out
 
 
 def main():
-    # TODO
-    pass
+    # GPU setting
+    if _C['LAB_SERVER_USE']:
+        os.environ["CUDA_VISIBLE_DEVICES"] = _C['LAB_SERVER_USE_GPU_NUM']    # Set GPU number to use
+
+    dimension = _C['DIMENSION']
+    iter_count_debug_info_period = _C['ITER_COUNT_DEBUG_INFO_PERIOD']
+
+    print(print_constants_to_str())
+
+    # Xavier initialization of weight matrices
+    W_in = torch.randn((1 << _C['HASH_BIT_SIZE']),
+                       dimension).cuda() / (dimension**0.5)
+    W_out = torch.randn(len(num2pydoc), dimension).cuda() / (dimension**0.5)
+
+    # LEARNING
+    print('Collect all training filenames.')
+    obj3_filenamelist = obj3_allfilelist()
+    iter_count = 0
+    avglosses = []
+    print('Training Start.')
+    for filename in obj3_filenamelist:
+        iter_count += 1
+        if _C['TRAIN_CONTENTNUM_UPPER_LIMIT'] > 0 and _C['TRAIN_CONTENTNUM_UPPER_LIMIT'] < iter_count:
+            break
+
+        content, answers = obj3_readfile(filename)
+        avgloss, _, _ = train_one_content(
+            content, answers, W_in, W_out, learning_rate=_C['LEARNING_RATE'])
+
+        avglosses.append(avgloss)
+        if (iter_count_debug_info_period > 0) and (iter_count % iter_count_debug_info_period == 0):
+            print("Content Iteration : " + str(iter_count))
+            if len(avglosses) != 0:
+                print("LOSS : %f" % (sum(avglosses)/len(avglosses),))
+            else:
+                print("LOSS : N/A")
+            avglosses = []
+
+
+    # SAVE W_in W_out to file.
+    save(W_in, _C['W_IN_FILENAME'])
+    save(W_out, _C['W_OUT_FILENAME'])
 
 
 if not _C['DEBUG_MODE']:
