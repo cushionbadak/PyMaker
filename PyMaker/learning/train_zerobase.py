@@ -1,4 +1,5 @@
 import os
+import sys
 import torch
 from torch.serialization import save
 from torch.serialization import load
@@ -16,12 +17,12 @@ from stringhash import str2bigramhashlist
 # Constants and Hyperparameters
 _C = {}
 _C['DEBUG_MODE'] = False
-_C['LAB_SERVER_USE'] = False
-_C['LAB_SERVER_USE_GPU_NUM'] = "00"
+_C['LAB_SERVER_USE'] = True
+_C['LAB_SERVER_USE_GPU_NUM'] = "03"
 # If ITER_COUNT_DEBUG_INFO_PERIOD <= 0, program will not print losses.
-_C['ITER_COUNT_DEBUG_INFO_PERIOD'] = 1
+_C['ITER_COUNT_DEBUG_INFO_PERIOD'] = 2000
 # If TRAIN_CONTENTNUM_UPPER_LIMIT <= 0, program will learn for the whole training set.
-_C['TRAIN_CONTENTNUM_UPPER_LIMIT'] = 10
+_C['TRAIN_CONTENTNUM_UPPER_LIMIT'] = 0
 
 _C['HASH_BIT_SIZE'] = 20
 _C['DIMENSION'] = 64
@@ -82,7 +83,7 @@ def train_one_content(input_string, output_classes, W_in, W_out, learning_rate=_
     losses = []
     inputhashlist = str2bigramhashlist(input_string)
     #print('PROFILING INFO : len(output_classes) * len(inputhashlist) = ' +
-          str(len(output_classes) * len(inputhashlist)))
+    #      str(len(output_classes) * len(inputhashlist)))
     for output_class in output_classes:
         for h in inputhashlist:
             L, G_in, G_out = get_gradient(h, output_class, W_in, W_out)
@@ -136,6 +137,8 @@ def main():
             else:
                 print("LOSS : N/A")
             avglosses = []
+
+        sys.stdout.flush()
 
 
     # SAVE W_in W_out to file.
