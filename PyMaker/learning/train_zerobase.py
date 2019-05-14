@@ -82,7 +82,7 @@ def train_one_content(input_string, output_classes, W_in, W_out, learning_rate=_
 
     losses = []
     inputhashlist = str2bigramhashlist(input_string)
-    #print('PROFILING INFO : len(output_classes) * len(inputhashlist) = ' +
+    # print('PROFILING INFO : len(output_classes) * len(inputhashlist) = ' +
     #      str(len(output_classes) * len(inputhashlist)))
     for output_class in output_classes:
         for h in inputhashlist:
@@ -102,7 +102,8 @@ def train_one_content(input_string, output_classes, W_in, W_out, learning_rate=_
 def main():
     # GPU setting
     if _C['LAB_SERVER_USE']:
-        os.environ["CUDA_VISIBLE_DEVICES"] = _C['LAB_SERVER_USE_GPU_NUM']    # Set GPU number to use
+        # Set GPU number to use
+        os.environ["CUDA_VISIBLE_DEVICES"] = _C['LAB_SERVER_USE_GPU_NUM']
 
     dimension = _C['DIMENSION']
     iter_count_debug_info_period = _C['ITER_COUNT_DEBUG_INFO_PERIOD']
@@ -126,7 +127,14 @@ def main():
             break
 
         content, answers = obj3_readfile(filename)
-        avgloss, _, _ = train_one_content(
+
+        # train title
+        _, lastfilename = os.path.split(filename)
+        _, W_in, W_out = train_one_content(
+            lastfilename, answers, W_in, W_out, learning_rate=_C['LEARNING_RATE'])
+
+        # train content
+        avgloss, W_in, W_out = train_one_content(
             content, answers, W_in, W_out, learning_rate=_C['LEARNING_RATE'])
 
         avglosses.append(avgloss)
@@ -139,7 +147,6 @@ def main():
             avglosses = []
 
         sys.stdout.flush()
-
 
     # SAVE W_in W_out to file.
     save(W_in, _C['W_IN_FILENAME'])
