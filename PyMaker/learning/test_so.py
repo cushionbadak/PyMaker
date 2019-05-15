@@ -12,6 +12,7 @@ _RESULT_LOG_FILENAME = 'result_so_zerobase_learned_full.log'
 # THIS MUST BE THE SAME VALUE WITH train_zerobase.py's _C['HASH_BIT_SIZE']
 _HASH_BIT_SIZE = 20
 
+_DEBUG_MODE = False
 _LAB_SERVER_USE = True
 _LAB_SERVER_USE_GPU_NUM = "03"
 
@@ -124,3 +125,7 @@ def test_so_N_contents(N=0, candidate_num=_N_FOR_TOP_N_VALUES, logging=True, spe
                     logfile.write('\t' + num2pydoc(a) + '\n')
 
     return corrects, candidates, answerurls
+
+
+if not _DEBUG_MODE:
+    test_so_N_contents()
