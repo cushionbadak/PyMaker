@@ -112,8 +112,8 @@ def main():
 
     # Xavier initialization of weight matrices
     W_in = torch.randn((1 << _C['HASH_BIT_SIZE']),
-                       dimension) / (dimension**0.5)
-    W_out = torch.randn(len(num2pydoc), dimension) / (dimension**0.5)
+                       dimension).cuda() / (dimension**0.5)
+    W_out = torch.randn(len(num2pydoc), dimension).cuda() / (dimension**0.5)
 
     # LEARNING
     print('Collect all training filenames.')
