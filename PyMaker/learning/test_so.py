@@ -6,10 +6,11 @@ import sys
 from stringhash import str2bigramhashlist
 from datasearch import *
 
-_W_IN_FILENAME = 'zerobase_learned_full_w_in'
-_W_OUT_FILENAME = 'zerobase_learned_full_w_out'
+_W_IN_FILENAME = 'zerobase_learned_full_w_in.pt'
+_W_OUT_FILENAME = 'zerobase_learned_full_w_out.pt'
 _RESULT_LOG_FILENAME = 'result_so_zerobase_learned_full.log'
-_HASH_BIT_SIZE = 20    # THIS MUST BE THE SAME VALUE WITH train_zerobase.py's _C['HASH_BIT_SIZE']
+# THIS MUST BE THE SAME VALUE WITH train_zerobase.py's _C['HASH_BIT_SIZE']
+_HASH_BIT_SIZE = 20
 
 _LAB_SERVER_USE = True
 _LAB_SERVER_USE_GPU_NUM = "03"
@@ -52,7 +53,7 @@ def pick_top_n(outputvec, n):
 
     l = [a.item() for a in outputvec.flatten()]
     return [l.index(k) for k in sorted(l, reverse=True)[:n]]
-    
+
 
 def test_so_one_content(filename, n):
     # filename : string. a filename from datasearch.obj3_getfilelist() or datasearch.obj3_allfilelist()
@@ -61,7 +62,7 @@ def test_so_one_content(filename, n):
     # correct : int. the number of corrrect candidate answers.
     # candidates : int list. what leraning results infer from content.
     # answerurls : int list. the correct answers.
-    
+
     # read file
     _, tailfilename = os.path.split(filename)
     contentstr, answerurls = obj3_readfile(filename)
@@ -82,7 +83,7 @@ def test_so_one_content(filename, n):
     return correct, candidates, answerurls
 
 
-def test_so_N_contents(N=0, candidate_num=5, logging=True, specific_logging=True, random=False):
+def test_so_N_contents(N=0, candidate_num=_N_FOR_TOP_N_VALUES, logging=True, specific_logging=True, random=False):
     # N : int. the number of contents to test. if N <= 0, this will test for whole contents.
     # candidate_num : int. it is for the argument value for pick_top_n function. (it must satisfy (0 < n <= OH))
     # logging : bool. True for printing one-line result of test_so_one_content(). (question name, the number of correct answers / total correct answers)
@@ -98,28 +99,28 @@ def test_so_N_contents(N=0, candidate_num=5, logging=True, specific_logging=True
     candidates = []
     answerurls = []
 
-    iter_count = 0
-    for fn in allfilenames:
-        iter_count += 1
-        if N > 0 and iter_count > N:
-            break
+    with open(_RESULT_LOG_FILENAME, 'w') as logfile:
+        iter_count = 0
+        for fn in allfilenames:
+            iter_count += 1
+            if N > 0 and iter_count > N:
+                break
 
-        co, ca, an = test_so_one_content(fn, candidate_num)
-        corrects.append(co)
-        candidates.append(ca)
-        answerurls.append(an)
+            co, ca, an = test_so_one_content(fn, candidate_num)
+            corrects.append(co)
+            candidates.append(ca)
+            answerurls.append(an)
 
-        if logging:
-            _, fntail = os.path.split(fn)
-            print('ITEATION ' + str(iter_count) + ' =>\tCORRECT: ' + str(co) + '\tfor ' + str(len(an)) + ' ANSWERS')
-        if specific_logging:
-            print('CANDIDATES:')
-            for c in ca:
-                print('\t' + num2pydoc(c))
-            print('ANSWERS:')
-            for a in an:
-                print('\t' + num2pydoc(c))
-
-        sys.stdout.flush()
+            if logging:
+                _, fntail = os.path.split(fn)
+                logfile.write('ITEATION ' + str(iter_count) + ' =>\tCORRECT: ' + str(
+                    co) + '\tfor ' + str(len(an)) + ' ANSWERS.\tFILE: ' + fntail + '\n')
+            if specific_logging:
+                logfile.write('CANDIDATES:\n')
+                for c in ca:
+                    logfile.write('\t' + num2pydoc(c) + '\n')
+                logfile.write('ANSWERS:\n')
+                for a in an:
+                    logfile.write('\t' + num2pydoc(a) + '\n')
 
     return corrects, candidates, answerurls
