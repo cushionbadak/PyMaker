@@ -30,7 +30,7 @@ def formatsplit(s):
 def stringhash(s, hash_bit_size):
     # input : string
     # output : int between [0, (2 ** HASH_BIT_SIZE) - 1]
-    return hash(s) & ((1 << hash_bit_size - 1))
+    return hash(s) & ((1 << hash_bit_size) - 1)
 
 
 def bigramhash(w1, w2, hash_bit_size, concatstr=' '):
