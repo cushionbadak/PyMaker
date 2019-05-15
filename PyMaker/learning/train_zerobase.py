@@ -81,7 +81,7 @@ def train_one_content(input_string, output_classes, W_in, W_out, learning_rate=_
     # W_out (learned)
 
     losses = []
-    inputhashlist = str2bigramhashlist(input_string)
+    inputhashlist = str2bigramhashlist(input_string, _C['HASH_BIT_SIZE'])
     # print('PROFILING INFO : len(output_classes) * len(inputhashlist) = ' +
     #      str(len(output_classes) * len(inputhashlist)))
     for output_class in output_classes:
