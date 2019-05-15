@@ -116,14 +116,14 @@ def test_so_N_contents(N=_N_FOR_TESTCASE_NUM, candidate_num=_N_FOR_TOP_N_VALUES,
             if logging:
                 _, fntail = os.path.split(fn)
                 logfile.write('ITEATION ' + str(iter_count) + ' =>\tCORRECT: ' + str(
-                    co) + '\tfor ' + str(len(an)) + ' ANSWERS.\tFILE: ' + fntail + '\n')
+                    co) + ' / ' + str(len(an)) + '\tFILE: ' + fntail + '\n')
             if specific_logging:
                 logfile.write('CANDIDATES:\n')
                 for c in ca:
-                    logfile.write('\t' + num2pydoc(c) + '\n')
+                    logfile.write('\t' + num2pydoc[c] + '\n')
                 logfile.write('ANSWERS:\n')
                 for a in an:
-                    logfile.write('\t' + num2pydoc(a) + '\n')
+                    logfile.write('\t' + num2pydoc[a] + '\n')
 
     return corrects, candidates, answerurls
 
