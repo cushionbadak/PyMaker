@@ -16,7 +16,7 @@ _DEBUG_MODE = False
 _LAB_SERVER_USE = True
 _LAB_SERVER_USE_GPU_NUM = "03"
 
-_N_FOR_TESTCASE_NUM = 100
+_N_FOR_TESTCASE_NUM = 10
 _N_FOR_TOP_N_VALUES = 5
 
 
@@ -73,6 +73,7 @@ def test_so_one_content(filename, n):
     # construct input vector.
     ws = str2bigramhashlist(contentstr, _HASH_BIT_SIZE)
     inputvec = torch.zeros(1, V).cuda()
+    print(ws)
     for h in ws:
         inputvec[0][h] = 1.0
 
@@ -88,7 +89,7 @@ def test_so_one_content(filename, n):
 def test_so_N_contents(N=_N_FOR_TESTCASE_NUM, candidate_num=_N_FOR_TOP_N_VALUES, logging=True, specific_logging=True, random=False):
     # N : int. the number of contents to test. if N <= 0, this will test for whole contents.
     # candidate_num : int. it is for the argument value for pick_top_n function. (it must satisfy (0 < n <= OH))
-    # logging : bool. True for printing one-line result of test_so_one_content(). (question name, the number of correct answers / total correct answers)
+    # logging : bool. True for printing two-line result of test_so_one_content(). (question name, the number of correct answers / total correct answers)
     # specific_logging : bool. True for printing the whole results of test_so_one_content(). (including the name of answers.)
     # random : bool. True for selecting N testcases randomly. Otherwise, it will test N contents from the front of the datasearch.obj3_allfilelist().
 
@@ -100,6 +101,7 @@ def test_so_N_contents(N=_N_FOR_TESTCASE_NUM, candidate_num=_N_FOR_TOP_N_VALUES,
     corrects = []
     candidates = []
     answerurls = []
+    answercount = 0
 
     with open(_RESULT_LOG_FILENAME, 'w') as logfile:
         iter_count = 0
@@ -112,11 +114,12 @@ def test_so_N_contents(N=_N_FOR_TESTCASE_NUM, candidate_num=_N_FOR_TOP_N_VALUES,
             corrects.append(co)
             candidates.append(ca)
             answerurls.append(an)
+            answercount += len(an)
 
             if logging:
                 _, fntail = os.path.split(fn)
                 logfile.write('ITEATION ' + str(iter_count) + ' =>\tCORRECT: ' + str(
-                    co) + ' / ' + str(len(an)) + '\tFILE: ' + fntail + '\n')
+                    co) + ' / ' + str(len(an)) + '\t\tFILE: ' + fntail + '\n')
             if specific_logging:
                 logfile.write('CANDIDATES:\n')
                 for c in ca:
@@ -124,6 +127,11 @@ def test_so_N_contents(N=_N_FOR_TESTCASE_NUM, candidate_num=_N_FOR_TOP_N_VALUES,
                 logfile.write('ANSWERS:\n')
                 for a in an:
                     logfile.write('\t' + num2pydoc[a] + '\n')
+            if logging or specific_logging:
+                logfile.write('\n')
+
+        if logging or specific_logging:
+            logfile.write('TOTAL CORRECT: ' + str(sum(corrects)) + ' / ' + str(answercount) + '\n')
 
     return corrects, candidates, answerurls
 
