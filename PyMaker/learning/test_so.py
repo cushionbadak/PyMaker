@@ -73,7 +73,7 @@ def test_so_one_content(filename, n):
     # construct input vector.
     ws = str2bigramhashlist(contentstr, _HASH_BIT_SIZE)
     inputvec = torch.zeros(1, V).cuda()
-    ov = torch.zeros(1, D).cuda()
+    ov = torch.zeros(1, OH).cuda()
     for h in ws:
         inputvec = torch.zeros(1, V).cuda()
         inputvec[0][h] = 1.0
