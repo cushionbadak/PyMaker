@@ -73,11 +73,14 @@ def test_so_one_content(filename, n):
     # construct input vector.
     ws = str2bigramhashlist(contentstr, _HASH_BIT_SIZE)
     inputvec = torch.zeros(1, V).cuda()
-    print(ws)
+    ov = torch.zeros(1, D).cuda()
     for h in ws:
+        inputvec = torch.zeros(1, V).cuda()
         inputvec[0][h] = 1.0
+        ov += classify(inputvec) / len(ws)
+        inputvec[0][h] = 0.0
 
-    candidates = pick_top_n(classify(inputvec), n)
+    candidates = pick_top_n(ov, n)
 
     # count correct answers.
     # https://stackoverflow.com/a/15375122
