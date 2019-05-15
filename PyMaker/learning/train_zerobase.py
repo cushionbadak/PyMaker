@@ -20,9 +20,9 @@ _C['DEBUG_MODE'] = False
 _C['LAB_SERVER_USE'] = True
 _C['LAB_SERVER_USE_GPU_NUM'] = "03"
 # If ITER_COUNT_DEBUG_INFO_PERIOD <= 0, program will not print losses.
-_C['ITER_COUNT_DEBUG_INFO_PERIOD'] = 2000
+_C['ITER_COUNT_DEBUG_INFO_PERIOD'] = 1
 # If TRAIN_CONTENTNUM_UPPER_LIMIT <= 0, program will learn for the whole training set.
-_C['TRAIN_CONTENTNUM_UPPER_LIMIT'] = 0
+_C['TRAIN_CONTENTNUM_UPPER_LIMIT'] = 10
 
 _C['HASH_BIT_SIZE'] = 20
 _C['DIMENSION'] = 64
@@ -112,8 +112,8 @@ def main():
 
     # Xavier initialization of weight matrices
     W_in = torch.randn((1 << _C['HASH_BIT_SIZE']),
-                       dimension).cuda() / (dimension**0.5)
-    W_out = torch.randn(len(num2pydoc), dimension).cuda() / (dimension**0.5)
+                       dimension) / (dimension**0.5)
+    W_out = torch.randn(len(num2pydoc), dimension) / (dimension**0.5)
 
     # LEARNING
     print('Collect all training filenames.')
@@ -129,7 +129,7 @@ def main():
         content, answers = obj3_readfile(filename)
 
         # train title
-        _, lastfilename = os.path.split(filename)
+        lastfilename = obj3_getdistinctfilename(filename)
         _, W_in, W_out = train_one_content(
             lastfilename, answers, W_in, W_out, learning_rate=_C['LEARNING_RATE'])
 

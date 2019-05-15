@@ -1,5 +1,5 @@
 from os import listdir
-from os.path import isfile, join
+from os.path import isfile, join, split
 
 # datas/object3/ folder should be unzipped like this.
 # [project_root]/PyMaker/datas/object3/1st/i501/Python_DOC_referPages.accept-file-and-pass-arguments-to-function-from-command-line-gives-no-output.txt
@@ -76,3 +76,10 @@ def obj3_allfilelist():
     for i in range(0, 226):
         r.extend(obj3_getfilelist(i))
     return r
+
+
+def obj3_getdistinctfilename(filename):
+    # every obj3's filename contains 'Python_DOC_referPages.' and '.txt'
+    # this function removes it.
+    _, tailfilename = split(filename)
+    return tailfilename[22:-4]

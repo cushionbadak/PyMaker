@@ -66,7 +66,7 @@ def test_so_one_content(filename, n):
     # answerurls : int list. the correct answers.
 
     # read file
-    _, tailfilename = os.path.split(filename)
+    tailfilename = obj3_getdistinctfilename(filename)
     contentstr, answerurls = obj3_readfile(filename)
     contentstr = tailfilename + ' ' + contentstr
 
@@ -120,7 +120,7 @@ def test_so_N_contents(N=_N_FOR_TESTCASE_NUM, candidate_num=_N_FOR_TOP_N_VALUES,
             answercount += len(an)
 
             if logging:
-                _, fntail = os.path.split(fn)
+                fntail = obj3_getdistinctfilename(fn)
                 logfile.write('ITEATION ' + str(iter_count) + ' =>\tCORRECT: ' + str(
                     co) + ' / ' + str(len(an)) + '\t\tFILE: ' + fntail + '\n')
             if specific_logging:
