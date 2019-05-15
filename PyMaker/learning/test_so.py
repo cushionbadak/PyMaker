@@ -16,6 +16,7 @@ _DEBUG_MODE = False
 _LAB_SERVER_USE = True
 _LAB_SERVER_USE_GPU_NUM = "03"
 
+_N_FOR_TESTCASE_NUM = 100
 _N_FOR_TOP_N_VALUES = 5
 
 
@@ -28,8 +29,8 @@ if _LAB_SERVER_USE:
 # W_out : torch.tensor (OH, D)
 W_in = load(_W_IN_FILENAME).cuda()
 W_out = load(_W_OUT_FILENAME).cuda()
-V, D = W_in.size
-OH, D2 = W_out.size
+V, D = W_in.size()
+OH, D2 = W_out.size()
 
 if D != D2:
     print('Invalid W_in, W_out size.')
@@ -84,7 +85,7 @@ def test_so_one_content(filename, n):
     return correct, candidates, answerurls
 
 
-def test_so_N_contents(N=0, candidate_num=_N_FOR_TOP_N_VALUES, logging=True, specific_logging=True, random=False):
+def test_so_N_contents(N=_N_FOR_TESTCASE_NUM, candidate_num=_N_FOR_TOP_N_VALUES, logging=True, specific_logging=True, random=False):
     # N : int. the number of contents to test. if N <= 0, this will test for whole contents.
     # candidate_num : int. it is for the argument value for pick_top_n function. (it must satisfy (0 < n <= OH))
     # logging : bool. True for printing one-line result of test_so_one_content(). (question name, the number of correct answers / total correct answers)
