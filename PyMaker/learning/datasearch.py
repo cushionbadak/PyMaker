@@ -1,5 +1,6 @@
 from os import listdir
 from os.path import isfile, join, split
+import re
 
 # datas/object3/ folder should be unzipped like this.
 # [project_root]/PyMaker/datas/object3/1st/i501/Python_DOC_referPages.accept-file-and-pass-arguments-to-function-from-command-line-gives-no-output.txt
@@ -7,8 +8,18 @@ from os.path import isfile, join, split
 _DATAPATH = '../datas/'
 _OBJ3_DATAPATH = _DATAPATH + 'object3/'
 
+
+def getupperpydoc(s):
+    # s : string. string in pydoc2num's key.
+    # output : string. input url's postfix deleted.
+    # example : 'reference/introduction.html#introduction' => 'reference/introduction.html'
+    return re.sub('#.*', '', s)
+
+
 pydoc2num = {}
 num2pydoc = {}
+upperpydoc2num = {}
+num2upperpydoc = {}
 
 with open(_DATAPATH + 'pythonDocToNumber.txt', 'r') as f:
     _temp_data = f.read()
@@ -18,6 +29,11 @@ with open(_DATAPATH + 'pythonDocToNumber.txt', 'r') as f:
 with open(_DATAPATH + 'numberToPythonDoc.txt', 'r') as f:
     _temp_data = f.read()
     num2pydoc = eval(_temp_data)
+
+
+upperpydocset = set([getupperpydoc(p) for p in pydoc2num])
+upperpydoc2num = dict(zip(upperpydocset, range(len(upperpydocset))))
+num2upperpydoc = dict((v, k) for k, v in upperpydoc2num.items())
 
 
 def obj3_readfile(filename):
