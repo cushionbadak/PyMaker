@@ -46,7 +46,15 @@ def bigramhashlist(word_seq, hash_bit_size):
     return [bigramhash(word_seq[i-1], word_seq[i], hash_bit_size, concatstr=' ') for i in range(1, len(word_seq))]
 
 
+def unigramhashlist(word_seq, hash_bit_size):
+    return [stringhash(w, hash_bit_size) for w in word_seq]
+
+
 def str2bigramhashlist(s, hash_bit_size=20):
     # s : string (long string)
     # output : int list (list of hashed bigram)
     return bigramhashlist(formatsplit(s), hash_bit_size)
+
+
+def str2unigramhashlist(s, hash_bit_size=20):
+    return unigramhashlist(formatsplit(s), hash_bit_size)

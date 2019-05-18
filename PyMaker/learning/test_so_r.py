@@ -4,13 +4,14 @@ import os
 import sys
 
 from stringhash import str2bigramhashlist
+from stringhash import str2unigramhashlist
 from datasearch import *
 
 _W_IN_FILENAME = 'zerobase_learned_full_w_in.pt'
 _W_OUT_FILENAME = 'zerobase_learned_full_w_out.pt'
 _RESULT_LOG_FILENAME = 'result_so_zerobase_learned_full.log'
 # THIS MUST BE THE SAME VALUE WITH train_zerobase.py's _C['HASH_BIT_SIZE']
-_HASH_BIT_SIZE = 20
+_HASH_BIT_SIZE = 18
 
 _DEBUG_MODE = False
 _LAB_SERVER_USE = True
@@ -71,7 +72,7 @@ def test_so_one_content(filename, n):
     contentstr = tailfilename + ' ' + contentstr
 
     # construct input vector.
-    ws = str2bigramhashlist(contentstr, _HASH_BIT_SIZE)
+    ws = str2unigramhashlist(contentstr, _HASH_BIT_SIZE)
     inputvec = torch.zeros(1, V).cuda()
     ov = torch.zeros(1, OH).cuda()
     for h in ws:
