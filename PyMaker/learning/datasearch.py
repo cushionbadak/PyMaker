@@ -20,6 +20,7 @@ pydoc2num = {}
 num2pydoc = {}
 upperpydoc2num = {}
 num2upperpydoc = {}
+pydoc2upperpydocnum = {}
 
 with open(_DATAPATH + 'pythonDocToNumber.txt', 'r') as f:
     _temp_data = f.read()
@@ -34,9 +35,11 @@ with open(_DATAPATH + 'numberToPythonDoc.txt', 'r') as f:
 upperpydocset = set([getupperpydoc(p) for p in pydoc2num])
 upperpydoc2num = dict(zip(upperpydocset, range(len(upperpydocset))))
 num2upperpydoc = dict((v, k) for k, v in upperpydoc2num.items())
+pydoc2upperpydocnum = dict(
+    (k, upperpydoc2num[getupperpydoc(k)]) for k, v in pydoc2num.items())
 
 
-def obj3_readfile(filename):
+def obj3_readfile(filename, isupperpydocused=False):
     # filename : filename its' path under 'object3'.
     # for exmample, argument 'sample_i1/hello.txt' for '[project_root]/PyMaker/datas/object3/sample_i1/hello.txt'
 
@@ -53,6 +56,8 @@ def obj3_readfile(filename):
     contentstr = ''
     answerurls = []
     status = 0
+    ansurlclass = pydoc2upperpydocnum if isupperpydocused else pydoc2num
+
     with open(filepath, 'r', encoding='utf-8') as f:
         for line in f:
             if status == 1:
@@ -65,7 +70,8 @@ def obj3_readfile(filename):
                     status = 1
             elif status == 2:
                 try:
-                    answerurls.append(pydoc2num[str.rstrip(line[urlheadlen:])])
+                    answerurls.append(
+                        ansurlclass[str.rstrip(line[urlheadlen:])])
                 except:
                     pass
             else:
