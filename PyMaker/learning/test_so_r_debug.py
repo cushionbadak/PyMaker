@@ -183,7 +183,7 @@ if not _DEBUG_MODE:
     test_so_N_contents()
 
 with open(_RESULT_LOG_FILENAME, 'w') as logfile:
-    for fn in obj3_allfilelist:
+    for fn in obj3_allfilelist():
         s = obj3_getdistinctfilename(fn)
         _, a = obj3_readfile(fn)
-        test_query(s, candidate_num=5, answers=a, stdoutputprint=False, outputfiledescriptor=logfile)
+        test_query(s, candidate_num=5, answers=a, stdoutprint=False, outputfiledescriptor=logfile)
