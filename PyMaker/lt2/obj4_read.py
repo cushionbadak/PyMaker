@@ -34,7 +34,7 @@ def obj4_filename(n, includepath=True):
 
 
 def obj4_allfilename():
-    return [obj4_filename(n) for n in range(0, 10655)]
+    return [obj4_filename(n) for n in range(0, OBJ4_SIZE)]
 
 
 def obj4_str(filename):
@@ -56,5 +56,27 @@ def obj4_str(filename):
     return link, formatsplit(content)
 
 
+def obj4_linklist():
+    linklist = []
+    for i in range(0, OBJ4_SIZE):
+        with open(obj4_filename(i), 'r', encoding='utf-8') as fp:
+            i = 0
+            for line in fp:
+                if i == 1:
+                    linklist.append(str.rstrip(line))
+                    break
+                i += 1
+    return linklist
+
+
 def obj4_vecrep_filename(n, includepath=True):
     return (OBJ4_VECREP_PATH if includepath else '') + str(n)
+
+
+def obj4_upperlink_list():
+    l = []
+    for fn in obj4_allfilename():
+        link, _ = obj4_str(fn)
+        if '#' not in link:
+            l.append(link)
+    return l

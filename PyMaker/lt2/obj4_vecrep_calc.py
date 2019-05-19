@@ -7,6 +7,9 @@ from obj4_read import *
 from google_w2v import *
 from obj3_datasearch import *
 
+obj4_link_list = obj4_linklist()
+uli = obj4_upperlink_list()
+
 
 def save_all_obj4_docvec():
     fns = obj4_allfilename()
@@ -37,12 +40,12 @@ def get_top_n_similar_pydoc(ws, d, n=N_FOR_TOP_N_VALUES):
     vrs = linalg.norm(vr)
 
     l = []
-    for i in range(0, 10655):
-        pydocvr, pydocvrs = d[i]
+    for i in range(0, len(uli)):
+        pydocvr, pydocvrs = d[obj4_link_list.index(uli[i])]
         l.append((dot(vr, pydocvr.T)/vrs/pydocvrs).item())
     
     # https://stackoverflow.com/a/7851166
-    return [l.index(k) for k in sorted(range(len(l)), reverse=True, key=lambda k: l[k])[:n]]
+    return [k for k in sorted(range(len(l)), reverse=True, key=lambda k: l[k])[:n]]
 
 
 def get_top_n_similar_pydoc_from_str(s, d, n=N_FOR_TOP_N_VALUES):
@@ -66,23 +69,24 @@ def test_obj3(d, n=N_FOR_TOP_N_VALUES, testnum=N_FOR_TESTCASE_NUM):
         if testnum > 0 and test_iter > testnum:
             break
         
-        c, a = obj3_readfile(fn, isupperpydocused=False)
+        c, a = obj3_readfile(fn, isupperpydocused=True)
+        a = [obj4_link_list.index(num2upperpydoc[aa]) for aa in a]
         gtnsp = get_top_n_similar_pydoc_from_str(c, d, n)
         co = correct_answers_count(gtnsp, a)
         corrects.append(co)
-        answercount.append(a)
+        answercount.append(len(a))
 
         fntail = obj3_getdistinctfilename(fn)
         print('ITEATION ' + str(test_iter) + ' =>\tCORRECT: ' + str(
             co) + ' / ' + str(len(a)) + '\t\tFILE: ' + fntail)
         
         print('CANDIDATES:')
-        for c in gtnsp:
-            print('\t' + num2pydoc[c])
+        for can in gtnsp:
+            print('\t' + uli[can])
         print('ANSWERS:')
         for a in a:
-            print('\t' + num2pydoc[a])
-    print('TOTAL CORRECT: ' + str(sum(corrects)) + ' / ' + str(answercount) + '\n')
+            print('\t' + obj4_link_list[a])
+    print('TOTAL CORRECT: ' + str(sum(corrects)) + ' / ' + str(sum(answercount)) + '\n')
 
     return
         
