@@ -60,4 +60,4 @@ def obj4_str(filename):
 
 
 def obj4_vecrep_filename(n, includepath=True):
-    return (OBJ4_VECREP_PATH if includepath else '') + str(n) + '.npv'
+    return (OBJ4_VECREP_PATH if includepath else '') + str(n)
