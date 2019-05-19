@@ -4,6 +4,7 @@ import torch
 from torch.serialization import save
 from torch.serialization import load
 import string
+from random import shuffle
 
 from datasearch import *
 from stringhash import str2bigramhashlist
@@ -30,9 +31,10 @@ _C['TRAIN_CONTENTNUM_UPPER_LIMIT'] = 0
 _C['HASH_BIT_SIZE'] = 18
 _C['DIMENSION'] = 64
 _C['LEARNING_RATE'] = 0.01
+_C['EPOCH'] = 5
 
-_C['W_IN_FILENAME'] = 'zerobase_learned_r_w_in.pt'
-_C['W_OUT_FILENAME'] = 'zerobase_learned_r_w_out.pt'
+_C['W_IN_FILENAME'] = 'result_r/zerobase_learned_full_r_4_w_in.pt'
+_C['W_OUT_FILENAME'] = 'result_r/zerobase_learned_full_r_4_w_out.pt'
 
 
 def print_constants_to_str():
@@ -124,32 +126,35 @@ def main():
     iter_count = 0
     avglosses = []
     print('Training Start.')
-    for filename in obj3_filenamelist:
-        iter_count += 1
-        if _C['TRAIN_CONTENTNUM_UPPER_LIMIT'] > 0 and _C['TRAIN_CONTENTNUM_UPPER_LIMIT'] < iter_count:
-            break
+    for epoch in range(_C['EPOCH']):
+        print("EPOCH " + str(epoch))
+        shuffle(obj3_filenamelist)
+        for filename in obj3_filenamelist:
+            iter_count += 1
+            if _C['TRAIN_CONTENTNUM_UPPER_LIMIT'] > 0 and _C['TRAIN_CONTENTNUM_UPPER_LIMIT'] < iter_count:
+                break
 
-        content, answers = obj3_readfile(filename, isupperpydocused=True)
+            content, answers = obj3_readfile(filename, isupperpydocused=True)
 
-        # train title
-        lastfilename = obj3_getdistinctfilename(filename)
-        _, W_in, W_out = train_one_content(
-            lastfilename, answers, W_in, W_out, learning_rate=_C['LEARNING_RATE'])
+            # train title
+            lastfilename = obj3_getdistinctfilename(filename)
+            _, W_in, W_out = train_one_content(
+                lastfilename, answers, W_in, W_out, learning_rate=_C['LEARNING_RATE'])
 
-        # train content
-        avgloss, W_in, W_out = train_one_content(
-            content, answers, W_in, W_out, learning_rate=_C['LEARNING_RATE'])
+            # train content
+            avgloss, W_in, W_out = train_one_content(
+                content, answers, W_in, W_out, learning_rate=_C['LEARNING_RATE'])
 
-        avglosses.append(avgloss)
-        if (iter_count_debug_info_period > 0) and (iter_count % iter_count_debug_info_period == 0):
-            print("Content Iteration : " + str(iter_count))
-            if len(avglosses) != 0:
-                print("LOSS : %f" % (sum(avglosses)/len(avglosses),))
-            else:
-                print("LOSS : N/A")
-            avglosses = []
+            avglosses.append(avgloss)
+            if (iter_count_debug_info_period > 0) and (iter_count % iter_count_debug_info_period == 0):
+                print("Content Iteration : " + str(iter_count))
+                if len(avglosses) != 0:
+                    print("LOSS : %f" % (sum(avglosses)/len(avglosses),))
+                else:
+                    print("LOSS : N/A")
+                avglosses = []
 
-        sys.stdout.flush()
+            sys.stdout.flush()
 
     # SAVE W_in W_out to file.
     save(W_in, _C['W_IN_FILENAME'])

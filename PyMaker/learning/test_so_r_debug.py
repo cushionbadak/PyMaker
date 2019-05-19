@@ -7,9 +7,9 @@ from stringhash import str2bigramhashlist
 from stringhash import str2unigramhashlist
 from datasearch import *
 
-_W_IN_FILENAME = 'zerobase_learned_full_r_2_w_in.pt'
-_W_OUT_FILENAME = 'zerobase_learned_full_r_2_w_out.pt'
-_RESULT_LOG_FILENAME = 'result_so_zerobase_learned_full_r_2.log'
+_W_IN_FILENAME = 'result_r/zerobase_learned_full_r_2_w_in.pt'
+_W_OUT_FILENAME = 'result_r/zerobase_learned_full_r_2_w_out.pt'
+_RESULT_LOG_FILENAME = 'result_r/result_so_zerobase_learned_full_r_3.log'
 # THIS MUST BE THE SAME VALUE WITH train_zerobase.py's _C['HASH_BIT_SIZE']
 _HASH_BIT_SIZE = 18
 
@@ -183,7 +183,7 @@ if not _DEBUG_MODE:
     test_so_N_contents()
 
 with open(_RESULT_LOG_FILENAME, 'w') as logfile:
-    for fn in obj3_allfilelist:
+    for fn in obj3_allfilelist():
         s = obj3_getdistinctfilename(fn)
-        _, a = obj3_readfile(fn)
-        test_query(s, candidate_num=5, answers=a, stdoutputprint=False, outputfiledescriptor=logfile)
+        _, a = obj3_readfile(fn, isupperpydocused=True)
+        test_query(s, candidate_num=5, answers=a, stdoutprint=False, outputfiledescriptor=logfile)
