@@ -53,12 +53,13 @@ def get_top_n_similar_pydoc_from_str(s, d, n=N_FOR_TOP_N_VALUES):
 
 
 def correct_answers_count(candidate, answer):
-    return sum(1 for i in candidate if i in answer)
+    answers = [obj4_link_list[a] for a in answer]
+    return sum([answers.count(uli[i]) for i in candidate])
 
 
 def test_obj3(d, n=N_FOR_TOP_N_VALUES, testnum=N_FOR_TESTCASE_NUM):
     # d : return value of get_all_obj4_docvec()
-    # output : No return value. test log will go to stdout.
+    # output : No return value. test log will go to stdout. 
 
     fnl = obj3_allfilelist()
     test_iter = 0
@@ -87,6 +88,7 @@ def test_obj3(d, n=N_FOR_TOP_N_VALUES, testnum=N_FOR_TESTCASE_NUM):
         for a in a:
             print('\t' + obj4_link_list[a])
     print('TOTAL CORRECT: ' + str(sum(corrects)) + ' / ' + str(sum(answercount)) + '\n')
+    print('')
 
     return
         
