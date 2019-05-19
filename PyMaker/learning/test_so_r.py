@@ -7,14 +7,14 @@ from stringhash import str2bigramhashlist
 from stringhash import str2unigramhashlist
 from datasearch import *
 
-_W_IN_FILENAME = 'zerobase_learned_full_w_in.pt'
-_W_OUT_FILENAME = 'zerobase_learned_full_w_out.pt'
-_RESULT_LOG_FILENAME = 'result_so_zerobase_learned_full.log'
+_W_IN_FILENAME = 'result_r/zerobase_learned_full_r_4_w_in.pt'
+_W_OUT_FILENAME = 'result_r/zerobase_learned_full_r_4_w_out.pt'
+_RESULT_LOG_FILENAME = 'result_r/result_so_zerobase_learned_full_r_6.log'
 # THIS MUST BE THE SAME VALUE WITH train_zerobase.py's _C['HASH_BIT_SIZE']
 _HASH_BIT_SIZE = 18
 
-_DEBUG_MODE = False
-_LAB_SERVER_USE = True
+_DEBUG_MODE = True
+_LAB_SERVER_USE = False
 _LAB_SERVER_USE_GPU_NUM = "03"
 
 _N_FOR_TESTCASE_NUM = 10
@@ -58,6 +58,19 @@ def pick_top_n(outputvec, n):
     return [l.index(k) for k in sorted(l, reverse=True)[:n]]
 
 
+def pick_top_n_elem(outputvec, n):
+    # filter outputvec's each element with non-linear function (ReLU-like).
+    # outputvec : torch.tensor(1, OH)
+    # n : int.
+    # output : torch.tensor(1, OH)
+    # example : pick-top_n_elem(torch.tensor([[5, 2, 7, 6, 3, 4, 1]]), 4) --> torch.tensor([[5, 0, 7, 6, 0, 4, 0]])
+
+    z = torch.zeros(1, OH)
+    for i in pick_top_n(outputvec, n):
+        z[0][i] = 1.0
+    return outputvec * z
+
+
 def test_so_one_content(filename, n):
     # filename : string. a filename from datasearch.obj3_getfilelist() or datasearch.obj3_allfilelist()
     # n : int. pick top n candidate answers.
@@ -73,13 +86,11 @@ def test_so_one_content(filename, n):
 
     # construct input vector.
     ws = str2unigramhashlist(contentstr, _HASH_BIT_SIZE)
-    inputvec = torch.zeros(1, V).cuda()
     ov = torch.zeros(1, OH).cuda()
     for h in ws:
         inputvec = torch.zeros(1, V).cuda()
         inputvec[0][h] = 1.0
-        ov += classify(inputvec) / len(ws)
-        inputvec[0][h] = 0.0
+        ov += pick_top_n_elem(classify(inputvec), _N_FOR_TOP_N_VALUES)
 
     candidates = pick_top_n(ov, n)
 
