@@ -1,9 +1,6 @@
-import sys
 import string
 
 from lt2_global import *
-sys.path.append('../learning')
-from datasearch import *
 
 _ALPHA_NUM_WS = string.ascii_letters + string.digits + string.whitespace
 

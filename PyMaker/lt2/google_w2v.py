@@ -20,6 +20,6 @@ def unigram_sentence_wordvecsum(ws):
             initv -= initv
     for w in ws:
         if w in model:
-            initv += model[w]    
+            initv += model[w]
 
     return initv
