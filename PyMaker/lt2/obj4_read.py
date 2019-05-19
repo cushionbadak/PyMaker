@@ -33,7 +33,7 @@ def formatsplit(s):
 
 def obj4_filename(n, includepath=True):
     # n : int. (0 <= n < 10655)
-    return (_OBJ4_PATH if includepath else '') + str(n) + '.txt'
+    return (OBJ4_PATH if includepath else '') + str(n) + '.txt'
 
 
 def obj4_allfilename():
@@ -60,4 +60,4 @@ def obj4_str(filename):
 
 
 def obj4_vecrep_filename(n, includepath=True):
-    return (_OBJ4_VECREP_PATH if includepath else '') + str(n) + '.npv'
+    return (OBJ4_VECREP_PATH if includepath else '') + str(n) + '.npv'
