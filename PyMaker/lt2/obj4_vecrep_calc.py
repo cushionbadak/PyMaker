@@ -57,7 +57,7 @@ def correct_answers_count(candidate, answer):
     return sum([answers.count(uli[i]) for i in candidate])
 
 
-def test_obj3(d, n=N_FOR_TOP_N_VALUES, testnum=N_FOR_TESTCASE_NUM):
+def test_obj3(d, n=N_FOR_TOP_N_VALUES, testnum=N_FOR_TESTCASE_NUM, removeDuplicateAnswer=True):
     # d : return value of get_all_obj4_docvec()
     # output : No return value. test log will go to stdout. 
 
@@ -72,6 +72,7 @@ def test_obj3(d, n=N_FOR_TOP_N_VALUES, testnum=N_FOR_TESTCASE_NUM):
         
         c, a = obj3_readfile(fn, isupperpydocused=True)
         a = [obj4_link_list.index(num2upperpydoc[aa]) for aa in a]
+        a = list(set(a)) if removeDuplicateAnswer else a
         gtnsp = get_top_n_similar_pydoc_from_str(c, d, n)
         co = correct_answers_count(gtnsp, a)
         corrects.append(co)
@@ -92,6 +93,6 @@ def test_obj3(d, n=N_FOR_TOP_N_VALUES, testnum=N_FOR_TESTCASE_NUM):
 
     return
         
-
-d = get_all_obj4_docvec()
-test_obj3(d)
+if OBJ4_VECREP_CALC_TEST:
+    d = get_all_obj4_docvec()
+    test_obj3(d)
