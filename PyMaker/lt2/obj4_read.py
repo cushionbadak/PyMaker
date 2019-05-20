@@ -1,6 +1,6 @@
 import string
 
-from lt2_global import *
+from .lt2_global import *
 
 _ALPHA_NUM_WS = string.ascii_letters + string.digits + string.whitespace
 

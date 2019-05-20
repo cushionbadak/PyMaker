@@ -2,11 +2,11 @@ from numpy import save
 from numpy import load
 from scipy import dot, linalg
 
-from lt2_global import *
-from obj4_read import *
-from google_w2v import *
-from obj3_datasearch import *
-from obj4_vecrep_calc import *
+from .lt2_global import *
+from .obj4_read import *
+from .google_w2v import *
+from .obj3_datasearch import *
+from .obj4_vecrep_calc import *
 
 
 ################## HOW TO USE ##########################

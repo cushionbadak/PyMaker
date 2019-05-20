@@ -1,10 +1,10 @@
 import numpy as np
 from scipy import dot, linalg
 
-from lt2_global import *
-from obj4_read import *
-from google_w2v import *
-from obj3_datasearch import *
+from .lt2_global import *
+from .obj4_read import *
+from .google_w2v import *
+from .obj3_datasearch import *
 
 obj4_link_list = obj4_linklist()
 uli = obj4_upperlink_list()
