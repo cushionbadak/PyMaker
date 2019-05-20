@@ -10,6 +10,8 @@ from obj4_vecrep_calc import *
 
 
 ################## HOW TO USE ##########################
+# -1. Make sure that PyMaker/lt2, PyMaker/datas/object4_wv_rep/,
+#      PyMaker/datas/GoogleNews/ contains appropriate files to run code.
 # 0. Check lt2_global.py if you want to configure service easily.
 #      They can be manipulated as function arguments too.
 # 1. from pymaker_service import evaluate_query
