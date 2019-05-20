@@ -1,0 +1,93 @@
+<div class="post-text" itemprop="text">
+<p>The problem I am facing is that:</p>
+<ul>
+<li>I have an asynchronous method</li>
+<li>Calling plain-old python code I cannot change</li>
+<li>Which calls back a plain-old python method</li>
+<li>Which needs to call async code using <code>await</code></li>
+</ul>
+<p>I have a custom command interpreter built on top of <a href="https://docs.python.org/3/library/cmd.html" rel="nofollow noreferrer">Python's Cmd class</a>. I provide it with custom stdin and stdout. For the purpose of this question, it looks like this:</p>
+<pre><code>import cmd
+import sys
+
+class CustomStream(object):
+    def readline(self):
+        return sys.stdin.readline()
+    def write(self, msg):
+        sys.stdout.write(msg)
+    def flush(self):
+        pass
+
+class MyShell(cmd.Cmd):
+    def do_stuff(self, args):
+        print("Getting things done...")
+    def do_exit(self, args):
+        return True
+
+stream = CustomStream()
+shell = MyShell(stdin=stream, stdout=stream)
+shell.use_rawinput = False 
+shell.cmdloop()
+</code></pre>
+<p>When <code>Cmd</code> needs to read from the user, it will do this:</p>
+<pre><code>line = self.stdin.readline()
+</code></pre>
+<p>I want to provide an SSH interface to my custom interperter using the AsyncSSH library based on <code>asyncio</code>. My SSH code is much like the <a href="https://asyncssh.readthedocs.io/en/latest/#simple-server-with-input" rel="nofollow noreferrer">Simple Server sample</a>, which reads a stdin like interface like this (notice the <code>await</code> keyword):</p>
+<pre><code>line_from_client = (await self._process.stdin.readline()).rstrip('\n')
+</code></pre>
+<p>I tried a number of things but I can't duck type the SSH code to Cmd's expectation of stdin. What must I do to have my <code>CustomStream</code> object use asyncio/coroutines on the inside while providing an old-school, single thread interface to <code>MyShell</code>?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The solution was to patch the <code>cmdloop</code> method to make it asyncio aware.</p>
+<p>This code is a copy of Python's 3.7.2 Cmd class cmdloop function you get if you set</p>
+<ul>
+<li><code>raw_input</code> set to <code>True</code></li>
+<li>put <code>await</code> in front of readline</li>
+</ul>
+<p>Results in this code (<a href="https://gist.github.com/ixe013/bcc2ccc2a5601004d4de29076d029c46" rel="nofollow noreferrer">aoicmd.py available as a gist</a>): </p>
+<pre><code>async def adapter_cmdloop(self, intro=None):
+    """Repeatedly issue a prompt, accept input, parse an initial prefix
+    off the received input, and dispatch to action methods, passing them
+    the remainder of the line as argument.
+
+    """
+    self.preloop()
+
+    #This is the same code as the Python 3.7.2 Cmd class, with the
+    #following changes
+    #  - Remove dead code caused by forcing use_rawinput=False.
+    #  - Added a readline in front of readline()
+    if intro is not None:
+        self.intro = intro
+    if self.intro:
+        self.stdout.write(str(self.intro)+"\n")
+    stop = None
+    while not stop:
+        if self.cmdqueue:
+            line = self.cmdqueue.pop(0)
+        else:
+            self.stdout.write(self.prompt)
+            self.stdout.flush()
+            line = await self.stdin.readline()
+            if not len(line):
+                line = 'EOF'
+            else:
+                line = line.rstrip('\r\n')
+        line = self.precmd(line)
+        stop = self.onecmd(line)
+        stop = self.postcmd(stop, line)
+    self.postloop()
+</code></pre>
+<p>Where you need to use your Cmd derived class, like <code>MyShell</code>, create a new class called <code>MyAsyncShell</code> at runtime:</p>
+<pre><code>#Patch the shell with async aware cmdloop
+MyAsyncShell = type('MyAsyncSHell', (MyShell,), {
+    'cmdloop' :aiocmd.adapter_cmdloop,
+    'use_rawinput':False,
+})
+</code></pre>
+<p>Implement <code>write</code> and <code>flush</code> as you see fit, but your readline should look like this:</p>
+<pre><code>async def readline(self):
+    return await my_implementation_of_readline()
+</code></pre>
+</div>
+<span class="comment-copy">This reddit thread sums up everything I tried so far... <a href="https://www.reddit.com/r/Python/comments/6m826s/calling_async_functions_from_synchronous_functions/" rel="nofollow noreferrer">reddit.com/r/Python/comments/6m826s/…</a></span>

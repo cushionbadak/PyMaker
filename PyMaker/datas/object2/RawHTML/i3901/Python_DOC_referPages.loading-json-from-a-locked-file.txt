@@ -1,0 +1,127 @@
+<div class="post-text" itemprop="text">
+<p>I have several instances of the same python script running in parallel, reading and writing to the same json file: First an instance reads information from the json file, then processes it then locks it then reads it again, to get the up to date contents of the file (might have been altered by other instances) then writes to it and releases the lock. Well, that is, this is how it would work if it... worked</p>
+<p>A stripped down version of the locking and writing part in my script looks like this:</p>
+<pre><code>import json
+import fcntl
+
+data = json.load(open('test.json'))
+
+# do things with data
+
+with open('test.json', 'w+') as file:
+    fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    data = json.load(open('test.json'))
+    fcntl.flock(file, fcntl.LOCK_UN)
+</code></pre>
+<p>But the open function seems to kind of clear the file, as it will be empty after running this snippet and json complains about invalid file format.</p>
+<p>How do I have to set this up correctly?</p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>But the open function seems to kind of clear the file</p>
+</blockquote>
+<p>Yes, opening a file in <code>w</code> write mode always clears the file; from the <a href="https://docs.python.org/3/library/functions.html#open" rel="nofollow noreferrer"><code>open()</code> function documentation</a>:</p>
+<blockquote>
+<p><code>'w'</code><br/>
+  open for writing, truncating the file first</p>
+<p>[...]
+  The default mode is <code>'r'</code> (open for reading text, synonym of <code>'rt'</code>). For binary read-write access, the mode <code>'w+b'</code> opens and truncates the file to 0 bytes. <code>'r+b'</code> opens the file without truncation.   </p>
+</blockquote>
+<p>You want to lock the file <strong>before</strong> truncating it. You can also open the file in <code>'r+'</code> mode (reading and writing), at which point you need to manually truncate it after locking. </p>
+<p>You also will need to lock the file for reading, because you don't want your readers to end up with truncated data when they try to read while another process is busy replacing the contents. Use a shared lock, at which point other processes are allowed to obtain a shared lock <em>too</em>, making it possible for many processes to read the data without having to wait for one another. A process that wants to write has to grab an exclusive lock, which is only going to be awarded when there are no shared locks anymore.</p>
+<p>Personally, I'd create a context manager that handles the locking (either in exclusive mode for writing, or in shared mode for reading), and only truncate the file after obtaining the lock. You'll also need to account for the file not yet existing, and if you don't want to wait for locks forever, you need to handle timeouts (meaning you need to use <code>LOCK_NB</code> <em>in a loop</em> and test for the return value to see if the lock was acquired, until a certain amount of time has passed).</p>
+<p>In the following context manager, I used the <code>os.open()</code> low-level system call to ensure the file is created when trying to lock it for exclusive access <em>without truncating it if it already exists</em>:</p>
+<pre><code>import errno
+import fcntl
+import os
+import time
+
+class Timeout(Exception):
+    """Could not obtain a lock within the time given"""
+
+class LockedFile:
+    """Lock and open a file.
+
+    If the file is opened for writing, an exclusive lock is used,
+    otherwise it is a shared lock
+
+    """
+    def __init__(self, path, mode, timeout=None, **fileopts):
+        self.path = path
+        self.mode = mode
+        self.fileopts = fileopts
+        self.timeout = timeout
+        # lock in exclusive mode when writing or appending (including r+)
+        self._exclusive = set('wa+').intersection(mode)
+        self._lockfh = None
+        self._file = None
+
+    def _acquire(self):
+        if self._exclusive:
+            # open the file in write &amp; create mode, but *without the 
+            # truncate flag* to make sure it is created only if it 
+            # doesn't exist yet
+            lockfhmode, lockmode = os.O_WRONLY | os.O_CREAT, fcntl.LOCK_EX
+        else:
+            lockfhmode, lockmode = os.O_RDONLY, fcntl.LOCK_SH
+        self._lockfh = os.open(self.path, lockfhmode)
+        start = time.time()
+        while True:
+            try:
+                fcntl.lockf(self._lockfh, lockmode | fcntl.LOCK_NB)
+                return
+            except OSError as e:
+                if e.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise
+            if self.timeout is not None and time.time() - start &gt; self.timeout:
+                raise Timeout()
+            time.sleep(0.1)
+
+    def _release(self):
+        fcntl.lockf(self._lockfh, fcntl.LOCK_UN)
+        os.close(self._lockfh)
+
+    def __enter__(self):
+        if self._file is not None:
+            raise LockException('Lock already taken')
+        self._acquire()
+        self._file = open(self.path, self.mode, **self.fileopts)
+        return self._file
+
+    def __exit__(self, *exc):
+        if self._file is None:
+            raise LockException('Not locked')
+        self._file.close()
+        self._file = None
+        self._release()
+</code></pre>
+<p>The processes that try to read the file then use:</p>
+<pre><code>with LockedFile('test.json', 'r') as file:
+    data = json.load(file)
+</code></pre>
+<p>and the process that wants to write uses:</p>
+<pre><code>with LockedFile('test.json', 'w') as file:
+    json.dump(data, file)
+</code></pre>
+<p>If you want to allow for a timeout, add a <code>try/except</code> block around the <code>with</code> block and catch the <code>Timeout</code> exception; you'll need to decide what should happen then:</p>
+<pre><code>try:
+    with LockedFile('test.json', 'w', timeout=10) as file:
+        json.dump(data, file)
+except Timeout:
+    # could not acquire an exclusive lock to write the file. What now?
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You used "w+" for opening the file. </p>
+<blockquote>
+<p>w+
+  Opens a file for both writing and reading. Overwrites the existing file if the file exists. If the file does not exist, creates a new file for reading and writing.</p>
+</blockquote>
+<p>So instead of <code>w+</code> use <code>a</code>.</p>
+<p>Looks to me you can really use threading library or multiprocessing to do this in more elegant way by using Locks, instead of running multiple instances of the same python script. </p>
+<p>Source : <a href="https://www.tutorialspoint.com/python/python_files_io.htm" rel="nofollow noreferrer">www.tutorialspoint.com</a>, <a href="https://docs.python.org/2/library/functions.html#open" rel="nofollow noreferrer">Python Docs</a></p>
+</div>
+<span class="comment-copy">Why did you use <code>LOCK_NB</code>? Failing to obtain the lock without testing for that is not a good idea, really.</span>
+<span class="comment-copy">I just followed a tutorial. Have never used this module before.</span>
+<span class="comment-copy">That's a very low-level system module; perhaps use a higher-level wrapper like the <a href="https://pypi.org/project/filelock/" rel="nofollow noreferrer"><code>filelock</code> library</a>?</span>
+<span class="comment-copy">On some platforms, the OS will prevent any kind of access to the file before the end point when opening in append mode.</span>

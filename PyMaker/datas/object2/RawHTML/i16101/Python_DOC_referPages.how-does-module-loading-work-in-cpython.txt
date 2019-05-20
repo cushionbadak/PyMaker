@@ -1,0 +1,140 @@
+<div class="post-text" itemprop="text">
+<p>How does module loading work in CPython under the hood? Especially, how does the dynamic loading of extensions written in C work? Where can I learn about this?</p>
+<p>I find the source code itself rather overwhelming. I can see that trusty ol' <code>dlopen()</code> and friends is used on systems that support it but without any sense of the bigger picture it would take a long time to figure this out from the source code.</p>
+<p>An enormous amount could be written on this topic but as far as I can tell, almost nothing has been — the abundance of webpages describing the Python language itself makes this difficult to search for. A great answer would provide a reasonably brief overview and references to resources where I can learn more.</p>
+<p>I'm mostly concerned with how this works on Unix-like systems simply because that's what I know but I am interested in if the process is similar elsewhere.</p>
+<p>To be more specific (but also risk assuming too much), how does CPython use the module methods table and initialization function to "make sense" of dynamically loaded C?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>TLDR short version bolded.</p>
+<p>References to the Python source code are based on version 2.7.6.</p>
+<p><strong>Python imports most extensions written in C through dynamic loading.</strong> Dynamic loading is an esoteric topic that isn't well documented but it's an absolute prerequisite. Before explaining <em>how</em> Python uses it, I must briefly explain <em>what it is</em> and <em>why</em> Python uses it.</p>
+<p>Historically C extensions to Python were statically linked against the Python interpreter itself. This required Python users to recompile the interpreter every time they wanted to use a new module written in C. As you can imagine, and as <a href="http://python-history.blogspot.com/2009/03/dynamically-loaded-modules.html" rel="noreferrer">Guido van Rossum describes</a>, this became impractical as the community grew. Today, most Python users never compile the interpreter once. We simply "pip install module" and then "import module" even if that module contains compiled C code.</p>
+<p><strong>Linking is what allows us to make function calls across compiled units of code. Dynamic loading solves the problem of linking code when the decision for what to link is made at runtime.</strong> That is, it allows a running program to interface with the linker and tell the linker what it wants to link with. <strong>For the Python interpreter to import modules with C code, this is what's called for.</strong> Writing code that makes this decision at runtime is quite uncommon and most programmers would be surprised that it's possible. Simply put, a C function has an address, it expects you to put certain data in certain places, and it promises to have put certain data in certain places upon return. If you know the secret handshake, you can call it.</p>
+<p>The challenge with dynamic loading is that it's incumbent upon the programmer to get the handshake right and there are no safety checks. At least, they're not provided for us. Normally, if we try to call a function name with an incorrect signature we get a compile or linker error. <strong>With dynamic loading we ask the linker for a function by name (a "symbol") at runtime. The linker can tell us if that name was found but it can’t tell us how to call that function. It just gives us an address - a void pointer. We can try to cast to a function pointer of some sort but it is solely up to the programmer to get the cast correct.</strong> If we get the function signature wrong in our cast, it’s too late for the compiler or linker to warn us. We’ll likely get a segfault after the program careens out of control and ends up accessing memory inappropriately. <strong>Programs using dynamic loading must rely on pre-arranged conventions and information gathered at runtime to make proper function calls.</strong> Here's a small example before we tackle the Python interpreter.</p>
+<p>File 1: main.c</p>
+<pre><code>/* gcc-4.8 -o main main -ldl */
+#include &lt;dlfcn.h&gt; /* key include, also in Python/dynload_shlib.c */
+
+/* used for cast to pointer to function that takes no args and returns nothing  */
+typedef void (say_hi_type)(void);
+
+int main(void) {
+    /* get a handle to the shared library dyload1.so */
+    void* handle1 = dlopen("./dyload1.so", RTLD_LAZY);
+
+    /* acquire function ptr through string with name, cast to function ptr */
+    say_hi_type* say_hi1_ptr = (say_hi_type*)dlsym(handle1, "say_hi1");
+
+    /* dereference pointer and call function */
+    (*say_hi1_ptr)();
+
+    return 0;
+}
+/* error checking normally follows both dlopen() and dlsym() */
+</code></pre>
+<p>File 2: dyload1.c</p>
+<pre><code>/* gcc-4.8 -o dyload1.so dyload1.c -shared -fpic */
+/* compile as C, C++ does name mangling -- changes function names */
+#include &lt;stdio.h&gt;
+
+void say_hi1() {
+    puts("dy1: hi");
+}
+</code></pre>
+<p>These files are compiled and linked separately but main.c knows to go looking for ./dyload1.so at runtime. The code in main assumes that dyload1.so will have a symbol "say_hi1". It gets a handle to dyload1.so's symbols with dlopen(), gets the address of a symbol using dlsym(), assumes it is a function that takes no arguments and returns nothing, and calls it. It has no way to know for sure what "say_hi1" is -- a prior agreement is all that keeps us from segfaulting.</p>
+<p>What I've shown above is the dlopen() family of functions. Python is deployed on many platforms, not all of which provide dlopen() but most have similar dynamic loading mechanisms. <strong>Python achieves portable dynamic loading by wrapping the dynamic loading mechanisms of several operating systems in a common interface.</strong></p>
+<p>This comment in Python/importdl.c summarizes the strategy.</p>
+<pre><code>/* ./configure sets HAVE_DYNAMIC_LOADING if dynamic loading of modules is
+   supported on this platform. configure will then compile and link in one
+   of the dynload_*.c files, as appropriate. We will call a function in
+   those modules to get a function pointer to the module's init function.
+*/
+</code></pre>
+<p>As referenced, in Python 2.7.6 we have these dynload*.c files:</p>
+<pre><code>Python/dynload_aix.c     Python/dynload_beos.c    Python/dynload_hpux.c
+Python/dynload_os2.c     Python/dynload_stub.c    Python/dynload_atheos.c
+Python/dynload_dl.c      Python/dynload_next.c    Python/dynload_shlib.c
+Python/dynload_win.c
+</code></pre>
+<p>They each define a function with this signature:</p>
+<pre><code>dl_funcptr _PyImport_GetDynLoadFunc(const char *fqname, const char *shortname,
+                                    const char *pathname, FILE *fp)
+</code></pre>
+<p>These functions contain the different dynamic loading mechanisms for different operating systems. The mechanism for dynamic loading on Mac OS newer than 10.2 and most Unix(-like) systems is dlopen(), which is called in Python/dynload_shlib.c.</p>
+<p>Skimming over dynload_win.c, the analagous function for Windows is LoadLibraryEx(). Its use looks very similar.</p>
+<p>At the bottom of Python/dynload_shlib.c you can see the actual call to dlopen() and to dlsym().</p>
+<pre><code>handle = dlopen(pathname, dlopenflags);
+/* error handling */
+p = (dl_funcptr) dlsym(handle, funcname);
+return p;
+</code></pre>
+<p>Right before this, Python composes the string with the function name it will look for. The module name is in the shortname variable.</p>
+<pre><code> PyOS_snprintf(funcname, sizeof(funcname),
+              LEAD_UNDERSCORE "init%.200s", shortname);
+</code></pre>
+<p><strong>Python simply hopes there's a function called init{modulename} and asks the linker for it. Starting here, Python relies on a small set of conventions to make dynamic loading of C code possible and reliable.</strong></p>
+<p>Let's look at what C extensions must do to fulfill the contract that makes the above call to dlsym() work. <strong>For compiled C Python modules, the first convention that allows Python to access the compiled C code is the init{shared_library_filename}() function.</strong> For <a href="https://docs.python.org/2/extending/extending.html" rel="noreferrer">a module named spam</a> compiled as shared library named “spam.so”, we might provide this initspam() function:</p>
+<pre><code>PyMODINIT_FUNC
+initspam(void)
+{
+    PyObject *m;
+    m = Py_InitModule("spam", SpamMethods);
+    if (m == NULL)
+        return;
+}
+</code></pre>
+<p>If the name of the init function does not match the filename, the Python interpreter cannot know how to find it. For example, renaming spam.so to notspam.so and trying to import gives the following.</p>
+<pre><code>&gt;&gt;&gt; import spam
+ImportError: No module named spam
+&gt;&gt;&gt; import notspam
+ImportError: dynamic module does not define init function (initnotspam)
+</code></pre>
+<p>If the naming convention is violated there's simply no telling if the shared library even contains an initialization function.</p>
+<p><strong>The second key convention is that once called, the init function is responsible for initializing itself by calling Py_InitModule.</strong> This call adds the module to a "dictionary"/hash table kept by the interpreter that maps module name to module data. It also registers the C functions in the method table. After calling Py_InitModule, modules may initialize themselves in other ways such as adding objects. (Ex: <a href="https://docs.python.org/2/extending/extending.html" rel="noreferrer">the SpamError object in the Python C API tutorial</a>). (Py_InitModule is actually a macro that creates the real init call but with some info baked in like what version of Python our compiled C extension used.)</p>
+<p>If the init function has the proper name but does not call Py_InitModule(), we get this:</p>
+<pre><code>SystemError: dynamic module not initialized properly
+</code></pre>
+<p>Our methods table happens to be called SpamMethods and looks like this.</p>
+<pre><code>static PyMethodDef SpamMethods[] = {
+    {"system", spam_system, METH_VARARGS,
+     "Execute a shell command."},
+    {NULL, NULL, 0, NULL}
+};
+</code></pre>
+<p><strong>The method table itself and the function signature contracts it entails is the third and final key convention</strong> necessary for Python to make sense of dynamically loaded C. The method table is an array of struct PyMethodDef with a final sentinel entry. A PyMethodDef is defined in Include/methodobject.h as follows.</p>
+<pre><code>struct PyMethodDef {
+    const char  *ml_name;   /* The name of the built-in function/method */
+    PyCFunction  ml_meth;   /* The C function that implements it */
+    int      ml_flags;  /* Combination of METH_xxx flags, which mostly
+                   describe the args expected by the C func */
+    const char  *ml_doc;    /* The __doc__ attribute, or NULL */
+};
+</code></pre>
+<p>The crucial part here is that the second member is a PyCFunction. We passed in the address of a function, so what is a PyCFunction? It's a typedef, also in Include/methodobject.h</p>
+<pre><code>typedef PyObject *(*PyCFunction)(PyObject *, PyObject *);
+</code></pre>
+<p>PyCFunction is a typedef for a pointer to a function that returns a pointer to a PyObject and that takes for arguments two pointers to PyObjects. <strong>As a lemma to convention three, C functions registered with the method table all have the same signature.</strong> </p>
+<p><strong>Python circumvents much of the difficulty in dynamic loading by using a limited set of C function signatures. One signature in particular is used for most C functions.</strong> Pointers to C functions that take additional arguments can be "snuck in" by casting to PyCFunction. (See the keywdarg_parrot example in the <a href="https://docs.python.org/2/extending/extending.html" rel="noreferrer">Python C API tutorial</a>.) Even C functions that backup Python functions that take no arguments in Python will take two arguments in C (shown below). All functions are also expected to return something (which may just be the None object). Functions that take multiple positional arguments in Python have to unpack those arguments from a single object in C.</p>
+<p>That's how the data for interfacing with dynamically loaded C functions is acquired and stored. Finally, here's an example of how that data is used.</p>
+<p>The context here is that we're evaluating Python "opcodes", instruction by instruction, and we've hit a function call opcode. (see <a href="https://docs.python.org/2/library/dis.html" rel="noreferrer">https://docs.python.org/2/library/dis.html</a>. It's worth a skim.) We've determined that the Python function object is backed by a C function. In the code below we check if the function in Python takes no arguments (in Python) and if so, call it (with two arguments in C).</p>
+<p>Python/ceval.c.</p>
+<pre><code>if (flags &amp; (METH_NOARGS | METH_O)) {
+    PyCFunction meth = PyCFunction_GET_FUNCTION(func);
+    PyObject *self = PyCFunction_GET_SELF(func);
+    if (flags &amp; METH_NOARGS &amp;&amp; na == 0) {
+        C_TRACE(x, (*meth)(self,NULL));
+    }
+</code></pre>
+<p>It does of course take arguments in C - exactly two. Since everything is an object in Python, it gets a self argument. At the bottom you can see that <code>meth</code> is assigned a function pointer which is then dereferenced and called. The return value ends up in x.</p>
+</div>
+<span class="comment-copy">There is a lot of information about module loading in the <a href="https://docs.python.org/3/reference/import.html" rel="nofollow noreferrer">import system documentation</a></span>
+<span class="comment-copy">This is a good question; I'm curious now. I'd have bountied more if I wasn't aiming for 10k.</span>
+<span class="comment-copy">Python searches for several different names for any given module; you can read about that part of the process here: <a href="http://stackoverflow.com/questions/6319379/python-shared-object-module-naming-convention" title="python shared object module naming convention">stackoverflow.com/questions/6319379/…</a></span>
+<span class="comment-copy">That's a good link but these are all high-level concerns, and I know a touch about that already. This question seems to touch lower level concerns, and since I'm someone who rarely uses low level languages for anything serious the specifics of that is something I'd love to learn about and currently know nearly nothing of.</span>
+<span class="comment-copy">@Veedrac Thanks for the motivation to take the time to dig through the source code. I've learned a lot and am now formatting the enormous answer I've nearly typed up.</span>
+<span class="comment-copy">+1 This is a very thorough answer.</span>
+<span class="comment-copy">If anyone is still reading this... is it safe to say that the built-in C modules are statically linked into the python binary, while custom extensions are dynamically linked?</span>
+<span class="comment-copy">@SamuelN You can get the list of modules statically linked in by importing <code>sys</code> and checking <code>sys.builtin_module_names</code>. Many seemingly fundamental modules that come with Python such as <code>math</code> are not strictly a "builtin" and are actually dynamically loaded. You can see this by importing <code>math</code> and checking <code>math.__file__</code>. The modules that are builtin and statically linked are modules that are very tightly integrated with the interpreter such as <code>sys</code>. (This response is a bit tentative. It's been a while since I've looked into this and I'm still double checking.).</span>
+<span class="comment-copy">You are correct! I get an <code>.so</code> file when printing <code>math.__file__</code>. Strange, but I noticed the <code>math</code> module object has no <code>__file__</code> attribute within the default Python installation in Ubuntu, but does have it from a Python 3 env; perhaps that binary was built with <code>math</code> statically linked, while the Python 3 env one was dynamically linked. Thank you for getting back at this old thread.</span>
+<span class="comment-copy">@SamuelN The cPython build system does allow configuring which modules are statically linked so that would make sense.</span>

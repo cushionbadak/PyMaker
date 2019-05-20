@@ -1,0 +1,130 @@
+<div class="post-text" itemprop="text">
+<p>I have an event loop that runs some co-routines as part of a command line tool. The user may interrupt the tool with the usual <kbd>Ctrl</kbd> + <kbd>C</kbd>, at which point I want to clean up properly after the interrupted event loop.</p>
+<p>Here's what I tried.</p>
+<pre class="lang-py prettyprint-override"><code>import asyncio
+
+
+@asyncio.coroutine
+def shleepy_time(seconds):
+    print("Shleeping for {s} seconds...".format(s=seconds))
+    yield from asyncio.sleep(seconds)
+
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+
+    # Side note: Apparently, async() will be deprecated in 3.4.4.
+    # See: https://docs.python.org/3.4/library/asyncio-task.html#asyncio.async
+    tasks = [
+        asyncio.async(shleepy_time(seconds=5)),
+        asyncio.async(shleepy_time(seconds=10))
+    ]
+
+    try:
+        loop.run_until_complete(asyncio.gather(*tasks))
+    except KeyboardInterrupt as e:
+        print("Caught keyboard interrupt. Canceling tasks...")
+
+        # This doesn't seem to be the correct solution.
+        for t in tasks:
+            t.cancel()
+    finally:
+        loop.close()
+</code></pre>
+<p>Running this and hitting <kbd>Ctrl</kbd> + <kbd>C</kbd> yields:</p>
+<pre><code>$ python3 asyncio-keyboardinterrupt-example.py 
+Shleeping for 5 seconds...
+Shleeping for 10 seconds...
+^CCaught keyboard interrupt. Canceling tasks...
+Task was destroyed but it is pending!
+task: &lt;Task pending coro=&lt;shleepy_time() running at asyncio-keyboardinterrupt-example.py:7&gt; wait_for=&lt;Future cancelled&gt; cb=[gather.&lt;locals&gt;._done_callback(1)() at /usr/local/Cellar/python3/3.4.3/Frameworks/Python.framework/Versions/3.4/lib/python3.4/asyncio/tasks.py:587]&gt;
+Task was destroyed but it is pending!
+task: &lt;Task pending coro=&lt;shleepy_time() running at asyncio-keyboardinterrupt-example.py:7&gt; wait_for=&lt;Future cancelled&gt; cb=[gather.&lt;locals&gt;._done_callback(0)() at /usr/local/Cellar/python3/3.4.3/Frameworks/Python.framework/Versions/3.4/lib/python3.4/asyncio/tasks.py:587]&gt;
+</code></pre>
+<p>Clearly, I didn't clean up correctly. I thought perhaps calling <code>cancel()</code> on the tasks would be the way to do it.</p>
+<p>What's the correct way to clean up after an interrupted event loop?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>When you CTRL+C, the event loop gets stopped, so your calls to <code>t.cancel()</code> don't actually take effect. For the tasks to be cancelled, you need to start the loop back up again.</p>
+<p>Here's how you can handle it:</p>
+<pre><code>import asyncio
+
+@asyncio.coroutine
+def shleepy_time(seconds):
+    print("Shleeping for {s} seconds...".format(s=seconds))
+    yield from asyncio.sleep(seconds)
+
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+
+    # Side note: Apparently, async() will be deprecated in 3.4.4.
+    # See: https://docs.python.org/3.4/library/asyncio-task.html#asyncio.async
+    tasks = asyncio.gather(
+        asyncio.async(shleepy_time(seconds=5)),
+        asyncio.async(shleepy_time(seconds=10))
+    )
+
+    try:
+        loop.run_until_complete(tasks)
+    except KeyboardInterrupt as e:
+        print("Caught keyboard interrupt. Canceling tasks...")
+        tasks.cancel()
+        loop.run_forever()
+        tasks.exception()
+    finally:
+        loop.close()
+</code></pre>
+<p>Once we catch <code>KeyboardInterrupt</code>, we  call <code>tasks.cancel()</code> and then start the <code>loop</code> up again. <code>run_forever</code> will actually exit as soon as <code>tasks</code> gets cancelled (note that cancelling the <code>Future</code> returned by <code>asyncio.gather</code> also cancels all the <code>Futures</code> inside of it), because the interrupted <code>loop.run_until_complete</code> call added a <code>done_callback</code> to <code>tasks</code> that stops the loop. So, when we cancel <code>tasks</code>, that callback fires, and the loop stops. At that point we call <code>tasks.exception</code>, just to avoid getting a warning about not fetching the exception from the <code>_GatheringFuture</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><strong>Updated for Python 3.6+</strong>: Add call to <code>loop.shutdown_asyncgens</code> to avoid memory leaks by asynchronous generators that weren't fully used. Additionally <code>asyncio.new_event_loop</code> is now used rather then <code>asyncio.get_event_loop</code> to ensure that the final <code>loop.close</code> call does not interfere with possible other uses of the loop.</p>
+<p>The following solution, inspired by some of the other answers, should work in almost all cases and does not depend on you manually keeping track of tasks that need to be cleaned up on <kbd>Ctrl</kbd>+<kbd>C</kbd>:</p>
+<pre><code>loop = asyncio.new_event_loop()
+try:
+    # Here `amain(loop)` is the core coroutine that may spawn any
+    # number of tasks
+    sys.exit(loop.run_until_complete(amain(loop)))
+except KeyboardInterrupt:
+    # Optionally show a message if the shutdown may take a while
+    print("Attempting graceful shutdown, press Ctrl+C again to exit…", flush=True)
+
+    # Do not show `asyncio.CancelledError` exceptions during shutdown
+    # (a lot of these may be generated, skip this if you prefer to see them)
+    def shutdown_exception_handler(loop, context):
+        if "exception" not in context \
+        or not isinstance(context["exception"], asyncio.CancelledError):
+            loop.default_exception_handler(context)
+    loop.set_exception_handler(shutdown_exception_handler)
+
+    # Handle shutdown gracefully by waiting for all tasks to be cancelled
+    tasks = asyncio.gather(*asyncio.Task.all_tasks(loop=loop), loop=loop, return_exceptions=True)
+    tasks.add_done_callback(lambda t: loop.stop())
+    tasks.cancel()
+
+    # Keep the event loop running until it is either destroyed or all
+    # tasks have really terminated
+    while not tasks.done() and not loop.is_closed():
+        loop.run_forever()
+finally:
+    if hasattr(loop, "shutdown_asyncgens"):  # This check is only needed for Python 3.5 and below
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    loop.close()
+</code></pre>
+<p>The above code will obtain all currently tasks from the event loop using <code>asyncio.Task.all_tasks</code> and place them in a single combined future using <code>asyncio.gather</code>. All tasks in that future (which are all currently running tasks) are then canceled using the future's <code>.cancel()</code> method. The <code>return_exceptions=True</code> then ensures that all the received <code>asyncio.CancelledError</code> exceptions are stored instead of causing the future to become errored.</p>
+<p>The above code will also override the default exception handler to prevent the generated <code>asyncio.CancelledError</code> exceptions from being logged.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Unless you are on Windows, set up event-loop based signal handlers for SIGINT (and also SIGTERM so you can run it as a service). In these handlers, you may either exit the event loop immediately, or initiate some kind of cleanup sequence and exit later.</p>
+<p>Example in official Python documentation: <a href="https://docs.python.org/3.4/library/asyncio-eventloop.html#set-signal-handlers-for-sigint-and-sigterm" rel="nofollow">https://docs.python.org/3.4/library/asyncio-eventloop.html#set-signal-handlers-for-sigint-and-sigterm</a></p>
+</div>
+<span class="comment-copy">In case it matters, I'm running Python 3.4.3 on OS X 10.10.3.</span>
+<span class="comment-copy">Ah, so nothing happens to a task outside of the event loop, not even a cancellation, right? That sounds like a simple rule to keep in mind.</span>
+<span class="comment-copy">Just tried this out and it seems to work as advertised. Sweet! Side note: I also noticed that if you pass <code>return_exceptions=True</code> to <code>gather()</code>, you can leave out the call to <code>tasks.exception()</code> since the exceptions are being returned as results.</span>
+<span class="comment-copy">@NickChammas Right, the loop must be running for the cancellation to take effect <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.Task.cancel" rel="nofollow noreferrer">(as the noted in the docs)</a>. And yes, in general nothing is going to happen with an <code>asyncio.Task</code> unless the loop is actively driving it. Using <code>return_exceptions=True</code> is a good trick, as long as you're ok with real exceptions (e.g. something other than <code>CancelledError</code>) being thrown from your wrapped coroutines not actually getting raised.</span>
+<span class="comment-copy">dano - Does the behavior you described here apply the same when a coroutine raises a regular exception (as opposed to the user raising a keyboard interrupt)? I'm finding that <a href="https://gist.github.com/nchammas/c1486678a0b36f38f22e" rel="nofollow noreferrer">the call to <code>loop.run_forever()</code> just keeps going and the canceled tasks just run anyway</a>. Is this expected?</span>
+<span class="comment-copy">@NickChammas Actually, you could probably make a pretty good case that the <code>_GatheringFuture</code> returned by  <code>asyncio.gather</code> should be enhanced to support calling <code>cancel()</code> on its children, even if the <code>_GatheringFuture</code> itself is already done, to support this use-case. Though I suppose if you want this behavior you may be better off using <code>asyncio.wait</code> with the <code>FIRST_EXCEPTION</code> option.</span>
+<span class="comment-copy">Apparently the core team deprecated using a separate <code>loop</code> which <code>is Not asyncio.get_event_loop()</code> (and consequently all those <code>loop=loop</code> kw params)</span>
+<span class="comment-copy">Can you clarify how this works and why it's preferable to simply capturing <code>KeyboardInterrupt</code> as I did in my example? The interrupt seems to work fine. Cleaning up the tasks left behind seems to be the problem. Is it because the event loop is not handling the interrupt itself?</span>
+<span class="comment-copy">Generally when you have an event loop you should handle all kinds of events within the event loop. I cannot say why KeyboardInterrupt would have problems specifically. Consider though that it may interrupt essentially any code executing within the event loop (but I cannot say that for sure since I do not know the details of the design).</span>
+<span class="comment-copy">How it works does not seem described in the docs. I suppose it's the "self-pipe" trick, you should look into the Python source if you want to know.</span>

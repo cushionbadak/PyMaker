@@ -1,0 +1,101 @@
+<div class="post-text" itemprop="text">
+<p>I have an <code>arcpy</code> process that requires doing a union on a bunch of layers, running some calculations, and writing an HTML report. Given the number of reports I need to generate (~2,100) I need this process to be as quick as possible (my target is 2 seconds per report). I've tried a number of ways to do this, including multiprocessing, when I ran across a problem, namely, that running the multi-process part essentially takes the same amount of time no matter how many cores I use.</p>
+<p>For instance, for the same number of reports:</p>
+<ul>
+<li>2 cores took ~30 seconds per round (so 40 reports takes 40/2 * 30 seconds)</li>
+<li>4 cores took ~60 seconds (40/4 * 60)</li>
+<li>10 cores took ~160 seconds (40/10 * 160)</li>
+</ul>
+<p>and so on. It works out to the same total time because churning through twice as many at a time takes twice as long to do.</p>
+<p><strong>Does this mean my problem is I/O bound, rather than CPU bound?</strong> (And if so - what do I do about it?) I would have thought it was the latter, given that the large bottleneck in my timing is the union (it takes up about 50% of the processing time). Unions are often expensive in ArcGIS, so I assumed breaking it up and running 2 - 10 at once would have been 2 - 10 times faster. Or, potentially I implementing multi-process incorrectly?</p>
+<pre><code>## Worker function just included to give some context
+
+def worker(sub_code):
+    layer = 'in_memory/lyr_{}'.format(sub_code)
+    arcpy.Select_analysis(subbasinFC, layer, where_clause="SUB_CD = '{}'".format(sub_code))
+    arcpy.env.extent = layer
+    union_name = 'in_memory/union_' + sub_code
+
+    arcpy.Union_analysis([fields],
+                     union_name,
+                     "NO_FID", "1 FEET")
+    #.......Some calculations using cursors
+
+    # Templating using Jinjah
+    context = {}
+    context['DATE'] = now.strftime("%B %d, %Y")
+    context['SUB_CD'] = sub_code
+    context['SUB_ACRES'] = sum([r[0] for r in arcpy.da.SearchCursor(union, ["ACRES"], where_clause="SUB_CD = '{}'".format(sub_code))])
+    # Etc
+
+    # Then write the report out using custom function
+    write_html('template.html', 'output_folder', context)
+
+
+if __name__ == '__main__':
+    subList = sorted({r[0] for r in arcpy.da.SearchCursor(subbasinFC, ["SUB_CD"])})
+    NUM_CORES = 7
+    chunk_list = [subList[i:i+NUM_CORES] for i in range(0, len(subList), NUM_CORES-1)]
+    for chunk in chunk_list:
+        jobs = []
+        for subbasin in chunk:
+            p = multiprocessing.Process(target=worker, args=(subbasin,))
+            jobs.append(p)
+            p.start()
+
+        for process in jobs:
+            process.join()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>There isn't much to go on here, and I have no experience with ArcGIS.  So I can just note two higher-level things.  First, "the usual" way to approach this would be to replace all the code below your <code>NUM_CORES = 7</code> with:</p>
+<pre><code>pool = multiprocessing.Pool(NUM_CORES)
+pool.map(worker, subList)
+pool.close()
+pool.join()
+</code></pre>
+<p><code>map()</code> takes care of keeping all the worker processes as busy as possible.  As is, you fire up 7 processes, then wait for <em>all</em> of them to finish.  All the processes that complete before the slowest vanish, and their cores sit idle waiting for the next outer loop iteration.  A <code>Pool</code> keeps the 7 processes alive for the duration of the job, and feeds each a new piece of work to do as soon as it finishes its last piece of work.</p>
+<p>Second, this part ends with a logical error:</p>
+<pre><code>chunk_list = [subList[i:i+NUM_CORES] for i in range(0, len(subList), NUM_CORES-1)]
+</code></pre>
+<p>You want <code>NUM_CORES</code> there rather than <code>NUM_CORES-1</code>.  As-is, the first time around you extract</p>
+<pre><code>subList[0:7]
+</code></pre>
+<p>then</p>
+<pre><code>subList[6:13]
+</code></pre>
+<p>then</p>
+<pre><code>subList[12:19]
+</code></pre>
+<p>and so on.  <code>subList[6]</code> and <code>subList[12]</code> (etc) are extracted twice each.  The sublists overlap.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You don't show us quite enough to be sure what you are doing. For example, what is your <code>env.workspace</code>? And what is the value of <code>subbasinFC</code>? It seems like you're doing an analysis at the beginning of each process to filter down the data into <code>layer</code>. But is <code>subbasinFC</code> coming from disk, or from memory? If it's from disk, I'd suggest you read everything into memory before any of the processes try their filtering. That should speed things along, if you have the memory to support it. Otherwise, yeah, you're I/O bound on the input data. </p>
+<p>Forgive my <code>arcpy</code> cluelessness, but why are you inserting a where clause in your sum of <code>context['SUB_ACRES']</code>? Didn't you already filter on <code>sub_code</code> at the start? (We don't know what the union is, so maybe you're unioning with something unfiltered...)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'm not sure you are using the <code>Process</code> pool correctly to track your jobs. This:</p>
+<pre><code>for subbasin in chunk:
+    p = multiprocessing.Process(target=worker, args=(subbasin,))
+    jobs.append(p)
+    p.start()
+
+    for process in jobs:
+        process.join()
+</code></pre>
+<p>Should instead be:</p>
+<pre><code>for subbasin in chunk:
+    p = multiprocessing.Process(target=worker, args=(subbasin,))
+    p.start()
+    p.join()
+</code></pre>
+<p>Is there a specific reason you are going against the <a href="https://docs.python.org/3/library/multiprocessing.html" rel="nofollow noreferrer">spec of using the multiprocessing library</a>? You are not waiting until the thread terminates before spinning another process up, which is just going to create a whole bunch of processes that are not handled by the parent calling process.</p>
+</div>
+<span class="comment-copy">How many cores does your box have?</span>
+<span class="comment-copy">8 physical, 16 "logical processors"</span>
+<span class="comment-copy">+1, thank you. My question (and situation, actually) are a mess because there are so many things going wrong with my code at the same time. Accepted because playing around <code>Process</code> convinced me that the overhead associated with waiting for all the processes to finish IS the cause of the weird slow-downs. Using <code>Pool</code> starts off really strong - but I had been avoiding it because it eventually crashes. I don't think I'm doing a good job deleting things in memory. I will come back and update my question when I know all the details - perhaps it may help someone else better that way.</span>
+<span class="comment-copy">Hmm.  Something to try:  add <code>maxtasksperchild=1</code> to the <code>Pool</code> constructor, and <code>chunksize=1</code> to the <code>map()</code> call.  That will force a brand new process to be created for each work item.  While that doesn't really "solve" anything, in some cases it can hide other problems effectively enough to at least make progress ;-)</span>
+<span class="comment-copy">+1 because of the reading from disk observation. You were right - I changed all of my reads from disk to in memory and it sped up the base worker function 3 fold (running it serially used to take 90 seconds, now takes 30). Thank you! This alone is an amazing improvement</span>
+<span class="comment-copy">If the OP does as you suggest, they're guaranteed to get no parallelism whatsoever:  the second loop fires up one process, and waits for it to complete before the loop goes on to the next process.  It's just running one process at a time, serially.</span>
+<span class="comment-copy">@TimPeters: Agreed - there should be another parent loop over the number of cores as you suggest in your response. The OP's code does not account for this, nor does it follow the lib spec.</span>
+<span class="comment-copy">I didn't see anything wrong in the OP's use of <code>Process</code>.  Their code fires off <code>NUM_CORES</code> processes simultaneously, waits for them to finish, then loops around to get the next <code>NUM_CORES</code> work items.  That's fine.  I only suggested to use <code>map()</code> because it accomplishes all they were after more easily, and in a more effective way (keeping all the worker processes as busy as possible).  What - very specifically - do you believe doesn't follow the spec?  It's absolutely legitimate to start as many processes as you like simultaneously (although at some point that becomes counterproductive).</span>

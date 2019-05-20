@@ -1,0 +1,228 @@
+<div class="post-text" itemprop="text">
+<p>I have a code which reassigns bins to a large <code>numpy</code> array. Basically, the elements of the large array has been sampled at different frequency and the final goal is to rebin the entire array at fixed bins <code>freq_bins</code>. The code is kind of slow for the array I have. Is there any good way to improve the runtime of this code? A factor of few would do for now. May be some <code>numba</code> magic would do.</p>
+<pre><code>import numpy as np
+import time
+division = 90
+freq_division = 50
+cd = 3000
+boost_factor = np.random.rand(division, division, cd)
+freq_bins = np.linspace(1, 60, freq_division)
+es = np.random.randint(1,10, size = (cd, freq_division))
+final_emit = np.zeros((division, division, freq_division))
+time1 = time.time()
+for i in xrange(division):
+    fre_boost = np.einsum('ij, k-&gt;ijk', boost_factor[i], freq_bins)
+    sky_by_cap = np.einsum('ij, jk-&gt;ijk', boost_factor[i],es)
+    freq_index = np.digitize(fre_boost, freq_bins)
+    freq_index_reshaped = freq_index.reshape(division*cd, -1)
+    freq_index = None
+    sky_by_cap_reshaped = sky_by_cap.reshape(freq_index_reshaped.shape)
+    to_bin_emit = np.zeros(freq_index_reshaped.shape)
+    row_index = np.arange(freq_index_reshaped.shape[0]).reshape(-1, 1)
+    np.add.at(to_bin_emit, (row_index, freq_index_reshaped), sky_by_cap_reshaped)
+    to_bin_emit = to_bin_emit.reshape(fre_boost.shape)
+    to_bin_emit = np.multiply(to_bin_emit, freq_bins, out=to_bin_emit)
+    final_emit[i] = np.sum(to_bin_emit, axis=1)
+print(time.time()-time1)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<h2>Keep the code simple and than optimize</h2>
+<p>If you have an idea what algorithm you want to code write a simple reference implementation. From this you can go two ways using Python. You can try to vectorize the code <strong>or</strong> you can compile the code to get good performance.</p>
+<p>Even if <code>np.einsum</code> or <code>np.add.at</code> were implementet in Numba, it would be very hard for any compiler to make efficient binary code from your example. </p>
+<p>The only thing I have rewritten is a more efficient approach of digitize for scalar values.</p>
+<p><strong>Edit</strong></p>
+<p>In the Numba source code there is a more efficient implimentation of digitize for scalar values.</p>
+<p><strong>Code</strong></p>
+<pre><code>#From Numba source
+#Copyright (c) 2012, Anaconda, Inc.
+#All rights reserved.
+
+@nb.njit(fastmath=True)
+def digitize(x, bins, right=False):
+    # bins are monotonically-increasing
+    n = len(bins)
+    lo = 0
+    hi = n
+
+    if right:
+        if np.isnan(x):
+            # Find the first nan (i.e. the last from the end of bins,
+            # since there shouldn't be many of them in practice)
+            for i in range(n, 0, -1):
+                if not np.isnan(bins[i - 1]):
+                    return i
+            return 0
+        while hi &gt; lo:
+            mid = (lo + hi) &gt;&gt; 1
+            if bins[mid] &lt; x:
+                # mid is too low =&gt; narrow to upper bins
+                lo = mid + 1
+            else:
+                # mid is too high, or is a NaN =&gt; narrow to lower bins
+                hi = mid
+    else:
+        if np.isnan(x):
+            # NaNs end up in the last bin
+            return n
+        while hi &gt; lo:
+            mid = (lo + hi) &gt;&gt; 1
+            if bins[mid] &lt;= x:
+                # mid is too low =&gt; narrow to upper bins
+                lo = mid + 1
+            else:
+                # mid is too high, or is a NaN =&gt; narrow to lower bins
+                hi = mid
+
+    return lo
+
+@nb.njit(fastmath=True)
+def digitize(value, bins):
+  if value&lt;bins[0]:
+    return 0
+
+  if value&gt;=bins[bins.shape[0]-1]:
+    return bins.shape[0]
+
+  for l in range(1,bins.shape[0]):
+    if value&gt;=bins[l-1] and value&lt;bins[l]:
+      return l
+
+@nb.njit(fastmath=True,parallel=True)
+def inner_loop(boost_factor,freq_bins,es):
+  res=np.zeros((boost_factor.shape[0],freq_bins.shape[0]),dtype=np.float64)
+  for i in nb.prange(boost_factor.shape[0]):
+    for j in range(boost_factor.shape[1]):
+      for k in range(freq_bins.shape[0]):
+        ind=nb.int64(digitize(boost_factor[i,j]*freq_bins[k],freq_bins))
+        res[i,ind]+=boost_factor[i,j]*es[j,k]*freq_bins[ind]
+  return res
+
+@nb.njit(fastmath=True)
+def calc_nb(division,freq_division,cd,boost_factor,freq_bins,es):
+  final_emit = np.empty((division, division, freq_division),np.float64)
+  for i in range(division):
+    final_emit[i,:,:]=inner_loop(boost_factor[i],freq_bins,es)
+  return final_emit
+</code></pre>
+<p><strong>Performance</strong></p>
+<pre><code>(Quadcore i7)
+original_code: 118.5s
+calc_nb: 4.14s
+#with digitize implementation from Numba source
+calc_nb: 2.66s
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This seems to be trivially parallelizable:</p>
+<ul>
+<li>You've got an outer loop that you run 90 times.</li>
+<li>Each time, you're not mutating any shared arrays except <code>final_emit</code>
+<ul>
+<li>… and that, only to store into a unique row.</li>
+</ul></li>
+<li>It looks like most of the work inside the loop is numpy array-wide operations, which will release the GIL.</li>
+</ul>
+<p>So (using the <a href="https://pypi.org/project/futures/" rel="nofollow noreferrer"><code>futures</code></a> backport of <a href="https://docs.python.org/3/library/concurrent.futures.html" rel="nofollow noreferrer"><code>concurrent.futures</code></a>, since you seem to be on 2.7):</p>
+<pre><code>import numpy as np
+import time
+import futures
+
+division = 90
+freq_division = 50
+cd = 3000
+boost_factor = np.random.rand(division, division, cd)
+freq_bins = np.linspace(1, 60, freq_division)
+es = np.random.randint(1,10, size = (cd, freq_division))
+final_emit = np.zeros((division, division, freq_division))
+
+def dostuff(i):
+    fre_boost = np.einsum('ij, k-&gt;ijk', boost_factor[i], freq_bins)
+    # ...
+    to_bin_emit = np.multiply(to_bin_emit, freq_bins, out=to_bin_emit)
+    return np.sum(to_bin_emit, axis=1)
+
+with futures.ThreadPoolExecutor(max_workers=8) as x:
+    for i, row in enumerate(x.map(dostuff, xrange(division))):
+        final_emit[i] = row
+</code></pre>
+<hr/>
+<p>If this works, there are two tweaks to try, either of which might be more efficient. We don't really care which order the results come back in, but <code>map</code> queues them up in order. This can waste a bit of space and time. I don't think it will make much difference (presumably, the vast majority of your time is presumably spent doing the calculations, not writing out the results), but without profiling your code, it's hard to be sure. So, there are two easy ways around this problem.</p>
+<hr/>
+<p>Using <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.as_completed" rel="nofollow noreferrer"><code>as_completed</code></a> lets us use the results in whatever order they finish, rather than in the order we queued them. Something like this:</p>
+<pre><code>def dostuff(i):
+    fre_boost = np.einsum('ij, k-&gt;ijk', boost_factor[i], freq_bins)
+    # ...
+    to_bin_emit = np.multiply(to_bin_emit, freq_bins, out=to_bin_emit)
+    return i, np.sum(to_bin_emit, axis=1)
+
+with futures.ThreadPoolExecutor(max_workers=8) as x:
+    fs = [x.submit(dostuff, i) for i in xrange(division))
+    for i, row in futures.as_completed(fs): 
+        final_emit[i] = row
+</code></pre>
+<hr/>
+<p>Alternatively, we can make the function insert the rows directly, instead of returning them. This means we're now mutating a shared object from multiple threads. So I think we need a lock here, although I'm not positive (numpy's rules are a bit complicated, and I haven't read you code that thoroughly…). But that probably won't hurt performance significantly, and it's easy. So:</p>
+<pre><code>import numpy as np
+import threading
+# etc.
+final_emit = np.zeros((division, division, freq_division))
+final_emit_lock = threading.Lock()
+
+def dostuff(i):
+    fre_boost = np.einsum('ij, k-&gt;ijk', boost_factor[i], freq_bins)
+    # ...
+    to_bin_emit = np.multiply(to_bin_emit, freq_bins, out=to_bin_emit)
+    with final_emit_lock:
+        final_emit[i] = np.sum(to_bin_emit, axis=1)
+
+with futures.ThreadPoolExecutor(max_workers=8) as x:
+    x.map(dostuff, xrange(division))
+</code></pre>
+<hr/>
+<p>That <code>max_workers=8</code> in all of my examples should be tuned for your machine. Too many threads is bad, because they start fighting each other instead of parallelizing; too few threads is even worse, because some of your cores just sit there idle.</p>
+<p>If you want this to run on a variety of machines, rather than tuning it for each one, the best guess (for 2.7) is usually:</p>
+<pre><code>import multiprocessing
+# ...
+with futures.ThreadPoolExecutor(max_workers=multiprocessing.cpu_count()) as x:
+</code></pre>
+<p>But if you want to squeeze the max performance out of a specific machine, you should test different values. In particular, for a typical quad-core laptop with hyperthreading, the ideal value can be anywhere from 4 to 8, depending on the exact work you're doing, and it's easier to just try all the values than to try to predict.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think you get a small boost in the performance by replacing <code>einsum</code> with actual multiplication.</p>
+<pre><code>import numpy as np
+import time
+division = 90
+freq_division = 50
+cd = 3000
+boost_factor = np.random.rand(division, division, cd)
+freq_bins = np.linspace(1, 60, freq_division)
+es = np.random.randint(1,10, size = (cd, freq_division))
+final_emit = np.zeros((division, division, freq_division))
+time1 = time.time()
+for i in xrange(division):
+    fre_boost = boost_factor[i][:, :, None]*freq_bins[None, None, :]
+    sky_by_cap = boost_factor[i][:, :, None]*es[None, :, :]
+    freq_index = np.digitize(fre_boost, freq_bins)
+    freq_index_reshaped = freq_index.reshape(division*cd, -1)
+    freq_index = None
+    sky_by_cap_reshaped = sky_by_cap.reshape(freq_index_reshaped.shape)
+    to_bin_emit = np.zeros(freq_index_reshaped.shape)
+    row_index = np.arange(freq_index_reshaped.shape[0]).reshape(-1, 1)
+    np.add.at(to_bin_emit, (row_index, freq_index_reshaped), sky_by_cap_reshaped)
+    to_bin_emit = to_bin_emit.reshape(fre_boost.shape)
+    to_bin_emit = np.multiply(to_bin_emit, freq_bins, out=to_bin_emit)
+    final_emit[i] = np.sum(to_bin_emit, axis=1)
+print(time.time()-time1)
+</code></pre>
+<p>Your code is rather slow at <code>np.add.at</code>, which I believe can be much faster with <code>np.bincount</code>, although I couldn't get it quite work for multidimensional arrays you have. May be someone here can add to that.</p>
+</div>
+<span class="comment-copy">maybe explaining what this code is doing would help...</span>
+<span class="comment-copy">@Julien sorry, I have added some more explanation now.</span>
+<span class="comment-copy">at line 21 you have: to_bin_emit = to_bin_emit.reshape(frequency_boost1.shape)    where is frequency_boost1.shape defined?</span>
+<span class="comment-copy">@TimothyLombard sorry, this has been fixed now.</span>
+<span class="comment-copy">about line 22: NameError: name 'to_bin_emission' is not defined    Your example seems to be self-contained perhaps you should consider running the code snip inside a notebook before posting...  I like to use the new google utility  <a href="https://colab.research.google.com/" rel="nofollow noreferrer">colab.research.google.com</a></span>
+<span class="comment-copy">@matttree I have added the Numba-source implementation of digitize. This gives an additional speedup...</span>
+<span class="comment-copy">Wow, that sped up the entire code by a factor of about 3. Could you please elaborate on the last two tweaks you mentioned. It isn't very clear to me how you would implement those exactly in the code.</span>
+<span class="comment-copy">@matttree OK, I added (untested) examples for both. There are also some great examples in the linked docs (which obviously don't fit your code as neatly, but they're tested, and well explained). Also, one more note at the end.</span>
+<span class="comment-copy">Thanks. But, I think the speed improvement is really little with what you suggested, as <code>einsum</code> is not taking that much of time. I was looking at <code>np.bincount</code>, but I think it is really tricky to get it right for multidimensional array, as you also noted.</span>

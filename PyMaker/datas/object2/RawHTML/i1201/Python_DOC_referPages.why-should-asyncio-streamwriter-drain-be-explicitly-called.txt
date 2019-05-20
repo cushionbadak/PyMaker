@@ -1,0 +1,135 @@
+<div class="post-text" itemprop="text">
+<p>From doc: 
+<a href="https://docs.python.org/3/library/asyncio-stream.html#asyncio.StreamWriter.write" rel="nofollow noreferrer">https://docs.python.org/3/library/asyncio-stream.html#asyncio.StreamWriter.write</a></p>
+<blockquote>
+<p>write(data)</p>
+<pre><code>Write data to the stream.
+
+This method is not subject to flow control. Calls to write() should be followed by drain().
+</code></pre>
+<p>coroutine drain()</p>
+<pre><code>Wait until it is appropriate to resume writing to the stream. Example:
+
+writer.write(data)
+await writer.drain()
+</code></pre>
+</blockquote>
+<p>From what I understand, </p>
+<ul>
+<li>You need to call <code>drain</code> every time <code>write</code> is called.</li>
+<li>If not I guess, <code>write</code> will block the loop thread</li>
+</ul>
+<p>Then why is write not a coroutine that calls it automatically? Why would one call <code>write</code> without having to drain? I can think of two cases</p>
+<ol>
+<li>You want to <code>write</code> and <code>close</code> immediately</li>
+<li>You have to buffer some data before message it is complete. </li>
+</ol>
+<p>First one is a special case, I think we can have a different api. Buffering should be handled inside write function and application should not care.</p>
+<hr/>
+<p>Let me put the question differently. What is the drawback of doing this? Does the python3.8 version effectively do this?</p>
+<pre><code>async def awrite(writer, data):
+    writer.write(data)
+    await writer.drain()
+</code></pre>
+<p>Note: <code>drain</code> doc explicitly states the below:</p>
+<blockquote>
+<p>When there is nothing to wait for, the drain() returns immediately.</p>
+</blockquote>
+<hr/>
+<p>Reading the answer and links again, I think the the functions work like this. <strong>Note</strong>: Check accepted answer for more accurate version.</p>
+<pre><code>def write(data):
+    remaining = socket.try_write(data)
+    if remaining:
+        _pendingbuffer.append(remaining) # Buffer will keep growing if other side is slow and we have a lot of data
+
+async def drain():
+    if len(_pendingbuffer) &lt; BUF_LIMIT:
+        return
+    await wait_until_other_side_is_up_to_speed()
+    assert len(_pendingbuffer) &lt; BUF_LIMIT
+
+async def awrite(writer, data):
+    writer.write(data)
+    await writer.drain()        
+</code></pre>
+<p>So when to use what:</p>
+<ol>
+<li>When the data is not continuous, Like responding to a HTTP request. We just need to send some data and don't care about when it is reached and memory is not a concern - Just use <code>write</code></li>
+<li>Same as above but memory is a concern, use <code>awrite</code></li>
+<li>When streaming data to a large number of clients (e.g. some live stream or a huge file). If the data is duplicated in each of the connection's buffers, it will definitely overflow RAM. In this case, write a loop that takes a chunk of data each iteration and call <code>awrite</code>. In case of huge file, <code>loop.sendfile</code> is better if available.</li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>From what I understand, (1) You need to call drain every time write is called. (2) If not I guess, write will block the loop thread</p>
+</blockquote>
+<p>Neither is correct, but the confusion is quite understandable. The way <code>write()</code> works is as follows:</p>
+<ul>
+<li><p>A call to <code>write()</code> just stashes the data to a buffer, leaving it to the event loop to actually write it out at a later time, and without further intervention by the program. As far as the application is concerned, the data is written in the background as fast as the other side is capable of receiving it. In other words, each <code>write()</code> will schedule its data to be transferred using as many OS-level writes as it takes, with those writes issued when the corresponding file descriptor is actually writable. All this happens automatically, even without ever awaiting <code>drain()</code>.</p></li>
+<li><p><code>write()</code> is not a coroutine, and it absolutely <strong>never</strong> blocks the event loop.</p></li>
+</ul>
+<p>The second property sounds convenient, but it's actually a major <em>flaw</em> of <code>write()</code>. Writing is decoupled from accepting the data, so if you write data faster than your peer can read it, the internal buffer will keep growing and you'll have a <a href="https://vorpus.org/blog/some-thoughts-on-asynchronous-api-design-in-a-post-asyncawait-world/#bug-1-backpressure" rel="nofollow noreferrer">memory leak</a> on your hands. Awaiting <code>drain()</code> pauses the coroutine once the buffer becomes too large. You don't need to await <code>drain()</code> after <em>every</em> write, but you do need to await it occasionally, typically between loop iterations. For example:</p>
+<pre><code>while True:
+    response = await peer1.readline()
+    peer2.write(b'&lt;response&gt;')
+    peer2.write(response)
+    peer2.write(b'&lt;/response&gt;')
+    await peer2.drain()
+</code></pre>
+<p><code>drain()</code> returns immediately if the amount of pending unwritten data is small. If the data exceeds a high threshold, <code>drain()</code> will suspend the calling coroutine until the amount of pending unwritten data drops beneath a low threshold. The pause will cause the coroutine to stop reading from <code>peer1</code>, which will in turn cause the peer to slow down the rate at which it sends us data. This kind of feedback is referred to as back-pressure.</p>
+<p>As <a href="https://stackoverflow.com/questions/52613588/python-async-io-stream#comment92178821_52616376">reported</a> by an asyncio developer, Python 3.8 will support <code>awrite</code> which removes the need for the explicit <code>drain()</code>. (The support was <a href="https://docs.python.org/3.8/library/asyncio-stream.html#asyncio.StreamWriter.awrite" rel="nofollow noreferrer">added</a> in the meantime.)</p>
+<blockquote>
+<p>Buffering should be handled inside write function and application should not care.</p>
+</blockquote>
+<p>That is pretty much how <code>write()</code> works now - it does handle buffering and it lets the application not care, for better or worse. Also see <a href="https://stackoverflow.com/a/52616376/1600898">this answer</a> for additional info.</p>
+<p><hr/>
+Addressing the edited part of the question:</p>
+<blockquote>
+<p>Reading the answer and links again, I think the the functions work like this.</p>
+</blockquote>
+<p><code>write()</code> is still a bit smarter than that. It won't try to write only once, it will actually arrange for data to continue to be written until there is no data left to write. This will happen even if you never await <code>drain()</code> - the only thing the application must do is let the event loop run its course for long enough to write everything out.</p>
+<p>A more correct pseudo code of <code>write</code> and <code>drain</code> might look like this:</p>
+<pre><code>class ToyWriter:
+    def __init__(self):
+        self._buf = bytearray()
+        self._empty = asyncio.Event(True)
+
+    def write(self, data):
+        self._buf.extend(data)
+        loop.add_writer(self._fd, self._do_write)
+        self._empty.clear()
+
+    def _do_write(self):
+        # Automatically invoked by the event loop when the
+        # file descriptor is writable, regardless of whether
+        # anyone calls drain()
+        while self._buf:
+            try:
+                nwritten = os.write(self._fd, self._buf)
+            except OSError as e:
+                if e.errno == errno.EWOULDBLOCK:
+                    return  # continue once we're writable again
+                raise
+            self._buf = self._buf[nwritten:]
+        self._empty.set()
+        loop.remove_writer(self._fd, self._do_write)
+
+    async def drain(self):
+        if len(self._buf) &gt; 64*1024:
+            await self._empty.wait()
+
+    async def awrite(self, data):
+        self.write(data)
+        await self.drain()
+</code></pre>
+<p>The actual implementation is more complicated because:</p>
+<ul>
+<li>it's written on top of a <a href="https://twistedmatrix.com/documents/current/core/howto/servers.html" rel="nofollow noreferrer">Twisted</a>-style <a href="https://docs.python.org/3/library/asyncio-protocol.html" rel="nofollow noreferrer">transport/protocol</a> layer with its own sophisticated <a href="https://docs.python.org/3/library/asyncio-protocol.html#asyncio.BaseProtocol.pause_writing" rel="nofollow noreferrer">flow control</a>, not on top of <code>os.write</code>;</li>
+<li>because <code>drain()</code> doesn't really wait until the buffer is empty, but until it reaches a <a href="https://docs.python.org/3/library/asyncio-stream.html#asyncio.StreamWriter.drain" rel="nofollow noreferrer">low watermark</a>;</li>
+<li>exceptions other than <code>EWOULDBLOCK</code> raised in <code>_do_write</code> are stored and re-raised in <code>drain()</code>.</li>
+</ul>
+<p>The last point is <em>another</em> good reason to call <code>drain()</code>, to actually notice that the peer is gone by write to it failing.</p>
+</div>
+<span class="comment-copy">the author of the <code>trio</code> async library wrote an interesting post that covers this: <a href="https://vorpus.org/blog/some-thoughts-on-asynchronous-api-design-in-a-post-asyncawait-world/" rel="nofollow noreferrer">vorpus.org/blog/…</a>…  search for <code>drain</code>.  I could post some subset of this as an answer here if you think it's relevant</span>
+<span class="comment-copy">Thanks. "you should occasionally await drain()".  I see what  you mean. But practically will make the code messy. I have also updated the question.</span>
+<span class="comment-copy">@balki No argument here, <code>write()</code> should have been a coroutine from the start. Current design makes sense in Twisted which was designed before coroutines were available, today it's both confusing and a bug attractor. I've updated the answer to address the edited question.</span>

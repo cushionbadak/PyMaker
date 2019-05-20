@@ -1,0 +1,105 @@
+<div class="post-text" itemprop="text">
+<p>I have to send a lot of HTTP requests, once all of them have returned, the program can continue. Sounds like a perfect match for <code>asyncio</code>. A bit naively, I wrapped my calls to <code>requests</code> in an <code>async</code> function and gave them to <code>asyncio</code>. This doesn't work. </p>
+<p>After searching online, I found two solutions:</p>
+<ul>
+<li>use a library like <a href="https://aiohttp.readthedocs.io/en/stable/" rel="nofollow noreferrer">aiohttp</a>, which is made to work with <code>asyncio</code></li>
+<li>wrap the blocking code in a call to <code>run_in_executor</code></li>
+</ul>
+<p>To understand this better, I wrote a small benchmark. The server-side is a flask program that waits 0.1 seconds before answering a request.</p>
+<pre><code>from flask import Flask
+import time
+
+app = Flask(__name__)
+
+
+@app.route('/')
+def hello_world():
+    time.sleep(0.1) // heavy calculations here :)
+    return 'Hello World!'
+
+
+if __name__ == '__main__':
+    app.run()
+</code></pre>
+<p>The client is my benchmark</p>
+<pre><code>import requests
+from time import perf_counter, sleep
+
+# this is the baseline, sequential calls to requests.get
+start = perf_counter()
+for i in range(10):
+    r = requests.get("http://127.0.0.1:5000/")
+stop = perf_counter()
+print(f"synchronous took {stop-start} seconds") # 1.062 secs
+
+# now the naive asyncio version
+import asyncio
+loop = asyncio.get_event_loop()
+
+async def get_response():
+    r = requests.get("http://127.0.0.1:5000/")
+
+start = perf_counter()
+loop.run_until_complete(asyncio.gather(*[get_response() for i in range(10)]))
+stop = perf_counter()
+print(f"asynchronous took {stop-start} seconds") # 1.049 secs
+
+# the fast asyncio version
+start = perf_counter()
+loop.run_until_complete(asyncio.gather(
+    *[loop.run_in_executor(None, requests.get, 'http://127.0.0.1:5000/') for i in range(10)]))
+stop = perf_counter()
+print(f"asynchronous (executor) took {stop-start} seconds") # 0.122 secs
+
+#finally, aiohttp
+import aiohttp
+
+async def get_response(session):
+    async with session.get("http://127.0.0.1:5000/") as response:
+        return await response.text()
+
+async def main():
+    async with aiohttp.ClientSession() as session:
+        await get_response(session)
+
+start = perf_counter()
+loop.run_until_complete(asyncio.gather(*[main() for i in range(10)]))
+stop = perf_counter()
+print(f"aiohttp took {stop-start} seconds") # 0.121 secs
+</code></pre>
+<p>So, an intuitive implementation with <code>asyncio</code> doesn't deal with blocking io code. But if you use <code>asyncio</code> correctly, it is just as fast as the special <code>aiohttp</code> framework. The docs for <a href="https://docs.python.org/3/library/asyncio-task.html" rel="nofollow noreferrer">coroutines and tasks</a> don't really mention this. Only if you read up on the <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.run_in_executor" rel="nofollow noreferrer">loop.run_in_executor()</a>, it says:</p>
+<blockquote>
+<pre><code># File operations (such as logging) can block the
+# event loop: run them in a thread pool.
+</code></pre>
+</blockquote>
+<p>I was surprised by this behaviour. The purpose of asyncio is to speed up blocking io calls. Why is an additional wrapper, <code>run_in_executor</code>, necessary to do this? </p>
+<p>The whole selling point of <code>aiohttp</code> seems to be support for <code>asyncio</code>. But as far as I can see, the <code>requests</code> module works perfectly - as long as you wrap it in an executor. Is there a reason to avoid wrapping something in an executor ?</p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>But as far as I can see, the requests module works perfectly - as long
+  as you wrap it in an executor. Is there a reason to avoid wrapping
+  something in an executor ?</p>
+</blockquote>
+<p>Running code in executor means to run it in <a href="https://en.wikipedia.org/wiki/Thread_(computing)" rel="noreferrer">OS threads</a>.</p>
+<p><code>aiohttp</code> and similar libraries allow to run non-blocking code without OS threads, using coroutines only.</p>
+<p>If you don't have much work, difference between OS threads and coroutines is not significant especially comparing to bottleneck - I/O operations. But once you have much work you can notice that OS threads perform relatively worse due to expensively <a href="https://en.wikipedia.org/wiki/Context_switch" rel="noreferrer">context switching</a>.</p>
+<p>For example, when I change your code to <code>time.sleep(0.001)</code> and <code>range(100)</code>, my machine shows:</p>
+<pre><code>asynchronous (executor) took 0.21461606299999997 seconds
+aiohttp took 0.12484742700000007 seconds
+</code></pre>
+<p>And this difference will only increase according to number of requests.</p>
+<blockquote>
+<p>The purpose of asyncio is to speed up blocking io calls.</p>
+</blockquote>
+<p>Nope, purpose of <code>asyncio</code> is to provide convenient way to control execution flow. <code>asyncio</code> allows you to choose how flow works - based on coroutines and OS threads (when you use executor) or on pure coroutines (like <code>aiohttp</code> does).</p>
+<p>It's <code>aiohttp</code>'s purpose to speed up things and it copes with the task as shown above :)</p>
+</div>
+<span class="comment-copy">The purpose of ayncio is not to speed things up in general, it's to reduce latency. Both of your approaches do that, while the executor might require a few more resources.</span>
+<span class="comment-copy">executor is based on threads. <code>asyncio</code> using non-blocking socket so it can request many with one thread but <code>requests</code> is not</span>
+<span class="comment-copy">Asyncio coroutines are not really green threads, because green threads are stackful. Carrying a full stack allows them to switch at arbitrary places and avoid the <a href="http://journal.stuffwithstuff.com/2015/02/01/what-color-is-your-function/" rel="nofollow noreferrer">function color</a> problem, but at the cost of each green thread being much more heavyweight than a coroutine/<a href="https://en.wikipedia.org/wiki/Fiber_(computer_science)" rel="nofollow noreferrer">fiber</a>. An example of Python implementation of green threads is the <a href="https://pypi.org/project/greenlet/" rel="nofollow noreferrer">greenlet</a> module and the <a href="http://www.gevent.org/" rel="nofollow noreferrer">gevent</a> event loop based on it.</span>
+<span class="comment-copy">@user4815162342 thanks for clarification! I altered answer.</span>
+<span class="comment-copy">@MikhailGerasimov, thanks for the elaboration on aiohttps performance, +1 from me :)  I still have some conceptual problems though, currently updating my question</span>
+<span class="comment-copy">I have updated my question. I don't understand the intersection between asyncio and aiohttp. Asyncio has non-blocking coroutines without OS-threads ? That sounds like a huge feature. Is this a part of asyncio ? If yes, why isn't that the default. If not, how is aiohttp based on asyncio (async/await are a language feature and not directly a part of asyncio) ?</span>
+<span class="comment-copy">@lhk Yes, asyncio has non-blocking coroutines without OS-threads, and it <i>is</i> a huge feature. Aiohttp is based on asyncio because it relies on asyncio's abstractions built on top of the raw async/await. See answers to <a href="https://stackoverflow.com/q/49005651/1600898">this question</a>, particularly <a href="https://stackoverflow.com/a/51177895/1600898">this one</a>, for in-depth coverage of the topic.</span>

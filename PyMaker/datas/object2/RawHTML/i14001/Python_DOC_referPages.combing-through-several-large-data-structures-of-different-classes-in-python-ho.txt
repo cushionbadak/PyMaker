@@ -1,0 +1,118 @@
+<div class="post-text" itemprop="text">
+<h2>What's going on</h2>
+<p>I'm collecting data from a few thousand network devices every few minutes in Python 2.7.8 via package <code>netsnmp</code>. I'm also using <code>fastsnmpy</code> so that I can access the (more efficient) Net-SNMP command <code>snmpbulkwalk</code>.</p>
+<p>I'm trying to cut down how much memory my script uses. I'm running three instances of the same script which sleeps for two minutes before re-querying all devices for data we want. When I created the original script in <code>bash</code> they would use less than 500MB when active simultaneously. As I've converted this over to Python, however, each instance hogs 4GB <em>each</em> which indicates (to me) that my data structures need to be managed more efficiently. Even when idle they're consuming a total of 4GB.</p>
+<hr/>
+<h2>Code Activity</h2>
+<p>My script begins with creating a list where I open a file and append the hostname of our target devices as separate values. These usually contain 80 to 1200 names.</p>
+<pre><code>expand = []
+f = open(self.deviceList, 'r')
+for line in f:
+    line = line.strip()
+    expand.append(line)
+</code></pre>
+<p>From there I set up the SNMP sessions and execute the requests</p>
+<pre><code>expandsession = SnmpSession ( timeout = 1000000 ,
+    retries = 1,            # I slightly modified the original fastsnmpy
+    verbose = debug,        # to reduce verbose messages and limit
+    oidlist = var,          # the number of attempts to reach devices
+    targets = expand,
+    community = 'expand'
+)
+expandresults = expandsession.multiwalk(mode = 'bulkwalk')
+</code></pre>
+<p>Because of how both SNMP packages behave, the device responses are parsed up into lists and stored into one giant data structure. For example,</p>
+<pre><code>for output in expandresults:
+    print ouput.hostname, output.iid, output.val
+#
+host1 1 1
+host1 2 2
+host1 3 3
+host2 1 4
+host2 2 5
+host2 3 6
+# Object 'output' itself cannot be printed directly; the value returned from this is obscure
+...
+</code></pre>
+<p>I'm having to iterate through each response, combine related data, then output each device's complete response. This is a bit difficult For example,</p>
+<pre><code>host1,1,2,3
+host2,4,5,6
+host3,7,8,9,10,11,12
+host4,13,14
+host5,15,16,17,18
+...
+</code></pre>
+<p>Each device has a varying number of responses. I can't loop through expecting every device having a uniform arbitrary number of values to combine into a string to write out to a CSV.</p>
+<hr/>
+<h2>How I'm handling the data</h2>
+<p>I believe it is here where I'm consuming a lot of memory but I cannot resolve how to simplify the process while simultaneously removing visited data.</p>
+<pre><code>expandarrays = dict()
+for output in expandresults:
+    if output.val is not None:
+        if output.hostname in expandarrays:
+            expandarrays[output.hostname] += ',' + output.val
+        else:
+            expandarrays[output.hostname] = ',' + output.val
+
+for key in expandarrays:
+    self.WriteOut(key,expandarrays[key])
+</code></pre>
+<p>Currently I'm creating a new dictionary, checking that the device response is not null, then appending the response value to a string that will be used to write out to the CSV file.</p>
+<p>The problem with this is that I'm essentially cloning the existing dictionary, meaning I'm using twice as much system memory. I'd like to remove values that I've visited in <code>expandresults</code> when I move them to <code>expandarrays</code> so that I'm not using so much RAM. Is there an efficient method of doing this? Is there also a better way of reducing the complexity of my code so that it's easier to follow?</p>
+<hr/>
+<h1>The Culprit</h1>
+<p>Thanks to those who answered. For those in the future that stumble across this thread due to experiencing similar issues: the <code>fastsnmpy</code> package is the culprit behind the large use of system memory. The <code>multiwalk()</code> function creates a thread for each host but does so all at once rather than putting some kind of upper limit. Since each instance of my script would handle up to 1200 devices that meant 1200 threads were instantiated and queued within just a few seconds. Using the <code>bulkwalk()</code> function was slower but still fast enough to suit my needs. The difference between the two was 4GB vs 250MB (of system memory use).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If the device responses are in order and are grouped together by host, then you don't need a dictionary, just three lists:</p>
+<pre><code>last_host = None
+hosts = []                # the list of hosts
+host_responses = []       # the list of responses for each host
+responses = []
+for output in expandresults:
+    if output.val is not None:
+        if output.hostname != last_host:    # new host
+            if last_host:    # only append host_responses after a new host
+                host_responses.append(responses)
+            hosts.append(output.hostname)
+            responses = [output.val]        # start the new list of responses
+            last_host = output.hostname
+        else:                               # same host, append the response
+            responses.append(output.val)
+host_responses.append(responses)
+
+for host, responses in zip(hosts, host_responses):
+    self.WriteOut(host, ','.join(responses))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The memory consumption was due to instantiation of several workers in an unbound manner.</p>
+<blockquote>
+<p>I've updated fastsnmpy (latest is version 1.2.1 ) and uploaded it to
+  PyPi.  You can do a search from PyPi for 'fastsnmpy', or grab it
+  directly from my PyPi page here at <a href="https://pypi.python.org/pypi/fastsnmpy2/1.2.1" rel="nofollow">FastSNMPy</a></p>
+</blockquote>
+<p>Just finished updating the docs, and posted them to the project page at <a href="http://ajaydivakaran.com/fastsnmpy/" rel="nofollow">fastSNMPy DOCS</a></p>
+<p>What I basically did here is to replace the earlier model of unbound-workers with a process-pool from multiprocessing. This can be passed in as an argument, or defaults to 1.</p>
+<p>You now have just 2 methods for simplicity. 
+snmpwalk(processes=n) and snmpbulkwalk(processes=n)</p>
+<p>You shouldn't see the memory issue anymore. If you do, please ping me on github.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You might have an easier time figuring out where the memory is going by using a profiler: </p>
+<p><a href="https://pypi.python.org/pypi/memory_profiler" rel="nofollow">https://pypi.python.org/pypi/memory_profiler</a></p>
+<p>Additionally, if you're already already tweaking the fastsnmpy classes, you can just change the implementation to do the dictionary based results merging for you instead of letting it construct a gigantic list first. </p>
+<p>How long are you hanging on to the session? The result list will grow indefinitely if you reuse it. </p>
+</div>
+<span class="comment-copy">I'm fairly new to Python and I'm having to learn it the hard way. I haven't seen <code>zip</code> used before but I'm safe to assume that it's compressing the stored data in order to reduce the amount of memory that the script is using?</span>
+<span class="comment-copy">No, it's not a memory compressor or file compactor like the desktop program.  Zip joins the lists together into a new list, like a zipper joins both sides of a jacket.  <a href="https://docs.python.org/3/library/functions.html#zip" rel="nofollow noreferrer">docs.python.org/3/library/functions.html#zip</a></span>
+<span class="comment-copy">Thanks, that explains it perfectly. Using your loop I'm definitely reducing the amount of memory and the data it writes out is correct. However I'm still having a large amount of memory being used by the system which I'll have to investigate further. For now though your answer definitely answers my question since the rest of what I need to investigate likely sits outside the bounds of what I'm asking for help here</span>
+<span class="comment-copy">Thanks! A lot has occurred since I've asked this. We actually modified the <code>fastsnmpy</code> package ourselves to act similar to the implementations you've made. (However we've since moved on to <code>easysnmp</code> for various reasons.) I'm surprised to see you comment here though. How'd you come across this?</span>
+<span class="comment-copy">I had to reimplement this at a much larger scale (roughly querying 8 million objects every minute), committing to a distributed bus, and eventually sharding to a nosql store. Had to start somewhere, so i just googled my old fastsnmpy package, and this was the first post that came up. Glad that someone else used it too.</span>
+<span class="comment-copy">That's similar to what we're doing, but you're likely doing it on a much larger scale. We're having to query 2,900+ wireless APs for the number of clients connected per radio, parse it for easier search/viewing in Kibana, then send it all to ElasticSearch. We didn't realize that NetSNMP had really bad memory leaks for <code>SNMPWALK</code> (~10MB per device we polled) so we had to resort to creating a <code>multiprocessing.pool</code> to prevent sucking up all system RAM. Anyways, I'll have to toy around with <code>fastsnmpy</code> sometime in the future.</span>
+<span class="comment-copy">yeah, netsnmp is pretty villainous.  I'd suggest doing an occassional walk (like once every few hours), and finding out the indexes that you actually need to poll (like the ones that are ifOper=up, ifName=~/eth*/ etc), and keeping them as your discovery. Then, every minute poll the interesting indexes from the discovery using pure snmpgets (with pdupacking set to reduce chattiness), and that would make it several orders of magnitude faster.</span>
+<span class="comment-copy">I didn't know I could release sessions. The Python documentation, and the test file included, do not mention a way to do this from within the API. I'm guessing that I would need to <code>del</code> each session after storing responses in their results variable?</span>
+<span class="comment-copy">I meant, are you creating a new session object for each scan or restarting your script, etc. Because looking at the library code, if you keep using the same session object, it hangs on to its result list forever.</span>
+<span class="comment-copy">I used the memory profiler and implemented the loop that Brent provided. Strangely the total amount of memory that my data uses is actually under 33MB. This leads me to believe that either <code>netsnmp</code> or <code>fastsnmpy</code>, or both, are the culprits here. The Net-SNMP C-language project itself has had a few reported bugs of memory leaks before. Perhaps that's what I'll need to delve into next. (EDIT) I was doing all this in an infinite global loop which created a new session each time. I have it set now to delete the session after results are passed in hopes of it releasing that list and freeing memory</span>
+<span class="comment-copy">That loop relies on the data being ordered, always, which doesn't seem like a good assumption but I'll let you sort that out. The simplest way to solve your memory problem, since you don't actually seem to have a memory problem is to run the python script from scratch every few minutes. That way you don't have to worry about leaks. If you are creating a new session each scan, the gc will clean up the old ones for you, you shouldn't have to manage them explicitly.</span>
+<span class="comment-copy">If it were possible to run the script from scratch every few minutes I'd certainly do so but this has to run every two minutes on its own since it will be run in three separate instances alongside other SNMP scripts (which are in <code>bash</code>). Anyways, yes it seems that <i>I</i> don't have a memory problem but the packages do. I'll have to dig deeper in them but all of that seem to lie outside the bounds of my original question so I'll pursue that independent of this thread</span>

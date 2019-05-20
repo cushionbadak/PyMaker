@@ -1,0 +1,288 @@
+<div class="post-text" itemprop="text">
+<p>I need to write a script that connects to a bunch of sites on our corporate intranet over HTTPS and verifies that their SSL certificates are valid; that they are not expired, that they are issued for the correct address, etc.  We use our own internal corporate Certificate Authority for these sites, so we have the public key of the CA to verify the certificates against.</p>
+<p>Python by default just accepts and uses SSL certificates when using HTTPS, so even if a certificate is invalid, Python libraries such as urllib2 and Twisted will just happily use the certificate.</p>
+<p><strike>Is there a good library somewhere that will let me connect to a site over HTTPS and verify its certificate in this way?</strike></p>
+<p>How do I verify a certificate in Python?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>From release version 2.7.9/3.4.3 on, Python <strong>by default</strong> attempts to perform certificate validation.</p>
+<p>This has been proposed in PEP 467, which is worth a read: <a href="https://www.python.org/dev/peps/pep-0476/">https://www.python.org/dev/peps/pep-0476/</a></p>
+<p>The changes affect all relevant stdlib modules (urllib/urllib2, http, httplib).</p>
+<p>Relevant documentation:</p>
+<p><a href="https://docs.python.org/2/library/httplib.html#httplib.HTTPSConnection">https://docs.python.org/2/library/httplib.html#httplib.HTTPSConnection</a></p>
+<blockquote>
+<p>This class now performs all the necessary certificate and hostname checks by default. To revert to the previous, unverified, behavior ssl._create_unverified_context() can be passed to the context parameter.</p>
+</blockquote>
+<p><a href="https://docs.python.org/3/library/http.client.html#http.client.HTTPSConnection">https://docs.python.org/3/library/http.client.html#http.client.HTTPSConnection</a></p>
+<blockquote>
+<p>Changed in version 3.4.3: This class now performs all the necessary certificate and hostname checks by default. To revert to the previous, unverified, behavior ssl._create_unverified_context() can be passed to the context parameter.</p>
+</blockquote>
+<p>Note that the new built-in verification is based on the <em>system-provided</em> certificate database. Opposed to that, the <a href="http://docs.python-requests.org">requests</a> package ships its own certificate bundle. Pros and cons of both approaches are discussed in the <a href="https://www.python.org/dev/peps/pep-0476/#trust-database"><em>Trust database</em> section of PEP 476</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I have added a distribution to the Python Package Index which makes the <code>match_hostname()</code> function from the Python 3.2 <code>ssl</code> package available on previous versions of Python.</p>
+<p><a href="http://pypi.python.org/pypi/backports.ssl_match_hostname/">http://pypi.python.org/pypi/backports.ssl_match_hostname/</a></p>
+<p>You can install it with:</p>
+<pre><code>pip install backports.ssl_match_hostname
+</code></pre>
+<p>Or you can make it a dependency listed in your project's <code>setup.py</code>. Either way, it can be used like this:</p>
+<pre><code>from backports.ssl_match_hostname import match_hostname, CertificateError
+...
+sslsock = ssl.wrap_socket(sock, ssl_version=ssl.PROTOCOL_SSLv3,
+                      cert_reqs=ssl.CERT_REQUIRED, ca_certs=...)
+try:
+    match_hostname(sslsock.getpeercert(), hostname)
+except CertificateError, ce:
+    ...
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can use Twisted to verify certificates.  The main API is <a href="http://twistedmatrix.com/documents/8.2.0/api/twisted.internet.ssl.CertificateOptions.html" rel="noreferrer">CertificateOptions</a>, which can be provided as the <code>contextFactory</code> argument to various functions such as <a href="http://twistedmatrix.com/documents/8.2.0/api/twisted.internet.interfaces.IReactorSSL.listenSSL.html" rel="noreferrer">listenSSL</a> and <a href="http://twistedmatrix.com/documents/8.2.0/api/twisted.internet.interfaces.ITLSTransport.html#startTLS" rel="noreferrer">startTLS</a>.</p>
+<p>Unfortunately, neither Python nor Twisted comes with a the pile of CA certificates required to actually do HTTPS validation, nor the HTTPS validation logic.  Due to <a href="https://bugs.launchpad.net/pyopenssl/+bug/324857" rel="noreferrer">a limitation in PyOpenSSL</a>, you can't do it completely correctly just yet, but thanks to the fact that almost all certificates include a subject commonName, you can get close enough.</p>
+<p>Here is a naive sample implementation of a verifying Twisted HTTPS client which ignores wildcards and subjectAltName extensions, and uses the certificate-authority certificates present in the 'ca-certificates' package in most Ubuntu distributions.  Try it with your favorite valid and invalid certificate sites :).</p>
+<pre><code>import os
+import glob
+from OpenSSL.SSL import Context, TLSv1_METHOD, VERIFY_PEER, VERIFY_FAIL_IF_NO_PEER_CERT, OP_NO_SSLv2
+from OpenSSL.crypto import load_certificate, FILETYPE_PEM
+from twisted.python.urlpath import URLPath
+from twisted.internet.ssl import ContextFactory
+from twisted.internet import reactor
+from twisted.web.client import getPage
+certificateAuthorityMap = {}
+for certFileName in glob.glob("/etc/ssl/certs/*.pem"):
+    # There might be some dead symlinks in there, so let's make sure it's real.
+    if os.path.exists(certFileName):
+        data = open(certFileName).read()
+        x509 = load_certificate(FILETYPE_PEM, data)
+        digest = x509.digest('sha1')
+        # Now, de-duplicate in case the same cert has multiple names.
+        certificateAuthorityMap[digest] = x509
+class HTTPSVerifyingContextFactory(ContextFactory):
+    def __init__(self, hostname):
+        self.hostname = hostname
+    isClient = True
+    def getContext(self):
+        ctx = Context(TLSv1_METHOD)
+        store = ctx.get_cert_store()
+        for value in certificateAuthorityMap.values():
+            store.add_cert(value)
+        ctx.set_verify(VERIFY_PEER | VERIFY_FAIL_IF_NO_PEER_CERT, self.verifyHostname)
+        ctx.set_options(OP_NO_SSLv2)
+        return ctx
+    def verifyHostname(self, connection, x509, errno, depth, preverifyOK):
+        if preverifyOK:
+            if self.hostname != x509.get_subject().commonName:
+                return False
+        return preverifyOK
+def secureGet(url):
+    return getPage(url, HTTPSVerifyingContextFactory(URLPath.fromString(url).netloc))
+def done(result):
+    print 'Done!', len(result)
+secureGet("https://google.com/").addCallback(done)
+reactor.run()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="http://pycurl.sourceforge.net/" rel="noreferrer">PycURL</a> does this beautifully.</p>
+<p>Below is a short example. It will throw a <code>pycurl.error</code> if something is fishy, where you get a tuple with error code and a human readable message.</p>
+<pre><code>import pycurl
+
+curl = pycurl.Curl()
+curl.setopt(pycurl.CAINFO, "myFineCA.crt")
+curl.setopt(pycurl.SSL_VERIFYPEER, 1)
+curl.setopt(pycurl.SSL_VERIFYHOST, 2)
+curl.setopt(pycurl.URL, "https://internal.stuff/")
+
+curl.perform()
+</code></pre>
+<p>You will probably want to configure more options, like where to store the results, etc. But no need to clutter the example with non-essentials.</p>
+<p>Example of what exceptions might be raised:</p>
+<pre><code>(60, 'Peer certificate cannot be authenticated with known CA certificates')
+(51, "common name 'CN=something.else.stuff,O=Example Corp,C=SE' does not match 'internal.stuff'")
+</code></pre>
+<p>Some links that I found useful are the libcurl-docs for setopt and getinfo.</p>
+<ul>
+<li><a href="http://curl.haxx.se/libcurl/c/curl_easy_setopt.html" rel="noreferrer">http://curl.haxx.se/libcurl/c/curl_easy_setopt.html</a></li>
+<li><a href="http://curl.haxx.se/libcurl/c/curl_easy_getinfo.html" rel="noreferrer">http://curl.haxx.se/libcurl/c/curl_easy_getinfo.html</a></li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's an example script which demonstrates certificate validation:</p>
+<pre><code>import httplib
+import re
+import socket
+import sys
+import urllib2
+import ssl
+
+class InvalidCertificateException(httplib.HTTPException, urllib2.URLError):
+    def __init__(self, host, cert, reason):
+        httplib.HTTPException.__init__(self)
+        self.host = host
+        self.cert = cert
+        self.reason = reason
+
+    def __str__(self):
+        return ('Host %s returned an invalid certificate (%s) %s\n' %
+                (self.host, self.reason, self.cert))
+
+class CertValidatingHTTPSConnection(httplib.HTTPConnection):
+    default_port = httplib.HTTPS_PORT
+
+    def __init__(self, host, port=None, key_file=None, cert_file=None,
+                             ca_certs=None, strict=None, **kwargs):
+        httplib.HTTPConnection.__init__(self, host, port, strict, **kwargs)
+        self.key_file = key_file
+        self.cert_file = cert_file
+        self.ca_certs = ca_certs
+        if self.ca_certs:
+            self.cert_reqs = ssl.CERT_REQUIRED
+        else:
+            self.cert_reqs = ssl.CERT_NONE
+
+    def _GetValidHostsForCert(self, cert):
+        if 'subjectAltName' in cert:
+            return [x[1] for x in cert['subjectAltName']
+                         if x[0].lower() == 'dns']
+        else:
+            return [x[0][1] for x in cert['subject']
+                            if x[0][0].lower() == 'commonname']
+
+    def _ValidateCertificateHostname(self, cert, hostname):
+        hosts = self._GetValidHostsForCert(cert)
+        for host in hosts:
+            host_re = host.replace('.', '\.').replace('*', '[^.]*')
+            if re.search('^%s$' % (host_re,), hostname, re.I):
+                return True
+        return False
+
+    def connect(self):
+        sock = socket.create_connection((self.host, self.port))
+        self.sock = ssl.wrap_socket(sock, keyfile=self.key_file,
+                                          certfile=self.cert_file,
+                                          cert_reqs=self.cert_reqs,
+                                          ca_certs=self.ca_certs)
+        if self.cert_reqs &amp; ssl.CERT_REQUIRED:
+            cert = self.sock.getpeercert()
+            hostname = self.host.split(':', 0)[0]
+            if not self._ValidateCertificateHostname(cert, hostname):
+                raise InvalidCertificateException(hostname, cert,
+                                                  'hostname mismatch')
+
+
+class VerifiedHTTPSHandler(urllib2.HTTPSHandler):
+    def __init__(self, **kwargs):
+        urllib2.AbstractHTTPHandler.__init__(self)
+        self._connection_args = kwargs
+
+    def https_open(self, req):
+        def http_class_wrapper(host, **kwargs):
+            full_kwargs = dict(self._connection_args)
+            full_kwargs.update(kwargs)
+            return CertValidatingHTTPSConnection(host, **full_kwargs)
+
+        try:
+            return self.do_open(http_class_wrapper, req)
+        except urllib2.URLError, e:
+            if type(e.reason) == ssl.SSLError and e.reason.args[0] == 1:
+                raise InvalidCertificateException(req.host, '',
+                                                  e.reason.args[1])
+            raise
+
+    https_request = urllib2.HTTPSHandler.do_request_
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        print "usage: python %s CA_CERT URL" % sys.argv[0]
+        exit(2)
+
+    handler = VerifiedHTTPSHandler(ca_certs = sys.argv[1])
+    opener = urllib2.build_opener(handler)
+    print opener.open(sys.argv[2]).read()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Or simply make your life easier by using the <a href="https://pypi.python.org/pypi/requests" rel="nofollow">requests</a> library:</p>
+<pre><code>import requests
+requests.get('https://somesite.com', cert='/path/server.crt', verify=True)
+</code></pre>
+<p><a href="http://docs.python-requests.org/en/latest/user/advanced/#ssl-cert-verification" rel="nofollow">A few more words about its usage.</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="http://chandlerproject.org/Projects/MeTooCrypto" rel="nofollow noreferrer">M2Crypto</a> can <a href="http://www.heikkitoivonen.net/blog/2008/10/14/ssl-in-python-26/" rel="nofollow noreferrer">do the validation</a>. You can also use <a href="http://svn.osafoundation.org/m2crypto/trunk/M2Crypto/SSL/TwistedProtocolWrapper.py" rel="nofollow noreferrer">M2Crypto with Twisted</a> if you like. The Chandler desktop client <a href="http://svn.osafoundation.org/chandler/trunk/chandler/parcels/osaf/framework/certstore/ssl.py" rel="nofollow noreferrer">uses Twisted for networking and M2Crypto for SSL</a>, including certificate validation.</p>
+<p>Based on Glyphs comment it seems like M2Crypto does better certificate verification by default than what you can do with pyOpenSSL currently, because M2Crypto checks subjectAltName field too.</p>
+<p>I've also blogged on how to <a href="http://www.heikkitoivonen.net/blog/2008/09/30/root-certificates-for-python-programs-using-python/" rel="nofollow noreferrer">get the certificates</a> Mozilla Firefox ships with in Python and usable with Python SSL solutions.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Jython DOES carry out certificate verification by default, so using standard library modules, e.g. httplib.HTTPSConnection, etc, with jython will verify certificates and give exceptions for failures, i.e. mismatched identities, expired certs, etc.</p>
+<p>In fact, you have to do some extra work to get jython to behave like cpython, i.e. to get jython to NOT verify certs. </p>
+<p>I have written a blog post on how to disable certificate checking on jython, because it can be useful in testing phases, etc.</p>
+<p>Installing an all-trusting security provider on java and jython.<br/>
+<a href="http://jython.xhaus.com/installing-an-all-trusting-security-provider-on-java-and-jython/" rel="nofollow">http://jython.xhaus.com/installing-an-all-trusting-security-provider-on-java-and-jython/</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The following code allows you to benefit from all SSL validation checks (e.g. date validity, CA certificate chain ...) EXCEPT a pluggable verification step e.g. to verify the hostname or do other additional certificate verification steps.</p>
+<pre><code>from httplib import HTTPSConnection
+import ssl
+
+
+def create_custom_HTTPSConnection(host):
+
+    def verify_cert(cert, host):
+        # Write your code here
+        # You can certainly base yourself on ssl.match_hostname
+        # Raise ssl.CertificateError if verification fails
+        print 'Host:', host
+        print 'Peer cert:', cert
+
+    class CustomHTTPSConnection(HTTPSConnection, object):
+        def connect(self):
+            super(CustomHTTPSConnection, self).connect()
+            cert = self.sock.getpeercert()
+            verify_cert(cert, host)
+
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    return CustomHTTPSConnection(host=host, context=context)
+
+
+if __name__ == '__main__':
+    # try expired.badssl.com or self-signed.badssl.com !
+    conn = create_custom_HTTPSConnection('badssl.com')
+    conn.request('GET', '/')
+    conn.getresponse().read()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://launchpad.net/pyopenssl" rel="nofollow noreferrer">pyOpenSSL</a> is an interface to the OpenSSL library. It should provide everything you need.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I was having the same problem but wanted to minimize 3rd party dependencies (because this one-off script was to be executed by many users). My solution was to wrap a <code>curl</code> call and make sure that the exit code was <code>0</code>. Worked like a charm.</p>
+</div>
+<span class="comment-copy">Your comment about Twisted is incorrect: Twisted uses pyopenssl, not Python's built-in SSL support.  While it doesn't validate HTTPS certificates by default in its HTTP client, you can use the "contextFactory" argument to getPage and downloadPage to construct a validating context factory.  By contrast, to my knowledge there's no way that the built-in "ssl" module can be convinced to do certificate validation.</span>
+<span class="comment-copy">With the SSL module in Python 2.6 and later, you can write your own certificate validator. Not optimal, but doable.</span>
+<span class="comment-copy">The situation changed, Python now by default validates certificates. I have added a new answer below.</span>
+<span class="comment-copy">The situation also changed for Twisted (somewhat before it did for Python, in fact); If you use <a href="https://treq.readthedocs.org/" rel="nofollow noreferrer"><code>treq</code></a> or <a href="https://twistedmatrix.com/documents/14.0.0/api/twisted.web.client.Agent.html" rel="nofollow noreferrer"><code>twisted.web.client.Agent</code></a> since version 14.0, Twisted verifies certificates by default.</span>
+<span class="comment-copy">any solutions to ensure verifications of certificate for previous version of python ? One can not always upgrade the version of python.</span>
+<span class="comment-copy">it doesn't validate revoked certificates. E.g. revoked.badssl.com</span>
+<span class="comment-copy">Is it compulsory to use <code>HTTPSConnection</code> class? I was using <a href="https://docs.python.org/3/library/ssl.html#ssl.SSLSocket" rel="nofollow noreferrer"><code>SSLSocket</code></a>. How can I do validation with <code>SSLSocket</code>? Do I have to explicitly validate using <code>pyopenssl</code> as explained <a href="http://www.yothenberg.com/validate-x509-certificate-in-python/" rel="nofollow noreferrer">here</a>?</span>
+<span class="comment-copy">I'm missing something... can you please fill in the blanks above or provide a complete example (for a site like Google)?</span>
+<span class="comment-copy">The example will look different depending on which library you are using to access Google, since different libraries put the SSL socket different places, and it is the SSL socket that needs its <code>getpeercert()</code> method called so the output can be passed to <code>match_hostname()</code>.</span>
+<span class="comment-copy">I'm embarrassed on Python's behalf that anyone has to use this.  Python's built-in SSL HTTPS libraries not verifying certificates out of the box by default is completely insane, and it's painful to imagine how many insecure systems are out there now as a result.</span>
+<span class="comment-copy">@Glenn - Also see <a href="http://bugs.python.org/issue1589" rel="nofollow noreferrer">New SSL module doesn't seem to verify hostname against commonName in certificate</a>.</span>
+<span class="comment-copy">can you make it non-blocking?</span>
+<span class="comment-copy">Thanks; I have one note now that I've read and understood this: verify callbacks should return True when there's no error and False when there is.  Your code basically returns an error when the commonName is not localhost.  I'm not sure whether that's what you intended, though it would make sense to do this in some cases.  I just figured I'd leave a comment about this for the benefit of future readers of this answer.</span>
+<span class="comment-copy">"self.hostname" in that case is not "localhost"; note the <code>URLPath(url).netloc</code>: that means the host part of the URL passed in to secureGet.  In other words, it's checking that the commonName of the subject is the same as the one being requested by the caller.</span>
+<span class="comment-copy">I've been running a version of this test code and have used Firefox, wget, and Chrome to hit a test HTTPS Server. In my test runs though, I'm seeing that the callback verifyHostname is being called 3-4 times every connection. Why is it not just running once?</span>
+<span class="comment-copy">URLPath(blah).netloc <i>is</i> always localhost: URLPath.__init__ takes individual url components, you're passing an entire url as "scheme" and getting the default netloc of 'localhost' to go with it. You probably meant to use URLPath.fromString(url).netloc. Unfortunately that exposes the check in verifyHostName being backwards: it starts rejecting <code>https://www.google.com/</code> because one of the subjects is 'www.google.com', causing the function to return False. It probably meant to return True (accepted) if the names match, and False if they do not?</span>
+<span class="comment-copy">This doesn't do any hostname validation, see: <a href="http://bugs.python.org/issue1589" rel="nofollow noreferrer">bugs.python.org/issue1589</a></span>
+<span class="comment-copy">@tonfa: Good catch; I ended up adding hostname checking as well, and I've edited my answer to include the code I used.</span>
+<span class="comment-copy">I can't reach the original link (i.e. 'this page').  Has it moved?</span>
+<span class="comment-copy">@Matt: I guess so, but FWIW the original link isn't necessary, since my test program is a complete, self-contained, working example.  I linked to the page which helped me write that code since it seemed like the decent thing to provide attribution.  But since it doesn't exist anymore, I'll edit my post to remove the link, thanks for pointing this out.</span>
+<span class="comment-copy"><a href="https://gist.github.com/2993700" rel="nofollow noreferrer">Here</a> is a cleaned up and working solution with <code>backports.ssl_match_hostname</code>.</span>
+<span class="comment-copy">The <code>cert</code> argument is the client side certificate, not a server certificate to check against. You want to use the <code>verify</code> argument.</span>
+<span class="comment-copy">requests validates <i>by default</i>. No need to use the <code>verify</code> argument, except for being more explicit or disabling verification.</span>
+<span class="comment-copy">no module named requests</span>
+<span class="comment-copy">It's not an internal module. You need to run pip install requests</span>
+<span class="comment-copy">OpenSSL does not perform hostname matching. Its planned for OpenSSL 1.1.0.</span>
+<span class="comment-copy">I'd say <a href="https://stackoverflow.com/a/1921551/1228491">stackoverflow.com/a/1921551/1228491</a> using pycurl is a much better solution then.</span>

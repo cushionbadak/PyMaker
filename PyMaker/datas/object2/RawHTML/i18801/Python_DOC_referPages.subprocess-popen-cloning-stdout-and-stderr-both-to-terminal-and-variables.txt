@@ -1,0 +1,283 @@
+<div class="post-text" itemprop="text">
+<p>Is it possible to modify code below to have printout from 'stdout 'and 'stderr':</p>
+<ul>
+<li>printed on the <b>terminal</b> (in real time),</li>
+<li>and finally stored in <b>outs</b> and <b>errs</b> variables?</li>
+</ul>
+<p>The code:</p>
+<pre><code>#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+import subprocess
+
+def run_cmd(command, cwd=None):
+    p = subprocess.Popen(command, cwd=cwd, shell=False,
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
+    outs, errs = p.communicate()
+    rc = p.returncode
+    outs = outs.decode('utf-8')
+    errs = errs.decode('utf-8')
+
+    return (rc, (outs, errs))
+</code></pre>
+<p>Thanks to @unutbu, special thanks for @j-f-sebastian, final function:</p>
+<pre><code>#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+
+import sys
+from queue import Queue
+from subprocess import PIPE, Popen
+from threading import Thread
+
+
+def read_output(pipe, funcs):
+    for line in iter(pipe.readline, b''):
+        for func in funcs:
+            func(line.decode('utf-8'))
+    pipe.close()
+
+
+def write_output(get):
+    for line in iter(get, None):
+        sys.stdout.write(line)
+
+
+def run_cmd(command, cwd=None, passthrough=True):
+    outs, errs = None, None
+
+    proc = Popen(
+        command,
+        cwd=cwd,
+        shell=False,
+        close_fds=True,
+        stdout=PIPE,
+        stderr=PIPE,
+        bufsize=1
+        )
+
+    if passthrough:
+
+        outs, errs = [], []
+
+        q = Queue()
+
+        stdout_thread = Thread(
+            target=read_output, args=(proc.stdout, [q.put, outs.append])
+            )
+
+        stderr_thread = Thread(
+            target=read_output, args=(proc.stderr, [q.put, errs.append])
+            )
+
+        writer_thread = Thread(
+            target=write_output, args=(q.get,)
+            )
+
+        for t in (stdout_thread, stderr_thread, writer_thread):
+            t.daemon = True
+            t.start()
+
+        proc.wait()
+
+        for t in (stdout_thread, stderr_thread):
+            t.join()
+
+        q.put(None)
+
+        outs = ' '.join(outs)
+        errs = ' '.join(errs)
+
+    else:
+
+        outs, errs = proc.communicate()
+        outs = '' if outs == None else outs.decode('utf-8')
+        errs = '' if errs == None else errs.decode('utf-8')
+
+    rc = proc.returncode
+
+    return (rc, (outs, errs))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You could spawn threads to read the stdout and stderr pipes, write to a common queue, and append to lists. Then use a third thread to print items from the queue.</p>
+<pre><code>import time
+import Queue
+import sys
+import threading
+import subprocess
+PIPE = subprocess.PIPE
+
+
+def read_output(pipe, funcs):
+    for line in iter(pipe.readline, ''):
+        for func in funcs:
+            func(line)
+            # time.sleep(1)
+    pipe.close()
+
+def write_output(get):
+    for line in iter(get, None):
+        sys.stdout.write(line)
+
+process = subprocess.Popen(
+    ['random_print.py'], stdout=PIPE, stderr=PIPE, close_fds=True, bufsize=1)
+q = Queue.Queue()
+out, err = [], []
+tout = threading.Thread(
+    target=read_output, args=(process.stdout, [q.put, out.append]))
+terr = threading.Thread(
+    target=read_output, args=(process.stderr, [q.put, err.append]))
+twrite = threading.Thread(target=write_output, args=(q.get,))
+for t in (tout, terr, twrite):
+    t.daemon = True
+    t.start()
+process.wait()
+for t in (tout, terr):
+    t.join()
+q.put(None)
+print(out)
+print(err)
+</code></pre>
+<p>The reason for using the third thread -- instead of letting the first two threads both print directly to the terminal -- is to prevent both print statements from occurring concurrently, which can result in sometimes garbled text.  </p>
+<hr/>
+<p>The above calls <code>random_print.py</code>, which prints to stdout and stderr at random:</p>
+<pre><code>import sys
+import time
+import random
+
+for i in range(50):
+    f = random.choice([sys.stdout,sys.stderr])
+    f.write(str(i)+'\n')
+    f.flush()
+    time.sleep(0.1)
+</code></pre>
+<hr/>
+<p>This solution borrows code and ideas from <a href="https://stackoverflow.com/a/4418891/190597">J. F. Sebastian, here</a>.</p>
+<hr/>
+<p>Here is an alternative solution for Unix-like systems, using <code>select.select</code>:</p>
+<pre><code>import collections
+import select
+import fcntl
+import os
+import time
+import Queue
+import sys
+import threading
+import subprocess
+PIPE = subprocess.PIPE
+
+def make_async(fd):
+    # https://stackoverflow.com/a/7730201/190597
+    '''add the O_NONBLOCK flag to a file descriptor'''
+    fcntl.fcntl(
+        fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+
+def read_async(fd):
+    # https://stackoverflow.com/a/7730201/190597
+    '''read some data from a file descriptor, ignoring EAGAIN errors'''
+    # time.sleep(1)
+    try:
+        return fd.read()
+    except IOError, e:
+        if e.errno != errno.EAGAIN:
+            raise e
+        else:
+            return ''
+
+def write_output(fds, outmap):
+    for fd in fds:
+        line = read_async(fd)
+        sys.stdout.write(line)
+        outmap[fd.fileno()].append(line)
+
+process = subprocess.Popen(
+    ['random_print.py'], stdout=PIPE, stderr=PIPE, close_fds=True)
+
+make_async(process.stdout)
+make_async(process.stderr)
+outmap = collections.defaultdict(list)
+while True:
+    rlist, wlist, xlist = select.select([process.stdout, process.stderr], [], [])
+    write_output(rlist, outmap)
+    if process.poll() is not None:
+        write_output([process.stdout, process.stderr], outmap)
+        break
+
+fileno = {'stdout': process.stdout.fileno(),
+          'stderr': process.stderr.fileno()}
+
+print(outmap[fileno['stdout']])
+print(outmap[fileno['stderr']])
+</code></pre>
+<p>This solution uses code and ideas from <a href="https://stackoverflow.com/a/7730201/190597">Adam Rosenfield's post, here</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>To capture and display at the same time both stdout and stderr from a child process line by line in a single thread, you could use asynchronous I/O:</p>
+<pre><code>#!/usr/bin/env python3
+import asyncio
+import os
+import sys
+from asyncio.subprocess import PIPE
+
+@asyncio.coroutine
+def read_stream_and_display(stream, display):
+    """Read from stream line by line until EOF, display, and capture the lines.
+
+    """
+    output = []
+    while True:
+        line = yield from stream.readline()
+        if not line:
+            break
+        output.append(line)
+        display(line) # assume it doesn't block
+    return b''.join(output)
+
+@asyncio.coroutine
+def read_and_display(*cmd):
+    """Capture cmd's stdout, stderr while displaying them as they arrive
+    (line by line).
+
+    """
+    # start process
+    process = yield from asyncio.create_subprocess_exec(*cmd,
+            stdout=PIPE, stderr=PIPE)
+
+    # read child's stdout/stderr concurrently (capture and display)
+    try:
+        stdout, stderr = yield from asyncio.gather(
+            read_stream_and_display(process.stdout, sys.stdout.buffer.write),
+            read_stream_and_display(process.stderr, sys.stderr.buffer.write))
+    except Exception:
+        process.kill()
+        raise
+    finally:
+        # wait for the process to exit
+        rc = yield from process.wait()
+    return rc, stdout, stderr
+
+# run the event loop
+if os.name == 'nt':
+    loop = asyncio.ProactorEventLoop() # for subprocess' pipes on Windows
+    asyncio.set_event_loop(loop)
+else:
+    loop = asyncio.get_event_loop()
+rc, *output = loop.run_until_complete(read_and_display(*cmd))
+loop.close()
+</code></pre>
+</div>
+<span class="comment-copy">The code example does store <code>outs</code> and <code>errs</code> and returns them... To print to the terminal, simply <code>if outs: print outs</code> <code>if errs: print errs</code></span>
+<span class="comment-copy">@bnlucas Thanks, but as I stated in first point: the output should be printed in REAL TIME to terminal, like as without PIPEing.</span>
+<span class="comment-copy">If you need Python 3 code; add <a href="https://stackoverflow.com/questions/tagged/python-3.x">python-3.x</a> tag (i see python3 in the shebang). Your code as written will leave reading threads hanging. In Python 3 <code>''</code> is a Unicode literal, but <code>pipe.readline()</code> returns bytes by default (<code>'' != b""</code> on Python 3). If you fix it then the writer thread won't end, because nothing puts <code>""</code> into the queue.</span>
+<span class="comment-copy">related: <a href="http://stackoverflow.com/q/25750468/4279">Displaying subprocess output to stdout and redirecting it</a></span>
+<span class="comment-copy">you could add <code>q.put(None)</code> after <code>process.wait()</code> and exit the 3rd thread on <code>None</code> e.g., <code>for line in iter(get, None):</code>. Also <code>pipe.close()</code> is missing.</span>
+<span class="comment-copy">@J.F.Sebastian: Thanks for the corrections. Suppose <code>read_output</code> for some reason does not keep pace with the output being written to <code>pipe</code>. (I try to simulate that with a <code>time.sleep(1)</code> above). When the <code>time.sleep(1)</code> is uncommented, <code>out</code> and <code>err</code> fail to collect all the output before <code>process.wait()</code> completes. Do you know a way to guarantee that <code>out</code> and <code>err</code> get all the output?</span>
+<span class="comment-copy"><code>t{err,out}.join()</code> before <code>put(None)</code>. btw, to get lines in "real time", <code>bufsize=1</code> might help (ignoring `block-buffering issue)</span>
+<span class="comment-copy">Ah, yes. Thanks again.</span>
+<span class="comment-copy">This code looks good, could you add a version for Python 2.7?</span>
+<span class="comment-copy">@kinORnirvana: <code>asyncio</code> works only on Python 3.3+ There is <code>trollius</code>—a Python 2 clone but <a href="http://trollius.readthedocs.org/" rel="nofollow noreferrer">it is deprecated</a></span>
+<span class="comment-copy">Nice work, J.F! I just "borrowed" your code for <a href="http://stackoverflow.com/a/41284244/4014959">this answer</a>. If you have any comments, suggestions, &amp;/or a better answer, they would be much appreciated.</span>
+<span class="comment-copy">Note that once the loop is closed doing <code>get_event_loop</code> will get you the same closed loop which cannot be re-used as is (<code>event loop is closed</code> message). I ended up doing <code>asyncio.set_event_loop(asyncio.new_event_loop())</code> to get a fresh event loop.</span>
+<span class="comment-copy">I was running this code in a Jupyter notebook. I was getting an <code>AttributeError</code> because <code>sys.stdout.buffer</code> no longer existed. This helped clear it up: <a href="https://docs.python.org/3/library/sys.html#sys.stderr" rel="nofollow noreferrer">docs.python.org/3/library/sys.html#sys.stderr</a> When in a Jupyter notebook I used <code>sys.stdout.write</code> in lieu of <code>sys.stdout.buffer.write</code>and the output appeared in the notebook logging output.</span>

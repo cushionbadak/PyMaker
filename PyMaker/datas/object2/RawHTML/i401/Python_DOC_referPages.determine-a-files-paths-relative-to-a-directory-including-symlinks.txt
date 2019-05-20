@@ -1,0 +1,281 @@
+<div class="post-text" itemprop="text">
+<p>I have a directory with thousands of descendants (at least 1,000, probably no more than 20,000). Given a file path (which is guaranteed to exist), I want to know where that file can be found inside that directory -- including via symlinks.</p>
+<p>For example, given:</p>
+<ul>
+<li>The directory path is <code>/base</code>.</li>
+<li>The real file path is <code>/elsewhere/myfile</code>.</li>
+<li><code>/base</code> is a symlink to <code>/realbase</code></li>
+<li><code>/realbase/foo</code> is a symlink to <code>/elsewhere</code>.</li>
+<li><code>/realbase/bar/baz</code> is a symlink to <code>/elsewhere/myfile</code>.</li>
+</ul>
+<p>I want to find the paths <code>/base/foo/myfile</code> and <code>/base/bar/baz</code>.</p>
+<p>I could do this by recursively checking every symlink in <code>/base</code>, but this would be very slow. I'm hoping that there's a more graceful solution.</p>
+<hr/>
+<h3>Motivation</h3>
+<p>This is for a Sublime Text plugin. When the user saves a file, we want to detect whether it is in the Sublime configuration directory. In particular, we want to do so even if the file is symlinked from inside the config directory and the user is editing the file at its physical path (e.g. inside their Dropbox directory). There may be other applications as well.</p>
+<p>Sublime runs on Linux, Windows, and the Mac OS, and so ideally should the solution.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This, like many things, is more complex than it might appear on the surface.</p>
+<p>Each entity in the file system points at an <code>inode</code>, which describes the content of the file. Entities are the things you see - files, directories, sockets, block devices, character devices, etc...</p>
+<p>The content of a single "<em>file</em>" can be accessed via one or more paths - each of these paths is called a "<em>hard link</em>". Hard links can only point at files on the same filesystem, they cannot cross the boundary of a filesystem.</p>
+<p>It is also possible for a path to address a "<em>symbolic link</em>", which can point at another path - that path doesn't have to exist, it can be another symbolic link, it can be on another filesystem, or it can point back at the original path producing an infinite loop.</p>
+<p>It is impossible to locate all links (symbolic or hard) that point at a particular entity without scanning the entire tree.</p>
+<hr/>
+<p>Before we get into this... some comments:</p>
+<ol>
+<li>See the end for some benchmarks. I'm not convinced that this is a significant issue, though admittedly this filesystem is on a 6-disk ZFS array, on an i7, so using a lower spec system will take longer...</li>
+<li>Given that this is <strong><em>impossible</em></strong> without calling <code>stat()</code> on every file at some point, you're going to struggle coming up with a better solution that isn't significantly more complex (such as maintaining an index database, with all the issues that introduces)</li>
+</ol>
+<hr/>
+<p>As mentioned, we <strong>must</strong> scan (index) the whole tree. I know it's not what you want to do, but it's impossible without doing this...</p>
+<p>To do this, you need to collect <strong>inodes</strong>, not filenames, and review them after the fact... there may be some optimisation here, but I've tried to keep it simple to prioritise understanding.</p>
+<p>The following function will produce this structure for us:</p>
+<pre class="lang-py prettyprint-override"><code>def get_map(scan_root):
+    # this dict will have device IDs at the first level (major / minor) ...
+    # ... and inodes IDs at the second level
+    # each inode will have the following keys:
+    #   - 'type'     the entity's type - i.e: dir, file, socket, etc...
+    #   - 'links'    a list of all found hard links to the inode
+    #   - 'symlinks' a list of all found symlinks to the inode
+    # e.g: entities[2049][4756]['links'][0]     path to a hard link for inode 4756
+    #      entities[2049][4756]['symlinks'][0]  path to a symlink that points at an entity with inode 4756
+    entity_map = {}
+
+    for root, dirs, files in os.walk(scan_root):
+        root = '.' + root[len(scan_root):]
+        for path in [ os.path.join(root, _) for _ in files ]:
+            try:
+                p_stat = os.stat(path)
+            except OSError as e:
+                if e.errno == 2:
+                    print('Broken symlink [%s]... skipping' % ( path ))
+                    continue
+                if e.errno == 40:
+                    print('Too many levels of symbolic links [%s]... skipping' % ( path ))
+                    continue
+                raise
+
+            p_dev = p_stat.st_dev
+            p_ino = p_stat.st_ino
+
+            if p_dev not in entity_map:
+                entity_map[p_dev] = {}
+            e_dev = entity_map[p_dev]
+
+            if p_ino not in e_dev:
+                e_dev[p_ino] = {
+                    'type': get_type(p_stat.st_mode),
+                    'links': [],
+                    'symlinks': [],
+                }
+            e_ino = e_dev[p_ino]
+
+            if os.lstat(path).st_ino == p_ino:
+                e_ino['links'].append(path)
+            else:
+                e_ino['symlinks'].append(path)
+
+    return entity_map
+</code></pre>
+<p>I've produced an example tree that looks like this:</p>
+<pre class="lang-none prettyprint-override"><code>$ tree --inodes
+.
+├── [  67687]  4 -&gt; 5
+├── [  67676]  5 -&gt; 4
+├── [  67675]  6 -&gt; dead
+├── [  67676]  a
+│   └── [  67679]  1
+├── [  67677]  b
+│   └── [  67679]  2 -&gt; ../a/1
+├── [  67678]  c
+│   └── [  67679]  3
+└── [  67687]  d
+    └── [  67688]  4
+
+4 directories, 7 files
+</code></pre>
+<p>The output of this function is:</p>
+<pre class="lang-none prettyprint-override"><code>$ places
+Broken symlink [./6]... skipping
+Too many levels of symbolic links [./5]... skipping
+Too many levels of symbolic links [./4]... skipping
+{201: {67679: {'links': ['./a/1', './c/3'],
+               'symlinks': ['./b/2'],
+               'type': 'file'},
+       67688: {'links': ['./d/4'], 'symlinks': [], 'type': 'file'}}}
+</code></pre>
+<p>If we are interested in <code>./c/3</code>, then you can see that just looking at symlinks (and ignoring hard links) would cause us to miss <code>./a/1</code>...</p>
+<p>By subsequently searching for the path we are interested in, we can find all other references within this tree:</p>
+<pre class="lang-py prettyprint-override"><code>def filter_map(entity_map, filename):
+    for dev, inodes in entity_map.items():
+        for inode, info in inodes.items():
+            if filename in info['links'] or filename in info['symlinks']:
+                return info
+</code></pre>
+<pre class="lang-none prettyprint-override"><code>$ places ./a/1
+Broken symlink [./6]... skipping
+Too many levels of symbolic links [./5]... skipping
+Too many levels of symbolic links [./4]... skipping
+{'links': ['./a/1', './c/3'], 'symlinks': ['./b/2'], 'type': 'file'}
+</code></pre>
+<hr/>
+<p>The full source for this demo is below. Note that I've used relative paths to keep things simple, but it would be sensible to update this to use absolute paths. Additionally, any symlink that points outside the tree will not currently have a corresponding <code>link</code>... that's an exercise for the reader.</p>
+<p>It might also be an idea to collect the data while you're filling the tree (if that's something that would work with your process)... you can use <a href="https://en.wikipedia.org/wiki/Inotify" rel="nofollow noreferrer"><code>inotify</code></a> to deal with this nicely - there's even a <a href="https://pypi.org/project/inotify/" rel="nofollow noreferrer">python module</a>.</p>
+<pre class="lang-py prettyprint-override"><code>#!/usr/bin/env python3
+
+import os, sys, stat
+from pprint import pprint
+
+def get_type(mode):
+    if stat.S_ISDIR(mode):
+        return 'directory'
+    if stat.S_ISCHR(mode):
+        return 'character'
+    if stat.S_ISBLK(mode):
+        return 'block'
+    if stat.S_ISREG(mode):
+        return 'file'
+    if stat.S_ISFIFO(mode):
+        return 'fifo'
+    if stat.S_ISLNK(mode):
+        return 'symlink'
+    if stat.S_ISSOCK(mode):
+        return 'socket'
+    return 'unknown'
+
+def get_map(scan_root):
+    # this dict will have device IDs at the first level (major / minor) ...
+    # ... and inodes IDs at the second level
+    # each inode will have the following keys:
+    #   - 'type'     the entity's type - i.e: dir, file, socket, etc...
+    #   - 'links'    a list of all found hard links to the inode
+    #   - 'symlinks' a list of all found symlinks to the inode
+    # e.g: entities[2049][4756]['links'][0]     path to a hard link for inode 4756
+    #      entities[2049][4756]['symlinks'][0]  path to a symlink that points at an entity with inode 4756
+    entity_map = {}
+
+    for root, dirs, files in os.walk(scan_root):
+        root = '.' + root[len(scan_root):]
+        for path in [ os.path.join(root, _) for _ in files ]:
+            try:
+                p_stat = os.stat(path)
+            except OSError as e:
+                if e.errno == 2:
+                    print('Broken symlink [%s]... skipping' % ( path ))
+                    continue
+                if e.errno == 40:
+                    print('Too many levels of symbolic links [%s]... skipping' % ( path ))
+                    continue
+                raise
+
+            p_dev = p_stat.st_dev
+            p_ino = p_stat.st_ino
+
+            if p_dev not in entity_map:
+                entity_map[p_dev] = {}
+            e_dev = entity_map[p_dev]
+
+            if p_ino not in e_dev:
+                e_dev[p_ino] = {
+                    'type': get_type(p_stat.st_mode),
+                    'links': [],
+                    'symlinks': [],
+                }
+            e_ino = e_dev[p_ino]
+
+            if os.lstat(path).st_ino == p_ino:
+                e_ino['links'].append(path)
+            else:
+                e_ino['symlinks'].append(path)
+
+    return entity_map
+
+def filter_map(entity_map, filename):
+    for dev, inodes in entity_map.items():
+        for inode, info in inodes.items():
+            if filename in info['links'] or filename in info['symlinks']:
+                return info
+
+entity_map = get_map(os.getcwd())
+
+if len(sys.argv) == 2:
+    entity_info = filter_map(entity_map, sys.argv[1])
+    pprint(entity_info)
+else:
+    pprint(entity_map)
+</code></pre>
+<hr/>
+<p>I've run this on my system out of curiosity. It's a 6x disk ZFS RAID-Z2 pool on an i7-7700K with plenty of data to play with. Admittedly this will run somewhat slower on lower-spec systems...</p>
+<p>Some benchmarks to consider:</p>
+<ul>
+<li>A dataset of ~3.1k files and links in ~850 directories.
+This runs in less than 3.5 seconds, ~80ms on subsequent runs</li>
+<li>A dataset of ~30k files and links in ~2.2k directories.
+This runs in less than 30 seconds, ~300ms on subsequent runs</li>
+<li>A dataset of ~73.5k files and links in ~8k directories.
+This runs in approx 60 seconds, ~800ms on subsequent runs</li>
+</ul>
+<p>Using simple maths, that's about 1140 <code>stat()</code> calls per second with an empty cache, or ~90k <code>stat()</code> calls per second once the cache has been filled - I don't think that <code>stat()</code> is as slow as you think it is!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Symlinks do not admit of shortcuts. You have to know about all relevant FS entries that might point at the file of interest. That corresponds either to creating an empty directory and then listening for all file creation events under it, or to scanning all files currently under it. Run the following.</p>
+<pre><code>#! /usr/bin/env python
+
+from pathlib import Path
+import collections
+import os
+import pprint
+import stat
+
+
+class LinkFinder:
+
+    def __init__(self):
+        self.target_to_orig = collections.defaultdict(set)
+
+    def scan(self, folder='/tmp'):
+        for fspec, target in self._get_links(folder):
+            self.target_to_orig[target].add(fspec)
+
+    def _get_links(self, folder):
+        for root, dirs, files in os.walk(Path(folder).resolve()):
+            for file in files:
+                fspec = os.path.join(root, file)
+                if stat.S_ISLNK(os.lstat(fspec).st_mode):
+                    target = os.path.abspath(os.readlink(fspec))
+                    yield fspec, target
+
+
+if __name__ == '__main__':
+    lf = LinkFinder()
+    for folder in '/base /realbase'.split():
+        lf.scan(folder)
+    pprint.pprint(lf.target_to_orig)
+</code></pre>
+<p>You wind up with a mapping from all symlinked filespecs to a set of aliases by which that filespec may be accessed.</p>
+<p>A symlink target may be a file or directory, so to properly use the mapping on a given filespec you must repeatedly truncate it, asking if parent directory or an ancestor directory appears in the mapping.</p>
+<p>Dangling symlinks are not handled specially, they are simply allowed to dangle.</p>
+<p>You might choose to serialize the mapping, probably in sorted order. If you repeatedly re-scan a large directory, there is an opportunity to remember directory mod times across runs, and avoid re-scanning files in that directory. Unfortunately, you would still have to recurse down into its descendant directories in case any of <em>them</em> had recent changes.
+Your subtrees may exhibit enough structure to let you avoid recursing more than K levels deep, or avoid descending into a directory whose name matches some regex.</p>
+<p>If most FS changes are produced by a handful of programs, such as package managers or a build system, then getting those programs to log their actions could yield a performance win. That is, if you do a full scan each midnight, and then you run <code>make</code> in only two out of a thousand directories, you could choose to re-scan just that pair of subtrees.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>My first instinct is to have the OS or some service inform you when the file-system tree has changed instead of you looking for the changes.  Essentially don't  reinvent the wheel.</p>
+<p>Maybe:</p>
+<ul>
+<li><a href="https://www.ostechnix.com/monitor-file-changes-using-fswatch-linux/" rel="nofollow noreferrer">fswatch</a></li>
+<li><a href="http://stefan.buettcher.org/cs/fschange/index.html" rel="nofollow noreferrer">fschange</a></li>
+<li><a href="https://www.linuxjournal.com/article/8478" rel="nofollow noreferrer">inotify</a></li>
+</ul>
+<p>Windows specific: <a href="https://www.itechtics.com/monitor-folder-changes/" rel="nofollow noreferrer">5 tools to monitor folder changes</a></p>
+</div>
+<span class="comment-copy">This question is similar: <a href="https://stackoverflow.com/questions/4532241/linux-find-all-symlinks-of-a-given-original-file-reverse-readlink" title="linux find all symlinks of a given original file reverse readlink">stackoverflow.com/questions/4532241/…</a>. Basic finding is you have to search everywhere. My gut feel is you should maintain a data structure which indexes all of a files links, updating when new symlinks are created.</span>
+<span class="comment-copy">Because of the differences in how the requested operating systems and their file systems work, you may <i>need</i> to have OS-specific modules that are selected at runtime.</span>
+<span class="comment-copy">Do you really need to worry about symlinks on Windows? (it's a somewhat obscure feature that average users don't know about)</span>
+<span class="comment-copy">"<i>This is for a Sublime Text plugin.</i>" - I'd suggest that this <b>is not</b> your job... and could even potentially be considered malicious... no, no, no. IDEs are already bloated and slow, this "<i>feature</i>" just adds to that.</span>
+<span class="comment-copy">If I didn't care about performance, then I wouldn't have asked this question. If it can't be done within reasonable performance bounds, then I won't do it at all. But what's reasonable depends on the application -- the performance budget for a handler that runs on every save event is much tighter than the budget for a user-invoked command that runs an automated test suite.</span>
+<span class="comment-copy">Depending on the directory structure it might be more efficient to use <a href="https://docs.python.org/3/library/os.html#os.scandir" rel="nofollow noreferrer"><code>os.scandir</code></a> instead of calling <code>os.stat</code> for each file. It is used by the <code>os.walk</code> implementation to divide files from subdirectories by using a single systemcall instead of doing one <code>os.stat</code> call per element in a directory. Ideally there would be a version of <code>os.walk</code> that simply yields the <code>DirEntry</code>s so you'd avoid having to repeat it...</span>
+<span class="comment-copy">@Bakuriu - indeed... I left optimisation out, but that would be a very sensible first step...</span>
+<span class="comment-copy"><code>os.scandir</code> is not available on Python 3.3.</span>
+<span class="comment-copy">This could be sped up substantially by relaxing the requirements a little — for example, only checking files with the same name as the modified file. This could fail if the user symlinks a file with a different name, but this may be acceptable in practice.</span>

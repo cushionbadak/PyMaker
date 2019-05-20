@@ -1,0 +1,158 @@
+<div class="post-text" itemprop="text">
+<p>I have a metaclass that defines a class level attribute which should be unique for each subclass but shared across instances of each subclass.</p>
+<pre><code>class MetaValidator(type):
+    def __new__(
+             cls, name, bases, dct
+    ):
+        new_cls = super().__new__(cls, name, bases, dct)
+        new_cls.valid_funcs = []
+        return new_cls
+</code></pre>
+<p>Now I'd like to implement a decorator that appends the decorated class method to valid_funcs within the derived class. However because the derived class is still being defined I don't have a reference to the derived decorator so I end up appending to the base class. Here's my code:</p>
+<pre><code>class Validator(object, metaclass=MetaValidator):
+
+    @classmethod
+    def add(cls, f):
+        cls.valid_funcs.append(f)
+        return f
+
+    def _validate(self, **kwargs):
+        for f in self.valid_funcs:
+            params = inspect.signature(f).parameters.keys()
+            f_kwargs = {name: kwargs[name] for name in params}
+            f(**f_kwargs)
+
+    def validate(self, **kwargs):
+        self._validate(**kwargs)
+
+class A(Validator):
+
+    @staticmethod
+    @Validator.add
+    def test_func(x):
+        return x
+
+class B(Validator):
+
+    @staticmethod
+    @Validator.add
+    def test_func(x, y):
+        return x, y
+
+a = A()
+a.validate(x="In A")
+b = B()
+b.validate(x="In B", y=" Called with arg y")
+
+print(Validator.valid_funcs)
+print(a.valid_funcs)
+print(b.valid_funcs)
+</code></pre>
+<p>This prints:</p>
+<pre><code>[&lt;function A.test_func at 0x7f0189d4fc80&gt;, 
+&lt;function B.test_func at 0x7f0189d4fd08&gt;]
+[]
+[]
+</code></pre>
+<p>I want:</p>
+<pre><code>[]
+[&lt;function A.test_func at 0x7f0189d4fc80&gt;]
+[&lt;function B.test_func at 0x7f0189d4fd08&gt;]
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>There is no class object <em>yet</em> when decorators on functions in the class body are executed. The class body is executed first, <em>then</em> the class is created.</p>
+<p>Instead of having the decorator look for a class attribute to mutate, add an attribute to a decorated function object. The metaclass, <em>or the <code>_validate()</code> implementation</em> then looks for any objects with this attribute and adds them to the list once the class object has been created.</p>
+<p>I'm going to assume you'd want to retain the order in which the decorators would have added the decorated items to the list:</p>
+<pre><code>from itertools import count
+
+class Validator(metaclass=MetaValidator):
+    @classmethod
+    def add(cls, f):
+        _count = getattr(Validator.add, '_count', None)
+        if _count is None:
+            _count = Validator.add.__func__._count = count()
+        f._validator_function_id = next(_count)
+        return f
+</code></pre>
+<p>and in the metaclass:</p>
+<pre><code>class MetaValidator(type):
+    def __new__(cls, name, bases, dct):
+        new_cls = super().__new__(cls, name, bases, dct)
+        registered = []
+        for v in dct.values():
+            id = getattr(v, '_validator_function_id', None)
+            if id is None and isinstance(v, (staticmethod, classmethod)):
+                # unwrap staticmethod or classmethod decorators
+                id = getattr(v.__func__, '_validator_function_id', None)
+            if id is not None:
+                registered.append((id, v))
+        new_cls.valid_funcs = [f for _, f in sorted(registered)]
+        return new_cls
+</code></pre>
+<p>Note that if you are using Python 3.6 or newer, then you don't need a metaclass at all any more. You can put the same logic into the <a href="https://docs.python.org/3/reference/datamodel.html#object.__init_subclass__" rel="nofollow noreferrer"><code>class.__init_subclass__</code> method</a>.</p>
+<p>Note that this registers <strong>unbound objects</strong>. For <code>staticmethod</code> objects, that means the call will fail with:</p>
+<pre><code>TypeError: &lt;staticmethod object at 0x10d1b7048&gt; is not a callable object
+</code></pre>
+<p>You perhaps want to register the <code>__func__</code> attribute in that case, or use <code>.__get__</code> to 'bind' the object to something (a <code>staticmethod</code> ignores the binding context anyway)`.</p>
+<p>If you bind explicitly, in the <code>_validate()</code> method, then you don't actually have to use <code>staticmethod</code> objects:</p>
+<pre><code>def _validate(self, **kwargs):
+    for f in self.valid_funcs:
+        bound = f.__get__(self)
+        signature = inspect.signature(bound)
+        bound(**{name: kwargs[name] for name in signature.parameters})
+</code></pre>
+<p>Now <code>@validator.add</code> will work with <code>staticmethod</code>, <code>classmethod</code> and regular functions.</p>
+<p>And if you have the <code>_validate()</code> method look for the methods, then binding can be done <em>for you</em>. You can choose to support inheritance here by just using <code>dir()</code> and <code>getattr()</code>:</p>
+<pre><code>from operator import itemgetter
+from itertools import count
+
+
+class Validator:
+    @classmethod
+    def add(cls, f):
+        _count = getattr(Validator.add, '_count', None)
+        if _count is None:
+            _count = Validator.add.__func__._count = count()
+        f._validator_function_id = next(_count)
+        return f
+
+    def _list_validators(self):
+        objects = (getattr(self, name) for name in dir(self))
+        return sorted(
+            (o for o in objects if hasattr(o, '_validator_function_id')),
+            key=attrgetter('_validator_function_id'))
+
+    def _validate(self, **kwargs):
+        for f in self._list_validators():
+            signature = inspect.signature(f)
+            f(**{name: kwargs[name] for name in signature.parameters})
+</code></pre>
+<p><code>getattr()</code> gives you a bound object, no further binding necessary.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>While having the metaclass <code>__new__</code> handle adding functions to <code>valid_funcs</code> is an option, another option would be to inject <code>valid_funcs</code> into the namespace of the class body before the class even exists, using <a href="https://docs.python.org/3/reference/datamodel.html#preparing-the-class-namespace" rel="nofollow noreferrer"><code>__prepare__</code></a>:</p>
+<pre><code>class MetaValidator(type):
+    @classmethod
+    def __prepare__(cls, name, bases, **kwds):
+        ns = super().__prepare__(name, bases, **kwds)
+        ns['valid_funcs'] = []
+        return ns
+
+def register(func_list):
+    def inner_register(func):
+        func_list.append(func)
+        return func
+    return inner_register
+
+class A(metaclass=MetaValidator):
+    @register(valid_funcs)
+    def method(self):
+        ...
+</code></pre>
+<p>I'd probably skip all the metaclass stuff and require classes to do <code>valid_funcs = []</code> themselves, though. The additional complexity of a metaclass isn't worth it just to save one line of boilerplate per class.</p>
+</div>
+<span class="comment-copy">is there a specific reason you are using the metaclass? why not simply add the class attribute using a class decorator?</span>
+<span class="comment-copy">I can do that as well but then I'd have to add the decorator to each derived class which is more cumbersome. It also doesn't help the main issue of the @add decorator. If using a decorator instead of the metaclass helps then I'd be open to it.</span>
+<span class="comment-copy">if you are using python 3.6+ you don't need to do that. you can use the <code>__subclass_init__</code> instead. much easier.</span>
+<span class="comment-copy">Whoops sorry: <code>__init_subclass__</code> ( I always have to look it up)</span>

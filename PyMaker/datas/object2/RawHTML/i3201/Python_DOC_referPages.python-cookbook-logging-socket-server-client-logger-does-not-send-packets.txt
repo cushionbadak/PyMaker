@@ -1,0 +1,160 @@
+<div class="post-text" itemprop="text">
+<p>I'm using the recipe directly from <a href="https://docs.python.org/3/howto/logging-cookbook.html" rel="nofollow noreferrer">the cookbook</a>, with the exception of a single line {ctrl-f for "print(rd,"} printing whatever pumps out of the socket:</p>
+<pre><code>import pickle
+import logging
+import logging.handlers
+import socketserver
+import struct
+
+
+class LogRecordStreamHandler(socketserver.StreamRequestHandler):
+    """Handler for a streaming logging request.
+
+    This basically logs the record using whatever logging policy is
+    configured locally.
+    """
+
+    def handle(self):
+        """
+        Handle multiple requests - each expected to be a 4-byte length,
+        followed by the LogRecord in pickle format. Logs the record
+        according to whatever policy is configured locally.
+        """
+        while True:
+            chunk = self.connection.recv(4)
+            if len(chunk) &lt; 4:
+                break
+            slen = struct.unpack('&gt;L', chunk)[0]
+            chunk = self.connection.recv(slen)
+            while len(chunk) &lt; slen:
+                chunk = chunk + self.connection.recv(slen - len(chunk))
+            obj = self.unPickle(chunk)
+            record = logging.makeLogRecord(obj)
+            self.handleLogRecord(record)
+
+    def unPickle(self, data):
+        return pickle.loads(data)
+
+    def handleLogRecord(self, record):
+        # if a name is specified, we use the named logger rather than the one
+        # implied by the record.
+        if self.server.logname is not None:
+            name = self.server.logname
+        else:
+            name = record.name
+        logger = logging.getLogger(name)
+        # N.B. EVERY record gets logged. This is because Logger.handle
+        # is normally called AFTER logger-level filtering. If you want
+        # to do filtering, do it at the client end to save wasting
+        # cycles and network bandwidth!
+        logger.handle(record)
+
+class LogRecordSocketReceiver(socketserver.ThreadingTCPServer):
+    """
+    Simple TCP socket-based logging receiver suitable for testing.
+    """
+
+    allow_reuse_address = True
+
+    def __init__(self, host='localhost',
+                 port=logging.handlers.DEFAULT_TCP_LOGGING_PORT,
+                 handler=LogRecordStreamHandler):
+        socketserver.ThreadingTCPServer.__init__(self, (host, port), handler)
+        self.abort = 0
+        self.timeout = 1
+        self.logname = None
+
+    def serve_until_stopped(self):
+        import select
+        abort = 0
+        while not abort:
+            rd, wr, ex = select.select([self.socket.fileno()],
+                                       [], [],
+                                       self.timeout)
+            print(rd, wr, ex)
+            if rd:
+                self.handle_request()
+            abort = self.abort
+
+def main():
+    logging.basicConfig(
+        format='%(relativeCreated)5d %(name)-15s %(levelname)-8s %(message)s')
+    tcpserver = LogRecordSocketReceiver()
+    print('About to start TCP server...')
+    tcpserver.serve_until_stopped()
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>To test, I use the recipe directly from <a href="https://docs.python.org/3/howto/logging-cookbook.html" rel="nofollow noreferrer">the cookbook</a>:</p>
+<pre><code>import logging, logging.handlers
+
+rootLogger = logging.getLogger('')
+rootLogger.setLevel(logging.DEBUG)
+socketHandler = logging.handlers.SocketHandler('localhost',
+                    logging.handlers.DEFAULT_TCP_LOGGING_PORT)
+# don't bother with a formatter, since a socket handler sends the event as
+# an unformatted pickle
+rootLogger.addHandler(socketHandler)
+
+# Now, we can log to the root logger, or any other logger. First the root...
+logging.info('Jackdaws love my big sphinx of quartz.')
+</code></pre>
+<p>But the thing just pumps out:</p>
+<pre><code>About to start TCP server...
+[] [] []
+[] [] []
+[] [] []
+[] [] []
+....
+</code></pre>
+<p>Ad infinitum.</p>
+<p>However, if I start up a basic socket client in another terminal:</p>
+<pre><code>import socket
+import logging.handlers
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect(("localhost",logging.handlers.DEFAULT_TCP_LOGGING_PORT))
+s.send('blah'.encode())
+</code></pre>
+<p>I get:</p>
+<pre><code>....
+[] [] []
+[] [] []
+[] [] []
+[3] [] []
+[] [] []
+....
+</code></pre>
+<p>So the error is in the <code>logging.handlers.SocketHandler</code>, but it doesn't give any errors or anything, it just doesn't work.</p>
+<p>Any thoughts?</p>
+<p><strong>UPDATE:</strong></p>
+<p>This seemed like it might be helpful:</p>
+<pre><code>&gt;&gt;&gt; socketHandler.__dict__
+{'filters': [], '_name': None, 'level': 0, 'formatter': None, 'lock': &lt;unlocked _thread.RLock object owner=0 count=0 at 0x7f6094d20330&gt;, 'host': 'localhost', 'port': 9020, 'address': ('localhost', 9020), 'sock': None, 'closeOnError': False, 'retryTime': 1531926559.6880224, 'retryStart': 1.0, 'retryMax': 30.0, 'retryFactor': 2.0, 'retryPeriod': 8.0}
+</code></pre>
+<p><strong>UPDATE:</strong></p>
+<p>It looks like it might be an IPV6 vs IPV4 problem.  Specifically, <code>SocketHandler.makeSocket()</code> calls <code>socket.create_connection</code>, which in turn calls <code>socket.getaddrinfo</code>.  On my machine, <code>socket.getaddrinfo</code> only returns IPV6 stuff, and coincidentally, <code>socket.create_connection</code> goes on to throw a <code>ConnectionRefused</code> error when it gets to the <code>.connect</code> call.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Still only 85% sure this is an ipv6 vs ipv4 problem, but circumventing the call to <code>socket.create_connection</code> solves the problem for me.  Here's a clean way to do it:</p>
+<pre><code>from logging import *
+import logging.handlers
+import socket
+
+class SocketHandler(logging.handlers.SocketHandler):
+    def makeSocket(self, timeout=1):
+        result = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            result.connect(self.address)
+        except OSError:
+            result.close()
+            raise
+        return result
+
+rootLogger = getLogger('')
+rootLogger.setLevel(DEBUG)
+socketHandler = SocketHandler('localhost',
+                    logging.handlers.DEFAULT_TCP_LOGGING_PORT)
+rootLogger.addHandler(socketHandler)
+</code></pre>
+</div>

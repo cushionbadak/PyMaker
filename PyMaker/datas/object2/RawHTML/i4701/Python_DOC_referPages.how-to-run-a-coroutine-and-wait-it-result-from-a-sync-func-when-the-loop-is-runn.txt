@@ -1,0 +1,141 @@
+<div class="post-text" itemprop="text">
+<p>I have a code like the foolowing:</p>
+<pre><code>def render():
+    loop = asyncio.get_event_loop()
+
+    async def test():
+        await asyncio.sleep(2)
+        print("hi")
+        return 200
+
+    if loop.is_running():
+        result = asyncio.ensure_future(test())
+    else:
+        result = loop.run_until_complete(test())
+</code></pre>
+<p>When the <code>loop</code> is not running is quite easy, just use <code>loop.run_until_complete</code> and it return the coro result but if the loop is already running (my blocking code running in app which is already running the loop) I cannot use <code>loop.run_until_complete</code> since it will raise an exception; when I call <code>asyncio.ensure_future</code> the task gets scheduled and run, but I want to wait there for the result, does anybody knows how to do this? Docs are not very clear how to do this.</p>
+<p>I tried passing a <code>concurrent.futures.Future</code> calling <code>set_result</code> inside the coro and then calling <code>Future.result()</code> on my blocking code, but it doesn't work, it blocks there and do not let anything else to run. ANy help would be appreciated.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>To implement <code>runner</code> with the proposed design, you would need a way to single-step the event loop from a callback running inside it. Asyncio  <a href="https://bugs.python.org/msg225883" rel="nofollow noreferrer">explicitly forbids</a> recursive event loops, so this approach is a dead end.</p>
+<p>Given that constraint, you have two options:</p>
+<ol>
+<li>make <code>render()</code> itself a coroutine;</li>
+<li>execute <code>render()</code> (and its callers) in a thread different than the thread that runs the asyncio event loop.</li>
+</ol>
+<p>Assuming #1 is out of the question, you can implement the #2 variant of <code>render()</code> like this:</p>
+<pre><code>def render():
+    loop = _event_loop  # can't call get_event_loop()
+
+    async def test():
+        await asyncio.sleep(2)
+        print("hi")
+        return 200
+
+    future = asyncio.run_coroutine_threadsafe(test(), loop)
+    result = future.result()
+</code></pre>
+<p>Note that you cannot use <code>asyncio.get_event_loop()</code> in <code>render</code> because the event loop is not (and should not be) set for that thread. Instead, the code that spawns the runner thread must call <code>asyncio.get_event_loop()</code> and send it to the thread, or just leave it in a global variable or a shared structure.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><strong>Waiting Synchronously for an Asynchronous Coroutine</strong></p>
+<p>If an asyncio event loop is already running by calling <code>loop.run_forever</code>, it will <em>block</em> the executing thread until <code>loop.stop</code> is called [see the <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.run_forever" rel="nofollow noreferrer">docs</a>]. Therefore, the only way for a synchronous wait is to run the event loop on a dedicated thread, schedule the <em>asynchronous</em> function on the loop and wait for it <em>synchronously</em> from <em>another</em> thread.</p>
+<p>For this I have composed my own minimal solution following the <a href="https://stackoverflow.com/a/49333864">answer</a> by user4815162342. I have also added the parts for cleaning up the loop when all work is finished [see <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.close" rel="nofollow noreferrer"><code>loop.close</code></a>].</p>
+<p>The <code>main</code> function in the code below runs the event loop on a dedicated thread, schedules several tasks on the event loop, plus the task the result of which is to be awaited <em>synchronously</em>. The synchronous wait will block until the desired result is ready. Finally, the loop is closed and cleaned up gracefully along with its thread.</p>
+<p>The dedicated thread and the functions <code>stop_loop</code>, <code>run_forever_safe</code>, and <code>await_sync</code> can be encapsulated in a module or a class.</p>
+<p>For thread-safery considerations, see section “<a href="https://docs.python.org/3/library/asyncio-dev.html#asyncio-multithreading" rel="nofollow noreferrer">Concurrency and Multithreading</a>” in asyncio docs.</p>
+<pre><code>import asyncio
+import threading
+#----------------------------------------
+
+def stop_loop(loop):
+    ''' stops an event loop '''
+    loop.stop()
+    print (".: LOOP STOPPED:", loop.is_running())
+
+def run_forever_safe(loop):
+    ''' run a loop for ever and clean up after being stopped '''
+
+    loop.run_forever()
+    # NOTE: loop.run_forever returns after calling loop.stop
+
+    #-- cancell all tasks and close the loop gracefully
+    print(".: CLOSING LOOP...")
+    # source: &lt;https://xinhuang.github.io/posts/2017-07-31-common-mistakes-using-python3-asyncio.html&gt;
+
+    loop_tasks_all = asyncio.Task.all_tasks(loop=loop)
+
+    for task in loop_tasks_all: task.cancel()
+    # NOTE: `cancel` does not guarantee that the Task will be cancelled
+
+    for task in loop_tasks_all:
+        if not (task.done() or task.cancelled()):
+            try:
+                # wait for task cancellations
+                loop.run_until_complete(task)
+            except asyncio.CancelledError: pass
+    #END for
+    print(".: ALL TASKS CANCELLED.")
+
+    loop.close()
+    print(".: LOOP CLOSED:", loop.is_closed())
+
+def await_sync(task):
+    ''' synchronously waits for a task '''
+    while not task.done(): pass
+    print(".: AWAITED TASK DONE")
+    return task.result()
+#----------------------------------------
+
+async def asyncTask(loop, k):
+    ''' asynchronous task '''
+    print("--start async task %s" % k)
+    await asyncio.sleep(3, loop=loop)
+    print("--end async task %s." % k)
+    key = "KEY#%s" % k
+    return key
+
+def main():
+    loop = asyncio.new_event_loop() # construct a new event loop
+
+    #-- closures for running and stopping the event-loop
+    run_loop_forever = lambda: run_forever_safe(loop)
+    close_loop_safe = lambda: loop.call_soon_threadsafe(stop_loop, loop)
+
+    #-- make dedicated thread for running the event loop
+    thread = threading.Thread(target=run_loop_forever)
+
+    #-- add some tasks along with my particular task
+    myTask = asyncio.run_coroutine_threadsafe(asyncTask(loop, 100200300), loop=loop)
+    otherTasks = [asyncio.run_coroutine_threadsafe(asyncTask(loop, i), loop=loop)
+                  for i in range(1, 10)]
+
+    #-- begin the thread to run the event-loop
+    print(".: EVENT-LOOP THREAD START")
+    thread.start()
+
+    #-- _synchronously_ wait for the result of my task
+    result = await_sync(myTask) # blocks until task is done
+    print("* final result of my task:", result) 
+
+    #... do lots of work ...
+    print("*** ALL WORK DONE ***")
+    #========================================
+
+    # close the loop gracefully when everything is finished
+    close_loop_safe()
+    thread.join()
+#----------------------------------------
+
+main()
+</code></pre>
+</div>
+<span class="comment-copy">You can't use await out of a coroutine, it will result in a SyntaxError</span>
+<span class="comment-copy">Hi, I'm curious if my answer helped with the issue you were having?</span>
+<span class="comment-copy">Sorry did not comment before, yeah it helped somehow to realize I cannot do what I wanted jejej; I opted for creating an async api and on the sync rise an exception when people try to use async methods throw the sync api on async scripts/apps.</span>
+<span class="comment-copy">If the answer resolved the question (or helped you realize that it cannot be resolved in that form), please consider <a href="https://meta.stackexchange.com/a/5235">accepting</a> it.</span>
+<span class="comment-copy">This seems not to be working. Calling <code>render</code> blocks and never returns.</span>
+<span class="comment-copy">@AlQuemist How are you invoking <code>render</code>, do you have a runnable example?</span>
+<span class="comment-copy">Here is my snippet following your suggestion: <a href="https://pastebin.com/di8JFb21" rel="nofollow noreferrer">pastebin.com/di8JFb21</a></span>
+<span class="comment-copy">The <code>reader</code> implementation applies to scenario #2, where you run the event loop in a separate thread, which your code is not doing. For example, <a href="https://pastebin.com/QCp1PA4z" rel="nofollow noreferrer">this works</a>.</span>
+<span class="comment-copy">I posted a minimal example following your suggestions.</span>

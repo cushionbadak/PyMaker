@@ -1,0 +1,102 @@
+<div class="post-text" itemprop="text">
+<p>I am curious what the fastest way to consume an iterator would be, and the most Pythonic way.</p>
+<p>For example, say that I want to create an iterator with the <code>map</code> builtin that accumulates something as a side-effect. I don't actually care about the result of the <code>map</code>, just the side effect, so I want to blow through the iteration with as little overhead or boilerplate as possible. Something like:</p>
+<pre><code>my_set = set()
+my_map = map(lambda x, y: my_set.add((x, y)), my_x, my_y)
+</code></pre>
+<p>In this example, I just want to blow through the iterator to accumulate things in <code>my_set</code>, and <code>my_set</code> is just an empty set until I actually run through <code>my_map</code>. Something like:</p>
+<pre><code>for _ in my_map:
+    pass
+</code></pre>
+<p>or a naked</p>
+<pre><code>[_ for _ in my_map]
+</code></pre>
+<p>works, but they both feel clunky. Is there a more Pythonic way to make sure an iterator iterates quickly so that you can benefit from some side-effect?</p>
+<hr/>
+<h2>Benchmark</h2>
+<p>I tested the two methods above on the following:</p>
+<pre><code>my_x = np.random.randint(100, size=int(1e6))
+my_y = np.random.randint(100, size=int(1e6))
+</code></pre>
+<p>with <code>my_set</code> and <code>my_map</code> as defined above. I got the following results with timeit:</p>
+<pre><code>for _ in my_map:
+    pass
+468 ms ± 20.1 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+
+[_ for _ in my_map]
+476 ms ± 12.6 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+</code></pre>
+<p>No real difference between the two, and they both feel clunky.</p>
+<p>Note, I got similar performance with <code>list(my_map)</code>, which was a suggestion in the comments.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>While you shouldn't be creating a map object just for side effects, there is in fact a standard recipe for consuming iterators in the <a href="https://docs.python.org/3/library/itertools.html#itertools-recipes" rel="nofollow noreferrer"><code>itertools</code> docs</a>:</p>
+<pre><code>def consume(iterator, n=None):
+    "Advance the iterator n-steps ahead. If n is None, consume entirely."
+    # Use functions that consume iterators at C speed.
+    if n is None:
+        # feed the entire iterator into a zero-length deque
+        collections.deque(iterator, maxlen=0)
+    else:
+        # advance to the empty slice starting at position n
+        next(islice(iterator, n, n), None)
+</code></pre>
+<p>For just the "consume entirely" case, this can be simplified to</p>
+<pre><code>def consume(iterator):
+    collections.deque(iterator, maxlen=0)
+</code></pre>
+<p>Using <code>collections.deque</code> this way avoids storing all the elements (because <code>maxlen=0</code>) and iterates at C speed, without bytecode interpretation overhead. There's even a <a href="https://github.com/python/cpython/blob/v3.6.5/Modules/_collectionsmodule.c#L356" rel="nofollow noreferrer">dedicated fast path</a> in the deque implementation for using a <code>maxlen=0</code> deque to consume an iterator.</p>
+<p>Timing:</p>
+<pre><code>In [1]: import collections
+
+In [2]: x = range(1000)
+
+In [3]: %%timeit
+   ...: i = iter(x)
+   ...: for _ in i:
+   ...:     pass
+   ...: 
+16.5 µs ± 829 ns per loop (mean ± std. dev. of 7 runs, 100000 loops each)
+
+In [4]: %%timeit
+   ...: i = iter(x)
+   ...: collections.deque(i, maxlen=0)
+   ...: 
+12 µs ± 566 ns per loop (mean ± std. dev. of 7 runs, 100000 loops each)
+</code></pre>
+<p>Of course, this is all based on CPython. The entire nature of interpreter overhead is very different on other Python implementations, and the <code>maxlen=0</code> fast path is specific to CPython. See <a href="https://stackoverflow.com/a/50938287/">abarnert's answer</a> for other Python implementations.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you only care about CPython, <code>deque</code> is the fastest way, as demonstrated in <a href="https://stackoverflow.com/a/50938015/908494">user2357112's answer</a>.<sup>1</sup> And the same thing has been demonstrated in 2.7 and 3.2, and 32- vs. 64-bit, and Windows vs. Linux, and so on.</p>
+<p>But that relies on an optimization in CPython's C implementation of <code>deque</code>. Other implementations may have no such optimization, which means they end up calling an <code>append</code> for each element.</p>
+<p>In PyPy in particular, there is no such optimization in the source,<sup>2</sup> and the JIT cannot optimize that no-op <code>append</code> out. (And it's hard to see how it couldn't require at least a guard test each time through the loop.) Of course compared to the cost of looping in Python… right? But looping in Python is blazing fast in PyPy, almost as fast as a C loop in CPython, so this actually makes a huge difference.</p>
+<p>Comparing the times (using identical tests as in user's answer:<sup>3</sup></p>
+<pre><code>          for      deque
+CPython   19.7us   12.7us
+PyPy       1.37us  23.3us
+</code></pre>
+<p>There's no 3.x versions of the other major interpreters, and I don't have IPython for any of them, but a quick test with Jython shows similar effects.</p>
+<p>So, the fastest portable implementation is something like:</p>
+<pre><code>if sys.implementation.name == 'cpython':
+    import collections
+    def consume(it):
+        return collections.deque(it, maxlen=0)
+else:
+    def consume(it):
+        for _ in it:
+            pass
+</code></pre>
+<p>This of course gives me 12.7us in CPython, and 1.41us in PyPy.</p>
+<hr/>
+<p><sub>1. Of course you could write a custom C extension, but it's only going to be faster by a tiny constant term—you can avoid the constructor call and the test before jumping to the fast path, but once you get into that loop, you have to do exactly what it's doing.</sub></p>
+<p><sub>2. Tracing through PyPy source is always fun… but I think it ends up in the <a href="https://bitbucket.org/pypy/pypy/src/20e8b110028c2cd54f65e0db9b85f5dd6dbfe7b1/pypy/module/_collections/interp_deque.py" rel="noreferrer"><code>W_Deque</code></a> class that's, which is part of the builtin <code>_collections</code> module.</sub></p>
+<p><sub>3. CPython 3.6.4; PyPy 5.10.1/3.5.3; both from the respective standard 64-bit macOS installers.</sub></p>
+</div>
+<span class="comment-copy">Instead of <code>[_ for _ in my_map]</code> you can also just do <code>list(my_map)</code> and discard the result</span>
+<span class="comment-copy">I'm pretty sure this is a dup of an old question, and I'm pretty sure I referred to that old question in an answer of my own… but I can't find it. (I can find a few answers like <a href="https://stackoverflow.com/questions/15843883/does-this-benchmark-seem-relevant/15844134#15844134">this one</a>, but they all just flat-out state that <code>deque</code> is fastest, without a link…).</span>
+<span class="comment-copy">That's great, thanks! And I should have added the caveat that this is, in general, a bad idea, but believe it or not I found a case where I need to do it!</span>
+<span class="comment-copy">@zvone: It's faster. Timings added.</span>
+<span class="comment-copy">@Engineero Such cases aren't super-common, but they do come up—otherwise, <code>itertools</code> wouldn't have a recipe for it in the docs, and <code>deque</code> wouldn't have an optimization for it in the C source.</span>
+<span class="comment-copy">It's worth noting that in PyPy, <code>deque</code> is not optimized for maxlen=0, so it's actually more than an order of magnitude <i>slower</i> than a <code>for</code> loop (23.3us vs. 1.17us on my laptop).</span>
+<span class="comment-copy">This is great, thanks! I hadn't really considered the difference in implementation between different interpreters. I am currently stuck in a Jupyter notebook. I am going to have to look into this aspect more...</span>
+<span class="comment-copy">@Engineero If you didn't already know this: Jupyter notebooks can run PyPy kernels. (Last time I tried, there were some glitches using PyPy kernels with a CPython notebook, while the other way around worked fine but had no way to install the local Qt stuff. But if you don't need to run both kernels together, you can just have two parallel Jupyter installations.)</span>

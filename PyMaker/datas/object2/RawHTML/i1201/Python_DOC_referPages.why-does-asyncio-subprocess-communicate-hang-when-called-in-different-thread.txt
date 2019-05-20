@@ -1,0 +1,106 @@
+<div class="post-text" itemprop="text">
+<p>I have a situation where the subprocess communicate hangs when i have to run the subprocess inside an asyncio event loop, and the whole thing is inside a separate thread. </p>
+<p>I learned that in order to run subprocess in separate thread, i need to have </p>
+<pre><code>1. an event loop running in main thread, and
+2. a child watcher must be initiated in main thread.
+</code></pre>
+<p>After having the above conditions i got my subprocess work. But the subprocess.communicate is hanging now. The same code is working if call it from the main thread.</p>
+<p>After digging further i observed that communicate is hanging because the process is not finishing on its own. <code>ie await process.wait()</code> is actually hanging.</p>
+<p>I have seen communicate hang when the command i am trying to issue in subprocess itself hangs, but that is not the case here.</p>
+<pre><code>import asyncio
+import shlex
+import threading
+import subprocess
+async def sendcmd(cmd):
+    cmdseq = tuple(shlex.split(cmd))
+    print(cmd)
+    p = await asyncio.create_subprocess_exec(*cmdseq, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    print(p.pid)
+    output = (await asyncio.wait_for(p.communicate(), 5))[0]
+    output = output.decode('utf8')
+    print(output)
+    return output
+
+
+async def myfunc(cmd):
+    o = await sendcmd(cmd)
+    return o
+
+def myfunc2():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    tasks = []
+    tasks.append(asyncio.ensure_future(myfunc('uname -a')))
+    loop.run_until_complete(asyncio.gather(*tasks))
+
+async def myfunc3():
+    t = threading.Thread(target=myfunc2)
+    t.start()
+    t.join()
+
+def main():
+    asyncio.get_child_watcher()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(asyncio.ensure_future(myfunc3()))
+    loop.close()
+
+main()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think this fixes it.  Use loop run_in_executor for the Threads.</p>
+<pre><code>import asyncio
+import shlex
+import threading
+import subprocess
+import logging
+async def sendcmd(cmd):
+    cmdseq = tuple(shlex.split(cmd))
+    print(cmd)
+    p = await asyncio.create_subprocess_exec(*cmdseq, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    print(p.pid)
+    output = (await asyncio.wait_for(p.communicate(), 5))[0]
+    output = output.decode('utf8')
+    print(output)
+    return output
+
+async def myfunc(cmd):
+    o = await sendcmd(cmd)
+    return o
+
+def myfunc2():
+    thread_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(thread_loop)
+    thread_loop.set_debug(True)     
+    tasks = []
+    tasks.append(asyncio.ensure_future(myfunc('uname -a')))
+    thread_loop.run_until_complete(asyncio.gather(*tasks))
+    thread_loop.close()
+
+async def myfunc3(loop=None):
+    await loop.run_in_executor(None, myfunc2)    
+
+def main():
+    logfilename='test.log'
+    print('Writing log to {}'.format(logfilename))
+    logging.basicConfig(filename=logfilename, level=logging.INFO, format='%(asctime)s %(name)s %(module)s %(levelname)-8s %(message)s')
+    logging.getLogger('asyncio').setLevel(logging.DEBUG)
+    root = logging.getLogger(__name__)
+
+    cw=asyncio.get_child_watcher()
+    main_loop = asyncio.get_event_loop()
+    main_loop.run_until_complete(asyncio.ensure_future(myfunc3(loop=main_loop)))
+    cw.close()
+    main_loop.close()
+
+main()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>It looks like the subprocess SIGCHLD isn't being received by the worker thread but by the parent.  These means process.wait() won't be signaled by the operating system.  There is another <a href="https://stackoverflow.com/questions/44684898/python-asyncio-running-subprocess-exec-on-a-worker-thread">discussion about this here</a>.</p>
+<p>It looks like the child watcher is supposed to detect the SIGCHLD and propagate it to other threads (or pids) and their event loops, which also seems to be it's primary design purpose.  (Documentation is lacking so reading the source is required.)</p>
+<p><strong><em>Note: I think the t.join() is blocking the main thread</em></strong> which runs the child watcher, so that needs to be fixed.  I just put a while loop there and end the main event loop when t.is_alive() returns False.</p></div>
+<span class="comment-copy">Why are you combining threads and asyncio? Have you considered structuring your program in such a way not to require threads? If you have blocking code to run, you can always use <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.run_in_executor" rel="nofollow noreferrer"><code>run_in_executor</code></a>.</span>
+<span class="comment-copy">I have considered restructuring, but that is lot of work. In fact, more than getting this done, i am curious about what makes the difference in behaviour.</span>
+<span class="comment-copy">To be more clear on my requirement -- i have a scheduler daemon which listens on a socket server (threaded), and it does some job when a request is received. This job when gets triggered upon receipt of a request on a threaded socket server, will be on a thread, and the job contains an asyncio event loop.</span>
+<span class="comment-copy">I have considered getting rid of the threaded  socket server (although that is bit of arduous task for me at this juncture) by replacing with an asyncio socket server. By doing so, since the event loop is already running for the socket sever, it will not allow another event loop which is required for the job.</span>

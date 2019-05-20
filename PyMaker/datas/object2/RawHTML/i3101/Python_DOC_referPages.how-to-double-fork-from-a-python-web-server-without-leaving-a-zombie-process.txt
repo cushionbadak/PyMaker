@@ -1,0 +1,89 @@
+<div class="post-text" itemprop="text">
+<p>Python 3.6</p>
+<p>I have a simple Python web server that, when it receives a POST request, spawns a netcat process to listen on a port.</p>
+<p>Seems to work OK except that a zombie is left following the spawn.</p>
+<p>(Server code below)</p>
+<p>I send a POST request to the server like so:</p>
+<pre><code>curl -X POST -H "Content-Type: text/plain" --data "example data"  localhost:8000
+</code></pre>
+<p>After that I do a ps ax to see the processes running and the netcat process is there, the web server is there, AND a zombie is there.</p>
+<pre><code>6873 pts/0    S+     0:00 python3 nc_server.py
+6876 ?        Zs     0:00 [python3] &lt;defunct&gt;
+6877 ?        S      0:00 nc -l 54927
+</code></pre>
+<p>Why?  How can I avoid the zombie?</p>
+<pre><code>from http.server import HTTPServer, BaseHTTPRequestHandler
+import socket
+import os
+import io
+
+host = '0.0.0.0'
+port = 8000
+
+def find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        return s.getsockname()[1]
+
+def spawn_netcat(port):
+    command = "/bin/nc"
+    params = f"nc -l {port}"
+    spawnDaemon(command, params.split())
+
+def spawnDaemon(path_to_executable, params):
+
+    # Do first fork
+    pid = os.fork()
+    if (pid != 0):
+        return
+
+    # Decouple from parent environment
+    os.chdir("/opt")
+    os.setsid()
+    os.umask(0)
+
+    # Do second fork
+    pid = os.fork()
+    if (pid != 0):
+        os._exit(0)
+
+    # exec this process into netcat.....
+    os.execv(path_to_executable, params)
+
+class Server(BaseHTTPRequestHandler):
+
+    def do_POST(self):
+        netcat_listen_port = find_free_port()
+        spawn_netcat(netcat_listen_port)
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        response = io.BytesIO()
+        response.write(str(netcat_listen_port).encode())
+        self.wfile.write(response.getvalue())
+
+if __name__ == "__main__":
+    httpd = HTTPServer((host, port), Server)
+    httpd.serve_forever()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>When a process terminates, it expects its return code to be collected by its parent. Until this takes place, it sits there undead (zombie), it no longer runs, but it cannot be cleared from process table in peace. If the parent is no longer around, a process would get re-parented to init (or dedicated reaper process on at least some systemd enabled systems IIRC). In your process list, you are seeing child of the first fork, which has its parent around, but not collecting the return status.</p>
+<p>Long story short, past the first <code>fork()</code>, you can insert this just before <code>return</code> in the parent process:</p>
+<pre><code>os.waitid(os.P_PID, pid, os.WEXITED)
+</code></pre>
+<p>I.e.:</p>
+<pre><code># Do first fork
+pid = os.fork()
+if (pid != 0):
+    os.waitid(os.P_PID, pid, os.WEXITED)
+    return
+</code></pre>
+<p>This child only is short lived and exits. This waits for it to do so before returning out of the function. It should be fine in this case. Otherwise in general if your process spawns children that may exit at any later point, you'd register a <code>SIGCHLD</code> handler to take care of this. Even though except for double fork to daemonize, you would normally use <a href="https://docs.python.org/3/library/subprocess.html#popen-constructor" rel="nofollow noreferrer">Popen</a> and interface with your process using <a href="https://docs.python.org/3/library/subprocess.html" rel="nofollow noreferrer">subprocess</a>.</p>
+</div>
+<span class="comment-copy">Why are you testing <code>os.getpid() == web_server_pid</code>?</span>
+<span class="comment-copy">It's not really needed but I wanted to ensure I was not killing the web server process.  The code above is actually culled down to a minimal example of the problem from a larger code base, so that test is unnecessary, I should have removed it for this example. The return statement is needed of course, just not its enclosing if statement. OK I have removed it now from the code for the sake of clarity.</span>
+<span class="comment-copy">@user2357112, Any particular reason you rolled back my edit?</span>
+<span class="comment-copy">@merlin2011 the edit removed the f prefix on the string which indicates string interpolation.</span>
+<span class="comment-copy">Because a parent process is meant at some point to wait on the sub process PID to get back the status. Until that happens it will be listed as a zombie. It will not consume resources except a slot in the process table where status is kept.</span>
+<span class="comment-copy">Nothing better than a one line fix thanks!</span>

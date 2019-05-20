@@ -1,0 +1,92 @@
+<div class="post-text" itemprop="text">
+<p>How should I customize unittest.mock.mock_open to handle this code?</p>
+<pre><code>file: impexpdemo.py
+def import_register(register_fn):
+    with open(register_fn) as f:
+        return [line for line in f]
+</code></pre>
+<p>My first attempt tried <code>read_data</code>.</p>
+<pre><code>class TestByteOrderMark1(unittest.TestCase):
+    REGISTER_FN = 'test_dummy_path'
+    TEST_TEXT = ['test text 1\n', 'test text 2\n']
+
+    def test_byte_order_mark_absent(self):
+        m = unittest.mock.mock_open(read_data=self.TEST_TEXT)
+        with unittest.mock.patch('builtins.open', m):
+            result = impexpdemo.import_register(self.REGISTER_FN)
+            self.assertEqual(result, self.TEST_TEXT)
+</code></pre>
+<p>This failed, presumably because the code doesn't use read, readline, or readlines. 
+The <a href="http://docs.python.org/3.4/library/unittest.mock.html#mock-open">documentation</a> for unittest.mock.mock_open says, "read_data is a string for the read(), readline(), and readlines() methods of the file handle to return. Calls to those methods will take data from read_data until it is depleted. The mock of these methods is pretty simplistic. If you need more control over the data that you are feeding to the tested code you will need to customize this mock for yourself. read_data is an empty string by default."</p>
+<p>As the documentation gave no hint on what kind of customization would be required I tried <code>return_value</code> and <code>side_effect</code>. Neither worked.</p>
+<pre><code>class TestByteOrderMark2(unittest.TestCase):
+    REGISTER_FN = 'test_dummy_path'
+    TEST_TEXT = ['test text 1\n', 'test text 2\n']
+
+    def test_byte_order_mark_absent(self):
+        m = unittest.mock.mock_open()
+        m().side_effect = self.TEST_TEXT
+        with unittest.mock.patch('builtins.open', m):
+            result = impexpdemo.import_register(self.REGISTER_FN)
+            self.assertEqual(result, self.TEST_TEXT)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <code>mock_open()</code> object does indeed not implement iteration.</p>
+<p>If you are not using the file object as a context manager, you could use:</p>
+<pre><code>m = unittest.mock.MagicMock(name='open', spec=open)
+m.return_value = iter(self.TEST_TEXT)
+
+with unittest.mock.patch('builtins.open', m):
+</code></pre>
+<p>Now <code>open()</code> returns an iterator, something that can be directly iterated over just like a file object can be, and it'll also work with <code>next()</code>. It can not, however, be used as a context manager.</p>
+<p>You can combine this with <code>mock_open()</code> then provide a <code>__iter__</code> and <code>__next__</code> method on the return value, with the added benefit that <code>mock_open()</code> also adds the prerequisites for use as a context manager:</p>
+<pre><code># Note: read_data must be a string!
+m = unittest.mock.mock_open(read_data=''.join(self.TEST_TEXT))
+m.return_value.__iter__ = lambda self: self
+m.return_value.__next__ = lambda self: next(iter(self.readline, ''))
+</code></pre>
+<p>The return value here is a <code>MagicMock</code> object specced from the <code>file</code> object (Python 2) or the <a href="https://docs.python.org/3/library/io.html#in-memory-streams" rel="noreferrer">in-memory file objects</a> (Python 3), but only the <code>read</code>, <code>write</code> and <code>__enter__</code> methods have been stubbed out.</p>
+<p>The above doesn't work in Python 2 because a) Python 2 expects <code>next</code> to exist, not <code>__next__</code> and b) <code>next</code> is not treated as a special method in Mock (rightly so), so even if you renamed <code>__next__</code> to <code>next</code> in the above example the <em>type</em> of the return value won't have a <code>next</code> method. For <em>most</em> cases it would be enough to make the file object produced an <em>iterable</em> rather than an iterator with:</p>
+<pre><code># Python 2!
+m = mock.mock_open(read_data=''.join(self.TEST_TEXT))
+m.return_value.__iter__ = lambda self: iter(self.readline, '')
+</code></pre>
+<p>Any code that uses <code>iter(fileobj)</code> will then work (including a <code>for</code> loop).</p>
+<p>There is a <a href="http://bugs.python.org/issue21258" rel="noreferrer">open issue in the Python tracker</a> that aims to remedy this gap.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As of Python 3.6, the mocked file-like object returned by the <code>unittest.mock_open</code> method <a href="https://bugs.python.org/issue21258" rel="noreferrer">doesn't support iteration</a>. This bug was reported in 2014 and it is still open as of 2017.</p>
+<p>Thus code like this silently yields zero iterations:</p>
+<pre><code>f_open = unittest.mock.mock_open(read_data='foo\nbar\n')
+f = f_open('blah')
+for line in f:
+  print(line)
+</code></pre>
+<p>You can work around this limitation via adding a method to the mocked object that returns a proper line iterator:</p>
+<pre><code>def mock_open(*args, **kargs):
+  f_open = unittest.mock.mock_open(*args, **kargs)
+  f_open.return_value.__iter__ = lambda self : iter(self.readline, '')
+  return f_open
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I found the following solution:</p>
+<pre><code>text_file_data = '\n'.join(["a line here", "the second line", "another 
+line in the file"])
+with patch('__builtin__.open', mock_open(read_data=text_file_data), 
+create=True) as m:
+    # mock_open doesn't properly handle iterating over the open file with for line in file:
+    # but if we set the return value like this, it works.
+    m.return_value.__iter__.return_value = text_file_data.splitlines()
+    with open('filename', 'rU') as f:
+        for line in f:
+            print line
+</code></pre>
+</div>
+<span class="comment-copy">Isn't it better to patch <code>module_under_test.open</code> than <code>builtins.open</code>?</span>
+<span class="comment-copy">This is based on the OP question and is also used in the <a href="https://docs.python.org/3/library/unittest.mock-examples.html#patch-decorators" rel="nofollow noreferrer"><code>unittest.mock</code> examples documentation</a>; I wanted to focus on the iterable aspect of the <code>mock_open()</code> return value. <code>module_under_test.open</code> would be slightly more specific, yes.</span>
+<span class="comment-copy"><code>with unittest.mock.patch('impexpdemo.open', m):</code>   produces the error message: <code>AttributeError: &lt;module 'impexpdemo' from 'E:\\...\\impexpdemo.py'&gt; does not have the attribute 'open'</code></span>
+<span class="comment-copy">@lemi57ssss: it could be that your actual code-under-test does more than just iterate. I've updated the first snippet to return <code>iter(listobj)</code> instead to return an iterator, not just an iterable.</span>
+<span class="comment-copy">I cannot get the mock_open code above to work. Does the code only work for python 3? I get the following error message:     TypeError: iter() returned non-iterator of type 'MagicMock'</span>
+<span class="comment-copy">Bug is still open as of 2018</span>

@@ -1,0 +1,82 @@
+<div class="post-text" itemprop="text">
+<p>I tested this:</p>
+<pre><code>strace python -c "fp = open('/dev/urandom', 'rb'); ans = fp.read(65600); fp.close()"
+</code></pre>
+<p>With the following partial output:</p>
+<pre><code>read(3, "\211^\250\202P\32\344\262\373\332\241y\226\340\16\16!&lt;\354\250\221\261\331\242\304\375\24\36\253!\345\311"..., 65536) = 65536
+read(3, "\7\220-\344\365\245\240\346\241&gt;Z\330\266^Gy\320\275\231\30^\266\364\253\256\263\214\310\345\217\221\300"..., 4096) = 4096
+</code></pre>
+<p>There are two calls for read syscall with different number of requested bytes.</p>
+<p>When I repeat the same using dd command, </p>
+<pre><code>dd if=/dev/urandom bs=65600 count=1 of=/dev/null
+</code></pre>
+<p>just one read syscall is triggered using the exact number of bytes requested.</p>
+<pre><code>read(0, "P.i\246!\356o\10A\307\376\2332\365=\262r`\273\"\370\4\n!\364J\316Q1\346\26\317"..., 65600) = 65600
+</code></pre>
+<p>I have googled this without any possible explanation. Is this related to page size or any Python memory management?</p>
+<p>Why does this happen?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I did some research on exactly why this happens.</p>
+<p>Note: I did my tests with Python 3.5. Python 2 has a different I/O system with the same quirk for a similar reason, but this was easier to understand with the new IO system in Python 3.</p>
+<p>As it turns out, this is due to Python's BufferedReader, not anything about the actual system calls.</p>
+<p>You can try this code:</p>
+<pre><code>fp = open('/dev/urandom', 'rb')
+fp = fp.detach()
+ans = fp.read(65600)
+fp.close()
+</code></pre>
+<p>If you try to strace this code, you will find:</p>
+<pre><code>read(3, "]\"\34\277V\21\223$l\361\234\16:\306V\323\266M\215\331\3bdU\265C\213\227\225pWV"..., 65600) = 65600
+</code></pre>
+<p>Our original file object was a BufferedReader:</p>
+<pre><code>&gt;&gt;&gt; open("/dev/urandom", "rb")
+&lt;_io.BufferedReader name='/dev/urandom'&gt;
+</code></pre>
+<p>If we call <code>detach()</code> on this, then we throw away the BufferedReader portion and just get the FileIO, which is what talks to the kernel. At this layer, it'll read everything at once.</p>
+<p>So the behavior that we're looking for is in BufferedReader. We can look in <code>Modules/_io/bufferedio.c</code> in the Python source, specifically the function <code>_io__Buffered_read_impl</code>. In our case, where the file has not yet been read from until this point, we dispatch to <code>_bufferedreader_read_generic</code>.</p>
+<p>Now, this is where the quirk we see comes from:</p>
+<pre><code>while (remaining &gt; 0) {
+    /* We want to read a whole block at the end into buffer.
+       If we had readv() we could do this in one pass. */
+    Py_ssize_t r = MINUS_LAST_BLOCK(self, remaining);
+    if (r == 0)
+        break;
+    r = _bufferedreader_raw_read(self, out + written, r);
+</code></pre>
+<p>Essentially, this will read as many full "blocks" as possible directly into the output buffer. The block size is based on the parameter passed to the <code>BufferedReader</code> constructor, which has a default selected by a few parameters:</p>
+<pre><code>     * Binary files are buffered in fixed-size chunks; the size of the buffer
+       is chosen using a heuristic trying to determine the underlying device's
+       "block size" and falling back on `io.DEFAULT_BUFFER_SIZE`.
+       On many systems, the buffer will typically be 4096 or 8192 bytes long.
+</code></pre>
+<p>So this code will read as much as possible without needing to start filling its buffer. This will be 65536 bytes in this case, because it's the largest multiple of 4096 bytes less than or equal to 65600. By doing this, it can read the data directly into the output and avoid filling up and emptying its own buffer, which would be slower.</p>
+<p>Once it's done with that, there might be a bit more to read. In our case, <code>65600 - 65536 == 64</code>, so it needs to read at least 64 more bytes. But yet it reads 4096! What gives? Well, the key here is that the point of a BufferedReader is to minimize the number of kernel reads we actually have to do, as each read has significant overhead in and of itself. So it simply reads another block to fill its buffer (so 4096 bytes) and gives you the first 64 of these.</p>
+<p>Hopefully, that makes sense in terms of explaining why it happens like this.</p>
+<p>As a demonstration, we could try this program:</p>
+<pre><code>import _io
+fp = _io.BufferedReader(_io.FileIO("/dev/urandom", "rb"), 30000)
+ans = fp.read(65600)
+fp.close()
+</code></pre>
+<p>With this, strace tells us:</p>
+<pre><code>read(3, "\357\202{u'\364\6R\fr\20\f~\254\372\3705\2\332JF\n\210\341\2s\365]\270\r\306B"..., 60000) = 60000
+read(3, "\266_ \323\346\302}\32\334Yl\ry\215\326\222\363O\303\367\353\340\303\234\0\370Y_\3232\21\36"..., 30000) = 30000
+</code></pre>
+<p>Sure enough, this follows the same pattern: as many blocks as possible, and then one more.</p>
+<p><code>dd</code>, in a quest for high efficiency of copying lots and lots of data, would try to read up to a much larger amount at once, which is why it only uses one read. Try it with a larger set of data, and I suspect you may find multiple calls to read.</p>
+<p>TL;DR: the BufferedReader reads as many full blocks as possible (64 * 4096) and then one extra block of 4096 to fill its buffer.</p>
+<p>EDIT:</p>
+<p>The easy way to change the buffer size, as @fcatho pointed out, is to change the <code>buffering</code> argument on <code>open</code>:</p>
+<blockquote>
+<pre><code>open(name[, mode[, buffering]])
+</code></pre>
+<p>( ... )</p>
+<p>The optional buffering argument specifies the file’s desired buffer size: 0 means unbuffered, 1 means line buffered, any other positive value means use a buffer of (approximately) that size (in bytes). A negative buffering means to use the system default, which is usually line buffered for tty devices and fully buffered for other files. If omitted, the system default is used.</p>
+</blockquote>
+<p>This works on both <a href="https://docs.python.org/2/library/functions.html#open" rel="nofollow">Python 2</a> and <a href="https://docs.python.org/3/library/functions.html#open" rel="nofollow">Python 3</a>.</p>
+</div>
+<span class="comment-copy">Just check the sources!?</span>
+<span class="comment-copy">@UlrichEckhardt, there are enough systems in play here that not everyone would know where to start.</span>
+<span class="comment-copy">Nice explanation! However, I found some related documentation about this behaviour in Python docs <a href="https://docs.python.org/2/library/functions.html#open" rel="nofollow noreferrer">docs.python.org/2/library/functions.html#open</a> There is a third parameter in open function which handles buffering.</span>
+<span class="comment-copy">@fcatho Good catch. I forgot about that one. I've added a reference to the docs.</span>

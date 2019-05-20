@@ -1,0 +1,154 @@
+<div class="post-text" itemprop="text">
+<p>I have been told that logging can not be used in Multiprocessing. You have to do the concurrency control in case multiprocessing messes the log.</p>
+<p>But I did some test, it seems like there is no problem using logging in multiprocessing</p>
+<pre><code>import time
+import logging
+from multiprocessing import Process, current_process, pool
+
+
+# setup log
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG,
+                    format='%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s %(message)s',
+                    datefmt='%a, %d %b %Y %H:%M:%S',
+                    filename='/tmp/test.log',
+                    filemode='w')
+
+
+def func(the_time, logger):
+    proc = current_process()
+    while True:
+        if time.time() &gt;= the_time:
+            logger.info('proc name %s id %s' % (proc.name, proc.pid))
+            return
+
+
+
+if __name__ == '__main__':
+
+    the_time = time.time() + 5
+
+    for x in xrange(1, 10):
+        proc = Process(target=func, name=x, args=(the_time, logger))
+        proc.start()
+</code></pre>
+<p>As you can see from the code.</p>
+<p>I deliberately let the subprocess write log at the same moment( 5s after start) to increase the chance of conflict. But there are no conflict at all.</p>
+<p>So my question is can we use logging in multiprocessing?
+Why so many posts say we can not ?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As Matino correctly explained: logging in a multiprocessing setup is not safe, as multiple processes (who do not know anything about the other ones existing) are writing into the same file, potentially intervening with each other.</p>
+<p>Now what happens is that every process holds an open file handle and does an "append write" into that file. The question is under what circumstances the append write is "atomic" (that is, cannot be interrupted by e.g. another process writing to the same file and intermingling his output). This problem applies to every programming language, as in the end they'll do a syscall to the kernel. <a href="https://stackoverflow.com/questions/1154446/is-file-append-atomic-in-unix">This answer</a> answers under which circumstances a shared log file is ok.</p>
+<p>It comes down to checking your pipe buffer size, on linux that is defined in <code>/usr/include/linux/limits.h</code> and is 4096 bytes. For other OSes you find <a href="http://ar.to/notes/posix#pipe-buf" rel="nofollow noreferrer">here</a> a good list.</p>
+<p>That means: If your log line is less than 4'096 bytes (if on Linux), then the append is safe, if the disk is directly attached (i.e. no network in between). But for more details please check the first link in my answer. To test this you can do <code>logger.info('proc name %s id %s %s' % (proc.name, proc.pid, str(proc.name)*5000))</code> with different lenghts. With 5000 for instance I got already mixed up log lines in <code>/tmp/test.log</code>.</p>
+<p>In <a href="https://stackoverflow.com/questions/641420/how-should-i-log-while-using-multiprocessing-in-python">this question</a> there are already quite a few solutions to this, so I won't add my own solution here.</p>
+<p><strong>Update: Flask and multiprocessing</strong></p>
+<blockquote>
+<p>Web frameworks like flask will be run in multiple workers if hosted by uwsgi or nginx. In that case, multiple processes may write into one log file. Will it have problems?</p>
+</blockquote>
+<p>The error handling in flask is done via stdout/stderr which is then cought by the webserver (uwsgi, nginx, etc.) which needs to take care that logs are written in correct fashion (see e.g. [this flask+nginx example])(<a href="http://flaviusim.com/blog/Deploying-Flask-with-nginx-uWSGI-and-Supervisor/" rel="nofollow noreferrer">http://flaviusim.com/blog/Deploying-Flask-with-nginx-uWSGI-and-Supervisor/</a>), probably also adding process information so you can associate error lines to processes. From <a href="http://flask.pocoo.org/docs/0.12/errorhandling/#logging-to-a-file" rel="nofollow noreferrer">flasks doc</a>:</p>
+<blockquote>
+<p>By default as of Flask 0.11, errors are logged to your webserver’s log automatically. Warnings however are not.</p>
+</blockquote>
+<p>So you'd still have this issue of intermingled log files if you use <code>warn</code> and the message exceeds the pipe buffer size.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It is not safe to write to a single file from multiple processes.</p>
+<p>According to <a href="https://docs.python.org/3/howto/logging-cookbook.html#logging-to-a-single-file-from-multiple-processes" rel="noreferrer">https://docs.python.org/3/howto/logging-cookbook.html#logging-to-a-single-file-from-multiple-processes</a></p>
+<blockquote>
+<p>Although logging is thread-safe, and logging to a single file from
+  multiple threads in a single process is supported, logging to a single
+  file from multiple processes is not supported, because there is no
+  standard way to serialize access to a single file across multiple
+  processes in Python.</p>
+</blockquote>
+<p>One possible solution would be to have each process write to its own file. You can achieve this by writing your own handler that adds process pid to the end of the file:</p>
+<pre><code>import logging.handlers
+import os
+
+
+class PIDFileHandler(logging.handlers.WatchedFileHandler):
+
+    def __init__(self, filename, mode='a', encoding=None, delay=0):
+        filename = self._append_pid_to_filename(filename)
+        super(PIDFileHandler, self).__init__(filename, mode, encoding, delay)
+
+    def _append_pid_to_filename(self, filename):
+        pid = os.getpid()
+        path, extension = os.path.splitext(filename)
+        return '{0}-{1}{2}'.format(path, pid, extension)
+</code></pre>
+<p>Then you just need to call <code>addHandler</code>:</p>
+<pre><code>logger = logging.getLogger('foo')
+fh = PIDFileHandler('bar.log')
+logger.addHandler(fh)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Use a queue for correct handling of concurrency simultaneously recovering from errors by feeding everything to the parent process via a pipe.</p>
+<pre><code>from logging.handlers import RotatingFileHandler
+import multiprocessing, threading, logging, sys, traceback
+
+class MultiProcessingLog(logging.Handler):
+    def __init__(self, name, mode, maxsize, rotate):
+        logging.Handler.__init__(self)
+
+        self._handler = RotatingFileHandler(name, mode, maxsize, rotate)
+        self.queue = multiprocessing.Queue(-1)
+
+        t = threading.Thread(target=self.receive)
+        t.daemon = True
+        t.start()
+
+    def setFormatter(self, fmt):
+        logging.Handler.setFormatter(self, fmt)
+        self._handler.setFormatter(fmt)
+
+    def receive(self):
+        while True:
+            try:
+                record = self.queue.get()
+                self._handler.emit(record)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except EOFError:
+                break
+            except:
+                traceback.print_exc(file=sys.stderr)
+
+    def send(self, s):
+        self.queue.put_nowait(s)
+
+    def _format_record(self, record):
+         # ensure that exc_info and args
+         # have been stringified.  Removes any chance of
+         # unpickleable things inside and possibly reduces
+         # message size sent over the pipe
+        if record.args:
+            record.msg = record.msg % record.args
+            record.args = None
+        if record.exc_info:
+            dummy = self.format(record)
+            record.exc_info = None
+
+        return record
+
+    def emit(self, record):
+        try:
+            s = self._format_record(record)
+            self.send(s)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except:
+            self.handleError(record)
+
+    def close(self):
+        self._handler.close()
+        logging.Handler.close(self)
+</code></pre>
+<p>The handler does all the file writing from the parent process and uses just one thread to receive messages passed from child processes</p>
+</div>
+<span class="comment-copy">One more question. Web frameworks like flask will be run in multiple workers if hosted by uwsgi or nginx. In that  case, multiple processes may write into one log file. Will it have problem?</span>
+<span class="comment-copy">@KramerLi: I've answered your question under a new section in my answer</span>
+<span class="comment-copy">thanks for the lesson on multiprocess vs threading...</span>

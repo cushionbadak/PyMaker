@@ -1,0 +1,59 @@
+<div class="post-text" itemprop="text">
+<p>I am trying to convert a program from Tornado to Asyncio and the first step would be to use the actual asyncio eventloop as <a href="http://www.tornadoweb.org/en/stable/asyncio.html" rel="nofollow noreferrer">described here</a>.</p>
+<p>This application runs on an embedded Linux machine, I am using GPIOs through the <a href="https://www.kernel.org/doc/Documentation/gpio/sysfs.txt" rel="nofollow noreferrer">sysfs/gpio subsystem</a> and on some of these GPIOs I am waiting for interrupts. I was able to directly integrate this into the Tornado IOLoop by doing:</p>
+<pre><code># Register with the queue
+self.io_loop.add_handler(
+    self.gpio._value_file, self._handle_interrupt, self.io_loop._EPOLLPRI | self.io_loop.ERROR
+)
+</code></pre>
+<p>In the code piece, <code>_value_file</code> is the file handle to the file that the GPIO can be read from. The event EPOLLPRI is fired, whenever an interrupt on that GPIO is available. On Tornado, this works very well. It would call the <code>_handle_interrupt</code> function shortly after the interrupt comes.</p>
+<p>My issue is, that I have not been able to translate this to the native asyncio event loop. In <a href="https://docs.python.org/3/library/asyncio-eventloop.html#watch-file-descriptors" rel="nofollow noreferrer">the documentation for watching file descriptors</a> I only find functions to add readers and writers but nothing to watch for a generic event mask on a file descriptor. I can't dive into the code since that goes into C. However, looking at the Tornado layer to translate calls from the Tornado IOLoop into the asyncio IOLoop it seems like this is the case:</p>
+<pre><code>def add_handler(self, fd, handler, events):
+    fd, fileobj = self.split_fd(fd)
+    if fd in self.handlers:
+        raise ValueError("fd %s added twice" % fd)
+    self.handlers[fd] = (fileobj, stack_context.wrap(handler))
+    if events &amp; IOLoop.READ:
+        self.asyncio_loop.add_reader(
+            fd, self._handle_events, fd, IOLoop.READ)
+        self.readers.add(fd)
+    if events &amp; IOLoop.WRITE:
+        self.asyncio_loop.add_writer(
+            fd, self._handle_events, fd, IOLoop.WRITE)
+        self.writers.add(fd)
+</code></pre>
+<p>Only READ and WRITE flags are translated, all other flags are ignored.</p>
+<p>Could someone confirm that it is currently not possible to use asyncio to watch for any events on file descriptors except READ and WRITE events? Or am I doing something wrong and there actually is a way?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I have found the solution for this myself now. My main source of information was <a href="https://groups.google.com/forum/#!topic/python-tulip/BFPN3ChkXAA" rel="nofollow noreferrer">this thread in the Python-tulip group</a> and <a href="https://gitlab.com/wrobell/apgpio/blob/master/apgpio.py" rel="nofollow noreferrer">this piece of code</a> which I had to adopt slightly.</p>
+<p>The main insight is that an epoll that can be used to watch for <code>POLLPRI</code> events is itself a file descriptor. Whenever an event occurs on an FD that the epoll watches, the epoll file descriptor will generate a <code>POLLIN</code> event which can be watched using asyncio with <code>add_reader</code>. So instead of registering directly, we manually create an epoll structure and register it with the ioloop like so:</p>
+<pre><code>self.epoll = select.epoll()
+self.io_loop.add_reader(self.epoll.fileno(), self._handle_interrupt)
+</code></pre>
+<p>The actual interrupt event is then registered to the epoll structure</p>
+<pre><code>self.epoll.register(self.gpio._value_file, select.POLLPRI)
+</code></pre>
+<p>At this point, interrupt events will be received in the <code>_handle_interrupt</code> function. Make sure to actually poll the epoll structure in the event handler, or it will continuously generate read events</p>
+<pre><code>def _handle_interrupt(self):
+    self.epoll.poll(0)
+    ...
+</code></pre>
+<p>It is important to use the low-level <code>select</code> functionality instead of the high-level <code>selectors</code> since they do a similar event flag filtering as in <code>asyncio</code>. The following code snipped is from <code>selectors.EpollSelector</code>:</p>
+<pre><code>def register(self, fileobj, events, data=None):
+    key = super().register(fileobj, events, data)
+    epoll_events = 0
+    if events &amp; EVENT_READ:
+        epoll_events |= select.EPOLLIN
+    if events &amp; EVENT_WRITE:
+        epoll_events |= select.EPOLLOUT
+    try:
+        self._epoll.register(key.fd, epoll_events)
+    except BaseException:
+        super().unregister(fileobj)
+        raise
+    return key
+</code></pre>
+<p>It can be seen, that all events except READ and WRITE are filtered. Hence, you can't use the high level interface to watch for POLLPRI events. Therefore, use the low-level interface.</p>
+<p>I hope this helps people stumbling over this issue.</p>
+</div>

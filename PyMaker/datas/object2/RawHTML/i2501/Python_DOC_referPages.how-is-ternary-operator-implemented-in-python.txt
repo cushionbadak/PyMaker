@@ -1,0 +1,147 @@
+<div class="post-text" itemprop="text">
+<p>I understand that conditional expressions (or ternary operators) are lazy in Python. They represent conditional <em>execution</em> rather than conditional <em>selection</em>. In other words, only one of <code>a</code> or <code>b</code> is evaluated in the following:</p>
+<pre><code>c = a if condition else b
+</code></pre>
+<p>What I'm interested to know is <strong>how</strong> this is implemented internally. Does Python convert to an <code>if</code> statement as below and, if so, at what stage does this conversion occur?</p>
+<pre><code>if condition:
+    c = a
+else:
+    c = b
+</code></pre>
+<p>Or is the ternary operator actually a distinct and separate expression, defined entirely separately? If so, can I access the CPython code for conditional expressions?</p>
+<p>I've looked at the following which explain <em>what</em> the ternary operator does, but none of them make clear <em>how</em> they are implemented:</p>
+<ul>
+<li><a href="https://stackoverflow.com/questions/394809/does-python-have-a-ternary-conditional-operator">Does Python have a ternary conditional operator?</a></li>
+<li><a href="https://stackoverflow.com/questions/2802726/putting-a-simple-if-then-else-statement-on-one-line">Putting a simple if-then-else statement on one line</a></li>
+<li><a href="https://stackoverflow.com/questions/3091316/python-conditional-ternary-operator-for-assignments">python ? (conditional/ternary) operator for assignments</a></li>
+<li><a href="https://docs.python.org/3.3/faq/programming.html#is-there-an-equivalent-of-c-s-ternary-operator" rel="nofollow noreferrer">Is there an equivalent of C’s ”?:” ternary operator?</a></li>
+<li><a href="https://docs.python.org/3/reference/expressions.html#conditional-expressions" rel="nofollow noreferrer">Conditional expressions</a></li>
+</ul>
+<hr/>
+<p><strong>Edit:</strong> You can assume CPython reference implementation.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Python doesn't have to convert anything, and couldn't if it wanted to.</p>
+<p>The conditional expression is parsed by using the <a href="https://docs.python.org/3/reference/grammar.html" rel="nofollow noreferrer">language grammar</a> into an <a href="https://docs.python.org/3/library/ast.html" rel="nofollow noreferrer">abstract syntax tree</a>, which in turn is then compiled to bytecode. You can produce the AST by using the <a href="https://docs.python.org/3/library/ast.html#ast.parse" rel="nofollow noreferrer"><code>ast.parse()</code> function</a>:</p>
+<pre><code>&gt;&gt;&gt; import ast
+&gt;&gt;&gt; ast.parse('c = a if condition else b').body[0]  # first statement in the tree
+&lt;_ast.Assign object at 0x10f05c550&gt;
+&gt;&gt;&gt; ast.dump(ast.parse('c = a if condition else b').body[0])
+"Assign(targets=[Name(id='c', ctx=Store())], value=IfExp(test=Name(id='condition', ctx=Load()), body=Name(id='a', ctx=Load()), orelse=Name(id='b', ctx=Load())))"
+</code></pre>
+<p>Note the <code>ast.IfExp()</code> node in the AST produced for the assignment; this is a dedicated node for conditional expressions. It has <code>test</code>, <code>body</code> and <code>orelse</code> parts to represent the 3 expressions that make up the condition, true and false parts. This is documented in the <a href="https://docs.python.org/3/library/ast.html#abstract-grammar" rel="nofollow noreferrer"><code>ast</code> module <em>Abstract Grammar</em> section</a>:</p>
+<blockquote>
+<pre><code>expr = [...]
+     | [...]
+     | IfExp(expr test, expr body, expr orelse)
+</code></pre>
+</blockquote>
+<p>This shows that the type of each element is another <code>expr</code> expression node.</p>
+<p>The parse tree is then compiled to bytecode that uses the stack to conditionally jump to the right section based on the test; we can pass the AST produced by <code>ast.parse()</code> directly to the <a href="https://docs.python.org/3/library/functions.html#compile" rel="nofollow noreferrer"><code>compile()</code> function</a>, after which the <a href="https://docs.python.org/3/library/dis.html" rel="nofollow noreferrer"><code>dis</code> module</a> lets us look at a human-friendly form of the bytecode produced by compilation:</p>
+<pre><code>&gt;&gt;&gt; import dis
+&gt;&gt;&gt; dis.dis(compile(ast.parse('c = a if condition else b'), '', 'exec'))
+  1           0 LOAD_NAME                0 (condition)
+              2 POP_JUMP_IF_FALSE        8
+              4 LOAD_NAME                1 (a)
+              6 JUMP_FORWARD             2 (to 10)
+        &gt;&gt;    8 LOAD_NAME                2 (b)
+        &gt;&gt;   10 STORE_NAME               3 (c)
+             12 LOAD_CONST               0 (None)
+             14 RETURN_VALUE
+</code></pre>
+<p>So if the condition is false, the interpreter loop jumps forward to instruction 8, otherwise instructions 4 and 6 are executed, with instruction 6 jumping forward to instruction 10 (so past the <code>else</code> expression). The end result is that either instruction 4 or instruction 8 puts a new result on the top of the stack for <code>STORE_NAME</code> to move to a variable.</p>
+<p>An <code>if</code> statement results in a different AST node, and the resulting bytecode <em>happens</em> to be very similar in that it too would use jumps. But the compiler treats them as distinct pieces of syntax, and it <em>has</em> to.</p>
+<p>Expressions and statements are <em>two very different fundamental building blocks</em> of a programming language. Statements can contain expressions, but expressions can't contain statements, only other expressions. And expressions can produce a value (for the surrounding syntax to use), but statements <em>can't</em>. So Python has to treat conditional expressions very differently from statements, in that the grammar parser knows when to expect a statement and when an expression is allowed. If you transformed a conditional expression into a statement, you would not be able to ever use such an expression as part of a bigger expression!</p>
+<p>Because an <code>if</code> statement is <em>not an expression</em>, it doesn't <em>return</em> a value (as only expressions can produce a value), and so the resulting bytecode would not produce a value on the top of the stack to be used by the surrounding Python code (there is no <code>c = if condition : ...</code>). <code>if</code> statements contain a <em>condition expression</em>, and a <em>suite</em>, which must always consist of more statements (there is such a thing as an 'expression statement' to let you put just an expression in a statement, such as <code>1 + 1</code> on a single line), and those statements can 'do stuff' like assignments or return from a function, but nothing they do would ever make <code>if</code> return something.</p>
+<p>This is reflected in the AST node definition for <code>if</code> statements:</p>
+<blockquote>
+<pre><code>stmt =  [...]
+      | [...]
+      | If(expr test, stmt* body, stmt* orelse)
+</code></pre>
+</blockquote>
+<p>So for an <code>If</code> node, <code>test</code> is the only expression node, and <code>body</code> and <code>orelse</code> both consist of <em>zero or more</em> statements. The <code>orelse</code> part would hold any <code>elif ...:</code> tests as further <code>If()</code> nodes, or any other type of statement to form an unconditional <code>else:</code>. With zero-or-more elements, you can't expect a single result.</p>
+<p>So this isn't unique to CPython, this applies to all Python implementations. The Python <em>grammar</em> is not an implementation detail.</p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>Does Python convert to an if statement as below</p>
+</blockquote>
+<p>Almost.</p>
+<pre><code>import dis
+
+def trenary():
+    x = 'a' if 1 == 1 else 'b'
+
+def normal_if():
+    if 1 == 1:
+        c = 'a'
+    else:
+        c = 'b'
+
+print('trenary')
+dis.dis(trenary)
+print()
+print('normal if')
+dis.dis(normal_if)
+</code></pre>
+<p>This outputs:</p>
+<pre><code>trenary
+ 68           0 LOAD_CONST               1 (1)
+              2 LOAD_CONST               1 (1)
+              4 COMPARE_OP               2 (==)
+              6 POP_JUMP_IF_FALSE       12
+              8 LOAD_CONST               2 ('a')
+             10 JUMP_FORWARD             2 (to 14)
+        &gt;&gt;   12 LOAD_CONST               3 ('b')
+        &gt;&gt;   14 STORE_FAST               0 (x)
+             16 LOAD_CONST               0 (None)
+             18 RETURN_VALUE
+
+normal if
+ 71           0 LOAD_CONST               1 (1)
+              2 LOAD_CONST               1 (1)
+              4 COMPARE_OP               2 (==)
+              6 POP_JUMP_IF_FALSE       14
+
+ 72           8 LOAD_CONST               2 ('a')
+             10 STORE_FAST               0 (c)
+             12 JUMP_FORWARD             4 (to 18)
+
+ 74     &gt;&gt;   14 LOAD_CONST               3 ('b')
+             16 STORE_FAST               0 (c)
+        &gt;&gt;   18 LOAD_CONST               0 (None)
+             20 RETURN_VALUE
+</code></pre>
+<p>These look almost the same, except for the location of <code>JUMP_FORWARD</code> and an additional <code>STORE_FAST</code> as pointed out by @L3viathan.</p>
+<p>We also get almost the same execution times (with a negligible difference):</p>
+<pre><code>from timeit import Timer
+
+print(min(Timer(trenary).repeat(5000, 5000)))
+print(min(Timer(normal_if).repeat(5000, 5000)))
+# 0.0006442809999998023
+# 0.0006442799999994975
+</code></pre>
+<p>As to <strong>when</strong> this conversion happens, I'd <em>assume</em> sometime during "compilation" to bytecode.</p>
+</div>
+<div class="post-text" itemprop="text">
+<h1>What</h1>
+<p>If you are asking what, then to best understand it, you need to understand the difference between functional and procedural. One can be converted to the other, but both can be view independently, you don't have to translate one to the other to understand them.</p>
+<p><code>value_a if condition else value_b</code> is functional, and returns a value <code>value_a</code> or <code>value_b</code>.</p>
+<pre><code>if condition then:
+   do_a
+else:
+   do_b
+</code></pre>
+<p>is procedural, it does <code>do_a</code> or <code>do_b</code>.</p>
+<p>Note: Procedural is about doing, do this, then do that, or that. Functional is about value, is this or is that.</p>
+<h1>How</h1>
+<p>If you are asking how, then you will need to look at the source-code of one of the implementations. Note that each implementation does not have to do it the same way, so long as behaviour is correct.</p>
+</div>
+<span class="comment-copy">Implementation will depend on implementation: It can be done however the implementer wishes, so long as the behaviour is correct. In your question you switch between how and what. Are you interested in how? if so then look at the source code of one of the implementations. Or are you interested in what? I.e. “What is the exact behaviour?”</span>
+<span class="comment-copy">@ctrl-alt-delor, I should have mentioned you can assume reference CPython implementation.</span>
+<span class="comment-copy">To clarify, is that the language grammar used by CPython, or is that an official thing that all implementations of python have to respect?</span>
+<span class="comment-copy">@Aran-Fey: it's an official thing that all implementations have to respect. It's part of the grammar.</span>
+<span class="comment-copy">@Aran-Fey: other implementations could not do anything different, because there is no way you can transform an expression into a statement and still be able to use it inside other expressions.</span>
+<span class="comment-copy">We also have an additional <code>STORE_FAST</code></span>
+<span class="comment-copy">@L3viathan thanks, I'll point that out</span>

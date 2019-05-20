@@ -1,0 +1,299 @@
+<div class="post-text" itemprop="text">
+<p>(Note: The background for this problem is pretty verbose, but there's an SSCCE at the bottom that can be skipped to)</p>
+<h2>Background</h2>
+<p>I'm trying to develop a Python-based CLI to interact with a web service. In my codebase I have a <code>CommunicationService</code> class that handles all direct communication with the web service. It exposes a <code>received_response</code> property that returns an <code>Observable</code> (from RxPY) that other objects can subscribe to in order to be notified when responses are received back from the web service.</p>
+<p>I've based my CLI logic on the <a href="http://click.pocoo.org/5/" rel="noreferrer"><code>click</code></a> library, where one of my subcommands is implemented as below:</p>
+<pre><code>async def enabled(self, request: str, response_handler: Callable[[str], Tuple[bool, str]]) -&gt; None:
+    self._generate_request(request)
+    if response_handler is None:
+        return None
+
+    while True:
+        response = await self.on_response
+        success, value = response_handler(response)
+        print(success, value)
+        if success:
+            return value
+</code></pre>
+<p>What's happening here (in the case that <code>response_handler</code> is not <code>None</code>) is that the subcommand is behaving as a coroutine that awaits responses from the web service (<code>self.on_response ==  CommunicationService.received_response</code>) and returns some processed value from the first response it can handle.</p>
+<p>I'm trying to test the behaviour of my CLI by creating test cases in which <code>CommunicationService</code> is completely mocked; a fake <code>Subject</code> is created (which can act as an <code>Observable</code>) and <code>CommunicationService.received_response</code> is mocked to return it. As part of the test, the subject's <code>on_next</code> method is invoked to pass mock web service responses back to the production code:</p>
+<pre><code>@when('the communications service receives a response from TestCube Web Service')
+def step_impl(context):
+    context.mock_received_response_subject.on_next(context.text)
+</code></pre>
+<p>I use a click 'result callback' function that gets invoked at the end of the CLI invocation and blocks until the coroutine (the subcommand) is done:</p>
+<pre><code>@cli.resultcallback()
+def _handle_command_task(task: Coroutine, **_) -&gt; None:
+    if task:
+        loop = asyncio.get_event_loop()
+        result = loop.run_until_complete(task)
+        loop.close()
+        print('RESULT:', result) 
+</code></pre>
+<h2>Problem</h2>
+<p>At the start of the test, I run <code>CliRunner.invoke</code> to fire off the whole shebang. The problem is that this is a blocking call and will block the thread until the CLI has finished and returned a result, which isn't helpful if I need my test thread to carry on so it can produce mock web service responses concurrently with it.</p>
+<p>What I guess I need to do is run <code>CliRunner.invoke</code> on a new thread using <code>ThreadPoolExecutor</code>. This allows the test logic to continue on the original thread and execute the <code>@when</code> step posted above. However, <em>notifications published with</em> <code>mock_received_response_subject.on_next</code> <em>do not seem to trigger execution to continue within the subcommand</em>.</p>
+<p>I believe the solution would involve making use of RxPY's <code>AsyncIOScheduler</code>, but I'm finding the documentation on this a little sparse and unhelpful.</p>
+<h2>SSCCE</h2>
+<p>The snippet below captures what I hope is the essence of the problem. If it can be modified to work, I should be able to apply the same solution to my actual code to get it to behave as I want.</p>
+<pre><code>import asyncio
+import logging
+import sys
+import time
+
+import click
+from click.testing import CliRunner
+from rx.subjects import Subject
+
+web_response_subject = Subject()
+web_response_observable = web_response_subject.as_observable()
+
+thread_loop = asyncio.new_event_loop()
+
+
+@click.group()
+def cli():
+    asyncio.set_event_loop(thread_loop)
+
+
+@cli.resultcallback()
+def result_handler(task, **_):
+    loop = asyncio.get_event_loop()
+    result = loop.run_until_complete(task) # Should block until subject publishes value
+    loop.close()
+
+    print(result)
+
+
+@cli.command()
+async def get_web_response():
+    return await web_response_observable
+
+
+def test():
+    runner = CliRunner()
+    future = thread_loop.run_in_executor(None, runner.invoke, cli, ['get_web_response'])
+    time.sleep(1)
+    web_response_subject.on_next('foo') # Simulate reception of web response.
+    time.sleep(1)
+    result = future.result()
+    print(result.output)
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(threadName)10s %(name)18s: %(message)s',
+    stream=sys.stderr,
+)
+
+test()
+</code></pre>
+<p><strong>Current Behaviour</strong></p>
+<p>The program hangs when run, blocking at <code>result = loop.run_until_complete(task)</code>.</p>
+<p><strong>Acceptance Criteria</strong></p>
+<p>The program terminates and prints <code>foo</code> on <code>stdout</code>.</p>
+<h2>Update 1</h2>
+<p>Based on Vincent's help I've made some changes to my code.</p>
+<p><code>Relay.enabled</code> (the subcommand that awaits responses from the web service in order to process them) is now implemented like this:</p>
+<pre><code>async def enabled(self, request: str, response_handler: Callable[[str], Tuple[bool, str]]) -&gt; None:
+    self._generate_request(request)
+
+    if response_handler is None:
+        return None
+
+    return await self.on_response \
+        .select(response_handler) \
+        .where(lambda result, i: result[0]) \
+        .select(lambda result, index: result[1]) \
+        .first()
+</code></pre>
+<p>I wasn't quite sure how <code>await</code> would behave with <code>RxPY</code> observables - would they return execution to the caller on each element generated, or only when the observable has completed (or errored?). I now know it's the latter, which honestly feels like the more natural choice and has allowed me to make the implementation of this function feel a lot more elegant and reactive.</p>
+<p>I've also modified the test step that generates mock web service responses:</p>
+<pre><code>@when('the communications service receives a response from TestCube Web Service')
+def step_impl(context):
+    loop = asyncio.get_event_loop()
+    loop.call_soon_threadsafe(context.mock_received_response_subject.on_next, context.text)
+</code></pre>
+<p>Unfortunately, <em>this will not work as it stands</em>, since the CLI is being invoked in its own thread...</p>
+<pre><code>@when('the CLI is run with "{arguments}"')
+def step_impl(context, arguments):
+    loop = asyncio.get_event_loop()
+    if 'async.cli' in context.tags:
+        context.async_result = loop.run_in_executor(None, context.cli_runner.invoke, testcube.cli, arguments.split())
+    else:
+        ...
+</code></pre>
+<p>And the CLI creates its own thread-private event loop when invoked...</p>
+<pre><code>def cli(context, hostname, port):
+    _initialize_logging(context.meta['click_log.core.logger']['level'])
+
+    # Create a new event loop for processing commands asynchronously on.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    ...
+</code></pre>
+<p>What I think I need is a way to allow my test steps to invoke the CLI on a new thread <em>and then fetch the event loop it's using</em>:</p>
+<pre><code>@when('the communications service receives a response from TestCube Web Service')
+def step_impl(context):
+    loop = _get_cli_event_loop() # Needs to be implemented.
+    loop.call_soon_threadsafe(context.mock_received_response_subject.on_next, context.text)
+</code></pre>
+<h2>Update 2</h2>
+<p>There doesn't seem to be an easy way to get the event loop that a particular thread creates and uses for itself, so instead I took Victor's advice and mocked <code>asyncio.new_event_loop</code> to return an event loop that my test code creates and stores:</p>
+<pre><code>def _apply_mock_event_loop_patch(context):
+    # Close any already-existing exit stacks.
+    if hasattr(context, 'mock_event_loop_exit_stack'):
+        context.mock_event_loop_exit_stack.close()
+
+    context.test_loop = asyncio.new_event_loop()
+    print(context.test_loop)
+    context.mock_event_loop_exit_stack = ExitStack()
+    context.mock_event_loop_exit_stack.enter_context(
+        patch.object(asyncio, 'new_event_loop', spec=True, return_value=context.test_loop))
+</code></pre>
+<p>I change my 'mock web response received' test step to do the following:</p>
+<pre><code>@when('the communications service receives a response from TestCube Web Service')
+def step_impl(context):
+    loop = context.test_loop
+    loop.call_soon_threadsafe(context.mock_received_response_subject.on_next, context.text)
+</code></pre>
+<p>The great news is that I'm actually getting the <code>Relay.enabled</code> coroutine to trigger when this step gets executed!</p>
+<p>The only problem now is the final test step in which I await the future I got from executing the CLI in its own thread and validate that the CLI is sending this on <code>stdout</code>:</p>
+<pre><code>@then('the CLI should print "{output}"')
+def step_impl(context, output):
+    if 'async.cli' in context.tags:
+        loop = asyncio.get_event_loop() # main loop, not test loop
+        result = loop.run_until_complete(context.async_result)
+    else:
+        result = context.result
+    assert_that(result.output, equal_to(output))
+</code></pre>
+<p>I've tried playing around with this but I can't seem to get <code>context.async_result</code> (which stores the future from <code>loop.run_in_executor</code>) to transition nicely to <code>done</code> and return the result. With the current implementation, I get an error for the first test (<code>1.1</code>) and indefinite hanging for the second (<code>1.2</code>):</p>
+<pre><code> @mock.comms @async.cli @wip
+  Scenario Outline: Querying relay enable state -- @1.1                           # testcube/tests/features/relay.feature:45
+    When the user queries the enable state of relay 0                             # testcube/tests/features/steps/relay.py:17 0.003s
+    Then the CLI should query the web service about the enable state of relay 0   # testcube/tests/features/steps/relay.py:48 0.000s
+    When the communications service receives a response from TestCube Web Service # testcube/tests/features/steps/core.py:58 0.000s
+      """
+      {'module':'relays','path':'relays[0].enabled','data':[True]}'
+      """
+    Then the CLI should print "True"                                              # testcube/tests/features/steps/core.py:94 0.003s
+      Traceback (most recent call last):
+        File "/Users/davidfallah/testcube_env/lib/python3.5/site-packages/behave/model.py", line 1456, in run
+          match.run(runner.context)
+        File "/Users/davidfallah/testcube_env/lib/python3.5/site-packages/behave/model.py", line 1903, in run
+          self.func(context, *args, **kwargs)
+        File "testcube/tests/features/steps/core.py", line 99, in step_impl
+          result = loop.run_until_complete(context.async_result)
+        File "/usr/local/Cellar/python3/3.5.2_1/Frameworks/Python.framework/Versions/3.5/lib/python3.5/asyncio/base_events.py", line 387, in run_until_complete
+          return future.result()
+        File "/usr/local/Cellar/python3/3.5.2_1/Frameworks/Python.framework/Versions/3.5/lib/python3.5/asyncio/futures.py", line 274, in result
+          raise self._exception
+        File "/usr/local/Cellar/python3/3.5.2_1/Frameworks/Python.framework/Versions/3.5/lib/python3.5/concurrent/futures/thread.py", line 55, in run
+          result = self.fn(*self.args, **self.kwargs)
+        File "/Users/davidfallah/testcube_env/lib/python3.5/site-packages/click/testing.py", line 299, in invoke
+          output = out.getvalue()
+      ValueError: I/O operation on closed file.
+
+      Captured stdout:
+      RECEIVED WEB RESPONSE: {'module':'relays','path':'relays[0].enabled','data':[True]}'
+      &lt;Future pending cb=[_chain_future.&lt;locals&gt;._call_check_cancel() at /usr/local/Cellar/python3/3.5.2_1/Frameworks/Python.framework/Versions/3.5/lib/python3.5/asyncio/futures.py:431]&gt;
+
+  @mock.comms @async.cli @wip
+  Scenario Outline: Querying relay enable state -- @1.2                           # testcube/tests/features/relay.feature:46
+    When the user queries the enable state of relay 1                             # testcube/tests/features/steps/relay.py:17 0.005s
+    Then the CLI should query the web service about the enable state of relay 1   # testcube/tests/features/steps/relay.py:48 0.001s
+    When the communications service receives a response from TestCube Web Service # testcube/tests/features/steps/core.py:58 0.000s
+      """
+      {'module':'relays','path':'relays[1].enabled','data':[False]}'
+      """
+RECEIVED WEB RESPONSE: {'module':'relays','path':'relays[1].enabled','data':[False]}'
+    Then the CLI should print "False"                                             # testcube/tests/features/steps/core.py:94
+</code></pre>
+<h2>Chapter 3: Finale</h2>
+<p>Screw all this asynchronous multi-threaded stuff, I'm too dumb for it.</p>
+<p>First off, instead of describing the scenario like this...</p>
+<pre><code>When the user queries the enable state of relay &lt;relay_id&gt;
+Then the CLI should query the web service about the enable state of relay &lt;relay_id&gt;
+When the communications service receives a response from TestCube Web Service:
+  """
+  {"module":"relays","path":"relays[&lt;relay_id&gt;].enabled","data":[&lt;relay_enabled&gt;]}
+  """
+Then the CLI should print "&lt;relay_enabled&gt;"
+</code></pre>
+<p>We describe it like this:</p>
+<pre><code>Given the communications service will respond to requests:
+  """
+  {"module":"relays","path":"relays[&lt;relay_id&gt;].enabled","data":[&lt;relay_enabled&gt;]}
+  """
+When the user queries the enable state of relay &lt;relay_id&gt;
+Then the CLI should query the web service about the enable state of relay &lt;relay_id&gt;
+And the CLI should print "&lt;relay_enabled&gt;"
+</code></pre>
+<p>Implement the new given step:</p>
+<pre><code>@given('the communications service will respond to requests')
+def step_impl(context):
+    response = context.text
+
+    def publish_mock_response(_):
+        loop = context.test_loop
+        loop.call_soon_threadsafe(context.mock_received_response_subject.on_next, response)
+
+    # Configure the mock comms service to publish a mock response when a request is made.
+    instance = context.mock_comms.return_value
+    instance.send_request.on_next.side_effect = publish_mock_response
+</code></pre>
+<p><strong>BOOM</strong></p>
+<pre><code>2 features passed, 0 failed, 0 skipped
+22 scenarios passed, 0 failed, 0 skipped
+58 steps passed, 0 failed, 0 skipped, 0 undefined
+Took 0m0.111s
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I can see two problems with your code:</p>
+<ul>
+<li>asyncio is not thread-safe, unless you use <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.AbstractEventLoop.call_soon_threadsafe" rel="nofollow">call_soon_threadsafe</a> or <a href="https://docs.python.org/3/library/asyncio-task.html?highlight=run_coroutine#asyncio.run_coroutine_threadsafe" rel="nofollow">run_coroutine_threadsafe</a>. <code>RxPy</code> doesn't use any of those in <a href="https://github.com/ReactiveX/RxPY/blob/3e44b48f84f851ab37bbffdd4725d41d88061ef2/rx/linq/observable/tofuture.py#L7" rel="nofollow">Observable.to_future</a>, so you have to access <code>RxPy</code> objects in the same thread that runs the asyncio event loop.</li>
+<li><code>RxPy</code> sets the result of the future when <code>on_completed</code> is called, so that awaiting for an observable returns the last object emitted. This means you have to call both <code>on_next</code> and <code>on_completed</code> to get <code>await</code> to return.</li>
+</ul>
+<p>Here is a working example:</p>
+<pre><code>import click
+import asyncio
+from rx.subjects import Subject
+from click.testing import CliRunner
+
+web_response_subject = Subject()
+web_response_observable = web_response_subject.as_observable()
+main_loop = asyncio.get_event_loop()
+
+@click.group()
+def cli():
+    pass
+
+@cli.resultcallback()
+def result_handler(task, **_):
+    future = asyncio.run_coroutine_threadsafe(task, main_loop)
+    print(future.result())
+
+@cli.command()
+async def get_web_response():
+    return await web_response_observable
+
+def test():
+    runner = CliRunner()
+    future = main_loop.run_in_executor(
+        None, runner.invoke, cli, ['get_web_response'])
+    main_loop.call_later(1, web_response_subject.on_next, 'foo')
+    main_loop.call_later(2, web_response_subject.on_completed)
+    result = main_loop.run_until_complete(future)
+    print(result.output, end='')
+
+if __name__ == '__main__':
+    test()
+</code></pre>
+</div>
+<span class="comment-copy">This question made my day :)</span>
+<span class="comment-copy">Thanks, I really appreciate the help. This works great and I think I've managed to make a bit of headway (I've updated my post). I don't suppose there's a way to inspect the event loop set within a thread? Some way to query asyncio's global context maybe? My production code shouldn't know or care about my test code and so it won't be able to use an event loop that the test code creates (unless maybe I do something crazy with unittest.mock).</span>
+<span class="comment-copy">@Tagc I'm not sure I understand all you constraints but my advice would be to keep it simple, and use a mock whenever you need to inject anything into your production code (e.g. patch <code>new_event_loop</code> to return a test loop). Also, try not to mix event loops: use a <a href="https://docs.python.org/dev/library/concurrent.futures.html#threadpoolexecutor" rel="nofollow noreferrer">ThreadPoolExecutor</a> if you really need to run a task in a thread.</span>
+<span class="comment-copy">Keep it simple? I'm keeping it really simple. I was plumbing right into the heart of asyncio to create an <code>AbstractEventLoopPolicy</code> decorator subclass that intercepted calls to <code>new_event_loop</code>. :) Your idea of just mocking it is a lot simpler, though, and I've had better success with that. The only thing left - I think - is just to have the Future created by <code>loop.run_in_executor</code> to neatly finish and return its results in the final test step. I've updated my post.</span>
+<span class="comment-copy">@Tagc I would use a <a href="https://docs.python.org/dev/library/concurrent.futures.html#concurrent.futures.Future" rel="nofollow noreferrer">concurrent.future</a> instead: <code>context.async_result = context.executor.submit(context.cli_runner.invoke, testcube.cli, arguments)</code> then later <code>result = context.async_result.result()</code></span>
+<span class="comment-copy">@Tagc Good thing you made it single-threaded. A motto I heard recently: adding a thread to a program introduces at least one bug ;)</span>

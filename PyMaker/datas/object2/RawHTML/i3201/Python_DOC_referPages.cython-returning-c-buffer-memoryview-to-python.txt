@@ -1,0 +1,138 @@
+<div class="post-text" itemprop="text">
+<p>I have following Cython code with one C buffer defined (<code>c_buffer</code>):</p>
+<pre><code>ctypedef struct my_struct_t:
+    float x
+    float y
+
+cdef class CMyClass:
+    cdef my_struct_t c_buffer[1000]
+
+    def get_array(self):
+        return &lt;my_struct_t[:1000]&gt;&amp;self.c_buffer[0]
+
+    def get_memoryview(self):
+        return memoryview(&lt;my_struct_t[:1000]&gt;&amp;self.c_buffer[0])
+</code></pre>
+<p>I'm using this class to store elements that eventually go to OpenGL VBO buffer. What I'm trying to do is avoid unnecessary copies of memory.</p>
+<p>When I call <code>get_array()</code> I get result of type </p>
+<pre><code>&lt;c_wrappers.array object at 0x7fffce17d650&gt;
+</code></pre>
+<p>with <code>get_memoryview()</code> the result is:</p>
+<pre><code>&lt;memory at 0x7fffd242e648&gt;
+</code></pre>
+<ol>
+<li><p>What's the difference between them (in functionality/speed)? I'm reading official document in about <a href="https://cython.readthedocs.io/en/latest/src/userguide/memoryviews.html" rel="nofollow noreferrer">Typed Memoryviews</a>, but it focuses mainly on numpy. Am I returning the memoryviews here correctly?</p></li>
+<li><p>Now the buffer is fixed (max 1000 elements). Does in Cython exist dynamic array that I could use and it automatically handles memory for me (for adding/removing elements at runtime) and having continuous memory layout (that I could eventually supply to OpenGL VBO)? Or should I use <code>from libcpp.vector cimport vector</code>?</p></li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<p>That is a quite complicated question! There are some aspects that need to be considered.</p>
+<p><strong>The speed:</strong></p>
+<p>Let's start with a simple <code>int</code>-buffer (I've skipped the unnecessary <code>&amp;c_buffer[0]</code>-business):</p>
+<pre><code>%%cython
+cdef class CMyClass:
+    cdef int c_buffer[1000]
+
+    def get_array(self):
+        return &lt;int[:1000]&gt;self.c_buffer
+
+    def get_memoryview(self):
+        return memoryview(&lt;int[:1000]&gt;self.c_buffer)
+</code></pre>
+<p>"Typed memory view" is somewhat opaque in Cython, there are some classes which are very similar and are returned from the function depending on the signature of the function:</p>
+<ul>
+<li><a href="https://github.com/cython/cython/blob/902be3fc9e49f64bb3682e849d56d54f70ae8d08/Cython/Utility/MemoryView.pyx#L104" rel="nofollow noreferrer">array</a></li>
+<li><a href="https://github.com/cython/cython/blob/902be3fc9e49f64bb3682e849d56d54f70ae8d08/Cython/Utility/MemoryView.pyx#L329" rel="nofollow noreferrer">memoryview</a></li>
+<li><a href="https://github.com/cython/cython/blob/902be3fc9e49f64bb3682e849d56d54f70ae8d08/Cython/Utility/MemoryView.pyx#L960" rel="nofollow noreferrer">memoryviewslice</a></li>
+<li>There is also a helper struct <a href="https://github.com/cython/cython/blob/fd85d226118aac2ce315becb020d3509f7417bfc/Cython/Compiler/PyrexTypes.py#L4196" rel="nofollow noreferrer">__Pyx_memviewslice</a>, which is not returned by used in function.</li>
+</ul>
+<p>However, none of these above is the memoryview you are returning in your second-function: it returns <a href="https://docs.python.org/3/library/stdtypes.html#memoryview" rel="nofollow noreferrer">Python's memoryview</a>.</p>
+<p>Quite confusing! Personally, I keep it simple and trust Cython to return the best suitable class - to me it just a buffer. </p>
+<p>When we measure the speed, the first version will be faster, because wrapping array_obj into a Python's memoryview just adds complexity:</p>
+<pre><code>&gt;&gt;&gt;c=CMyClass()
+&gt;&gt;&gt;%timeit c.get_array()
+377 ns ± 1.69 ns per loop (mean ± std. dev. of 7 runs, 1000000 loops each)
+&gt;&gt;&gt;%timeit c.get_memoryview()
+561 ns ± 2.31 ns per loop (mean ± std. dev. of 7 runs, 1000000 loops each)
+</code></pre>
+<hr/>
+<p><strong>The lifetime:</strong></p>
+<p>The memory from <code>c_buffer</code> isn't copied:</p>
+<pre><code>&gt;&gt;&gt;c=CMyClass()
+&gt;&gt;&gt;c.get_array()[0]=42
+&gt;&gt;&gt;print(c.get_memoryview()[0])
+</code></pre>
+<p>Which sounds like a Good Thing, but isn't!  The problem: <code>c_buffer</code> isn't a Python-object and when it goes out of scope, the data-pointer of the memory-view becomes dangling:</p>
+<pre><code>&gt;&gt;c=CMyClass()
+&gt;&gt;&gt;c.get_array()[0]=42
+&gt;&gt;&gt;c=c.get_array()   # old c-object is now destroyed
+&gt;&gt;&gt;print(c[0])       # anything can happen!
+-304120624
+</code></pre>
+<p>I got lucky, the python didn't crash but it could, because after binding <code>c</code> to the memoryview, the underlying object is destroyed and the memory freed.</p>
+<p>Using <code>std::vector</code> will not help you there. What you need is a real Python-object with reference counting! For example we could use Cython's array for that:</p>
+<pre><code>%%cython 
+
+from cython.view cimport array as cvarray
+cdef class CMyClass:
+    cdef int[:] c_buffer
+
+    def __cinit__(self):
+        self.c_buffer = cvarray(shape=(1000,), itemsize=sizeof(int), format="i")
+
+    def  get_array(self):
+        cdef int[:] res=self.c_buffer # nobody needs to know which class we use
+        return res
+</code></pre>
+<p>Now the code from above is safe:</p>
+<pre><code>&gt;&gt;c=CMyClass()
+&gt;&gt;&gt;c.get_array()[0]=42
+&gt;&gt;&gt;c=c.get_array()   # old c-object is now destroyed
+&gt;&gt;&gt;print(c[0])       # but the underlying memory is still alive
+42
+</code></pre>
+<hr/>
+<p><strong>Custom structs:</strong></p>
+<p>But what about customs structs, as in your example above? The probably easiest way is to use numpy:</p>
+<pre><code>%%cython -a
+import numpy as np
+cimport numpy as np
+
+#define a type for memory view
+ctypedef packed struct my_struct_t:
+    np.float32_t x
+    np.float32_t y
+
+#define a type for numpy-array (is a python-object)
+my_struct = np.dtype([
+    ('x', np.float32, 1), 
+    ('y', np.float32, 1),  
+])
+
+cdef class CMyClass:
+    cdef object c_buffer
+
+    def __cinit__(self):
+        self.c_buffer = np.empty(1000,dtype=my_struct)
+
+    def  get_array(self):
+        cdef my_struct_t[:] res=self.c_buffer
+        return res
+</code></pre>
+<p>Which works as advertised:</p>
+<pre><code>&gt;&gt;&gt;c=CMyClass()
+&gt;&gt;&gt;c.get_array()[0]={'x':42,'y':42}
+&gt;&gt;&gt;c=c.get_array()   # old c-object is now destroyed
+&gt;&gt;&gt;print(c[0])       # but this is still ok
+{'x': 42.0, 'y': 42.0}
+</code></pre>
+<p>Two more remarks:</p>
+<ul>
+<li><p>using numpy is slower - <code>get_array()</code> is three times slower than the original <code>get_array()</code> version</p></li>
+<li><p>using <code>my_struct_t c_buffer</code> would not really help you there (beside being dangerous), because there would be no rule how to translate the data from c-struct to an python object, but this check happens at run time, when the elements of the array are acccessed.</p></li>
+</ul>
+</div>
+<span class="comment-copy">Thanks for exhausting answer! Just few remarks: so "typed memory view" is just a concept and I need to find proper function(malloc, cvarray etc..) to set it? In your example you set cvarray to 1000, what if i want add more elements at runtine? Should I reallocate?</span>
+<span class="comment-copy">@AndrejKesely I think of "typed memory views" as an abstraction. I don't see much  value in known which classes/combination of classes makes it work.</span>
+<span class="comment-copy">@AndrejKesely you could use <code>array.array</code>, which can grow dynamically: <a href="http://cython.readthedocs.io/en/latest/src/tutorial/array.html" rel="nofollow noreferrer">cython.readthedocs.io/en/latest/src/tutorial/array.html</a>. However, if there are memory views around, they lock the underlying buffer, so it cannot be changed.</span>
+<span class="comment-copy">I see, it's complicated...I want to grab memoryview only when I'm ready to draw the buffer, so that shouldn't be a problem. Thanks for clarifying me the typed memory view.</span>

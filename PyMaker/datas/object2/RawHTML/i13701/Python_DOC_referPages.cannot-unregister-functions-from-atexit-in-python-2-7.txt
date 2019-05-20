@@ -1,0 +1,132 @@
+<div class="post-text" itemprop="text">
+<p>First, I wrote a recording class with a flush method:</p>
+<pre><code>class Recorder
+    def __init__(self, buffer_size, path):
+        self._big_buffer = np.array(*buffer_size)
+        self._path = path
+    def push(self, data):
+        # insert in self._big_buffer
+        # if self._big_buffer is full:
+        #     self._flush()
+    def flush(self):
+        # write buffer to disk (self._path)
+</code></pre>
+<p>Then, I wanted to flush at exit: when manually stopped, crashed or whatever reason.</p>
+<p>So I used:</p>
+<pre><code>def __init__(self):
+    (...)
+    atexit.register(self.flush)
+</code></pre>
+<p>And it worked pretty well.</p>
+<p>But now, I want to record, stop recording, record again, multiple times, with a different buffer size and to a different path. So I have to discard, then instanciate several <code>Recorder</code>. It kind of works, but older <code>Recorder</code>'s memory (containing some fat <code>self._big_buffer̀</code>) is not freed since it's retained by <code>atexit</code>. Even when I explicitly call <code>del</code>.
+I can't <code>atexit.unregister(self._flush)</code> since it's Python 3 only.</p>
+<p>I would prefer not to reuse existing instances, but discarding older instances and create new ones.</p>
+<p>How would you handle such a case?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can try using a weak reference to the <code>atexit</code> handler, so the object
+won't be retained if it is deleted elsewhere:</p>
+<pre><code>import atexit
+import weakref
+
+class CallableMethodWeakRef:
+    def __init__(self, object, method_name):
+        self.object_ref = weakref.ref(object)
+        self.method_name = method_name
+    def __call__(self):
+        object = self.object_ref()
+        if object:
+            getattr(object, self.method_name)()
+
+class Recorder:
+    def __init__(self, *args):
+        atexit.register(CallableMethodWeakRef(self, 'flush'))
+
+    def flush(self):
+        print 'flushing'
+</code></pre>
+<p>The method is passed as a string in order to avoid a lot of problems with
+bound method weak references, if you find it disturbing you can always use
+a <code>BoundMethodWeakref</code> implementation like this one: <a href="http://code.activestate.com/recipes/578298-bound-method-weakref/" rel="nofollow">http://code.activestate.com/recipes/578298-bound-method-weakref/</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I would say you're trying to use the wrong tool. The <code>with</code> statement and context managers are a very good tool for this. File IO is the main example that most python users will get introduced to the with statement.</p>
+<pre><code>f = open("somefile.txt", "w")
+try:
+    f.write("...")
+    # more file operations
+finally:
+    # regardless of what happens, make sure the files is closed 
+    f.close()
+</code></pre>
+<p>Becomes:</p>
+<pre><code>with open("somefile.txt", "w") as f:
+    f.write("...")
+    # more file operations
+# close automatically called at the end of the block
+</code></pre>
+<p>You can create your own context managers by writing <code>__enter__</code> and <code>__exit__</code> methods for your class.</p>
+<pre><code>class Recorder
+    def __init__(self, buffer_size, path):
+        self._big_buffer = np.array(*buffer_size)
+        self._path = path
+    def push(self, data):
+        # insert in self._big_buffer
+        # if self._big_buffer is full:
+        #     self._flush()
+    def flush(self):
+        # write buffer to disk (self._path)
+    def __enter__(self):
+        return self
+    def __exit__(self, exctype, exception, traceback):
+        # If an exception was thrown in the with block you will get the details here. 
+        # If you want the say that the exception has been handled and for it not to be 
+        # raised outside the with block then return True
+        self.flush()
+        # self.close() ?
+</code></pre>
+<p>You would then use your <code>Recorder</code> object like:</p>
+<pre><code>with Recorder(...) as recorder:
+    # operations with recorder
+    ...
+# regardless of what happens the recorder will be flushed at this point
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Surely the answer <em>is</em> to allow your <code>Recorder</code> to change paths and buffer characteristics at will. You say <em>"I would prefer not to reuse existing instances, but discarding older instances and create new ones."</em> but you don't give any rationale for that,
+except perhaps your assumption that the <em>"older Recorder's memory (containing some fat <code>self._big_buffer̀</code>) is not freed since it's retained by <code>atexit</code>"</em>, which I believe is incorrect.</p>
+<p>While it is true that <code>atexit</code> retains a reference to the recorder object, this will only mean that the buffer memory is retained as long as the recorder refers to it. It would be quite easy to add a <code>close()</code> method such as</p>
+<pre><code>    def close(self):
+        self.flush()
+        self._big_buffer = None
+</code></pre>
+<p>and bingo! No reference to the buffer memory exists, and it is collectable.</p>
+<p>Your <code>__init__()</code> method should simply register with <code>atexit</code>, then the <code>open()</code> method (which does the rest of what <code>__init__()</code> currently does) can be used multiple times, each one followed by a <code>close()</code> call.</p>
+<p>In summary, I think your problem cries out for a single object.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can remove the handle by hand from the (undocumented) <code>atexit._exithandlers</code> list.</p>
+<pre><code>import atexit
+
+def unregister(func, *targs, **kargs):
+
+    """unregister a function previously registered with atexit.
+       use exactly the same aguments used for before register.
+    """
+    for i in range(0,len(atexit._exithandlers)):
+        if (func, targs, kargs) == atexit._exithandlers[i] :
+            del atexit._exithandlers[i]
+            return True
+    return False
+</code></pre>
+<p>Hope that helps.</p>
+</div>
+<span class="comment-copy">Note: the registered <code>CallableMethodWeakRef</code> objects will be called, even if the underlying object has been deleted. It doesn't really matter, except if you have a huge number of <code>Recorder</code> objects - in this case, you can combine the technique described here with a custom <code>atexit.unregister</code> method of your own, I can give you some hints</span>
+<span class="comment-copy">I tried your recipe with the method passed as a string and it's working great! Thank you.</span>
+<span class="comment-copy">Well, I do know about with statement. It's just I cannot use it because of the way the app is built right now. Or maybe I could still use it but 1/ the code will be a lot uglier, 2/ it would be easy to forget to use <code>with</code>. Still, +1 for a good answer :)</span>
+<span class="comment-copy">The answer from @Dunes represents a more general approach to the problem, though I suspect there <i>may</i> be rare cases where <code>atexit</code> traps circumstances that the <code>__exit__</code> method of a context manager may not.</span>
+<span class="comment-copy">The problem, in my case, for a single object, is I intend to use simultany, more than one instance of the class in a near future. The atexit mechanism is merely here to flush before a crash or a way to quit the app which is not handled (it uses pyqt by the way)</span>
+<span class="comment-copy">There's absolutely no reason I can think of why you shouldn't have as many instances as you like. While it's true that the <code>atexit</code> calls will retain references to them, as long as you call their <code>close()</code> method first that won't be unduly expensive, since no buffer references will be retained. Just make sure the <code>flush()</code> method call returns immediately if the buffer is <code>None</code> so's not to cause problems on exit.</span>
+<span class="comment-copy">leading underscore in <code>_exithandlers</code> is there for purpose, given solution looks like a hack, which abuses <a href="https://docs.python.org/3/library/atexit.html" rel="nofollow noreferrer">non-documented behavior</a></span>
+<span class="comment-copy">If you want to be polite, you can create my_atexit just based in atexit code and do the same as your own extension. ;)</span>
+<span class="comment-copy">Please, your link is for py3 and this topic is for py2.</span>

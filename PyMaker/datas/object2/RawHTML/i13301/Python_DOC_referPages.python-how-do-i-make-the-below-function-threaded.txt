@@ -1,0 +1,223 @@
+<div class="post-text" itemprop="text">
+<p>I'm quite new to python and programming in general - looking for advice on how to tighten up the below function and shave off some time. Some background information:</p>
+<p>The requirement is that I gather the Name and ID of every single sub-file/folder in a given Top level folder. The catch, is that the server I request the data from will only ever return the contents of a single folder and the response will always specify whether the returned object is a file or a folder.</p>
+<p>(pseudocode example, just trying to quickly demonstrate):</p>
+<pre><code>Top_level_folderid = 1111
+url = "fileserverapi.couldbebetter.com/thismighttakeawhile"
+post(url, data=Top_level_folderid)
+response({"jim's folder" : id=1234, filetype=folder}, {"weird_video.mp4" : id=4321, filetype=file}) 
+</code></pre>
+<p>I then have to iterate over each response and post back to the server to get the next set, in some cases a whole Top level folder may contain up to 15,000 folders and 30,000+ files distributed randomly with some folders containing 1 file and 15 folders and others containing 7 files and 2 more sub folders etc.</p>
+<p>The API itself responds quite quickly however I don't know how many concurrent connections it can handle so I need to be able to tune and find a sweet spot within the function, at a guess it will handle anywhere from 10-50. My function as it is now:</p>
+<pre><code>def drill_folder_loop(folder_list, project_id, directory, jsession_id):
+    count = 0
+    temp_folder_list = folder_list #\\ A list of dicts [{folder_name1 : folder_id1}, {folder_name2 : folder_id2}]
+    while count == 0:
+        temp_folder_list1 = []
+        for folder in temp_folder_list:
+            f_name = folder.keys()[0] #// folder_name (not actually used here)
+            f_id = folder.values()[0] #// folder id
+            folder_dict = list_folders_files(f_id, jsession_id) #// list_folders_files posts to the api and builds the response back into a list of dicts, same as the original passed to this function.
+            folder_list = process_folder_files(folder_dict, directory, jsession_id) #// somewhat irrelevant to the question - I have to commit the file data to a DB, I could strip the folder list in this function but since i need it there I just return it instead.
+            process_recipients = recipient_process(folder_dict, "no", f_id,
+                                                   directory, project_id)#// more irrelevant but necessary processing.
+            for i in range(0, len(folder_list)):
+                append_f = folder_list[i]
+                temp_folder_list1.append(append_f)#// append new folders to list outside loop
+        temp_folder_list = [] #// empty temp_folder_list, loop may contain more than a single folder so I have to empty it once I've processed all the folders
+        for i in range(0, len(temp_folder_list1)):#// Put the new folder list into temp_folder_list so the loop restarts
+            append_f2 = temp_folder_list1[i]
+            temp_folder_list.append(append_f2)
+        if not temp_folder_list: #// end the loop if there are no more sub-folders
+            count += 1
+    return log_info("Folder loop complete")
+</code></pre>
+<p>Re-reading this was a good lesson in variable naming... isn't exactly the most concise.. The code itself works fine but as you can probably imagine by now, it takes a long time to churn through thousands of folders... Any advice/direction on how I can turn this into a multi-threaded/processing beast? Thanks for taking the time to read this! </p>
+<p><strong>EDIT:</strong> </p>
+<p>For clarity, instead of processing the folders in a loop I would like to task them off in threads to have multiple folders and therefore post requests and responses occurring simultaneously so that the whole process takes less time. Right now it just loops through one folder at a time.. hope this clarifies.. </p>
+<p><strong>EDIT:</strong>
+From Noctis Skytower's suggestion I've made a few small changes to support python 2.7 (Queue vs queue and .clock() instead of perf_counter()). It's SO CLOSE! The issue I'm running into is that when I change the running threads down to 1, it completes perfectly - when I increase it back to 25 for some reason (and randomly) the variable f_id in dfl_worker() is None. Given it works with 1 thread fine I'm guessing this isn't an issue with the suggestion but rather something else in my code so I'll mark it as accepted. Thanks!</p>
+<pre><code>class ThreadPool:
+
+    def __init__(self, count, timeout, daemonic):
+        self.__busy = 0
+        self.__idle = clock()
+        self.__jobs = Queue()
+        self.__lock = Lock()
+        self.__pool = []
+        self.__timeout = timeout
+        for _ in range(count):
+            thread = Thread(target=self.__worker)
+            thread.daemon = daemonic
+            thread.start()
+            self.__pool.append(thread)
+
+    def __worker(self):
+        while True:
+            try:
+                function, args, kwargs = self.__jobs.get(True, 0.1)
+            except Empty:
+                with self.__lock:
+                    if self.__busy:
+                        continue
+                    if clock() - self.__idle &lt; self.__timeout:
+                        continue
+                    break
+            else:
+                with self.__lock:
+                    self.__busy += 1
+                try:
+                    function(*args, **kwargs)
+                except:
+                    pass
+                with self.__lock:
+                    self.__busy -= 1
+                    self.__idle = clock()
+
+    def apply(self, function, *args, **kwargs):
+        self.__pool = list(filter(Thread.is_alive, self.__pool))
+        if not self.__pool:
+            raise RuntimeError('ThreadPool has no running Threads')
+        self.__jobs.put((function, args, kwargs))
+
+    def join(self):
+        for thread in self.__pool:
+            thread.join()
+
+
+def drill_folder_loop(folder_list, project_id, directory, jsession_id):
+    tp = ThreadPool(25, 1, False)
+    tp.apply(dfl_worker, tp, folder_list, project_id, directory, jsession_id)
+    tp.join()
+
+
+def dfl_worker(tp, folder_list, project_id, directory, jsession_id):
+    for folder in folder_list:
+        f_name = folder.keys()[0]
+        f_id = folder.values()[0]
+        f_dict = list_folders_files(f_id, jsession_id)
+        f_list = process_folder_files(f_dict, directory, jsession_id)
+        tp.apply(dfl_worker, tp, f_list, project_id, directory, jsession_id)
+        recipient_process(f_dict, 'no', f_id, directory, project_id)
+    log_info('One folder processed')
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>May I recommend the following?</p>
+<pre><code>from queue import Empty, Queue
+from threading import Lock, Thread
+from time import perf_counter
+
+
+def drill_folder_loop(folder_list, project_id, directory, jsession_id):
+    while True:
+        next_folder_list = []
+        for folder in folder_list:
+            f_name, f_id = folder.popitem()
+            f_dict = list_folders_files(f_id, jsession_id)
+            f_list = process_folder_files(f_dict, directory, jsession_id)
+            recipient_process(f_dict, 'no', f_id, directory, project_id)
+            next_folder_list.extend(f_list)
+        if not next_folder_list:
+            break
+        folder_list = next_folder_list
+    return log_info('Folder loop complete')
+
+###############################################################################
+
+
+class ThreadPool:
+
+    def __init__(self, count, timeout, daemonic):
+        self.__busy = 0
+        self.__idle = perf_counter()
+        self.__jobs = Queue()
+        self.__lock = Lock()
+        self.__pool = []
+        self.__timeout = timeout
+        for _ in range(count):
+            thread = Thread(target=self.__worker)
+            thread.daemon = daemonic
+            thread.start()
+            self.__pool.append(thread)
+
+    def __worker(self):
+        while True:
+            try:
+                function, args, kwargs = self.__jobs.get(True, 0.1)
+            except Empty:
+                with self.__lock:
+                    if self.__busy:
+                        continue
+                    if perf_counter() - self.__idle &lt; self.__timeout:
+                        continue
+                    break
+            else:
+                with self.__lock:
+                    self.__busy += 1
+                try:
+                    function(*args, **kwargs)
+                except:
+                    pass
+                with self.__lock:
+                    self.__busy -= 1
+                    self.__idle = perf_counter()
+
+    def apply(self, function, *args, **kwargs):
+        self.__pool = list(filter(Thread.is_alive, self.__pool))
+        if not self.__pool:
+            raise RuntimeError('ThreadPool has no running Threads')
+        self.__jobs.put((function, args, kwargs))
+
+    def join(self):
+        for thread in self.__pool:
+            thread.join()
+
+
+def drill_folder_loop(folder_list, project_id, directory, jsession_id):
+    tp = ThreadPool(25, 1, False)
+    tp.apply(dfl_worker, tp, folder_list, project_id, directory, jsession_id)
+    tp.join()
+
+
+def dfl_worker(tp, folder_list, project_id, directory, jsession_id):
+    for folder in folder_list:
+        f_name, f_id = folder.popitem()
+        f_dict = list_folders_files(f_id, jsession_id)
+        f_list = process_folder_files(f_dict, directory, jsession_id)
+        tp.apply(dfl_worker, tp, f_list, project_id, directory, jsession_id)
+        recipient_process(f_dict, 'no', f_id, directory, project_id)
+    log_info('One folder processed')
+</code></pre>
+<p>The first <code>drill_folder_loop</code> is a rewrite of your function that should do the same thing, but the second version should utilize the <code>ThreadPool</code> class so that your folder lists can be processed by up to 25 threads concurrently. Please note that nothing of significance is returned from the threaded version, and it returns almost immediately upon executing if <code>tp.join()</code> is removed at the end.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Its a bit tricky to understand what you want to do with this code.</p>
+<p>As far as I could understand you would like to make this code multi-threaded; to achieve this you need to find out a <code>routine/taskset</code> which can be performed independent of each other and then you can take it out of the loop and create a independent function of it.</p>
+<pre><code>def task(someparams):
+    #mytasks using the required someparams
+</code></pre>
+<p>Now you can create a set of worker threads and assign them the the work to run the <code>task</code> routine and get your work done.</p>
+<p>here how you can multi thread the <code>task</code> routine:</p>
+<pre><code>import thread
+
+WORKER_THREAD = 10
+
+c = 0
+while c &lt; WORKER_THREAD: 
+    thread.start_new_thread( task, (someparams, ) )
+
+while 1:
+   pass
+</code></pre>
+<p>thread.start_new_thread( task, (someparams, ) )</p>
+</div>
+<span class="comment-copy">Just to let you know, there is a race condition between the last to lines of the <code>apply</code> method. It is possible that all threads could quit between the filter and scheduling of a job. The only error this will produce is that the last call to <code>apply</code> will not lead to the code being run. If further calls to the method are made, then the <code>RuntimeError</code> will raised. In the presented use case, this should not be a problem since the <code>ThreadPool</code> is not reused after it completes its purpose.</span>
+<span class="comment-copy">thank you so much, I will try this and report back</span>
+<span class="comment-copy">You don't need to reinvent a <code>ThreadPool</code> class. Python already has it. The <code>multiprocessing</code> module has a <code>multiprocessing.dummy</code> submodule that implements the <code>multiprocessing</code> API using threads. So if you do <code>import multiprocessing.dummy as multiprocessing</code>, then use <code>multiprocessing.Pool</code>, it's a thread pool.</span>
+<span class="comment-copy">@ShadowRanger: Any chance you could assist with a semi-relevant example of this implementation?</span>
+<span class="comment-copy">The <code>ThreadPool</code> in Noctis's example is actually fairly faithful to the API of <code>multiprocessing</code>'s <code>Pool</code>. Take a look at the <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.Pool" rel="nofollow noreferrer">API docs for it</a>, it's mostly a drop in replacement (though it can do a lot more; in particular, doing a specific task for each of a number of inputs and iterating the results is usually done most efficiently with <code>imap_unordered</code>).</span>
+<span class="comment-copy">@NoctisSkytower: <a href="https://docs.python.org/3/library/multiprocessing.html#module-multiprocessing.dummy" rel="nofollow noreferrer"><code>multiprocessing.dummy</code> <i>is</i> a threaded solution</a>. It's the same API as <code>multiprocessing</code>, but it's implemented using threads instead of processes. So the <code>Pool</code> it provides <i>is</i> actually a <code>ThreadPool</code> (in fact, that's the name of the class that <code>dummy</code>'s <code>Pool</code> function returns).</span>
+<span class="comment-copy">Thank you, I'm familiar with the threading module - I think I'm just struggling with the logic of how to manage the returns of the threads. Where do I start the thread in the loop.. I can't help but think I need to somehow be adding the folders to a queue.. "to achieve this you need to find out a routine/taskset which can be performed independent of each other" I think you nailed it here, I think the way I've written it has cornered me - struggling to break the loop out into independent functions because I have to keep iterating over the results...  Thanks for taking the time to respond.</span>
+<span class="comment-copy">@circa keep in mind when you are sharing data may be by using any queue or another mechanism keep them <code>threadsafe</code> otherwise you may run into race condition.</span>
+<span class="comment-copy">The <code>thread</code> module is deprecated since forever now (in favor of the <code>threading</code> module) and the busy <code>while</code> loop at the end is a quite horrible idea.</span>

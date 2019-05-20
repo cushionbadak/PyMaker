@@ -1,0 +1,180 @@
+<div class="post-text" itemprop="text">
+<div class="question-status question-originals-of-duplicate">
+<p>This question already has an answer here:</p>
+<ul>
+<li>
+<a dir="ltr" href="/questions/3588776/how-is-eq-handled-in-python-and-in-what-order">How is __eq__ handled in Python and in what order?</a>
+<span class="question-originals-answer-count">
+                    2 answers
+                </span>
+</li>
+</ul>
+</div>
+<p>In python 2.7.6, suppose that I have a class that defines <code>__eq__</code> and a subclass
+thereof:</p>
+<pre><code>&gt;&gt;&gt; class A(object):
+...     def __eq__(self,other):
+...         print self.__class__,other.__class__
+...         return True
+... 
+&gt;&gt;&gt; class B(A):
+...     pass
+... 
+</code></pre>
+<p>Now I create an object of each class, and want to compare them:</p>
+<pre><code>&gt;&gt;&gt; a = A()
+&gt;&gt;&gt; b = B()
+&gt;&gt;&gt; a==b
+</code></pre>
+<p>The result I get:</p>
+<pre><code>&lt;class '__main__.B'&gt; &lt;class '__main__.A'&gt;
+</code></pre>
+<p>This shows that the interpreter is calling <code>b.__eq__(a)</code>, instead of <code>a.__eq__(b)</code> as
+expected.</p>
+<p>The <a href="https://docs.python.org/release/2.7.6/reference/datamodel.html#coercion-rules%20documentation" rel="nofollow noreferrer">documentation</a> states (emphasis added):</p>
+<blockquote>
+<ul>
+<li><p>For objects <code>x</code> and <code>y</code>, first <code>x.__op__(y)</code> is tried. If this is not implemented or returns <code>NotImplemented</code>, <code>y.__rop__(x)</code> is tried. If this is also not implemented or returns <code>NotImplemented</code>, a <code>TypeError</code> exception is raised. But see the following exception:</p></li>
+<li><p>Exception to the previous item: if the left operand is an instance of a built-in type or a new-style class, and the right operand is an instance of a proper subclass of that type or class <em>and overrides the base’s <code>__rop__()</code> method</em>, the right operand’s <code>__rop__()</code> method is tried before the left operand’s <code>__op__()</code> method.</p>
+<p>This is done so that a subclass can completely override binary operators. Otherwise, the left operand’s <code>__op__()</code> method would always accept the right operand: when an instance of a given class is expected, an instance of a subclass of that class is always acceptable.</p></li>
+</ul>
+</blockquote>
+<p><strong>Since the subclass <code>B</code> does not override the <code>__eq__</code> operator, shouldn't <code>a.__eq__(b)</code>
+be called instead of <code>b.__eq__(a)</code>?</strong> Is this expected behavior, or a bug?  It is contrary to the documentation as I read it: am I misreading the documentation or missing something else?</p>
+<p>Some related questions: </p>
+<ul>
+<li><p><a href="https://stackoverflow.com/a/2282795/407588">This answer</a> quotes the documentation that I quoted above.  In that case the final question involved a comparison between an object of built in type (1) and an an instance
+of a new style class.  Here, I'm specifically comparing an instance of a parent class
+with an instance of a subclass which <strong>does not</strong> override the <strong><code>rop()</code></strong> method of its
+parent (in this case, <code>__eq__</code> is both <strong><code>op()</code></strong> and <strong><code>rop()</code></strong>).</p>
+<p>In this case, python actually does call <code>b.__eq__(a)</code> instead of <code>a.__eq__(b)</code> first, even though class <code>B</code> does not explicitly override <code>A</code>.  </p></li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's the code that implements the described logic:</p>
+<p><a href="http://hg.python.org/cpython/file/ee879c0ffa11/Objects/object.c#l607" rel="nofollow">Python 2.7</a>:</p>
+<pre class="lang-c prettyprint-override"><code>/* Macro to get the tp_richcompare field of a type if defined */
+#define RICHCOMPARE(t) (PyType_HasFeature((t), Py_TPFLAGS_HAVE_RICHCOMPARE) \
+             ? (t)-&gt;tp_richcompare : NULL)
+
+...
+
+static PyObject *
+try_rich_compare(PyObject *v, PyObject *w, int op)
+{
+    richcmpfunc f;
+    PyObject *res;
+
+    if (v-&gt;ob_type != w-&gt;ob_type &amp;&amp;
+        PyType_IsSubtype(w-&gt;ob_type, v-&gt;ob_type) &amp;&amp;
+        (f = RICHCOMPARE(w-&gt;ob_type)) != NULL) {
+        res = (*f)(w, v, _Py_SwappedOp[op]);  // We're executing this
+        if (res != Py_NotImplemented)
+            return res;
+        Py_DECREF(res);
+    }
+    if ((f = RICHCOMPARE(v-&gt;ob_type)) != NULL) {
+        res = (*f)(v, w, op);  // Instead of this.
+        if (res != Py_NotImplemented)
+            return res;
+        Py_DECREF(res);
+    }
+    if ((f = RICHCOMPARE(w-&gt;ob_type)) != NULL) {
+        return (*f)(w, v, _Py_SwappedOp[op]);
+    }
+    res = Py_NotImplemented;
+    Py_INCREF(res);
+    return res;
+}
+</code></pre>
+<p><a href="http://hg.python.org/cpython/file/d08d1569aa04/Objects/object.c#l633" rel="nofollow">Python 3.x:</a></p>
+<pre class="lang-c prettyprint-override"><code>/* Perform a rich comparison, raising TypeError when the requested comparison
+   operator is not supported. */
+static PyObject *
+do_richcompare(PyObject *v, PyObject *w, int op)
+{
+    richcmpfunc f;
+    PyObject *res;
+    int checked_reverse_op = 0; 
+
+    if (v-&gt;ob_type != w-&gt;ob_type &amp;&amp;
+        PyType_IsSubtype(w-&gt;ob_type, v-&gt;ob_type) &amp;&amp;
+        (f = w-&gt;ob_type-&gt;tp_richcompare) != NULL) {
+        checked_reverse_op = 1; 
+        res = (*f)(w, v, _Py_SwappedOp[op]);  // We're executing this
+        if (res != Py_NotImplemented)
+            return res; 
+        Py_DECREF(res);
+    }    
+    if ((f = v-&gt;ob_type-&gt;tp_richcompare) != NULL) {
+        res = (*f)(v, w, op);   // Instead of this.
+        if (res != Py_NotImplemented)
+            return res; 
+        Py_DECREF(res);
+    }    
+    if (!checked_reverse_op &amp;&amp; (f = w-&gt;ob_type-&gt;tp_richcompare) != NULL) {
+        res = (*f)(w, v, _Py_SwappedOp[op]);
+        if (res != Py_NotImplemented)
+            return res; 
+        Py_DECREF(res);
+    }    
+</code></pre>
+<p>The two version are similar, except that the Python 2.7 version uses a RICHCOMPARE macro that checks <code>PyType_HasFeature((t), Py_TPFLAGS_HAVE_RICHCOMPARE</code> instead of <code>ob_type-&gt;tp_richcompare != NULL</code>.</p>
+<p>In both versions, the first <code>if</code> block is evaluating to true. The specific piece that one would perhaps expect to be false, going by the description in the docs, is this: <code>f = w-&gt;ob_type-&gt;tp_richcompare != NULL</code> (for Py3) / <code>PyType_HasFeature((t), Py_TPFLAGS_HAVE_RICHCOMPARE</code>. However, the docs say that <a href="https://docs.python.org/2/c-api/typeobj.html#PyTypeObject.tp_richcompare" rel="nofollow"><code>tp_richcompare</code> is inherited by child classes</a>:</p>
+<blockquote>
+<p><strong>richcmpfunc PyTypeObject.tp_richcompare</strong></p>
+<p>An optional pointer to the rich comparison function...</p>
+<p>This field is inherited by subtypes together with tp_compare and tp_hash...</p>
+</blockquote>
+<p>With the 2.x version, <code>PyType_HasFeature((t), Py_TPFLAGS_HAVE_RICHCOMPARE</code> will also evaluate to true, because the <a href="https://docs.python.org/2/c-api/typeobj.html#Py_TPFLAGS_HAVE_RICHCOMPARE" rel="nofollow"><code>Py_TPFLAGS_HAVE_RICHCOMPARE</code></a>  flag is true if <code>tp_richcompare</code>, <a href="https://docs.python.org/2/c-api/typeobj.html#PyTypeObject.tp_clear" rel="nofollow"><code>tp_clear</code></a>, and <a href="https://docs.python.org/2/c-api/typeobj.html#PyTypeObject.tp_traverse" rel="nofollow"><code>tp_traverse</code></a> are true, and all of those are inherited from the parent.</p>
+<p>So, even though <code>B</code> doesn't provide its own rich comparison method, it still returns a non-NULL value because its parent class provides it. As others have stated, this seems to be a doc bug; the child class doesn't actually need to <em>override</em> the <code>__eq__</code> method of the parent, it just needs to provide one, even via inheritance.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It appears that a subclass is considered to "override" the superclass behavior even if all it does is inherit the superclass behavior.  This is difficult to see in the <code>__eq__</code> case because <code>__eq__</code> is its own reflection, but you can see it more clearly if you use different operators, such as <code>__lt__</code> and <code>__gt__</code>, which are each other's reflections:</p>
+<pre><code>class A(object):
+    def __gt__(self,other):
+        print "GT", self.__class__, other.__class__
+
+    def __lt__(self,other):
+        print "LT", self.__class__, other.__class__
+
+class B(A):
+    pass
+</code></pre>
+<p>Then:</p>
+<pre><code>&gt;&gt;&gt; A() &gt; B()
+LT &lt;class '__main__.B'&gt; &lt;class '__main__.A'&gt;
+</code></pre>
+<p>Note that <code>A.__gt__</code> was not called; instead, <code>B.__lt__</code> was called.</p>
+<p>The <a href="https://docs.python.org/3/reference/datamodel.html#object.__ror__" rel="nofollow">Python 3 documentation</a> is illustrative, in that it states the rule in different words that are technically more accurate (emphasis added):</p>
+<blockquote>
+<p>If the right operand’s type is a subclass of the left operand’s type and that subclass <strong>provides</strong> the reflected method for the operation, this method will be called before the left operand’s non-reflected method. This behavior allows subclasses to override their ancestors’ operations.</p>
+</blockquote>
+<p>The subclass does indeed "provide" the reflected method, it just provides it via inheritance.  If you actually remove the reflected method behavior in the subclass (by returning NotImplemented), the superclass method is correctly called (after the subclass one):</p>
+<pre><code>class A(object):
+    def __gt__(self,other):
+        print "GT", self.__class__, other.__class__
+
+    def __lt__(self,other):
+        print "LT", self.__class__, other.__class__
+
+class B(A):
+    def __lt__(self, other):
+        print "LT", self.__class__, other.__class__
+        return NotImplemented
+
+&gt;&gt;&gt; A() &gt; B()
+LT &lt;class '__main__.B'&gt; &lt;class '__main__.A'&gt;
+GT &lt;class '__main__.A'&gt; &lt;class '__main__.B'&gt;
+</code></pre>
+<p>So basically this appears to be a documentation bug.  It should say that the subclass reflected method is <em>always</em> tried first (for comparison operators), regardless of whether the subclass explicitly overrides the superclass implementation.  (As noted by Mark Dickinson in a comment, though, it only works this way for comparison operators, not for the mathematical operator pairs like <code>__add__</code>/<code>__radd__</code>.)</p>
+<p>In practice, this is unlikely to matter, since the only time you notice it is when the subclass <em>doesn't</em> override the superclass.  But in that case, the subclass behavior is by definition the same as the superclass's anyway, so it doesn't really matter which one is called (unless you're doing something dangerous like mutating the object from within the comparison method, in which case you should have been on your guard anyway).</p>
+</div>
+<span class="comment-copy">I don't have time to dig into this myself at the moment, but I believe <a href="http://hg.python.org/cpython/file/d08d1569aa04/Objects/object.c#l633" rel="nofollow noreferrer">this</a> is the relevant C-code (as of Python 3.5).</span>
+<span class="comment-copy">I agree that this looks like a bug - at the very least, a documentation bug.  You'd probably need a good use-case to convince the Python folks to change the behaviour rather than the docs, though.  In case you're interested, the logic is in <code>do_richcompare</code> in <code>Objects/object.c</code>.  <a href="https://github.com/python/cpython/blob/master/Objects/object.c#L635" rel="nofollow noreferrer">Here</a> is the current code.</span>
+<span class="comment-copy">Darn: dano beat me to it by a few seconds!  Anyway, the question is definitely not a duplicate of the one linked to.</span>
+<span class="comment-copy">@stochastic: do you want to open a bug report?</span>
+<span class="comment-copy">Opened <a href="http://bugs.python.org/issue22052" rel="nofollow noreferrer">bugs.python.org/issue22052</a>.  It's not 100% clear to me that this <i>is</i> a doc bug, since the portion of the docs you quote comes from the 'emulating numeric types' section, which doesn't cover the comparison operators.  Nevertheless, it wouldn't harm to make the docs clearer on this point.  Nice catch, by the way: after almost 20 years of using Python (and a few of those years helping develop it) I thought I knew the core language pretty well, but it seems it still has the power to surprise!</span>
+<span class="comment-copy">The behaviour is still different for comparison operators than for regular arithmetic operators, though: if <code>A</code> defines both <code>__add__</code> and <code>__radd__</code>, then <code>A() + B()</code> still calls <code>A</code>'s method first.  So your interpretation of <code>provides</code> (via inheritance) doesn't apply in that case.</span>
+<span class="comment-copy">@MarkDickinson: Good point, I added a note about that to my answer.</span>
+<span class="comment-copy">&gt; is not the inverse of &lt;</span>

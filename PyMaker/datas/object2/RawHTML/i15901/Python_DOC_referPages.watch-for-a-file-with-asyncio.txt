@@ -1,0 +1,177 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to identify a good way to watch for the appearance of a file using <a href="https://docs.python.org/3/library/asyncio.html">Python's asyncio library</a>. This is what I've come up with so far:</p>
+<pre><code>#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""Watches for the appearance of a file."""
+
+import argparse
+import asyncio
+import os.path
+
+
+@asyncio.coroutine
+def watch_for_file(file_path, interval=1):
+    while True:
+        if not os.path.exists(file_path):
+            print("{} not found yet.".format(file_path))
+            yield from asyncio.sleep(interval)
+        else:
+            print("{} found!".format(file_path))
+            break
+
+
+def make_cli_parser():
+    cli_parser = argparse.ArgumentParser(description=__doc__)
+    cli_parser.add_argument('file_path')
+    return cli_parser
+
+
+def main(argv=None):
+    cli_parser = make_cli_parser()
+    args = cli_parser.parse_args(argv)
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(watch_for_file(args.file_path))
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>I saved this as <code>watch_for_file.py</code>, and can run it with</p>
+<pre><code>python3 watch_for_file.py testfile
+</code></pre>
+<p>In another shell session, I issue</p>
+<pre><code>touch testfile
+</code></pre>
+<p>to end the loop.</p>
+<p>Is there a more elegant solution than using this infinite loop and <code>yield from asyncio.sleep()</code>?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Well, there are nicer, platform-specific ways of being notified when a file is created. Gerrat linked to one for Windows in his comment, and <a href="https://github.com/seb-m/pyinotify" rel="noreferrer"><code>pyinotify</code></a> can be used for Linux. Those platform-specific approaches can probably be plugged into <code>asyncio</code>, but you'd end up writing a whole bunch of code to make it work in a platform independent way, which probably isn't worth the effort to just check for the appearance of a single file. If you need more sophisticated filesystem watching in addition to this, it is might be worth pursuing, though. It looks like <code>pyinotify</code> can be tweaked to add a subclass of its <code>Notifier</code> class that plugins into the <code>asyncio</code> event loop (there are already classes for <code>tornado</code> and <code>asyncore</code>), for example.</p>
+<p>For your simple use-case, I think your infinite loop approach to polling is fine, but you could also just schedule callbacks with the event loop, if you wanted:</p>
+<pre><code>def watch_for_file(file_path, interval=1, loop=None):
+    if not loop: loop = asyncio.get_event_loop()
+    if not os.path.exists(file_path):
+        print("{} not found yet.".format(file_path))
+        loop.call_later(interval, watch_for_file, file_path, interval, loop)
+    else:
+        print("{} found!".format(file_path))
+        loop.stop()
+
+def main(argv=None):
+    cli_parser = make_cli_parser()
+    args = cli_parser.parse_args(argv)
+    loop = asyncio.get_event_loop()
+    loop.call_soon(watch_for_file, args.file_path)
+    loop.run_forever()
+</code></pre>
+<p>I'm not sure this is much more elegant than the infinite loop, though.</p>
+<p><strong>Edit:</strong></p>
+<p>Just for fun, I wrote a solution using <code>pyinotify</code>:</p>
+<pre><code>import pyinotify
+import asyncio
+import argparse
+import os.path
+
+
+class AsyncioNotifier(pyinotify.Notifier):
+    """
+
+    Notifier subclass that plugs into the asyncio event loop.
+
+    """
+    def __init__(self, watch_manager, loop, callback=None,
+                 default_proc_fun=None, read_freq=0, threshold=0, timeout=None):
+        self.loop = loop
+        self.handle_read_callback = callback
+        pyinotify.Notifier.__init__(self, watch_manager, default_proc_fun, read_freq,
+                                    threshold, timeout)
+        loop.add_reader(self._fd, self.handle_read)
+
+    def handle_read(self, *args, **kwargs):
+        self.read_events()
+        self.process_events()
+        if self.handle_read_callback is not None:
+            self.handle_read_callback(self)
+
+
+class EventHandler(pyinotify.ProcessEvent):
+    def my_init(self, file=None, loop=None):
+        if not file:
+            raise ValueError("file keyword argument must be provided")
+        self.loop = loop if loop else asyncio.get_event_loop()
+        self.filename = file
+
+    def process_IN_CREATE(self, event):
+        print("Creating:", event.pathname)
+        if os.path.basename(event.pathname) == self.filename:
+            print("Found it!")
+            self.loop.stop()
+
+
+def make_cli_parser():
+    cli_parser = argparse.ArgumentParser(description=__doc__)
+    cli_parser.add_argument('file_path')
+    return cli_parser
+
+
+def main(argv=None):
+    cli_parser = make_cli_parser()
+    args = cli_parser.parse_args(argv)
+    loop = asyncio.get_event_loop()
+
+    # set up pyinotify stuff
+    wm = pyinotify.WatchManager()
+    mask = pyinotify.IN_CREATE  # watched events
+    dir_, filename = os.path.split(args.file_path)
+    if not dir_:
+        dir_ = "."
+    wm.add_watch(dir_, mask)
+    handler = EventHandler(file=filename, loop=loop)
+    notifier = pyinotify.AsyncioNotifier(wm, loop, default_proc_fun=handler)
+
+    loop.run_forever()
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Butter <a href="https://pypi.python.org/pypi/butter" rel="nofollow">https://pypi.python.org/pypi/butter</a> has support for asyncio out of the box, BTW.</p>
+<pre><code>import asyncio
+from butter.inotify import IN_ALL_EVENTS
+from butter.asyncio.inotify import Inotify_async
+
+@asyncio.coroutine
+def watcher(loop):
+
+    inotify = Inotify_async(loop=loop)
+    print(inotify)
+    wd = inotify.watch('/tmp', IN_ALL_EVENTS)
+
+    for i in range(5):
+        event = yield from inotify.get_event()
+        print(event)
+
+    inotify.ignore(wd)
+    print('done')
+
+    event = yield from inotify.get_event()
+    print(event)
+
+    inotify.close()
+    print(inotify)
+
+loop = asyncio.get_event_loop()
+task = loop.create_task(watcher(loop))
+loop.run_until_complete(task)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>According to the <a href="https://docs.python.org/3.4/library/asyncio-eventloop.html#watch-file-descriptors" rel="nofollow">documentation</a>, you can now watch file descriptors. This should help you solve this with much less code.</p>
+</div>
+<span class="comment-copy">If you're not set on rolling-your-own with asyncio, you could look <a href="http://stackoverflow.com/questions/182197/how-do-i-watch-a-file-for-changes-using-python">at this related question</a> for other possible solutions.</span>
+<span class="comment-copy">As an update to this, I submitted a patch to add the <code>AsyncioNotifier</code> to <code>pyinotify</code>, and it was accepted. So future versions should have this support built in.</span>
+<span class="comment-copy"><code>asyncio.coroutine</code> is misspelled. Also, according to the <a href="https://docs.python.org/3/library/asyncio-task.html#task" rel="nofollow noreferrer">asyncio docs</a>, one shouldn't instantiate <code>Task</code>, but use <code>async()</code> or <code>BaseEventLoop.create_task()</code> instead.</span>
+<span class="comment-copy">Spelling fixed, thanks. Well, the preferable way to use <code>loop.create_task(coro)</code> but just <code>Task(coro, loop=loop)</code> also works. Fixed, anyway.</span>
+<span class="comment-copy">This one is not compatible with Python 3.7 at the moment</span>
+<span class="comment-copy">Sorry, what is not compatible?</span>

@@ -1,0 +1,119 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to  close the transport right after sending the UDP packet and I'm getting an <code>Exception in callback _SelectorDatagramTransport._read_ready()</code></p>
+<pre><code>import asyncio
+
+
+class MyProtocol:
+    def __init__(self, message, loop):
+        self.message = message
+        self.loop = loop
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+        print("Send:", self.message)
+        self.transport.sendto(self.message.encode())
+        self.transport.close()  # &lt;----------
+
+    def error_received(self, exc):
+        print('Error received', exc)
+
+    def connection_lost(self, exc):
+        print("Socket closed, stop the event loop")
+        self.loop.stop()
+
+loop = asyncio.get_event_loop()
+message = "hello"
+connect = loop.create_datagram_endpoint(lambda: MyProtocol(message, loop), remote_addr=('127.0.0.1', 2222))
+transport, protocol = loop.run_until_complete(connect)
+
+loop.run_forever()
+</code></pre>
+<p>The full stack trace that I get is while running the snippet above in CPython 3.5.1 is:</p>
+<pre><code>Socket closed, stop the event loop
+Exception in callback _SelectorDatagramTransport._read_ready()
+handle: &lt;Handle _SelectorDatagramTransport._read_ready()&gt;
+Traceback (most recent call last):
+  File "/home/ecerulm/.pyenv/versions/3.5.1/lib/python3.5/asyncio/selector_events.py", line 1002, in _read_ready
+    data, addr = self._sock.recvfrom(self.max_size)
+AttributeError: 'NoneType' object has no attribute 'recvfrom'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/ecerulm/.pyenv/versions/3.5.1/lib/python3.5/asyncio/events.py", line 125, in _run
+    self._callback(*self._args)
+  File "/home/ecerulm/.pyenv/versions/3.5.1/lib/python3.5/asyncio/selector_events.py", line 1008, in _read_ready
+    self._fatal_error(exc, 'Fatal read error on datagram transport')
+  File "/home/ecerulm/.pyenv/versions/3.5.1/lib/python3.5/asyncio/selector_events.py", line 587, in _fatal_error
+    self._loop.call_exception_handler({
+AttributeError: 'NoneType' object has no attribute 'call_exception_handler'
+</code></pre>
+<p>I believe the exception is only generated if the UDP packet is actively refused, with an ICMP Destination Unreachable (which I'm not interested in).</p>
+<p>So the question is what is the right way of doing this. I'm not interested in this connection anymore after sending so I want to get rid of the transport as soon as possible. The documentation for <a href="https://docs.python.org/3/library/asyncio-protocol.html#asyncio.DatagramTransport.sendto" rel="nofollow"><code>DatagramTransport.sendto()</code></a> just says that the methods doesn't block. But how do I know when the sending is completed? (<strong>And by complete I mean when is handed over to the OS, not delivered to the remote</strong>). </p>
+<p>Is there any other <code>asyncio</code> coroutine to send an UDP packet asynchronously and simple <code>await</code> (maybe even skipping the whole <code>create_datagram_endpoint</code>) ? </p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>Is there any other asyncio coroutine to send an UDP packet asynchronously and simple <code>await</code>?</p>
+</blockquote>
+<p>I would, base on <code>DatagramTransport</code> source, wrap it in <code>Future</code> to be yieldable/awaitable. It will raise exception on error and return <code>True</code> on success. The <a href="https://gist.github.com/kwarunek/42a7e4655b2d7009e5f4" rel="nofollow">example PoC code</a>:</p>
+<pre><code>import asyncio
+import socket
+
+class UDPClient():
+
+    def __init__(self, host, port, loop=None):
+        self._loop = asyncio.get_event_loop() if loop is None else loop
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setblocking(False)
+        self._addr = (host, port)
+        self._future = None
+        self._data = None
+
+    def sendto(self, data):
+        self._future = asyncio.Future(loop=self._loop)
+        self.data = data if isinstance(data, bytes) else str(data).encode('utf-8')
+        loop.add_writer(self._sock.fileno(), self._sendto)
+        return self._future
+
+    def _sendto(self):
+        try:
+            self._sock.sendto(self.data, self._addr)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError as exc:
+            self.abort(exc)
+        except Exception as exc:
+            self.abort(exc)
+        else:
+            self.close()
+            self._future.set_result(True)
+
+    def abort(self, exc):
+        self.close()
+        self._future.set_exception(exc)
+
+    def close(self):
+        self._loop.remove_writer(self._sock.fileno())
+        self._sock.close()
+</code></pre>
+<p>Than simple example would look like:</p>
+<pre><code>@asyncio.coroutine
+def test():
+    yield from UDPClient('127.0.0.1', 1234).sendto('ok')
+
+# or 3.5+ syntax
+# async def test():
+#     await UDPClient('127.0.0.1', 1234).sendto('ok')
+
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(test())
+</code></pre>
+</div>
+<span class="comment-copy">you cant know sending is complete in udp, but if you need, the receiver is responsible to send success packet to sender, which can still be lost, but for that case sender have to send again.</span>
+<span class="comment-copy">You can know when you have hand it over to the OS, which is what I'm asking. I don't need confirmation from the receiver. I just want to be able to close the socket after send which I can do which the <code>socket</code> module. Here I want to do the same thing send/close without getting an exception.</span>
+<span class="comment-copy">I just ocurred to me that there is no reason why I couldn't just use the regular <code>socket</code> api to create a nonblocking socket and use that to send UDP packets inside the event loop.</span>
+<span class="comment-copy">not sure about python, but in C, sending packets with UDP using <code>sendto</code> function, return &lt; 0 if sending is failed, if you just want to know "when is handed over to the OS". you can close the server socket, but not connection, because UDP is connectionless protocol.</span>
+<span class="comment-copy">can you provide full stacktrace? which python? As I tested your code with 3.5.0 and 3.4.3 (Ubunt812.04 kernel:3.11.0-26, Fedora23 kernel:4.2.0), I cannot reproduce the problem. Maybe some kind of race, because close only sets _closing flag and remove reader's fd then let the buffer to be proceeded if not empty</span>

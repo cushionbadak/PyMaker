@@ -1,0 +1,105 @@
+<div class="post-text" itemprop="text">
+<p>Since C++11, static variable initialization is guaranteed to be thread safe. But how about modifying a static variable in multiple threads? like below</p>
+<pre><code>static int initialized = 0;
+Initialize()
+{
+ if (initialized)
+    return;
+ initialized = 1; // Is this thread safe? 
+}
+</code></pre>
+<p>The reason I ask this question is that I am reading the source code for 
+<code>Py_Initialize()</code>, I am trying to embed Python in a multithreaded C++ application, I am wondering if it is safe to call <code>Py_Initialize()</code> multiple times in several threads? The implementation of <code>Py_Initialize()</code> boils down to 
+function <code>_Py_InitializeEx_Private</code>, which is like below</p>
+<pre><code>// pylifecycle.c
+static int initialized = 0;
+
+_Py_InitializeEx_Private(int install_sigs, int install_importlib)
+{
+    if (initialized)
+        return;
+    initialized = 1;
+ // a bunch of other stuff
+ }
+</code></pre>
+<p>And is the conclusion for C the same as C++?</p>
+<p><strong>EDIT</strong>
+So all the answers are good, I chose the one which clears my head most.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>Py_Initialize</code> is not thread-safe. You can call it from multiple threads only if you know that the Python interpreter has already been initialized, but if you can prove that it would be silly to call the function.</p>
+<p>Indeed, most Python C-API calls are not thread-safe; you need to acquire the Global Interpreter Lock (GIL) in order to interact with the Python interpreter. (See the <a href="https://docs.python.org/3/c-api/init.html#thread-state-and-the-global-interpreter-lock" rel="nofollow noreferrer">Python C-API docs</a> for more details. Read it carefully.)</p>
+<p>However, as far as I know you cannot use the standard API to acquire the GIL until the interpreter has been initialized. So if you have multiple threads, any of which might initialize the same Python interpreter, you would need to protect the calls to <code>Py_Initialize</code> with your own mutex. You might well be better off doing the initialization once before you start up any threads, if that is possible with your program logic.</p>
+<hr/>
+<p>The code you cite:</p>
+<pre><code>static int initialized = 0;
+
+void Initialize_If_Necessary() 
+{
+    if (initialized)
+        return;
+    initialized = 1;
+    // Do the initialization only once
+}
+</code></pre>
+<p>is clearly not threadsafe in any language, even if <code>initialized</code> is an atomic type. Suppose two threads were simultaneously executing this code before any initialization happened: both of them see <code>initialized</code> as false, so both of them proceed with the initialization. (If you don't have two cores, you could imagine that the first process is task switched between the test of <code>initialized</code> and the assignment.)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, static in this context is only about the storage duration (see <a href="http://en.cppreference.com/w/c/language/static_storage_duration" rel="noreferrer">http://en.cppreference.com/w/c/language/static_storage_duration</a>). 
+The variable has no extra thread safety at all over some other variable.</p>
+<p>Try using std::call_once for this, see <a href="http://en.cppreference.com/w/cpp/thread/call_once" rel="noreferrer">http://en.cppreference.com/w/cpp/thread/call_once</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It's not thread safe to modify a static variable, but initializing a static variable is thread safe. So you can do:</p>
+<pre><code>void my_py_init() {
+    static bool x = (Py_Initialize(), true);
+}
+</code></pre>
+<p>That's it. You can now call <code>my_py_init</code> from as many threads as you want and <code>Py_Initialize</code> will only ever get called once.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Modifying a static variable across multiple threads is not safe, since if the variable is put into a register, then other cores' information in the same registers will be different (modifying the variable in another thread would be the same as attempting to access that core's version of the register, which contains completely different data).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The first code sample is the typical starting point for what is referred to as 'lazy-initialisation'. It's useful for guaranteeing once-only initialisation of "expensive objects"; but doing so only if needed just before any use of the object.</p>
+<p>That specific example doesn't have any serious problems, but it's an oversimplification. And when you look more holistically at lazy-initialisation, you'll see that multi-threaded lazy-initialisation is not a good idea.</p>
+<hr/>
+<p>The concept of "<em>Thread Safety</em>" goes way beyond just a single variable (static or otherwise). You need to step back and consider <em>things happening to the same<sup>1</sup> resources (memory, objects, files, ...) at the same time</em>.</p>
+<p><sup>1: Different instances of the same class are not the same thing; but their static members are.</sup></p>
+<p>Consider the following extract from your second example.</p>
+<pre><code>if (initialized)
+    return;
+initialized = 1;
+// a bunch of other stuff
+</code></pre>
+<p>In the first 3 lines, there's no serious harm if multiple threads execute that code approximately concurrently. Some threads might return early; others might be a little "too quick" and all perform the task of setting <code>initialized = 1;</code>. However, that wouldn't be a concern, since no matter how many threads set the shared variable, the net effect is always the same.</p>
+<p>The problem comes in with the fourth line. The one almost nonchalantly brushed aside as "<em>a bunch of other stuff</em>". That "<strong>other stuff</strong>" is the really critical code, because if it's possible for <code>initialized = 1;</code> to be called multiple times, you need to consider the impact of calling "other stuff" multiple times <em>and concurrently</em>.</p>
+<hr/>
+<p>Now, in the unlikely event you satisfy yourself that "other stuff" can be called multiple times, <em>there's another concern</em>...</p>
+<p>Consider the client code that might be using Python.</p>
+<pre><code>Py_Initialize();
+//use Python
+</code></pre>
+<p>If 2 threads call the above simultaneously; with 1 'returning early' and the other actually performing the initialisation. Then the 'early-returning thread' would <em>start (or try to start) using Python <strong>before</strong> it's fully initialised</em>!</p>
+<p>As a bit of a hack, you might try blocking at the <code>if (initialized)</code> line for the duration of the initialisation process. But this is undesirable for 2 reasons:</p>
+<ul>
+<li>Multiple threads are likely to be stuck waiting in the early stages of their processing.</li>
+<li>Even after initialisation is complete you'd have a small (but totally wasteful) overhead of checking the lock each time you 'lazy-initialise' the Python framework.</li>
+</ul>
+<hr/>
+<h1>Conclusion</h1>
+<p>Lazy-initialisation has its uses. But you're much better off not trying to perform the lazy initialisation from multiple threads. Rather have a "safe thread" (main thread is usually good enough) that can perform the lazy-initialisation before even creating any threads that would try to use whatever has been initialised. <em>Then you won't have to worry about the thread-safety at all.</em></p>
+</div>
+<span class="comment-copy">Two threads are not allowed to modify the same memory location without synchronization.</span>
+<span class="comment-copy">Well, err.. they are allowed!   You do have to be aware of the possible outcomes and how that might affect the functionality of your app.</span>
+<span class="comment-copy">@ThingyWotsit, can you be a bit clear on what are allowed?</span>
+<span class="comment-copy">@Allanqunzi What he's saying is that unsynchronized reads and writes are permitted, but you must be prepared to deal with the effects that could have on program state. For example, writing a 64-bit integer to memory is usually not an atomic operation on 32-bit architectures, which means that if you might get the upper half of one value and the lower half of another if you don't take measures to synchronize reads and writes.</span>
+<span class="comment-copy">@Allanqunzi And if you are accessing the same static variable multiple times in succession, the compiler is permitted to optimize those accesses into a single operation, under the assumption that the value is <i>not</i> going to be modified concurrently by another thread. This is where things like <code>std::atomic</code> and <code>volatile</code> (with a proper understanding of what the latter does) can be useful.</span>
+<span class="comment-copy">That makes sense, I think the python doc is a little bit vague resulting in misleading people. I think the solution by @NirFriedman below will be what I am gonna do.</span>
+<span class="comment-copy">Then why the initialization is thread safe if it is only about storage duration?</span>
+<span class="comment-copy">In this case you are correct but do note that in C++11 and above initialization of local static variables is thread safe.</span>
+<span class="comment-copy">@Allanqunzi: because <i>initialization</i> is unique. It happens only once, and you can't put a mutex around that single initialization. Further use is normal and can be protected by a mutex, as desired/needed. But you might also use an atomic variable instead of a mutex, and there too you'd need the special handling for running the initializer once. The atomic doesn't even exist while the initializer is ruuning!</span>
+<span class="comment-copy">And also because static initialization conceptually happens before any other code is executed. Emphasis on conceptually</span>
+<span class="comment-copy">Modifying a static variable across multiple threads is not safe, <i>because the Standard says so</i>. And because the Standard says it's unsafe, compilers can put them in registers. Your description has cause and effect reversed.</span>
+<span class="comment-copy">The standard says that modifying threads across multiple threads is not safe for a reason. Above is most likely the reason why.</span>
+<span class="comment-copy">I'd like to add that <code>call_once</code> from in <a href="http://stackoverflow.com/a/43837757/224704">Andrew's answer</a> is specified so that it would provide suitable protection for multi-threaded lazy-initialisation. … It blocks each thread calling the method until initialisation completes successfully; at which point all callers (current and future) simply return without further processing. It also allows only one thread at a time to actually attempt initialisation; and even has built-in protection against exceptions. Feel free to use <code>call_once</code>; it handles the "bit of a hack" cleanly.</span>

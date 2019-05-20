@@ -1,0 +1,163 @@
+<div class="post-text" itemprop="text">
+<p>I'm testing with the asyncio module, however I need a hint / suggesstion how to fetch large emails in an async way. </p>
+<p>I have a list with usernames and passwords for the mail accounts.</p>
+<pre><code>data = [
+    {'usern': 'foo@bar.de', 'passw': 'x'},
+    {'usern': 'foo2@bar.de', 'passw': 'y'},
+    {'usern': 'foo3@bar.de', 'passw': 'z'} (...)
+]
+</code></pre>
+<p>I thought about:</p>
+<pre><code>loop = asyncio.get_event_loop()
+loop.run_until_complete(asyncio.wait([get_attachment(d) for d in data]))
+loop.close()
+</code></pre>
+<p>However, the long part is to download the email attachments. </p>
+<p>Email: </p>
+<pre><code>@asyncio.coroutine
+def get_attachment(d):
+    username = d['usern']
+    password = d['passw']
+
+    connection = imaplib.IMAP4_SSL('imap.bar.de')
+    connection.login(username, password)
+    connection.select()
+
+    # list all available mails
+    typ, data = connection.search(None, 'ALL')
+
+    for num in data[0].split():
+        # fetching each mail
+        typ, data = connection.fetch(num, '(RFC822)')
+        raw_string = data[0][1].decode('utf-8')
+        msg = email.message_from_string(raw_string)
+        for part in msg.walk():
+            if part.get_content_maintype() == 'multipart':
+                continue
+
+            if part.get('Content-Disposition') is None:
+                continue
+
+            if part.get_filename():
+                body = part.get_payload(decode=True)
+                # do something with the body, async?
+
+    connection.close()
+    connection.logout()
+</code></pre>
+<p>How could I process all (downloading attachments) mails in an async way?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you don't have an asynchronous I/O-based imap library, you can just use a <code>concurrent.futures.ThreadPoolExecutor</code> to do the I/O in threads. Python will release the GIL during the I/O, so you'll get true concurrency:</p>
+<pre><code>def init_connection(d):    
+    username = d['usern']
+    password = d['passw']
+
+    connection = imaplib.IMAP4_SSL('imap.bar.de')
+    connection.login(username, password)
+    connection.select()
+    return connection
+
+local = threading.local() # We use this to get a different connection per thread
+def do_fetch(num, d, rfc):
+    try:
+        connection = local.connection
+    except AttributeError:
+        connnection = local.connection = init_connection(d)
+    return connnection.fetch(num, rfc)
+
+@asyncio.coroutine
+def get_attachment(d, pool):
+    connection = init_connection(d)    
+    # list all available mails
+    typ, data = connection.search(None, 'ALL')
+
+    # Kick off asynchronous tasks for all the fetches
+    loop = asyncio.get_event_loop()
+    futs = [asyncio.async(loop.run_in_executor(pool, do_fetch, num, d, '(RFC822)'))
+                for num in data[0].split()]
+
+    # Process each fetch as it completes
+    for fut in asyncio.as_completed(futs):
+        typ, data = yield from fut
+        raw_string = data[0][1].decode('utf-8')
+        msg = email.message_from_string(raw_string)
+        for part in msg.walk():
+            if part.get_content_maintype() == 'multipart':
+                continue
+
+            if part.get('Content-Disposition') is None:
+                continue
+
+            if part.get_filename():
+                body = part.get_payload(decode=True)
+                # do something with the body, async?
+
+    connection.close()
+    connection.logout()    
+
+
+loop = asyncio.get_event_loop()
+pool = ThreadPoolExecutor(max_workers=5)  # You can probably increase max_workers, because the threads are almost exclusively doing I/O.
+loop.run_until_complete(asyncio.wait([get_attachment(d, pool) for d in data]))
+loop.close()
+</code></pre>
+<p>This isn't quite as nice as a truly asynchronous I/O-based solution, because you've still got the overhead of creating the threads, which limits scalability and adds extra memory overhead. You also do get <em>some</em> GIL slowdown because of all the code wrapping the actual I/O calls. Still, if you're dealing with less than thousands of mails, it should still perform ok.</p>
+<p>We use <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.BaseEventLoop.run_in_executor" rel="nofollow"><code>run_in_executor</code></a> to use the <code>ThreadPoolExecutor</code> as part of the asyncio event loop, <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.async" rel="nofollow"><code>asyncio.async</code></a> to wrap the coroutine object returned in a <code>asyncio.Future</code>, and <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.as_completed" rel="nofollow"><code>as_completed</code></a> to iterate through the futures in the order they complete.</p>
+<p><strong>Edit</strong>:</p>
+<p>It seems <code>imaplib</code> is not thread-safe. I've edited my answer to use thread-local storage via <a href="https://docs.python.org/3.5/library/threading.html#thread-local-data" rel="nofollow"><code>threading.local</code></a>, which allows us to create one connection object per-thread, which can be re-used for the entire life of the thread (meaning you create <code>num_workers</code> connection objects only, rather than a new connection for every <code>fetch</code>).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I had the same needs : fetching emails with python 3 fully async. If others here are interested I pushed an asyncio IMAP lib here : <a href="https://github.com/bamthomas/aioimaplib" rel="nofollow">https://github.com/bamthomas/aioimaplib</a></p>
+<p>You can use it like this :</p>
+<pre><code>import asyncio
+from aioimaplib import aioimaplib
+
+@asyncio.coroutine
+def wait_for_new_message(host, user, password):
+    imap_client = aioimaplib.IMAP4(host=host)
+    yield from imap_client.wait_hello_from_server()
+
+    yield from imap_client.login(user, password)
+    yield from imap_client.select()
+
+    asyncio.async(imap_client.idle())
+    id = 0
+    while True:
+        msg = yield from imap_client.wait_server_push()
+        print('--&gt; received from server: %s' % msg)
+        if 'EXISTS' in msg:
+            id = msg.split()[0]
+            imap_client.idle_done()
+            break
+
+    result, data = yield from imap_client.fetch(id, '(RFC822)')
+    email_message = email.message_from_bytes(data[0])
+
+    attachments = []
+    body = ''
+    for part in email_message.walk():
+        if part.get_content_maintype() == 'multipart':
+            continue
+        if part.get_content_maintype() == 'text' and 'attachment' not in part.get('Content-Disposition', ''):
+            body = part.get_payload(decode=True).decode(part.get_param('charset', 'ascii')).strip()
+        else:
+            attachments.append(
+                {'type': part.get_content_type(), 'filename': part.get_filename(), 'size': len(part.as_bytes())})
+
+    print('attachments : %s' % attachments)
+    print('body : %s' % body)
+    yield from imap_client.logout()
+
+
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(wait_for_new_message('my.imap.server', 'user', 'pass'))
+</code></pre>
+<p>Large emails with attachments are also downloaded with asyncio.</p>
+</div>
+<span class="comment-copy">Imaplib is a synchronous library, you can fake it with threads and the like, but it will never be truly asynchronous.</span>
+<span class="comment-copy">Thanks, this approach is what I was looking for. However receive some errors while running workers &gt; 1. See here: <a href="https://gist.github.com/wiesson/5d611016ec223993e25d" rel="nofollow noreferrer">gist.github.com/wiesson/5d611016ec223993e25d</a>  Why you are calling the asyncio.get_event_loop in the get_attachment loop?</span>
+<span class="comment-copy">@wiesson There's actually no need to call get_event_loop, since you can use the global one. Re: the errors you're seeing, my guess is that <code>imaplib</code> isn't thread safe, and would therefore require a connection object per-thread. You can use <code>threading.local()</code> to help with that. I'll edit my answer.</span>
+<span class="comment-copy">As a warning: there exist servers that will send <code>* n EXISTS</code> (n unchanged) as a keepalive during IDLE.  On these servers you will fetch the same message repeatedly here.</span>

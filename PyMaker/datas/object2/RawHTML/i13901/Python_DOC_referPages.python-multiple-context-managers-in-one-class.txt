@@ -1,0 +1,209 @@
+<div class="post-text" itemprop="text">
+<p>I would like to be able to write code like this:</p>
+<pre><code>with obj.in_batch_mode:
+    obj.some_attr = "some_value"
+    obj.some_int = 142
+    ...
+</code></pre>
+<p>when I want <code>obj</code> to wait with sending updates about itself until multiple jobs are completed. I have hooks on <code>__setattr__</code> that take some time to run, and the changes can be sent together.</p>
+<p>I do not want to use code like this, since it increases the risk of forgetting to leave batch_mode (which is what the <code>with</code> keyword is good for):</p>
+<pre><code>obj.enter_batch_mode()
+obj.some_attr = "some_value"
+obj.some_int = 142
+...
+obj.exit_batch_mode()
+</code></pre>
+<p>I have not been able to figure out how to implement this. Just typing <code>with obj:</code> (and simply implementing <code>with</code> on <code>obj</code>) does not read anywhere near as descriptive.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Generally, a very simple way to implement context managers is to use the <a href="https://docs.python.org/3/library/contextlib.html" rel="nofollow"><code>contextlib</code></a> module. Writing a context manager becomes as simple as writing a single yield generator. Before the yield replaces the <code>__enter__</code> method, the object yielded is the return value of <code>__enter__</code>, and the section after the yield is the <code>__exit__</code> method. Any function on your class can be a context manager, it just needs the be decorated as such. For instance, take this simple <code>ConsoleWriter</code> class:</p>
+<pre><code>from contextlib import contextmanager
+
+from sys import stdout
+from io import StringIO
+from functools import partial
+
+class ConsoleWriter:
+
+    def __init__(self, out=stdout, fmt=None):
+        self._out = out
+        self._fmt = fmt
+
+    @property
+    @contextmanager
+    def batch(self):
+        original_out = self._out
+        self._out = StringIO()
+        try:
+            yield self
+        except Exception as e:
+            # There was a problem. Ignore batch commands.
+            # (do not swallow the exception though)
+            raise
+        else:
+            # no problem
+            original_out.write(self._out.getvalue())
+        finally:
+            self._out = original_out
+
+    @contextmanager
+    def verbose(self, fmt="VERBOSE: {!r}"):
+        original_fmt = self._fmt
+        self._fmt = fmt
+        try:
+            yield self
+        finally:
+            # don't care about errors, just restore end
+            self._fmt = original_fmt
+
+    def __getattr__(self, attr):
+        """creates function that writes capitalised attribute three times"""
+        return partial(self.write, attr.upper()*3)
+
+
+    def write(self, arg):
+        if self._fmt:
+            arg = self._fmt.format(arg)
+        print(arg, file=self._out)
+</code></pre>
+<p>Example usage:</p>
+<pre><code>writer = ConsoleWriter()
+with writer.batch:
+    print("begin batch")
+    writer.a()
+    writer.b()
+    with writer.verbose():
+        writer.c()
+    print("before reentrant block")
+    with writer.batch:
+        writer.d()
+    print("after reentrant block")
+    print("end batch -- all data is now flushed")
+</code></pre>
+<p>Outputing:</p>
+<pre><code>begin batch
+before reentrant block
+after reentrant block
+end batch -- all data is now flushed
+AAA
+BBB
+VERBOSE: 'CCC'
+DDD
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you are after a simple solution and do not need any nested mode-change (e.g. from STD to BATCH to VERBOSE back to BATCH back to STD)</p>
+<pre><code>class A(object):
+    STD_MODE = 'std' 
+    BATCH_MODE = 'batch'
+    VERBOSE_MODE = 'verb'
+
+    def __init__(self):
+        self.mode = self.STD_MODE
+
+    def in_mode(self, mode):
+        self.mode = mode
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, tb):
+        self.mode = self.STD_MODE
+
+obj = A()
+print obj.mode
+with obj.in_mode(obj.BATCH_MODE) as x:
+    print x.mode
+print obj.mode
+</code></pre>
+<p>outputs</p>
+<pre><code>std
+batch
+std
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Maybe something like this:</p>
+<p>Implement helper class</p>
+<pre><code>class WithHelperObj(object):
+    def __init__(self,obj):
+        self.obj = obj
+
+    def __enter__(self):
+        self.obj.impl_enter_batch()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.obj.impl_exit_batch()
+
+    class MyObject(object):
+        def in_batch_mode(self):
+            return WithHelperObj(self)
+</code></pre>
+<p>In the class itself, implement method instead of field, to use with the with statement</p>
+<pre><code>    def impl_enter_batch(self):
+        print 'In impl_enter_batch'
+
+    def impl_exit_batch(self):
+        print 'In impl_exit_batch'
+
+    def doing(self):
+        print 'doing'
+</code></pre>
+<p>Then use it:  </p>
+<pre><code>o = MyObject()
+with o.in_batch_mode():
+    o.doing()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This builds on Pynchia's answer, but adds support for multiple modes and allows nesting of <code>with</code> statements, even with the same mode multiple times. It scales <code>O(#nested_modes)</code> which is basically <code>O(1)</code>. </p>
+<p>Just remember to use stacks for data storage related to the modes.</p>
+<pre><code>class A():
+    _batch_mode = "batch_mode"
+    _mode_stack = []
+
+    @property
+    def in_batch_mode(self):
+        self._mode_stack.append(self._batch_mode)
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, tb):
+        self._mode_stack.pop()
+        if self._batch_mode not in self._mode_stack:
+            self.apply_edits()
+</code></pre>
+<p>and then I have these checks wherever I need them:</p>
+<pre><code>if self._batch_mode not in self._mode_stack:
+    self.apply_edits()
+</code></pre>
+<hr/>
+<p>It is also possible to use methods for modes:</p>
+<pre><code>with x.in_some_mode(my_arg):
+</code></pre>
+<p>just remember to save <code>my_arg</code> in a stack within <code>x</code>, and to clear it from the stack when that mode is popped from the mode stack.</p>
+<hr/>
+<p>The code using this object can now be</p>
+<pre><code>with obj.in_batch_mode:
+    obj.some_property = "some_value"
+</code></pre>
+<p>and there are no problems with nesting, so we can add another <code>with obj.in_some_mode:</code> wherever without any hard-to-debug errors or having to check every function called to make sure the object's <code>with</code>-statements are never nested:</p>
+<pre><code>def b(obj):
+    with obj.in_batch_mode:
+        obj.some_property = "some_value"
+
+x = A()
+with x.in_batch_mode:
+    x.my_property = "my_value"
+    b(x)
+</code></pre>
+</div>
+<span class="comment-copy">You need to implement the <b>enter</b> and <b>exit</b> functions in order to use the built in with statement</span>
+<span class="comment-copy">Please read the whole question :)</span>
+<span class="comment-copy">what do you mean by "multiple context managers"?</span>
+<span class="comment-copy">I want to implement multiple context managers on different properties so i can write <code>with obj.in_batch_mode</code> and <code>with obj.in_verbose_mode</code> etc. instead of the <code>with obj</code> example above, which does not read well</span>
+<span class="comment-copy">Could you have some mode state in the object that affects the way the object behaves in the <code>__enter__</code> and <code>__exit__</code> methods? It wouldn't be quite as explicit as it sounds like you want since the mode would not necessarily be included in your <code>with obj:</code> call...</span>
+<span class="comment-copy">this could easily be modified to allowing multiple modes by using a list of modes or a bitmap</span>

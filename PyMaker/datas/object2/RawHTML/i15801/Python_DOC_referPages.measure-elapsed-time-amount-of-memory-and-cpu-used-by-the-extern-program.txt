@@ -1,0 +1,69 @@
+<div class="post-text" itemprop="text">
+<p>I'm executing an external program through Python. I want to know what is the best choice for calling the outside program, with <code>subprocess.Popen()</code> or with <code>subprocess.call()</code>. Also, I need to measure elapsed time, the amount of memory and CPU used by the external program. I've heard of <code>psutil</code>, but I don't really know which to choose.</p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>also I need to measure elapsed time, amount of memory and cpu used by the extern program</p>
+</blockquote>
+<p>(I'm going to assume you only need the information available in your platform's <a href="http://linux.die.net/man/2/getrusage" rel="nofollow"><code>rusage</code></a>. And, since Windows has no such thing at all, I'm also going to assume you don't care about Windows. If you need additional information that's only available in some platform-specific way (reading out of Linux's <code>proc</code> filesystem, or calling AIX's monitor APIs, or whatever), you pretty much can't do this with the stdlib, and the <code>psutil</code> answer is the only one.)</p>
+<p>The <code>subprocess</code> library wraps up calling <a href="https://docs.python.org/3/library/os.html#os.fork" rel="nofollow"><code>fork</code></a>, then an <a href="https://docs.python.org/3/library/os.html#os.execv" rel="nofollow"><code>execv</code></a>-family function in the child and a <a href="https://docs.python.org/3/library/os.html#os.waitpid" rel="nofollow"><code>waitpid</code></a>-family function in the parent. (You can see this by starting with the source to <a href="https://hg.python.org/cpython/file/3/Lib/subprocess.py#l529" rel="nofollow"><code>call</code></a> and tracing down into the other calls from there.)</p>
+<p>Unfortunately, the easy way to get resource usage from a child is to call <code>wait3</code> or <a href="https://docs.python.org/3/library/os.html#os.wait4" rel="nofollow"><code>wait4</code></a>, not <code>wait</code> or <code>waitpid</code>. So <code>subprocess</code> gets you maddeningly close to what you want, but not quite there.</p>
+<p>But you've got a few options:</p>
+<ul>
+<li>If you only have one child process, <a href="https://docs.python.org/3/library/resource.html#resource.getrusage" rel="nofollow"><code>getrusage(RUSAGE_CHILDREN)</code></a> is all you need.</li>
+<li>You can launch the process, then use <code>psutil</code> (or platform-specific code) to get resource information from <code>proc.pid</code> before reaping the child.</li>
+<li>You can use <code>psutil</code> to do everything, leaving <code>subprocess</code> behind.</li>
+<li>You can subclass <code>subprocess.Popen</code> to override its <code>wait</code> method.</li>
+</ul>
+<p>The last one is a lot simpler than it sounds. If you look at the source, there are only 3 places where <code>os.waitpid</code> is actually called, and only one of them will be the one that affects your code; I think it's the one in <a href="https://hg.python.org/cpython/file/default/Lib/subprocess.py#l1510" rel="nofollow"><code>_try_wait</code></a>. So (untested):</p>
+<pre><code>class ResourcePopen(subprocess.Popen):
+    def _try_wait(self, wait_flags):
+        """All callers to this function MUST hold self._waitpid_lock."""
+        try:
+            (pid, sts, res) = _eintr_retry_call(os.wait4, self.pid, wait_flags)
+        except OSError as e:
+            if e.errno != errno.ECHILD:
+                raise
+            # This happens if SIGCLD is set to be ignored or waiting
+            # for child processes has otherwise been disabled for our
+            # process.  This child is dead, we can't get the status.
+            pid = self.pid
+            sts = 0
+        else:
+            self.rusage = res
+        return (pid, sts)
+
+def resource_call(*popenargs, timeout=None, **kwargs):
+    """Run command with arguments.  Wait for command to complete or
+    timeout, then return the returncode attribute and resource usage.
+
+    The arguments are the same as for the Popen constructor.  Example:
+
+    retcode, rusage = call(["ls", "-l"])
+    """
+    with ResourcePopen(*popenargs, **kwargs) as p:
+        try:
+            retcode = p.wait(timeout=timeout)
+            return retcode, p.rusage
+        except:
+            p.kill()
+            p.wait()
+            raise
+</code></pre>
+<p>And now:</p>
+<pre><code>retcode, rusage = resource_call(['spam', 'eggs'])
+print('spam used {}s of system time'.format(rusage.ru_stime))
+</code></pre>
+<p>Compare that to using a hybrid with <code>psutil</code> (which won't even work when used this way on many platforms…):</p>
+<pre><code>p = subprocess.Popen(['spam', 'eggs'])
+ps = psutil.Process(p.pid)
+p.wait()
+print('spam used {}s of system time'.format(ps.cpu_times().system))
+</code></pre>
+<p>Of course the latter isn't more complex for not good reason, it's more complex because it's a whole lot more powerful and flexible; you can also get all kinds of data that <code>rusage</code> doesn't include, and you can get information every second while the process is running instead of waiting until it's done, and you can use it on Windows, and so on…</p>
+</div>
+<span class="comment-copy"><a href="https://hg.python.org/cpython/file/4ea3cc4d1d9d/Lib/subprocess.py#l533" rel="nofollow noreferrer"><code>subprocess.call</code></a> is a thin wrapper around <code>subprocess.Popen</code>.  Having a look at the source should help you understand the differences.</span>
+<span class="comment-copy">Thanks for the well elaborated answer! I'm going with the psutil approach, but as I tried to run my file.py, traceback resulted in: psutil.NoSuchProcess: process no longer exists. That's coming from the last print. What can I do?</span>
+<span class="comment-copy">@C.Porto: OK, some of the <code>psutil</code> functions can't be used after you reap the process, some can, and the list depends on the platform. This is exactly why the hybrid solution (use <code>subprocess</code> to run things, use <code>psutil</code> to measure them) is the worst of the options… If you don't need to work with psutil 1.x, and <a href="http://pythonhosted.org//psutil/#popen-class" rel="nofollow noreferrer"><code>psutil.Popen</code></a> has enough functionality, try that. I believe that it gives you a <code>psutil.Process</code> subclass, and that you're guaranteed to be able to access its stuff between the <code>communicate</code> and <code>wait</code> calls, but I may be wrong.</span>
+<span class="comment-copy">Apparently after the process gets reaped I'm really not allowed see the process information (I'm on Mac OS X), even with psutil.Popen, do you know if there is other way to measure memory and cpu (e.g. right before the process gets reaped)?</span>
+<span class="comment-copy">@C.Porto: What you need to do is block until it's finished, but not actually call <code>wait</code>. As I explained in my previous comment, I think the <code>psutil.Process</code> class (in 2.0+) lets you call <code>communicate</code> and then <code>wait</code>, but the <code>subprocess.Process</code> class definitely does not (because <code>communicate</code> has an implicit <code>wait</code> in it). If I'm remembering wrong, there's probably a different alternative.</span>

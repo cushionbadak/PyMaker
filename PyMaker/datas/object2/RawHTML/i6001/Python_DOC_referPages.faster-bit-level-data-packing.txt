@@ -1,0 +1,177 @@
+<div class="post-text" itemprop="text">
+<p>An 256*64 pixel OLED display connected to Raspberry Pi (Zero W) has 4 bit greyscale pixel data packed into a byte (i.e. two pixels per byte), so 8192 bytes in total. E.g. the bytes</p>
+<pre><code>0a 0b 0c 0d (only lower nibble has data)
+</code></pre>
+<p>become</p>
+<pre><code>ab cd
+</code></pre>
+<p>Converting these <a href="https://docs.python.org/3/library/stdtypes.html#bytes" rel="nofollow noreferrer">bytes</a> either obtained <a href="http://pillow.readthedocs.io/en/4.3.x/reference/Image.html#PIL.Image.Image.tobytes" rel="nofollow noreferrer">from a Pillow (PIL) Image</a> or a <a href="https://pycairo.readthedocs.io/en/latest/reference/surfaces.html#class-imagesurface-surface" rel="nofollow noreferrer">cairo ImageSurface</a> takes up to 0.9 s when <em>naively</em> iterating the pixel data, depending on color depth.</p>
+<p>Combining every two bytes from a Pillow "L" (monochrome 8 bit) Image:</p>
+<pre><code>imd = im.tobytes()
+nibbles = [int(p / 16) for p in imd]
+packed = []
+msn = None
+for n in nibbles:
+    nib = n &amp; 0x0F
+    if msn is not None:
+        b = msn &lt;&lt; 4 | nib
+        packed.append(b)
+        msn = None
+    else:
+        msn = nib
+</code></pre>
+<p>This (omitting <em>state</em> and saving float/integer conversion) brings it down to about half (0.2 s):</p>
+<pre><code>packed = []
+for b in range(0, 256*64, 2):
+    packed.append( (imd[b]//16)&lt;&lt;4 | (imd[b+1]//16) )
+</code></pre>
+<p>Basically the first applied to an RGB24 (32 bit!) cairo ImageSurface, though with crude greyscale conversion:</p>
+<pre><code>mv = surface.get_data()
+w = surface.get_width()
+h = surface.get_height()
+f = surface.get_format()
+s = surface.get_stride()
+print(len(mv), w, h, f, s)
+
+# convert xRGB
+o = []
+msn = None
+for p in range(0, len(mv), 4):
+    nib = int( (mv[p+1] + mv[p+2] + mv[p+3]) / 3 / 16) &amp; 0x0F
+    if msn is not None:
+        b = msn &lt;&lt; 4 | nib
+        o.append(b)
+        msn = None
+    else:
+        msn = nib
+</code></pre>
+<p>takes about twice as long (0.9 s vs 0.4 s).</p>
+<p>The <code>struct</code> module does not support nibbles (half-bytes).</p>
+<p><code>bitstring</code> does allow packing nibbles: </p>
+<pre><code>&gt;&gt;&gt; a = bitstring.BitStream()
+&gt;&gt;&gt; a.insert('0xf')
+&gt;&gt;&gt; a.insert('0x1')
+&gt;&gt;&gt; a
+BitStream('0xf1')
+&gt;&gt;&gt; a.insert(5)
+&gt;&gt;&gt; a
+BitStream('0b1111000100000')
+&gt;&gt;&gt; a.insert('0x2')
+&gt;&gt;&gt; a
+BitStream('0b11110001000000010')
+&gt;&gt;&gt;
+</code></pre>
+<p>But there does not seem to be a method to unpack this into a list of integers quickly -- this takes 30 seconds!:</p>
+<pre><code>a = bitstring.BitStream()
+for p in imd:
+    a.append( bitstring.Bits(uint=p//16, length=4) )
+
+packed=[]
+a.pos=0
+for p in range(256*64//2):
+    packed.append( a.read(8).uint )
+</code></pre>
+<p>Does Python 3 have the means to do this efficiently or do I need an alternative?
+External packer wrapped with ctypes? The same, but simpler, with Cython <s>(I have not yet looked into these)</s>? Looks very good, see my answer.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Down to 130 ms from 200 ms by <a href="https://stackoverflow.com/questions/11241523/">just wrapping the loop in a function</a></p>
+<pre><code>def packer0(imd):
+    """same loop in a def"""
+    packed = []
+    for b in range(0, 256*64, 2):
+        packed.append( (imd[b]//16)&lt;&lt;4 | (imd[b+1]//16) )
+    return packed
+</code></pre>
+<p>Down to 35 ms by <em><a href="http://docs.cython.org/en/latest/src/quickstart/build.html#building-a-cython-module-using-distutils" rel="nofollow noreferrer">Cythonizing</a></em> the same code</p>
+<pre><code>def packer1(imd):
+    """Cythonize python nibble packing loop"""
+    packed = []
+    for b in range(0, 256*64, 2):
+        packed.append( (imd[b]//16)&lt;&lt;4 | (imd[b+1]//16) )
+    return packed
+</code></pre>
+<p>Down to 16 ms with type</p>
+<pre><code>def packer2(imd):
+    """Cythonize python nibble packing loop, typed"""
+    packed = []
+    cdef unsigned int b
+    for b in range(0, 256*64, 2):
+        packed.append( (imd[b]//16)&lt;&lt;4 | (imd[b+1]//16) )
+    return packed
+</code></pre>
+<p>Not much of a difference with a "simplified" loop</p>
+<pre><code>def packer3(imd):
+    """Cythonize python nibble packing loop, typed"""
+    packed = []
+    cdef unsigned int i
+    for i in range(256*64/2):
+        packed.append( (imd[i*2]//16)&lt;&lt;4 | (imd[i*2+1]//16) )
+    return packed
+</code></pre>
+<p>Maybe a tiny bit faster even (15 ms)</p>
+<pre><code>def packer4(it):
+    """Cythonize python nibble packing loop, typed"""
+    cdef unsigned int n = len(it)//2
+    cdef unsigned int i
+    return [ (it[i*2]//16)&lt;&lt;4 | it[i*2+1]//16 for i in range(n) ]
+</code></pre>
+<p>Here's with <a href="https://docs.python.org/3/library/timeit.html" rel="nofollow noreferrer">timeit</a></p>
+<pre><code>&gt;&gt;&gt; timeit.timeit('packer4(data)', setup='from pack import packer4; data = [0]*256*64', number=100)
+1.31725951000044
+&gt;&gt;&gt; exit()
+pi@raspberrypi:~ $ python3 -m timeit -s 'from pack import packer4; data = [0]*256*64' 'packer4(data)'
+100 loops, best of 3: 9.04 msec per loop
+</code></pre>
+<p>This already meets my requirements, but I guess there may be further optimization possible with the input/output iterables (-&gt; unsigned int array?) or accessing the input data with a wider data type (Raspbian is 32 bit, <a href="https://www.raspberrypi.org/documentation/hardware/raspberrypi/bcm2835/README.md" rel="nofollow noreferrer">BCM2835</a> is ARM1176JZF-S single-core).</p>
+<p>Or with parallelism on the <a href="https://github.com/nineties/py-videocore" rel="nofollow noreferrer">GPU</a> or the multi-core Raspberry Pis.</p>
+<hr/>
+<p>A crude comparison with the same loop in C (<a href="https://ideone.com/cpoo3z" rel="nofollow noreferrer">ideone</a>):</p>
+<pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdint.h&gt;
+#define SIZE (256*64)
+int main(void) {
+  uint8_t in[SIZE] = {0};
+  uint8_t out[SIZE/2] = {0};
+  uint8_t t;
+  for(t=0; t&lt;100; t++){
+    uint16_t i;
+    for(i=0; i&lt;SIZE/2; i++){
+        out[i] = (in[i*2]/16)&lt;&lt;4 | in[i*2+1]/16;
+    }
+  }
+  return 0;
+}
+</code></pre>
+<p>It's apparently 100 times faster:</p>
+<pre><code>pi@raspberry:~ $ gcc p.c
+pi@raspberry:~ $ time ./a.out
+
+real    0m0.085s
+user    0m0.060s
+sys     0m0.010s
+</code></pre>
+<hr/>
+<p>Eliminating the the shifts/division may be another slight optimization (I have not checked the resulting C, nor the binary):</p>
+<pre><code>def packs(bytes it):
+    """Cythonize python nibble packing loop, typed"""
+    cdef unsigned int n = len(it)//2
+    cdef unsigned int i
+    return [ ( (it[i&lt;&lt;1]&amp;0xF0) | (it[(i&lt;&lt;1)+1]&gt;&gt;4) ) for i in range(n) ]
+</code></pre>
+<p>results in </p>
+<pre><code>python3 -m timeit -s 'from pack import pack; data = bytes([0]*256*64)' 'pack(data)'
+100 loops, best of 3: 12.7 msec per loop
+python3 -m timeit -s 'from pack import packs; data = bytes([0]*256*64)' 'packs(data)'
+100 loops, best of 3: 12 msec per loop
+python3 -m timeit -s 'from pack import packs; data = bytes([0]*256*64)' 'packs(data)'
+100 loops, best of 3: 11 msec per loop
+python3 -m timeit -s 'from pack import pack; data = bytes([0]*256*64)' 'pack(data)'
+100 loops, best of 3: 13.9 msec per loop
+</code></pre>
+</div>
+<span class="comment-copy">Did you try numpy using vector operations (for example, use reshape to combine <code>x&gt;&gt;4</code> and <code>x&amp;0xF</code> using some concat and reshape, where <code>x</code> is your data vector)?</span>
+<span class="comment-copy">Not yet, since I don't know much about NumPy. I think I'll try Cython first.</span>
+<span class="comment-copy">Slight error: the actual data is a bytes object, which makes things slightly slower, even if bytes is specified as parameter type. To get the Cython HTML report, have a look here: <a href="https://stackoverflow.com/questions/11058933/">stackoverflow.com/questions/11058933</a></span>
+<span class="comment-copy">See <a href="https://stackoverflow.com/questions/47377115/typing-python-sequence-to-cython-array-and-back" title="typing python sequence to cython array and back">stackoverflow.com/questions/47377115/…</a> for further optimization.</span>
+<span class="comment-copy">Down to 150 us (1000x faster) using a memory view on an array (<code>bytearray</code> works similarly, <code>bytes</code> does not yet: a bug in cython requires a mutable sequence), optimizing the loop calculations and creating and returning another <code>array</code>.</span>

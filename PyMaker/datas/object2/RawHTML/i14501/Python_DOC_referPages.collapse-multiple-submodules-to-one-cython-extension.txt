@@ -1,0 +1,202 @@
+<div class="post-text" itemprop="text">
+<p>This setup.py:</p>
+<pre class="lang-py prettyprint-override"><code>from distutils.core import setup
+from distutils.extension import Extension
+from Cython.Build import cythonize
+
+extensions = (
+    Extension('myext', ['myext/__init__.py',
+                        'myext/algorithms/__init__.py',
+                        'myext/algorithms/dumb.py',
+                        'myext/algorithms/combine.py'])
+)
+setup(
+    name='myext',
+    ext_modules=cythonize(extensions)
+)
+</code></pre>
+<p>Doesn't have the intended effect. I want it to produce a single <code>myext.so</code>, which it does; but when I invoke it via</p>
+<pre class="lang-none prettyprint-override"><code>python -m myext.so
+</code></pre>
+<p>I get:</p>
+<pre class="lang-none prettyprint-override"><code>ValueError: Attempted relative import in non-package
+</code></pre>
+<p>due to the fact that <code>myext</code> attempts to refer to <code>.algorithms</code>.</p>
+<p>Any idea how to get this working?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>First off, I should note that it's <a href="https://github.com/cython/cython/wiki/FAQ#how-to-compile-cython-with-subpackages" rel="noreferrer">impossible</a> to compile a single <code>.so</code> file with sub packages using Cython. So if you want sub packages, you're going to have to generate multiple <code>.so</code> files, as each <code>.so</code> can only represent a single module.</p>
+<p>Second, it doesn't appear that you can compile multiple Cython/Python files (I'm using the Cython language specifically) and link them into a single module at all.</p>
+<p>I've tried to compile multiply Cython files into a single <code>.so</code> every which way, both with <code>distutils</code> and with manual compilation, and it always fails to import at runtime.</p>
+<p>It seems that it's fine to link a compiled Cython file with other libraries, or even other C files, but something goes wrong when linking together two compiled Cython files, and the result isn't a proper Python extension.</p>
+<p>The only solution I can see is to compile everything as a single Cython file. In my case, I've edited my <code>setup.py</code> to generate a single <code>.pyx</code> file which in turn <code>include</code>s every <code>.pyx</code> file in my source directory:</p>
+<pre><code>includesContents = ""
+for f in os.listdir("src-dir"):
+    if f.endswith(".pyx"):
+        includesContents += "include \"" + f + "\"\n"
+
+includesFile = open("src/extension-name.pyx", "w")
+includesFile.write(includesContents)
+includesFile.close()
+</code></pre>
+<p>Then I just compile <code>extension-name.pyx</code>. Of course this breaks incremental and parallel compilation, and you could end up with extra naming conflicts since everything gets pasted into the same file. On the bright side, you don't have to write any <code>.pyd</code> files.</p>
+<p>I certainly wouldn't call this a preferable build method, but if everything absolutely has to be in one extension module, this is the only way I can see to do it.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This answer provides a prototype for Python3 (which can be easily adapted for Python2) and shows how several cython-modules can be bundled into single extension/shared-library/pyd-file. </p>
+<p>I keep it around for historical/didactical reasons - a more concise recipe is given <a href="https://stackoverflow.com/a/52729181/5769463">in this answer</a>, which present a good alternative to @Mylin's proposal of putting everything into the same pyx-file.</p>
+<hr/>
+<p>When bundling multiple Cython-extension (let's call them <code>bar_a</code> and <code>bar_b</code>) into one single shared object (let's call it <code>foo</code>), the main problem is the <code>import bar_a</code> operation, because of the way the loading of modules works in Python (obviously simplified):</p>
+<ol>
+<li>Look for <code>bar_a.py</code> and load it, if not successful...</li>
+<li>Look for <code>bar_a.so</code> (or similar), use <code>ldopen</code> for loading the shared library and call <code>PyInit_bar_a</code> which would initialize/register the module.</li>
+</ol>
+<p>Now, the issue is that there is no <code>bar_a.so</code> to be found and albeit the initialization function <code>PyInit_bar_a</code> can be found in <code>foo.so</code>, Python doesn't know where to look and gives up on searching.</p>
+<p>Luckily, there are hooks available, so we can teach Python to look in the right places.</p>
+<p>When importing a module, Python utilizes <a href="https://docs.python.org/3/glossary.html#term-finder" rel="nofollow noreferrer">finders</a> from <a href="https://docs.python.org/3/library/sys.html#sys.meta_path" rel="nofollow noreferrer"><code>sys.meta_path</code></a>, which return the right <a href="https://docs.python.org/3/glossary.html#term-loader" rel="nofollow noreferrer">loader</a> for a module (for simplicity I'm using the legacy workflow with loaders and not <a href="https://docs.python.org/3/glossary.html#term-module-spec" rel="nofollow noreferrer">module-spec</a>). The default finders return <code>None</code>, i.e. no loader and it results in the import error.</p>
+<p>That means we need to add a custom finder to <code>sys.meta_path</code>, which would recognize our bundled modules and return loaders, which in their turn would call the right <code>PyInit_xxx</code>-function.</p>
+<p>The missing part: How should the custom finder finds its way into the <code>sys.meta_path</code>? It would be pretty inconvenient if the user would have to do it manually. </p>
+<p>When a submodule of a package is imported, first the package's <code>__init__.py</code>-module is loaded and this is the place where we can inject our custom finder.</p>
+<p>After calling <code>python setup.py build_ext install</code> for the setup presented further below, there is a single shared library installed and the submodules can be loaded as usual:</p>
+<pre><code>&gt;&gt;&gt; import foo.bar_a as a
+&gt;&gt;&gt; a.print_me()
+I'm bar_a
+&gt;&gt;&gt; from foo.bar_b import print_me as b_print
+&gt;&gt;&gt; b_print()
+I'm bar_b
+</code></pre>
+<h3>Putting it all together:</h3>
+<p>Folder structure:</p>
+<pre><code>../
+ |-- setup.py
+ |-- foo/
+      |-- __init__.py
+      |-- bar_a.pyx
+      |-- bar_b.pyx
+      |-- bootstrap.pyx
+</code></pre>
+<p><strong>__init__.py</strong>:</p>
+<pre><code># bootstrap is the only module which 
+# can be loaded with default Python-machinery
+# because the resulting extension is called `bootstrap`:
+from . import bootstrap
+
+# injecting our finders into sys.meta_path
+# after that all other submodules can be loaded
+bootstrap.bootstrap_cython_submodules()
+</code></pre>
+<p><strong>bootstrap.pyx</strong>:</p>
+<pre><code>import sys
+import importlib
+
+# custom loader is just a wrapper around the right init-function
+class CythonPackageLoader(importlib.abc.Loader):
+    def __init__(self, init_function):
+        super(CythonPackageLoader, self).__init__()
+        self.init_module = init_function
+
+    def load_module(self, fullname):
+        if fullname not in sys.modules:
+            sys.modules[fullname] = self.init_module()
+        return sys.modules[fullname]
+
+# custom finder just maps the module name to init-function      
+class CythonPackageMetaPathFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, init_dict):
+        super(CythonPackageMetaPathFinder, self).__init__()
+        self.init_dict=init_dict
+
+    def find_module(self, fullname, path):
+        try:
+            return CythonPackageLoader(self.init_dict[fullname])
+        except KeyError:
+            return None
+
+# making init-function from other modules accessible:
+cdef extern from *:
+    """
+    PyObject *PyInit_bar_a(void);
+    PyObject *PyInit_bar_b(void);
+    """
+    object PyInit_bar_a()
+    object PyInit_bar_b()
+
+# wrapping C-functions as Python-callables:
+def init_module_bar_a():
+    return PyInit_bar_a()
+
+def init_module_bar_b():
+    return PyInit_bar_b()
+
+
+# injecting custom finder/loaders into sys.meta_path:
+def bootstrap_cython_submodules():
+    init_dict={"foo.bar_a" : init_module_bar_a,
+               "foo.bar_b" : init_module_bar_b}
+    sys.meta_path.append(CythonPackageMetaPathFinder(init_dict))  
+</code></pre>
+<p><strong>bar_a.pyx</strong>:</p>
+<pre><code>def print_me():
+    print("I'm bar_a")
+</code></pre>
+<p><strong>bar_b.pyx</strong>:</p>
+<pre><code>def print_me():
+    print("I'm bar_b")
+</code></pre>
+<p><strong>setup.py</strong>:</p>
+<pre><code>from setuptools import setup, find_packages, Extension
+from Cython.Build import cythonize
+
+sourcefiles = ['foo/bootstrap.pyx', 'foo/bar_a.pyx', 'foo/bar_b.pyx']
+
+extensions = cythonize(Extension(
+            name="foo.bootstrap",
+            sources = sourcefiles,
+    ))
+
+
+kwargs = {
+      'name':'foo',
+      'packages':find_packages(),
+      'ext_modules':  extensions,
+}
+
+
+setup(**kwargs)
+</code></pre>
+<hr/>
+<p>NB: <a href="https://stackoverflow.com/a/52670820/5769463">This answer</a> was the starting point for my experiments, however it uses <code>PyImport_AppendInittab</code> and I cannot see a way how can this be plugged in into the normal python.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This answer is follows the basic pattern of @ead's answer, but uses a slightly simpler approach, which eliminates most of boilerplate code.</p>
+<p>The only difference is the simpler version of <code>bootstrap.pyx</code>:</p>
+<pre><code>import sys
+import importlib
+
+# Chooses the right init function     
+class CythonPackageMetaPathFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, name_filter):
+        super(CythonPackageMetaPathFinder, self).__init__()
+        self.name_filter =  name_filter
+
+    def find_module(self, fullname, path):
+        if fullname.startswith(self.name_filter):
+            # use this extension-file but PyInit-function of another module:
+            return importlib.machinery.ExtensionFileLoader(fullname,__file__)
+
+
+# injecting custom finder/loaders into sys.meta_path:
+def bootstrap_cython_submodules():
+    sys.meta_path.append(CythonPackageMetaPathFinder('foo.')) 
+</code></pre>
+<p>Essentially, I look to see if the name of the module being imported starts with <code>foo.</code>, and if it does I reuse the standard <code>importlib</code> approach to loading an extension module, passing the current <code>.so</code> filename as the path to look in - the right name of the init function (there are multiple ) will be deduced from the package name.</p>
+<p>Obviously, this is just a prototype - one might want to do some improvements. For example, right now <code>import foo.bar_c</code> would lead to a somewhat unusual error message: <code>"ImportError: dynamic module does not define module export function (PyInit_bar_c)"</code>, one could return <code>None</code> for all submodule names that are not on a white list.</p>
+</div>
+<span class="comment-copy">Doe this guide help you at all? <a href="https://github.com/cython/cython/wiki/PackageHierarchy" rel="nofollow noreferrer">github.com/cython/cython/wiki/PackageHierarchy</a></span>
+<span class="comment-copy">I had actually read and followed that already; the issue being that they do not have a single binary output. They produce a binary for each Python file.</span>
+<span class="comment-copy">I was think about a similar approach myself yesterday. I wondered if you could use the existing <a href="https://docs.python.org/3/library/importlib.html#importlib.machinery.ExtensionFileLoader" rel="nofollow noreferrer"><code>ExtensionFileLoader</code></a> rather than writing your own, since the module name and path look like they can be different. If that is the case then you might be able to simplify your approach slightly</span>
+<span class="comment-copy">@DavidW thanks for the hint! It is probably possible to get this to work and would greatly decrease the necessary boilerplate-code. But due to my poor understanding of the machinery I was not able to get it to work after tinkering for some time...</span>
+<span class="comment-copy">It turns out to be pretty easy to get it to work in the end. I've made my answer community-wiki since this answer did most of the work - I'm happy enough if you want to just edit the changes into this one (or leave it as is)</span>
+<span class="comment-copy">that is a nice trick to replace <code>__init__.py</code> through a so. If I remember correctly building such a module on Windows will fail: The visibility of the symbols is "hidden" per default and thus linking has to happen with ` /EXPORT:PyInit___init__` in order to make the init-function visible, but <code>PyInit___init__</code> is nowhere to be found.</span>
+<span class="comment-copy">Ah maybe. I only tested it on Linux, but I do remember having difficulty with <code>__init__.so</code> on Windows</span>
+<span class="comment-copy">@DavidD I have changed it to a slightly simpler approach without <code>__init__.so</code> which has the upside also to work on Windows</span>

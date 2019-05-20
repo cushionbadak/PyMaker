@@ -1,0 +1,149 @@
+<div class="post-text" itemprop="text">
+<p>How can I find all implicit conversions to boolean in source code? This includes conditional statements like <code>if x</code>, loops like <code>while x</code>, operators like <code>x or y</code>, etc.; but not <code>if x == 0</code> or <code>if len(x) == 0</code>, etc. I don't mind using a static analyzer, or IDE, or a regular expression, or a python library designed for this purpose. Of course there will be some false positives, when <code>x</code> is actually boolean; that's fine.</p>
+<p>Use case: I found bugs caused by coercion to boolean. For example, a variable <code>x</code> was supposed to be an integer or <code>None</code> and was incorrectly tested with <code>if not x</code> implying <code>if x is None</code>. I want to make all boolean conversions explicit (e.g., replacing <code>if not x</code> with <code>if x is None</code> or <code>if x == 0</code>, etc.). Of course, it would have to be done manually, but at least identifying the locations where implicit conversion occurs would be helpful.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'd suggest you take a look at the standard <code>ast</code> module. Here is some trivial code:</p>
+<pre><code>import ast
+source = '''
+x=1
+if not x:
+    print('not x')
+'''
+
+tree = ast.parse(source)
+print(ast.dump(tree))
+</code></pre>
+<p>And here is the output:</p>
+<blockquote>
+<pre><code>$ python test.py
+Module(body=[Assign(targets=[Name(id='x', ctx=Store())], value=Num(n=1)), If(test=UnaryOp(op=Not(), operand=Name(id='x', ctx=Load())), body=[Expr(value=Call(func=Name(id='print', ctx=Load()), args=[Str(s='not x')], keywords=[]))], orelse=[])])
+</code></pre>
+</blockquote>
+<p>Eli Bendersky has written an <a href="http://eli.thegreenplace.net/2009/11/28/python-internals-working-with-python-asts/" rel="nofollow noreferrer">article</a> on working with AST's, and he includes some sample code for <em>visiting</em> the nodes of an AST. You would want to do a visit where you looked for particular constructions. In the example above, you'd be looking for (sub)expressions beneath an <code>If</code> node where an operand was either directly treated as a boolean, or treated as the sole operand to a <code>Not()</code> node.</p>
+<p>Finding every possible case could be quite complex. But I think you can easily find the "simple" cases (if x, if not x, if x or y) with a page or two of code.</p>
+<p><strong>EDIT:</strong> Here's some code that (I think) does what you want. </p>
+<pre><code>import ast
+source = '''#Line 1
+x=1
+y=2
+
+if not x:
+    print('not x')
+
+if y is None:
+    print('y is none')
+
+
+while y or not x or (x &lt; 1 and not y and x &lt; 10):
+    print('x &lt; 10')
+    x += 1
+
+'''
+
+tree = ast.parse(source)
+
+class FindNameAsBoolean(ast.NodeVisitor):
+    def __init__(self, lines):
+        self.source_lines = lines
+
+    def report_find(self, kind, locn, size=3):
+        print("\nFound %s at %s" % (kind, locn))
+        print(self.source_lines[locn[0]-1])
+        print(' ' * locn[1], '^' * size, sep='')
+
+    def visit_UnaryOp(self, node):
+        if isinstance(node.op, ast.Not) and isinstance(node.operand, ast.Name):
+            self.report_find('NOT-NAME', (node.lineno, node.col_offset), size=4 + len(node.operand.id))
+        self.generic_visit(node)
+
+    def visit_BoolOp(self, node):
+        opname = type(node.op).__name__.upper()
+        for kid in node.values:
+            if isinstance(kid, ast.Name):
+                self.report_find('%s-NAME' % opname, (node.lineno, node.col_offset), size=len(kid.id))
+
+        self.generic_visit(node)
+
+class FindTests(ast.NodeVisitor):
+    def __init__(self, lines):
+        self.source_lines = lines
+
+    def _fnab(self, node):
+        cond = node.test
+        FindNameAsBoolean(self.source_lines).visit(cond)
+
+    def visit_If(self, node):
+        self._fnab(node)
+        self.generic_visit(node)
+
+    def visit_While(self, node):
+        self._fnab(node)
+        self.generic_visit(node)
+
+FindTests(source.splitlines()).visit(tree)
+</code></pre>
+<p>And here's the output:</p>
+<blockquote>
+<pre><code>$ python test.py
+
+Found NOT-NAME at (5, 3)
+if not x:
+   ^^^^^
+
+Found OR-NAME at (12, 6)
+while y or not x or (x &lt; 1 and not y and x &lt; 10):
+      ^
+
+Found NOT-NAME at (12, 11)
+while y or not x or (x &lt; 1 and not y and x &lt; 10):
+           ^^^^^
+
+Found NOT-NAME at (12, 31)
+while y or not x or (x &lt; 1 and not y and x &lt; 10):
+                               ^^^^^
+</code></pre>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<p>My first idea was to decorate the built-in <code>bool</code> function, but for some reason, this did not work with Python 3.4.</p>
+<p>Therefore, I propose a solution, when the full set of the potentially used classes is known: basically decorate the <code>__bool__</code> method of every class.</p>
+<pre><code>def bool_highlighter(f):
+    def _f(*args, **kwargs):
+        print("Coercion to boolean")
+        return f(*args, **kwargs)
+    return _f
+
+for c in classes:
+    try:
+        c.__bool__ = bool_highlighter(c.__bool__)
+    except AttributeError:
+        pass
+</code></pre>
+<p>I just assumed that <code>classes</code> was an iterable containing the targeted classes. You can probably populate it dynamically.</p>
+<p>If you execute this code at the startup, every boolean coercion will print <code>"Coercion to boolean"</code>.</p>
+<p>Just a short test:</p>
+<pre><code>&gt;&gt;&gt; class Foo:
+...     def __init__(self, v):
+...         self.v = v
+...
+...     def __bool__(self):
+...         return self.v == 12
+...
+&gt;&gt;&gt; foo = Foo(15)
+&gt;&gt;&gt; if not foo:
+...     print("hello")
+...
+Coercion to boolean
+hello
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Actually, there's a typing library that does precisely this. It works for both python 2 and python 3.</p>
+<p>See <a href="http://mypy.readthedocs.io/en/latest/index.html" rel="nofollow noreferrer">mypy</a>, use command <code>--strict-boolean</code>.</p>
+<p>I move the accepted answer to this one, even though @AustinHastings has a very useful answer about how one could do it using <code>ast</code>, because I want people to be aware of <code>mypy</code> - it's a great tool (not likely to be abandoned any time soon, with 100+ contributors, including Guido).</p>
+</div>
+<span class="comment-copy">You know that <code>x or y</code> is kind of a hybrid - the inputs are <i>evaluated</i> as boolean, but the <i>output</i> of the full expression will be one of the inputs (not boolean).</span>
+<span class="comment-copy">As a complement, you should read the <a href="https://docs.python.org/3/reference/grammar.html" rel="nofollow noreferrer">grammar</a> and identify the exact statements you want to isolate. What you want is probably around <code>test</code>.</span>
+<span class="comment-copy">I was hoping to do that statically, not dynamically -- primarily because there's no way of ensuring that every single coercion will be on an execution path during testing. In addition, there's no way to decorate <code>__bool__</code> of built-in types, which is where most of the implicit conversions happen.</span>
+<span class="comment-copy">@max I understand. Well, I'll let my answer here because it might be useful, but surely this does not solve your problem...</span>

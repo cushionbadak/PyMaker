@@ -1,0 +1,135 @@
+<div class="post-text" itemprop="text">
+<p>How do I mock async call from one native coroutine to other one using <code>unittest.mock.patch</code>?</p>
+<p>I currently have quite an awkward solution:</p>
+<pre><code>class CoroutineMock(MagicMock):
+    def __await__(self, *args, **kwargs):
+        future = Future()
+        future.set_result(self)
+        result = yield from future
+        return result
+</code></pre>
+<p>Then </p>
+<pre><code>class TestCoroutines(TestCase):
+    @patch('some.path', new_callable=CoroutineMock)
+    def test(self, mock):
+        some_action()
+        mock.assert_called_with(1,2,3)
+</code></pre>
+<p>This works but looks ugly. Is there more pythonic way to do this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Subclassing <code>MagicMock</code> will propagate your custom class for all the mocks generated from your coroutine mock. For instance, <code>AsyncMock().__str__</code> will also become an <code>AsyncMock</code> which is probably not what you're looking for.</p>
+<p>Instead, you might want to define a factory that creates a <code>Mock</code> (or a <code>MagicMock</code>) with custom arguments, for instance <code>side_effect=coroutine(coro)</code>. Also, it might be a good idea to separate the coroutine function from the coroutine (as explained in the <a href="https://docs.python.org/3/library/asyncio-task.html#coroutines" rel="nofollow noreferrer">documentation</a>). </p>
+<p>Here is what I came up with:</p>
+<pre><code>from asyncio import coroutine
+
+def CoroMock():
+    coro = Mock(name="CoroutineResult")
+    corofunc = Mock(name="CoroutineFunction", side_effect=coroutine(coro))
+    corofunc.coro = coro
+    return corofunc
+</code></pre>
+<p>An explanation of the different objects:</p>
+<ul>
+<li><code>corofunc</code>: the coroutine function mock</li>
+<li><code>corofunc.side_effect()</code>: the coroutine, generated for each call</li>
+<li><code>corofunc.coro</code>: the mock used by the coroutine to get the result</li>
+<li><code>corofunc.coro.return_value</code>: the value returned by the coroutine</li>
+<li><code>corofunc.coro.side_effect</code>: might be used to raise an exception</li>
+</ul>
+<p>Example:</p>
+<pre><code>async def coro(a, b):
+    return await sleep(1, result=a+b)
+
+def some_action(a, b):
+    return get_event_loop().run_until_complete(coro(a, b))
+
+@patch('__main__.coro', new_callable=CoroMock)
+def test(corofunc):
+    a, b, c = 1, 2, 3
+    corofunc.coro.return_value = c
+    result = some_action(a, b)
+    corofunc.assert_called_with(a, b)
+    assert result == c
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The solution was actually quite simple:
+I just needed to convert <code>__call__</code> method of mock into coroutine:</p>
+<pre><code>class AsyncMock(MagicMock):
+    async def __call__(self, *args, **kwargs):
+        return super(AsyncMock, self).__call__(*args, **kwargs)
+</code></pre>
+<p>This works perfectly, when mock is called, code receives native coroutine</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Everyone's missing what's probably the simplest and clearest solution:</p>
+<pre><code>@patch('some.path')
+def test(self, mock):
+    f = asyncio.Future()
+    f.set_result('whatever result you want')
+    mock.return_value = f
+    mock.assert_called_with(1, 2, 3)
+</code></pre>
+<p>remember a coroutine can be thought of as just a function which is guaranteed to return a future which can, in turn be awaited.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Another way of mocking coroutine is to make coroutine, that returns mock. This way you can mock coroutines that will be passed into <code>asyncio.wait</code> or <code>asyncio.wait_for</code>.</p>
+<p>This makes more universal coroutines though makes setup of tests more cumbersome:</p>
+<pre><code>def make_coroutine(mock)
+    async def coroutine(*args, **kwargs):
+        return mock(*args, **kwargs)
+    return coroutine
+
+
+class Test(TestCase):
+    def setUp(self):
+        self.coroutine_mock = Mock()
+        self.patcher = patch('some.coroutine',
+                             new=make_coroutine(self.coroutine_mock))
+        self.patcher.start()
+
+    def tearDown(self):
+        self.patcher.stop()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Based on @scolvin answer I created this (imo) cleaner way:</p>
+<pre><code>def async_return(result):
+    f = asyncio.Future()
+    f.set_result(result)
+    return f
+</code></pre>
+<p>That's it, just use it around whatever return you want to be async, as in</p>
+<pre><code>mock = MagicMock(return_value=async_return("Example return"))
+await mock()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>One more variant of "simplest" solution to mock a async object, which is just a one liner.</p>
+<p>In source:</p>
+<pre><code>class Yo:
+    async foo(self):
+        await self.bar()
+    async bar(self):
+        # Some code
+</code></pre>
+<p>In test:</p>
+<pre><code>from asyncio import coroutine
+
+yo = Yo()
+# Here bounded method bar is mocked and will return a customised result.
+yo.bar = Mock(side_effect=coroutine(lambda:'the awaitable should return this'))
+event_loop.run_until_complete(yo.foo())
+</code></pre>
+</div>
+<span class="comment-copy">Also this mock doesn't work with asyncio.await because of asyncio.tasks.ensure_future</span>
+<span class="comment-copy">this doesn't work, side_effect=coroutine(coro), coroutine is not defined</span>
+<span class="comment-copy">@Skorpeo <code>coroutine</code> has to be imported from <code>asyncio</code>. Edited.</span>
+<span class="comment-copy">This is nice, but it doesn't play well with autospec, which is basically mandatory when using MagicMock. Any thoughts on how to get that working? I'm not familiar enough with the internals...</span>
+<span class="comment-copy">It works perfectly for me. I used it like this: ``` @mock.patch(     'my.path.asyncio.sleep',     new_callable=AsyncMock, ) def test_stuff(sleep):     # code ```</span>
+<span class="comment-copy">This works. I initially like the other solution below by Ivan Castellanos. But the future is never executed and I tried like hell, but didn't get it to work.</span>
+<span class="comment-copy">THANK YOU! This is such a simple and elegant way to do it!</span>
+<span class="comment-copy">what is process_smtp_message.return_value = f?  Also, where is the call to the function being tested?</span>
+<span class="comment-copy">@Skorpeo - i think he means mock.return_value = f</span>
+<span class="comment-copy">I definitely don't. Mock is the test fixture. process_smtp_message is whatever you're trying to mock obviously.</span>

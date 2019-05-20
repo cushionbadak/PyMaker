@@ -1,0 +1,204 @@
+<div class="post-text" itemprop="text">
+<p>Is there a way to use variable data in the actual format part of the logger? </p>
+<p>I want my logs to contain the names of the functions on the stack. For example here is the following code:</p>
+<pre><code># logging_utils.py
+
+def init_logger(logger_name: str) -&gt; logging.Logger:
+
+    log = logging.getLogger(logger_name)
+    log.setLevel(logging.INFO)
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.INFO)
+
+    formatter = logging.Formatter(f'[ %(asctime)s ] [ %(levelname)s ] [ %(callStack?)s ] %(message)s')
+
+    handler.setFormatter(formatter)
+
+    log.addHandler(handler)
+
+    return log
+
+
+def format_stack() -&gt; str:
+    return ':'.join(frame.function for frame in inspect.stack()[::-1][:-1]).replace('&lt;module&gt;:', '')
+
+
+
+def f():
+    g()
+
+def g():
+    h()
+
+def h():
+    logger = init_logger('x')
+    logger.info('My actual message')
+
+
+if __name__ == '__main__':
+    f()
+</code></pre>
+<p>I would like the logging messages to look like</p>
+<pre><code>[ 2019-02-18 14:14:23,558 ] [ INFO ] [ logging_utils:f:g:h ] My actual message
+</code></pre>
+<p>The nearest I came to this is using a custom class like this:</p>
+<pre><code>import sys
+import inspect
+import logging
+
+
+class Logger:
+
+    _logger: logging.Logger
+
+    def __init__(self, name: str):
+
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.INFO)
+
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(logging.INFO)
+
+        formatter = logging.Formatter(f'[ %(asctime)s ] [ %(levelname)s ] %(message)s')
+
+        handler.setFormatter(formatter)
+
+        logger.addHandler(handler)
+
+        self._logger = logger
+
+    @staticmethod
+    def _format_stack_for_logger() -&gt; str:
+
+        stack = inspect.stack()[::-1]
+        stack_names = (inspect.getmodulename(stack[0].filename),
+                       *(frame.function
+                         for frame
+                         in stack[1:-3]))
+
+        return '::'.join(stack_names)
+
+    def _log(self, level: int, msg: str, *args, **kwargs):
+        self._logger.log(level, '[ %s ] %s', self._format_stack_for_logger(), msg, *args, **kwargs)
+
+    def debug(self, msg: str, *args, **kwargs):
+        self._log(logging.DEBUG, msg, *args, **kwargs)
+
+    def info(self, msg: str, *args, **kwargs):
+        self._log(logging.INFO, msg, *args, **kwargs)
+
+    def warning(self, msg: str, *args, **kwargs):
+        self.info(logging.WARNING, msg, *args, **kwargs)
+
+    def error(self, msg: str, *args, **kwargs):
+        self._log(logging.ERROR, msg, *args, **kwargs)
+
+    def critical(self, msg: str, *args, **kwargs):
+        self._log(logging.CRITICAL, msg, *args, **kwargs)
+
+
+def f():
+    g()
+
+
+def g():
+    h()
+
+
+def h():
+    logger = Logger('x')
+    logger.info('My actual message :(')
+
+
+if __name__ == '__main__':
+    f()
+</code></pre>
+<p>But the stack trace information is... semi-hard-coded(?) into the logging string. I am looking for an elegant way to obtain this outcome.</p>
+<p>Thanks in advance!</p>
+<p><strong>EDIT:</strong></p>
+<p>Thanks to @VinaySajip fot the nudge in the correct direction.</p>
+<p>Unfortunately the default <code>Formatter</code>'s <code>format</code> method just appends the output of <code>formatStack</code> at the end of the string to be printed. No matter what you do, as long as you use the default <code>format</code> implementation that is what will happen. </p>
+<p>What I did was to extend the <code>Formatter</code> class, reimplementing the <code>format</code> method. The contents of the format method are 70% copy and pasted from the <code>logging</code> module but the part that appends the stack info is removed. </p>
+<p>Instead, the nicely formatted result of <code>inspect.stack()</code> (returned by the new <code>formatStack</code>) is placed  in the <code>stack_info</code> member of the <code>LogRecord</code> that will be formatted. </p>
+<p>This is done because to get the final message that will be printed, the dictionary of <code>LogRecord</code> is used as the second operand of <code>fmt_string % args</code>. So when the format string is interpolated with the dictionary of <code>LogRecord</code>, <code>LogRecord.stack_info</code> will contain the nicely formatted call stack so all one really has to do is use <code>%(stack_info)s</code> in their format string.</p>
+<p>Essentially I have added support for <code>%(stack_info)s</code> in the format string of the formatter.</p>
+<p>The code:</p>
+<pre><code>import sys
+import inspect
+import logging
+
+from logging import Logger
+
+
+class CallStackFormatter(logging.Formatter):
+
+    def formatStack(self, _ = None) -&gt; str:
+        stack = inspect.stack()[::-1]
+        stack_names = (inspect.getmodulename(stack[0].filename),
+                       *(frame.function
+                         for frame
+                         in stack[1:-9]))
+        return '::'.join(stack_names)
+
+    def format(self, record):
+        record.message = record.getMessage()
+        record.stack_info = self.formatStack()
+        if self.usesTime():
+            record.asctime = self.formatTime(record, self.datefmt)
+        s = self.formatMessage(record)
+        if record.exc_info:
+            # Cache the traceback text to avoid converting it multiple times
+            # (it's constant anyway)
+            if not record.exc_text:
+                record.exc_text = self.formatException(record.exc_info)
+        if record.exc_text:
+            if s[-1:] != "\n":
+                s = s + "\n"
+            s = s + record.exc_text
+        return s
+
+
+def get_logger(name: str, fmt: str = '[ %(asctime)s ] [ %(levelname)-5s ] [ %(stack_info)s ] %(message)s') -&gt; Logger:
+
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.INFO)
+
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(logging.INFO)
+
+        formatter = CallStackFormatter(fmt)
+
+        handler.setFormatter(formatter)
+
+        logger.addHandler(handler)
+
+        return logger
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The easiest way is to have a custom <code>Formatter</code> subclass which overrides the <code>formatStack</code> method, which is documented <a href="https://docs.python.org/3/library/logging.html?highlight=formatstack#logging.Formatter.formatStack" rel="nofollow noreferrer">here</a>.</p>
+<blockquote>
+<p>Formats the specified stack information (a string as returned by <code>traceback.print_stack()</code>, but with the last newline removed) as a string. This default implementation just returns the input value.</p>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<p>I can't comment, so I am using an answer :</p>
+<p>Here's a decorator I used to use, which logs the executed function, with its args</p>
+<pre><code>def logging(f):
+@wraps(f)
+def wrapper(*args, **kwargs):
+    import logging
+    now = datetime.datetime.now()
+    time = now.strftime("%Y-%m-%d %H:%M")
+    logging.basicConfig(filename='logs/webservices.log',level=logging.INFO)
+    handle = f(*args, **kwargs)
+    logging.info(f'[{time}] - Executing instruction : [{" ".join((inspect.stack()[1][4][0]).split())}]')
+    logging.info(f'[{time}] - with args [{args}]')
+    logging.info(f'[{time}] - Returned result [{handle}]')
+    return handle
+return wrapper
+</code></pre>
+</div>
+<span class="comment-copy">Thank you! I have solved my problem! The way you described did not offer the possibility of doing so directly however it did lead to another interesting implementation that does exactly what I wanted! Please, have a look!</span>
+<span class="comment-copy">Thanks! But that is not what I wish to do at all! I need the logging function to be callable, not for a decorator to log function calls. (i.e. I want ot have multiple logs/"prints" in the same function, and i want to know what function that is, who called that function, who called the calling function and so on)</span>

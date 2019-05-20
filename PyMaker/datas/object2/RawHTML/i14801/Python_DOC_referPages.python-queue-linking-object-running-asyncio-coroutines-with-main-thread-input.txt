@@ -1,0 +1,141 @@
+<div class="post-text" itemprop="text">
+<p>I have a script running where the main thread takes input from stdin and then passes it to a child thread using a queue. In the child thread I'm using asyncio coroutines to spin up a listener on a socket and wait for connections. Once a connection is made I can now send data through the listener from the main thread. </p>
+<p>It all seems to work well enough, but since asyncio.BaseEventLoop is not thread safe am I going to run into problems? </p>
+<p>This is my attempt to solve the problem of using a blocking library like python's cmd module with asyncio.</p>
+<p>My code is below.</p>
+<pre><code>import sys
+import asyncio
+from time import sleep
+from threading import Thread
+from queue import Queue
+
+stdin_q = Queue()
+
+clients = {} # task -&gt; (reader, writer)
+
+def client_connected_handler(client_reader, client_writer):
+    # Start a new asyncio.Task to handle this specific client connection
+    task = asyncio.Task(handle_client(client_reader, client_writer))
+    clients[task] = (client_reader, client_writer)
+
+    def client_done(task):
+        # When the tasks that handles the specific client connection is done
+        del clients[task]
+
+    # Add the client_done callback to be run when the future becomes done
+    task.add_done_callback(client_done)
+
+@asyncio.coroutine
+def handle_client(client_reader, client_writer):
+    # Handle the requests for a specific client with a line oriented protocol
+    while True:
+
+        cmd = yield from get_input()
+        client_writer.write(cmd.encode())
+
+        data = yield from client_reader.read(1024)
+
+        print(data.decode(),end="",flush=True)
+
+@asyncio.coroutine
+def get_input():
+  while True:
+    try:
+      return stdin_q.get()
+    except:
+      pass
+
+
+
+class Control:
+
+    def start(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self.loop = asyncio.get_event_loop()
+
+        server = self.loop.run_until_complete(asyncio.start_server(client_connected_handler, '0.0.0.0', 2222))
+        self.loop.run_forever()
+        self.stop()
+
+    def stop(self):    
+        self.loop.stop()
+        self.loop.close()
+
+def fire_control():
+    con = Control()
+    con.start()
+
+if __name__ == "__main__":
+
+    stdin_q.put("\n")
+    t = Thread(target=fire_control)
+    t.start()
+    sleep(2)
+    _cmd = ""
+    while _cmd.lower() != "exit":
+        _cmd = input("")
+        if _cmd == "":
+          _cmd = "\r\n"
+
+        stdin_q.put(_cmd)      
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This isn't going to work quite right, because the call to <code>stdin_q.get()</code> is going to block your event loop. This means that if your server has multiple clients, all of them will be completely blocked by whichever one happens to get to <code>stdin_q.get()</code> first, until you send data into the queue. The simplest way to get around this is  use <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.BaseEventLoop.run_in_executor" rel="nofollow"><code>BaseEvent.loop.run_in_executor</code></a> to run the <code>stdin_q.get</code> in a background <code>ThreadPoolExecutor</code>, which allows you to wait for it without blocking the event loop:</p>
+<pre><code>@asyncio.coroutine
+def get_input():
+    loop = asyncio.get_event_loop()
+    return (yield from loop.run_in_executor(None, stdin_q.get))  # None == use default executor.
+</code></pre>
+<p><strong>Edit (1/27/16):</strong></p>
+<p>There is a library called <a href="https://github.com/aio-libs/janus" rel="nofollow"><code>janus</code></a>, which provides an asyncio-friendly, thread-safe queue implementation.</p>
+<p>Using that library, your code would look like this (I left out unchanged parts):</p>
+<pre><code>...
+import janus
+
+loop = asyncio.new_event_loop()
+stdin_q = janus.Queue(loop=loop)
+...
+
+@asyncio.coroutine
+def get_input():
+  loop = asyncio.get_event_loop()
+  return (yield from stdin_q.async_q.get())
+
+class Control:
+
+    def start(self):
+        asyncio.set_event_loop(loop)
+        self.loop = asyncio.get_event_loop()
+
+        server = self.loop.run_until_complete(asyncio.start_server(client_connected_handler, '0.0.0.0', 2222))
+        self.loop.run_forever()
+        self.stop()
+
+    def stop(self):    
+        self.loop.stop()
+        self.loop.close()
+
+...
+
+if __name__ == "__main__":
+
+    stdin_q.sync_q.put("\n")
+    t = Thread(target=runner)
+    t.start()
+    sleep(2)
+    _cmd = ""
+    while _cmd.lower() != "exit":
+        _cmd = input("")
+        if _cmd == "":
+          _cmd = "\r\n"
+
+        stdin_q.sync_q.put(_cmd)
+</code></pre>
+</div>
+<span class="comment-copy">Interesting. You are a wealth of knowledge when it comes to asyncio. So if I wanted to send data to a specific connection would I just need to create a queue for each one to communicate between the main thread and child?</span>
+<span class="comment-copy">@RG5 Yep, that would work.</span>
+<span class="comment-copy">That is true, but you could also just use the <code>asyncio.Queue</code> which I think would allow you to <code>await stdin_q.get()</code></span>
+<span class="comment-copy">@dalanmiller <code>asyncio.Queue</code> is not thread-safe, so it can't be used to pass values between threads. However, since I wrote this answer, I became aware of <a href="https://github.com/aio-libs/janus" rel="nofollow noreferrer"><code>janus</code></a>, which provides an asyncio-friendly, thread-safe queue implementation.</span>
+<span class="comment-copy">Ahh awesome. Out of curiosity, why use Threads <i>and</i> coroutines in this context? Is there a performance benefit here?</span>

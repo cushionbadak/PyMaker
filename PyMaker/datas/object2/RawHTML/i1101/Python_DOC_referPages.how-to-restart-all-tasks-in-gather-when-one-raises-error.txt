@@ -1,0 +1,269 @@
+<div class="post-text" itemprop="text">
+<p>I have two tasks. When one task raises an error, I wish to restart them both. 
+Is the following the appropriate way to catch an exception propagated by one task, and restart the gather for the two tasks?</p>
+<pre><code>import asyncio
+
+async def foo():
+    while True:
+        await asyncio.sleep(1)
+        print("foo")
+
+async def bar():
+    for _ in range(3):
+        await asyncio.sleep(1)
+        print("bar")
+    raise ValueError
+
+
+async def main():
+    while True:
+        footask = asyncio.create_task(foo())
+        bartask = asyncio.create_task(bar())    
+        bothtasks = asyncio.gather(footask, bartask)
+        try:
+            await bothtasks 
+        except ValueError:
+            print("caught ValueError")  
+            try:
+                footask.cancel()
+            except asyncio.CancelledError:
+                pass
+
+
+asyncio.run(main())
+</code></pre>
+<p>Basically <code>asyncio</code> intentionally doesn't cancel the other tasks in a gather when one task raises an error. So, since I can't think of anything better, I manually cancel the other task(s) with <code>task.cancel()</code> and handle the <code>asyncio.CancelledError</code> myself.</p>
+<p>I'm just not convinced this is the intended use of the api, insights appreciated.</p>
+<p>Edit:-</p>
+<p>In the asyncio-3.7 docs it reads </p>
+<blockquote>
+<p>If <em>gather()</em> is cancelled, all submitted awaitables (that have not completed yet) are also cancelled.</p>
+</blockquote>
+<p>But the behaviour I observe when I replace <code>footask.cancel()</code> with <code>bothtasks.cancel()</code> is that for every iteration of the while loop, an additional <code>foo</code> is awaited, i.e. the <code>foo</code> appears not to be cancelled by cancelling the gather. The output looks something like this:</p>
+<pre><code>foo
+bar
+foo
+bar
+foo
+bar
+caught ValueError
+foo
+foo
+bar
+foo
+foo
+bar
+foo
+foo
+bar
+caught ValueError
+foo
+foo
+foo
+bar
+foo
+foo
+foo
+bar
+foo
+foo
+foo
+bar
+caught ValueError
+...
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The standard idiom to ensure that the tasks have processed their cancelation is to add a <code>gather(*tasks, return_exceptions=True)</code> following the cancellation. For example:</p>
+<pre><code>async def main():
+    while True:
+        footask = asyncio.create_task(foo())
+        bartask = asyncio.create_task(bar())    
+        tasks = (footask, bartask)  # or a list comprehension, etc.
+        try:
+            await asyncio.gather(*tasks)
+        except ValueError:
+            print("caught ValueError")  
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+</code></pre>
+<p>Note that you might want to do that for <em>all</em> exceptions, not just <code>ValueError</code>, because otherwise a task completing with a non-<code>ValueError</code> exception will still cause other tasks to continue running.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>When exceptions happens <code>footask</code> is not cancelled because as you can read <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.gather" rel="nofollow noreferrer">in doc</a>:</p>
+<blockquote>
+<p>If return_exceptions is False (default), the first raised exception is
+  immediately propagated to the task that awaits on gather(). <strong>Other
+  awaitables in the aws sequence won’t be cancelled and will continue to
+  run.</strong></p>
+</blockquote>
+<p>So we should manually cancel <code>footask</code> and <a href="https://stackoverflow.com/a/43810272/1113207">await it was cancelled</a>:</p>
+<pre><code>async def main():
+    while True:
+        footask = asyncio.create_task(foo())
+        bartask = asyncio.create_task(bar())    
+        bothtasks = asyncio.gather(footask, bartask)
+        try:
+            await bothtasks 
+        except ValueError:
+            print("caught ValueError")
+
+            footask.cancel()  # cancel just mark task to be cancelled
+            try:
+                await footask  # await actually been cancelled
+            except asyncio.CancelledError:
+                pass
+</code></pre>
+<p><strong>Upd:</strong></p>
+<p>I wrote <code>advanced_gather</code> that acts like <code>gather</code>, but has additional kawrg <code>cancel_on_exception</code> to cancel every task on exception in one of them. Full code:</p>
+<pre><code>import asyncio
+
+
+async def advanced_gather(
+        *aws, 
+        loop=None, 
+        return_exceptions=False, 
+        cancel_on_exception=False
+    ):
+
+    tasks = [
+        asyncio.ensure_future(aw, loop=loop) 
+        for aw 
+        in aws
+    ]
+
+    try:
+        return await asyncio.gather(
+            *tasks, 
+            loop=loop, 
+            return_exceptions=return_exceptions
+        )    
+    except Exception:
+        if cancel_on_exception:            
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+            await asyncio.gather(
+                *tasks, 
+                loop=loop, 
+                return_exceptions=True
+            )
+        raise
+
+
+async def foo():
+    while True:
+        await asyncio.sleep(1)
+        print("foo")
+
+
+async def bar():
+    for _ in range(3):
+        await asyncio.sleep(1)
+        print("bar")
+    raise ValueError
+
+
+async def main():
+    while True:
+        try:
+            await advanced_gather(
+                foo(),
+                bar(),
+                cancel_on_exception=True
+            )
+        except ValueError:
+            print("caught ValueError")
+
+
+asyncio.run(main())
+</code></pre>
+<p><strong>Different cases of what can happen:</strong></p>
+<pre><code>import asyncio
+from contextlib import asynccontextmanager, suppress
+
+
+async def test(_id, raise_exc=False):
+    if raise_exc:
+        print(f'we raise RuntimeError inside {_id}')
+        raise RuntimeError('!')
+
+    try:
+        await asyncio.sleep(0.2)
+    except asyncio.CancelledError:
+        print(f'cancelledError was raised inside {_id}')
+        raise
+    else:
+        print(f'everything calm inside {_id}')
+
+
+@asynccontextmanager
+async def prepared_stuff(foo_exc=False):
+    foo = asyncio.create_task(test('foo', raise_exc=foo_exc))
+    bar = asyncio.create_task(test('bar'))
+    gather = asyncio.gather(
+        foo,
+        bar
+    )
+    await asyncio.sleep(0)  # make sure everything started
+
+    yield (foo, bar, gather)
+
+    try:
+        await gather
+    except Exception as exc:
+        print(f'gather raised {type(exc)}')
+    finally:
+        # make sure both tasks finished:
+        await asyncio.gather(
+            foo, 
+            bar, 
+            return_exceptions=True
+        )
+
+    print('')
+
+
+# ----------------------------------------------
+
+async def everyting_calm():
+    async with prepared_stuff() as (foo, bar, gather):
+        print('everyting_calm:')
+
+
+async def foo_raises_exception():
+    async with prepared_stuff(foo_exc=True) as (foo, bar, gather):
+        print('foo_raises_exception:')
+
+
+async def foo_cancelled():
+    async with prepared_stuff() as (foo, bar, gather):
+        print('foo_cancelled:')
+        foo.cancel()
+
+
+async def gather_cancelled():
+    async with prepared_stuff() as (foo, bar, gather):
+        print('gather_cancelled:')
+        gather.cancel()
+
+
+async def main():
+    await everyting_calm()
+    await foo_raises_exception()
+    await foo_cancelled()
+    await gather_cancelled()
+
+
+asyncio.run(main())
+</code></pre>
+</div>
+<span class="comment-copy">Great, thanks. (Suspect its a typo where keyword param <code>ignore_exceptions</code> should be <code>return_exceptions</code> in first sentence)</span>
+<span class="comment-copy">@JSStuball Yes, fixed if, thanks.</span>
+<span class="comment-copy">Thanks for highlighting the point about <code>task.cancel()</code> not immediately cancelling, but rather ensuring the next time the task is awoken it will raise a <code>CancelledError</code>.  However, all these nested <code>try</code>/<code>except</code> blocks don't seem to scale very well with <i>n</i> tasks in a gather. Any ideas about the point made in the Edit?</span>
+<span class="comment-copy">@JSStuball I updated answer. Hope it'll help.</span>
+<span class="comment-copy">Suggest calling <code>asyncio.ensure_future</code> instead of <code>create_task</code>. While <code>ensure_future</code> is often misusued when <code>create_task</code> would suffice, in this case the former is actually appropriate. Since <code>gather</code> accepts arbitrary awaitables and not just coroutine objects, you need to call <code>ensure_future</code> to convert them to futures. (Using <code>create_task</code> would unnecessarily restrict <code>advance_gather</code> to just coroutines.)</span>
+<span class="comment-copy">@user4815162342 good point, thanks! I altered answer.</span>
+<span class="comment-copy">@JSStuball I updated answer added snippet showing different cases of what can happen. You can check it and compare with documentation. Situation when gather() is cancelled is shown in <code>gather_cancelled()</code> coroutine.</span>

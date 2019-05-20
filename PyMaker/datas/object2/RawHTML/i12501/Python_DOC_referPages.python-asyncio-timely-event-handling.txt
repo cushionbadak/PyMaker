@@ -1,0 +1,193 @@
+<div class="post-text" itemprop="text">
+<p>I'm playing a bit with python's asyncio library, in the wake of <a href="https://docs.python.org/3/library/asyncio-subprocess.html#subprocess-using-transport-and-protocol" rel="nofollow">this example</a>, I wrote the following scripts:</p>
+<pre><code># file: get_rand.py
+from random import choice
+from time import sleep
+import sys
+
+def main():
+    sys.stderr.write('child: starting loop...\n')
+    for _ in range(5):
+        print(choice('abcdefghijklmnopqrstuvwxyz'))
+        sys.stderr.write('child: going to sleep\n')
+        sleep(0.5)
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>and:</p>
+<pre><code># file: async_test.py
+import asyncio
+import time
+
+
+class Protocol(asyncio.SubprocessProtocol):
+
+    def __init__(self, exit_f):
+        self.exit = exit_f
+        print('Protocol initialised')
+
+    def pipe_data_received(self, fd, data):
+        print('Data received')
+        if fd == 1:
+            with open('rand_file.txt', 'a') as out:
+                out.write(bytes(data).decode('ascii'))
+        elif fd == 2:
+            print('Received error data!')
+            print(data)
+
+    def pipe_connection_lost(self, fd, exc):
+        print('Pipe connection lost')
+        if exc is not None:
+            print(exc)
+            raise exc
+
+    def process_exited(self):
+        self.exit.set_result(True)
+        print('Subprocess exited')
+
+
+@asyncio.coroutine
+def mycoro():
+    loop = asyncio.get_event_loop()
+    exit_future = asyncio.Future(loop=loop)
+    print('creating process...')
+    subprocess = loop.subprocess_exec(lambda: Protocol(exit_future),
+                                      'python3.5', 'get_rand.py',
+                                      stdin=None, stderr=None)
+    transp, proto = yield from subprocess
+    print('waiting for subprocess to finish...')
+    yield from exit_future
+    transp.close()
+
+
+def main():
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(mycoro())
+    loop.close()
+</code></pre>
+<p>When executing this code, I get the following:</p>
+<pre><code>$ python3.5 async_test.py 
+creating process...
+Protocol initialised
+waiting for subprocess to finish...
+child: starting loop...
+child: going to sleep 
+child: going to sleep 
+child: going to sleep 
+child: going to sleep 
+child: going to sleep 
+Data received
+Pipe connection lost
+Subprocess exited
+</code></pre>
+<p>I have many questions about all this:</p>
+<ol>
+<li>Apparently the data the child sends trigger the pipe_data_received event only once and after the child has terminated. Is there a way to spawn a child process and have the pipe_data_received event triggered at every write on stdout?</li>
+<li>If I remove the line <code>transp, proto = yield from subprocess</code> the whole thing just hangs on <code>creating process...</code>, so it looks like the child is not started until the parent does <code>transp, proto = yield from subprocess</code>. Is that correct? Why is that?</li>
+<li>What if I wanted my process to spawn a child which runs forever and periodically triggers the pipe_data_received, while the lauching process keeps its execution flow, and does other stuff? Is this the right tool for such a need?</li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<h3>1.</h3>
+<p><code>print</code> writes data to stdout buffers, by default they are flushed only once.  You can add explicit <code>flush</code>.</p>
+<pre><code>for _ in range(5):
+   print(choice('abcdefghijklmnopqrstuvwxyz'))
+   sys.stdout.flush()
+</code></pre>
+<p>or on ptyhon3.3 and above</p>
+<pre><code>for _ in range(5):
+    print(choice('abcdefghijklmnopqrstuvwxyz'), flush=True)
+</code></pre>
+<p>More info <a href="https://stackoverflow.com/questions/230751/how-to-flush-output-of-python-print">How to flush output of Python print?</a>.</p>
+<h3>2.</h3>
+<p>The <code>subprocess_exec</code> returns coroutine. Every coroutine that you want to run  must be scheduled on the loop. <code>yield from</code> just schedules it and wait until it's done (for <code>subprocess_exec</code> done means process is executed). </p>
+<h3>3.</h3>
+<p>To run task in background, you have to as well schedule it on loop, but do not wait for results. You can use <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.ensure_future" rel="nofollow noreferrer">ensure_future`</a>.</p>
+<pre><code>@asyncio.coroutine
+def mycoro():
+    loop = asyncio.get_event_loop()
+    exit_future = asyncio.Future(loop=loop)
+    print('creating process...')
+    subprocess = loop.subprocess_exec(lambda: Protocol(exit_future),
+                                      'python3.5', 'get_rand.py',
+                                      stdin=None, stderr=None)
+    task = asyncio.ensure_future(subprocess)
+    print('Subprocess is handled in the background task')
+
+    # this function is called with run_until_complete, 
+    # since that returning means complete we would not
+    # finish subprocess task
+    # so im leaving it
+    yield from exit_future
+</code></pre>
+<p><strong>edit</strong></p>
+<p>And here simple example of running loop forever. I have removed all <code>exit_future</code> related stuff, as it is not needed.</p>
+<pre><code>import asyncio
+import time
+
+
+class Protocol(asyncio.Protocol):
+
+    def __init__(self):
+        print('Protocol initialised')
+
+    def pipe_data_received(self, fd, data):
+        print('Data received %s' % data)
+        if fd == 1:
+
+            with open('rand_file.txt', 'a') as out:
+                out.write(bytes(data).decode('ascii'))
+        elif fd == 2:
+            print('Received error data!')
+            print(data)
+
+
+    def pipe_connection_lost(self, fd, exc):
+        print('Pipe connection lost')
+        if exc is not None:
+            print(exc)
+            raise exc
+
+    def process_exited(self):
+        print('Subprocess exited')
+
+
+@asyncio.coroutine
+def mycoro():
+    loop = asyncio.get_event_loop()
+    print('creating process...')
+    subprocess = loop.subprocess_exec(lambda: Protocol(),
+                                      'python3.5', 'get_rand.py',
+                                      stdin=None, stderr=None)
+    asyncio.ensure_future(subprocess)
+    asyncio.ensure_future(dummy_work())
+    print('Mycoro finished, tasks are scheduled')
+
+
+@asyncio.coroutine
+def dummy_work():
+    while True:
+        yield from asyncio.sleep(1)
+        print('dummy work')
+
+def main():
+    loop = asyncio.get_event_loop()
+    asyncio.ensure_future(mycoro())
+    loop.run_forever()
+    loop.close()
+
+main()
+
+
+def main():
+    loop = asyncio.get_event_loop()
+    asyncio.ensure_future(mycoro())
+    loop.run_forever()
+    loop.close()
+
+main()
+</code></pre>
+</div>
+<span class="comment-copy">Thanks a lot for the thorough answer. Just one more question: in this case <code>yield from exit_future</code> blocks until the subprocess terminates? In case I wanted to keep execution outside of <code>mycoro()</code> while the subprocess was running (i.e. the protocol handles the data I receive from the subprocess while I do something else), how would I do that?</span>
+<span class="comment-copy">that's is right. I've added simple example.</span>

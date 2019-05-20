@@ -1,0 +1,198 @@
+<div class="post-text" itemprop="text">
+<p>Python 3.4.2</p>
+<p>I am learning asyncio and I use it to continously listen IPC bus, while gbulb listens to the dbus.</p>
+<h3>Some side notes:</h3>
+<p><em>So I created a function <code>listen_to_ipc_channel_layer</code> that continously listens for incoming messages on the IPC channel and passes the message to a <code>message_handler</code>.</em></p>
+<p><em>I am also listening to SIGTERM and SIGINT. So when I send a SIGTERM to the python process running the code you find at the bottom, the script should terminate gracefully.</em></p>
+<h3>The problem</h3>
+<p>… I am having is the following warning:</p>
+<pre><code>got signal 15: exit
+Task was destroyed but it is pending!
+task: &lt;Task pending coro=&lt;listen_to_ipc_channel_layer() running at /opt/mainloop-test.py:23&gt; wait_for=&lt;Future cancelled&gt;&gt;
+
+Process finished with exit code 0
+</code></pre>
+<p>… with the following code:</p>
+<pre><code>import asyncio
+import gbulb
+import signal
+import asgi_ipc as asgi
+
+def main():
+    asyncio.async(listen_to_ipc_channel_layer())
+    loop = asyncio.get_event_loop()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, ask_exit)
+
+    # Start listening on the Linux IPC bus for incoming messages
+    loop.run_forever()
+    loop.close()
+
+@asyncio.coroutine
+def listen_to_ipc_channel_layer():
+    """Listens to the Linux IPC bus for messages"""
+    while True:
+        message_handler(message=channel_layer.receive(["my_channel"]))
+        try:
+            yield from asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            break
+
+def ask_exit():
+    loop = asyncio.get_event_loop()
+    for task in asyncio.Task.all_tasks():
+        task.cancel()
+    loop.stop()
+
+
+if __name__ == "__main__":
+    gbulb.install()
+    # Connect to the IPC bus
+    channel_layer = asgi.IPCChannelLayer(prefix="my_channel")
+    main()
+</code></pre>
+<p>I still only understand very little of asyncio, but I think I know what is going on. While waiting for <code>yield from asyncio.sleep(0.1)</code> the signal handler caught the SIGTERM and in that process it calls <code>task.cancel()</code>.</p>
+<p><strong>Question thrown in: Shouldn't this trigger the <code>CancelledError</code> within the <code>while True:</code> loop?</strong> (Because it is not, but that is how I understand <a href="https://docs.python.org/3.4/library/asyncio-task.html#task" rel="noreferrer">"Calling cancel() will throw a CancelledError to the wrapped coroutine"</a>).</p>
+<p>Eventually <code>loop.stop()</code> is called which stops the loop without waiting for either <code>yield from asyncio.sleep(0.1)</code> to return a result or even the whole coroutine <code>listen_to_ipc_channel_layer</code>.</p>
+<p>Please correct me if I am wrong.</p>
+<p>I think the only thing I need to do is to make my program wait for the <code>yield from asyncio.sleep(0.1)</code> to return a result <em>and/or</em> coroutine to break out the while-loop and finish.</p>
+<p>I believe I confuse a lot of things. Please help me get those things straight so that I can figure out how to gracefully close the event loop without warning.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem comes from closing the loop immediately after cancelling the tasks. As the <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.Task.cancel" rel="noreferrer">cancel() docs state</a> </p>
+<blockquote>
+<p>"This arranges for a CancelledError to be thrown into the wrapped coroutine on <strong>the next cycle</strong> through the event loop."</p>
+</blockquote>
+<p>Take this snippet of code:</p>
+<pre><code>import asyncio
+import signal
+
+
+async def pending_doom():
+    await asyncio.sleep(2)
+    print("&gt;&gt; Cancelling tasks now")
+    for task in asyncio.Task.all_tasks():
+        task.cancel()
+
+    print("&gt;&gt; Done cancelling tasks")
+    asyncio.get_event_loop().stop()
+
+
+def ask_exit():
+    for task in asyncio.Task.all_tasks():
+        task.cancel()
+
+
+async def looping_coro():
+    print("Executing coroutine")
+    while True:
+        try:
+            await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            print("Got CancelledError")
+            break
+
+        print("Done waiting")
+
+    print("Done executing coroutine")
+    asyncio.get_event_loop().stop()
+
+
+def main():
+    asyncio.async(pending_doom())
+    asyncio.async(looping_coro())
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, ask_exit)
+
+    loop.run_forever()
+
+    # I had to manually remove the handlers to
+    # avoid an exception on BaseEventLoop.__del__
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.remove_signal_handler(sig)
+
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>Notice <code>ask_exit</code> cancels the tasks but does not <code>stop</code> the loop, on the next cycle <code>looping_coro()</code> stops it. The output if you cancel it is:</p>
+<pre><code>Executing coroutine
+Done waiting
+Done waiting
+Done waiting
+Done waiting
+^CGot CancelledError
+Done executing coroutine
+</code></pre>
+<p>Notice how <code>pending_doom</code> cancels and stops the loop <em>immediately after</em>. If you let it run until the <code>pending_doom</code> coroutines awakes from the sleep you can see the same warning you're getting:</p>
+<pre><code>Executing coroutine
+Done waiting
+Done waiting
+Done waiting
+Done waiting
+Done waiting
+Done waiting
+Done waiting
+&gt;&gt; Cancelling tasks now
+&gt;&gt; Done cancelling tasks
+Task was destroyed but it is pending!
+task: &lt;Task pending coro=&lt;looping_coro() running at canceling_coroutines.py:24&gt; wait_for=&lt;Future cancelled&gt;&gt;
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The meaning of the issue is that a loop doesn't have time to finish all the tasks.</p>
+<blockquote>
+<p>This arranges for a CancelledError to be thrown into the wrapped coroutine on the next cycle through the event loop.</p>
+</blockquote>
+<p>There is no chance to do a "next cycle" of the loop in your approach. To make it properly you should move a stop operation to a separate non-cyclic coroutine to give your loop a chance to finish.</p>
+<p>Second significant thing is <code>CancelledError</code> raising.</p>
+<blockquote>
+<p>Unlike Future.cancel(), this does not guarantee that the task will be cancelled: the exception might be caught and acted upon, delaying cancellation of the task or preventing cancellation completely. The task may also return a value or raise a different exception.</p>
+<p>Immediately after this method is called, cancelled() will not return True (unless the task was already cancelled). A task will be marked as cancelled when the wrapped coroutine terminates with a CancelledError exception (even if cancel() was not called).</p>
+</blockquote>
+<p>So after cleanup your coroutine must raise <code>CancelledError</code> to be marked as cancelled.</p>
+<p>Using an extra coroutine to stop the loop is not an issue because it is not cyclic and be done immediately after execution.</p>
+<pre><code>def main():                                              
+    loop = asyncio.get_event_loop()                      
+    asyncio.ensure_future(listen_to_ipc_channel_layer()) 
+
+    for sig in (signal.SIGINT, signal.SIGTERM):          
+        loop.add_signal_handler(sig, ask_exit)           
+    loop.run_forever()                                   
+    print("Close")                                       
+    loop.close()                                         
+
+
+@asyncio.coroutine                                       
+def listen_to_ipc_channel_layer():                       
+    while True:                                          
+        try:                                             
+            print("Running")                                 
+            yield from asyncio.sleep(0.1)                
+        except asyncio.CancelledError as e:              
+            print("Break it out")                        
+            raise e # Raise a proper error
+
+
+# Stop the loop concurrently           
+@asyncio.coroutine                                       
+def exit():                                              
+    loop = asyncio.get_event_loop()                      
+    print("Stop")                                        
+    loop.stop()                                          
+
+
+def ask_exit():                          
+    for task in asyncio.Task.all_tasks():
+        task.cancel()                    
+    asyncio.ensure_future(exit())        
+
+
+if __name__ == "__main__":               
+    main()                               
+</code></pre>
+</div>
+<span class="comment-copy">About the exception related to the signal handlers: You can also avoid this exception by calling <code>loop.close()</code> at the end.</span>

@@ -1,0 +1,166 @@
+<div class="post-text" itemprop="text">
+<p>I have a weird issue in one of my program, where a thread acquire a condition and an other thread tell that the condition is not acquired.</p>
+<p>I made some debug informations in order to know if the thread has acquired the condition, and it looks like yes, he did. But the other thread tell me that the condition is not acquired.</p>
+<p>Here is a summary (not really short, sorry about that) about how I did that, and the output I have :</p>
+<pre><code>import logging
+import time
+from threading import Condition, Lock, Thread
+logging.basicConfig(level=logging.DEBUG)
+
+class MyClass:
+
+    def __init__(self):
+
+        self._is_alive = False
+        self._thread_update = None
+        self._conditioned_thread = None
+        self._thread_condition = Condition(Lock()) # Or RLock() or nothing, same issue
+
+    def start(self):
+
+        self._is_alive = True
+        self._thread_update = Thread(target=self._loop_update, name="Updater")
+        self._conditioned_thread = Thread(target=self._loop_conditioned, name="Conditioned")
+        self._thread_update.start()
+        self._conditioned_thread.start()
+
+    def _loop_conditioned(self):
+        logging.debug("Starting conditioned thread")
+
+        with self._thread_condition:
+            while self._is_alive:
+                logging.debug("Awaiting... Is acquired ? %s", self._thread_condition._is_owned())
+                self._thread_condition.wait()
+                logging.debug("Success !")
+
+    def _loop_update(self):
+        time.sleep(1)
+        logging.debug("Notifying ! Is acquired ? %s", self._thread_condition._is_owned())
+        self._thread_condition.notify(1)
+        # Do some stuff
+
+    def stop(self):
+
+        self._is_alive = False
+        self._thread_condition.notify()
+        self._thread_update.join()
+        self._thread_condition.join()
+
+if __name__ == "__main__":
+    c = MyClass()
+    c.start()
+    time.sleep(4)
+    c.stop()
+</code></pre>
+<p>And here is the output :</p>
+<pre><code>DEBUG:root:Starting conditioned thread
+DEBUG:root:Awaiting... Is acquired ? True
+DEBUG:root:Notifying ! Is acquired ? False
+Exception in thread Updater:
+Traceback (most recent call last):
+  File "/usr/lib64/python2.6/threading.py", line 532, in __bootstrap_inner
+    self.run()
+  File "/usr/lib64/python2.6/threading.py", line 484, in run
+    self.__target(*self.__args, **self.__kwargs)
+  File ".../test.py", line 39, in _loop_update
+    self._thread_condition.notify(1)
+  File "/usr/lib64/python2.6/threading.py", line 274, in notify
+    raise RuntimeError("cannot notify on un-acquired lock")
+RuntimeError: cannot notify on un-acquired lock
+
+Traceback (most recent call last):
+  File ".../test.py", line 53, in &lt;module&gt;
+    c.stop()
+  File ".../test.py", line 45, in stop
+    self._thread_condition.notify()
+  File "/usr/lib64/python2.6/threading.py", line 274, in notify
+    raise RuntimeError("cannot notify on un-acquired lock")
+RuntimeError: cannot notify on un-acquired lock
+</code></pre>
+<p>The question is why do I have RuntimeError on that, even if I have acquired the condition ?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'm no thread expert, but the <a href="https://docs.python.org/3/library/threading.html#threading.Condition.wait" rel="nofollow">documentation</a> has this to say:</p>
+<blockquote>
+<p><strong>wait</strong>(<em>timeout=None</em>)</p>
+<p>Wait until notified or until a timeout occurs. If
+  <em>the calling thread has not acquired the lock</em> when this method is
+  called, a RuntimeError is raised.</p>
+<p><em>This method releases the underlying lock</em>, and then blocks until it is
+  awakened by a notify() or notify_all() call for the same condition
+  variable in another thread, or until the optional timeout occurs. Once
+  awakened or timed out, it re-acquires the lock and returns.</p>
+</blockquote>
+<p>(emphasis mine).</p>
+<p>So, it appears calling wait() releases the lock acquired by the <code>_conditioned_thread</code> thread. Possibly, that lock then needs somehow to be acquired by the other thread (possibly in a loop checking whether the lock is available); then, that other thread can <code>notify(1)</code> the other, first, thread to continue (and re-acquire the lock, as per the last words above).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The correct code after the answer :</p>
+<pre><code>import logging
+import time
+from threading import Condition, Lock, Thread
+logging.basicConfig(level=logging.DEBUG)
+
+class MyClass:
+
+    def __init__(self):
+
+        self._is_alive = False
+        self._thread_update = None
+        self._conditioned_thread = None
+        self._thread_condition = Condition()
+
+    def start(self):
+
+        self._is_alive = True
+        self._thread_update = Thread(target=self._loop_update, name="Updater")
+        self._conditioned_thread = Thread(target=self._loop_conditioned, name="Conditioned")
+        self._thread_update.start()
+        self._conditioned_thread.start()
+
+    def _loop_conditioned(self):
+        logging.debug("Starting conditioned thread")
+
+        with self._thread_condition:
+            while self._is_alive:
+                logging.debug("Awaiting... Is acquired ? %s", self._thread_condition._is_owned())
+                self._thread_condition.wait()
+                logging.debug("Success !")
+
+    def _loop_update(self):
+        time.sleep(1)
+
+        self._thread_condition.acquire()
+        logging.debug("Notifying ! Is acquired ? %s", self._thread_condition._is_owned())
+        self._thread_condition.notify()
+
+        self._thread_condition.release()
+        # Do some stuff
+
+    def stop(self):
+
+        self._is_alive = False
+        with self._thread_condition:
+            self._thread_condition.notify()
+        self._thread_update.join()
+        self._conditioned_thread.join()
+
+if __name__ == "__main__":
+    c = MyClass()
+    c.start()
+    time.sleep(4)
+    c.stop()
+</code></pre>
+<p>Output :</p>
+<pre><code>DEBUG:root:Starting conditioned thread
+DEBUG:root:Awaiting... Is acquired ? True
+DEBUG:root:Notifying ! Is acquired ? True
+DEBUG:root:Success !
+DEBUG:root:Awaiting... Is acquired ? True
+DEBUG:root:Success !
+</code></pre>
+</div>
+<span class="comment-copy">I'm not sure I follow, but you're calling notify() from the thread/method that has not acquired the condition (<code>_loop_update</code>), so it makes sense it fails there.</span>
+<span class="comment-copy">Wait : that's not the thread awaiting for condition event who must acquire the condition ? That's the second thread who notify the condition ?</span>
+<span class="comment-copy">More examples about the subject : <a href="http://www.laurentluce.com/posts/python-threads-synchronization-locks-rlocks-semaphores-conditions-events-and-queues/" rel="nofollow noreferrer">laurentluce.com/posts/…</a></span>
+<span class="comment-copy">@FunkySayu For my own curiousity: could you post (possibly as an additional answer) the working version of the code in your question? I'm curious how the releasing and acquiring of the lock between the two threads works in practice.</span>

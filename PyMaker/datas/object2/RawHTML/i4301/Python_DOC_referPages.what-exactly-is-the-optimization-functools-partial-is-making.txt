@@ -1,0 +1,92 @@
+<div class="post-text" itemprop="text">
+<p>CPython 3.6.4:</p>
+<pre><code>from functools import partial
+
+def add(x, y, z, a):
+    return x + y + z + a
+
+list_of_as = list(range(10000))
+
+def max1():
+    return max(list_of_as , key=lambda a: add(10, 20, 30, a))
+
+def max2():
+    return max(list_of_as , key=partial(add, 10, 20, 30))
+</code></pre>
+<p>now:</p>
+<pre><code>In [2]: %timeit max1()
+4.36 ms ± 42.3 µs per loop (mean ± std. dev. of 7 runs, 100 loops each)
+
+In [3]: %timeit max2()
+3.67 ms ± 25.9 µs per loop (mean ± std. dev. of 7 runs, 100 loops each)
+</code></pre>
+<p>I thought <code>partial</code> just remembers part of parameters and then forwards them to the original function when called with the rest of the parameters (so it's nothing more than a shortcut), but it seems it makes some optimization. In my case the whole <code>max2</code> function gets optimized by 15% compared to the <code>max1</code>, which is pretty nice.</p>
+<p>It would be great to know what the optimization is, so I could use it in a more efficient way. <a href="https://docs.python.org/3.6/library/functools.html#functools.partial" rel="nofollow noreferrer">Docs</a> are silent regarding any optimization. Not surprisingly, "roughly equivalent to" implementation (given in docs), does not optimize at all:</p>
+<pre><code>In [3]: %timeit max2()  # using `partial` implementation from docs 
+10.7 ms ± 267 µs per loop (mean ± std. dev. of 7 runs, 100 loops each)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The following arguments actually apply only to CPython, for other Python implementations it could be completely different. You actually said your question is about CPython but nevertheless I think it's important to realize that these in-depth questions almost always depend on implementation details that might be different for different implementations and might even be different between different CPython versions (for example CPython 2.7 could be completely different, but so could be CPython 3.5)!</p>
+<h2>Timings</h2>
+<p>First of all, I can't reproduce differences of 15% or even 20%. On my computer the difference is around ~10%. It's even less when you change the <code>lambda</code> so it doesn't have to look up <code>add</code> from the global scope (as already pointed out in the comments you can pass the <code>add</code> function as default argument to the function so the lookup happens in the local scope).</p>
+<pre><code>from functools import partial
+
+def add(x, y, z, a):
+    return x + y + z + a
+
+def max_lambda_default(lst):
+    return max(lst , key=lambda a, add=add: add(10, 20, 30, a))
+
+def max_lambda(lst):
+    return max(lst , key=lambda a: add(10, 20, 30, a))
+
+def max_partial(lst):
+    return max(lst , key=partial(add, 10, 20, 30))
+</code></pre>
+<p>I actually benchmarked these:</p>
+<p><a href="https://i.stack.imgur.com/Sjb9o.png" rel="noreferrer"><img alt="enter image description here" src="https://i.stack.imgur.com/Sjb9o.png"/></a></p>
+<pre><code>from simple_benchmark import benchmark
+from collections import OrderedDict
+
+arguments = OrderedDict((2**i, list(range(2**i))) for i in range(1, 20))
+b = benchmark([max_lambda_default, max_lambda, max_partial], arguments, "list size")
+
+%matplotlib notebook
+b.plot_difference_percentage(relative_to=max_partial)
+</code></pre>
+<h2>Possible explanations</h2>
+<p>It's very hard to find the exact reason for the difference. However there are a few possible options, assuming you have a <a href="https://github.com/python/cpython/blob/v3.6.4/Lib/functools.py#L319-L322" rel="noreferrer">CPython version with compiled <code>_functools</code> module</a> (all desktop versions of CPython that I use have it). </p>
+<p>As you already found out the <a href="https://github.com/python/cpython/blob/v3.6.4/Lib/functools.py#L236-L317" rel="noreferrer">Python version of <code>partial</code></a> will be significantly slower.</p>
+<ul>
+<li><p><code>partial</code> is implemented in C and can call the function directly - without intermediate Python layer<sup>1</sup>. The <code>lambda</code> on the other hand needs to do a Python level call to the "captured" function. </p></li>
+<li><p><code>partial</code> actually knows how the arguments fit together. So it can create the arguments that are passed to the function more efficiently (it just <a href="https://github.com/python/cpython/blob/v3.6.4/Modules/_functoolsmodule.c#L77" rel="noreferrer">concatenats the stored argument tuple to the passed in argument tuple</a>) instead of building a completely new argument tuple.</p></li>
+<li><p>In more recent Python versions several internals were changed in an effort to optimize function calls (the so called FASTCALL optimization). Victor Stinner has a list of related pull requests on his <a href="https://vstinner.github.io/fastcall-issues.html" rel="noreferrer">blog</a> in case you want to find out more about it. </p>
+<p>That probably will affect both the <code>lambda</code> and the <code>partial</code> but again because <code>partial</code> is a C function it <em>knows</em> which one to call directly without having to <em>infer</em> it like <code>lambda</code> does.</p></li>
+</ul>
+<p>However it's very important to realize that creating the <code>partial</code> has some overhead. The break-even point is for ~10 list elements, if the list is shorter, then the <code>lambda</code> will be faster.</p>
+<h3>Footnotes</h3>
+<p><sup>1</sup> If you call a function from Python it uses the OP-code <code>CALL_FUNCTION</code> which is actually a <a href="https://github.com/python/cpython/blob/v3.6.4/Python/ceval.c#L4805-L4867" rel="noreferrer">wrapper (that's what I meant with Python layer) around the <code>PyObject_Call*</code> (or FASTCAL) functions</a>. But it also includes creating the argument tuple/dictionary. If you call a function from a C function you can avoid this thin wrapper by directly calling the <code>PyObject_Call*</code> functions.</p>
+<p>In case you're interested about the OP-Codes, you can <a href="https://docs.python.org/3/library/dis.html" rel="noreferrer"><code>dis</code>assemble the function</a>:</p>
+<pre><code>import dis
+
+dis.dis("add(10, 20, 30, a)")
+
+  1           0 LOAD_NAME                0 (add)
+              2 LOAD_CONST               0 (10)
+              4 LOAD_CONST               1 (20)
+              6 LOAD_CONST               2 (30)
+              8 LOAD_NAME                1 (a)
+             10 CALL_FUNCTION            4
+             12 RETURN_VALUE
+</code></pre>
+<p>As you can see the <code>CALL_FUNCTION</code> op code is actually in there.</p>
+<p>As an aside: The <code>LOAD_NAME</code> is responsible for the performance difference between the <code>lambda_default</code> and the <code>lambda</code> without default. That's because loading a name actually starts by checking the local scope (the function scope), in the case of <code>add=add</code> the add function is in the local scope and it can stop then. If you don't have it in the local scope it will check each surrounding scope until it finds the name and it only stops when it reaches the global scope. And that lookup is done every time the <code>lambda</code> is called!</p>
+</div>
+<span class="comment-copy">did not know about partial, thanks for bringing it to my attention. As a hazarded guess: your overhead of creating new stack frames is less with partial involved as it only needs to store one variable instead of all four -but thats just a hazy (and most probably wrong) guess. I am waiting for the pros to pipe in for an in depth explanation :)</span>
+<span class="comment-copy">Any difference if instead of a lambda, you use a ‘def’?</span>
+<span class="comment-copy">@MichalCharemza I just checked (created an external <code>def helper(a): return add(10, 20, 30, a)</code> and used it in <code>max</code>) and there is no difference in speed.</span>
+<span class="comment-copy">There are also C sources for <code>partial</code>: <a href="https://github.com/python/cpython/blob/3070b71e5eedf62e49b8e7dedab75742a5f67ece/Modules/_functoolsmodule.c" rel="nofollow noreferrer">github.com/python/cpython/blob/…</a></span>
+<span class="comment-copy">One difference is that <code>max1</code> needs to lookup <code>add</code> in the global scope for each call while <code>max2</code> only does the lookup once. Adding <code>add=add</code> as a lambda parameter will make it faster. Alternatively, you can put it in a local variable of <code>max1</code>.</span>
+<span class="comment-copy">Isn't <code>functools.partial</code> implemented in Python since Python 3.4? <a href="https://github.com/python/cpython/blob/master/Lib/functools.py#L234" rel="nofollow noreferrer">github.com/python/cpython/blob/master/Lib/functools.py#L234</a></span>
+<span class="comment-copy">@PeterNimroot That's just a fallback in case you don't have the compiled <code>_functools</code> module (<a href="https://github.com/python/cpython/blob/master/Lib/functools.py#L312-L315" rel="nofollow noreferrer">the class is overwritten by an import shortly after</a>). And it's very rare that you don't have that.</span>

@@ -1,0 +1,186 @@
+<div class="post-text" itemprop="text">
+<p>I'm writing a library that uses abstract syntax trees to rewrite parts of a
+module. Once it's rewritten, I put it in <code>sys.modules</code> so other modules can
+call it. However, the timing is important, and I can't just run the rewritten module
+at the start. I want it to run when it gets imported by another module, and not
+before.</p>
+<p>I had solved this by writing an <a href="https://docs.python.org/3/glossary.html#term-importer" rel="nofollow noreferrer">importer</a>, but that used the <code>imp</code> module to
+create a new module object for my rewritten code. That <code>imp</code> module is now
+deprecated, and the replacement doesn't seem to let me create and execute a
+new module. It just lets me find the source file, and create a spec object
+pointing to that.</p>
+<p>If I can't use the <code>imp</code> module anymore, How can I create a new module with the
+rewritten code?</p>
+<p>As a trivial example, I have a module that just prints out a couple of messages:</p>
+<pre><code># my_module.py
+print('This is in my_module.py.')
+
+def do_something():
+    print('Doing something.')
+</code></pre>
+<p>My tracer has options for whether or not to import my_module.py and whether or
+not to rewrite it with an extra <code>print()</code> message.</p>
+<pre><code># tracer.py
+import builtins
+import imp
+import sys
+from argparse import ArgumentParser
+from ast import NodeTransformer, Expr, Call, Name, Load, Str, parse, fix_missing_locations
+from pathlib import Path
+
+
+def main():
+    print('Starting.')
+    args = parse_args()
+
+    if args.traced:
+        sys.meta_path.insert(0, TracedModuleImporter('my_module'))
+        print('Set up tracing.')
+
+    if args.imported:
+        from my_module import do_something
+        do_something()
+
+    print('Done.')
+
+
+class TracedModuleImporter(object):
+    PSEUDO_FILENAME = '&lt;traced&gt;'
+
+    def __init__(self, fullname):
+        self.fullname = fullname
+        source = Path(fullname + '.py').read_text()
+        tree = parse(source, self.PSEUDO_FILENAME)
+        new_tree = Tracer().visit(tree)
+        fix_missing_locations(new_tree)
+        self.code = compile(new_tree, self.PSEUDO_FILENAME, 'exec')
+
+    def find_module(self, fullname, path=None):
+        if fullname != self.fullname:
+            return None
+        return self
+
+    def load_module(self, fullname):
+        new_mod = imp.new_module(fullname)
+        sys.modules[fullname] = new_mod
+        new_mod.__builtins__ = builtins
+        new_mod.__file__ = self.PSEUDO_FILENAME
+        new_mod.__package__ = None
+
+        exec(self.code, new_mod.__dict__)
+        return new_mod
+
+
+class Tracer(NodeTransformer):
+    def visit_Module(self, node):
+        new_node = self.generic_visit(node)
+        new_node.body.append(Expr(value=Call(func=Name(id='print', ctx=Load()),
+                                             args=[Str(s='Traced')],
+                                             keywords=[])))
+        return new_node
+
+
+def parse_args():
+    parser = ArgumentParser()
+    parser.add_argument('--imported', action='store_true')
+    parser.add_argument('--traced', action='store_true')
+    return parser.parse_args()
+
+
+main()
+</code></pre>
+<p>When I call it, you can see the messages:</p>
+<pre><code>$ python tracer.py
+Starting.
+Done.
+$ python tracer.py --imported
+Starting.
+This is in my_module.py.
+Doing something.
+Done.
+$ python tracer.py --imported --traced
+Starting.
+Set up tracing.
+This is in my_module.py.
+Traced
+Doing something.
+Done.
+$ python tracer.py --traced
+Starting.
+Set up tracing.
+Done.
+</code></pre>
+<p>That all works fine with Python 3.6, but Python 3.7 complains about the <code>imp</code> module:</p>
+<pre><code>$ python tracer.py
+tracer.py:100: DeprecationWarning: the imp module is deprecated in favour of importlib; see the module's documentation for alternative uses
+  import imp
+Starting.
+Done.
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>It looks like I misunderstood the importer protocol. You can override the  part that executes the module, and leave the part that creates the new module unchanged. Here's my example, rewritten to use the newer importer protocol with <code>find_spec()</code> and <code>execute_module()</code> instead of <code>find_module()</code> and <code>load_module()</code>.</p>
+<pre><code>import sys
+from argparse import ArgumentParser
+from ast import NodeTransformer, Expr, Call, Name, Load, Str, parse, fix_missing_locations
+from importlib.abc import MetaPathFinder, Loader
+from importlib.machinery import ModuleSpec
+from pathlib import Path
+
+
+def main():
+    print('Starting.')
+    args = parse_args()
+
+    if args.traced:
+        sys.meta_path.insert(0, TracedModuleImporter('my_module'))
+        print('Set up tracing.')
+
+    if args.imported:
+        from my_module import do_something
+        do_something()
+
+    print('Done.')
+
+
+class TracedModuleImporter(MetaPathFinder, Loader):
+    PSEUDO_FILENAME = '&lt;traced&gt;'
+
+    def __init__(self, fullname):
+        self.fullname = fullname
+        source = Path(fullname + '.py').read_text()
+        tree = parse(source, self.PSEUDO_FILENAME)
+        new_tree = Tracer().visit(tree)
+        fix_missing_locations(new_tree)
+        self.code = compile(new_tree, self.PSEUDO_FILENAME, 'exec')
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname != self.fullname:
+            return None
+        return ModuleSpec(fullname, self)
+
+    def exec_module(self, module):
+        module.__file__ = self.PSEUDO_FILENAME
+        exec(self.code, module.__dict__)
+
+
+class Tracer(NodeTransformer):
+    def visit_Module(self, node):
+        new_node = self.generic_visit(node)
+        new_node.body.append(Expr(value=Call(func=Name(id='print', ctx=Load()),
+                                             args=[Str(s='Traced')],
+                                             keywords=[])))
+        return new_node
+
+
+def parse_args():
+    parser = ArgumentParser()
+    parser.add_argument('--imported', action='store_true')
+    parser.add_argument('--traced', action='store_true')
+    return parser.parse_args()
+
+
+main()
+</code></pre>
+<p>The output from that is exactly the same as the old version, but the deprecation warning is gone.</p>
+</div>

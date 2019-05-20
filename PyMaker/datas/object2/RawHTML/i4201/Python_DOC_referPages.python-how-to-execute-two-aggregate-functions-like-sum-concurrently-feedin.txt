@@ -1,0 +1,223 @@
+<div class="post-text" itemprop="text">
+<p>Imagine we have an iterator, say <code>iter(range(1, 1000))</code>. And we have two functions, each accepting an iterator as the only parameter, say <code>sum()</code> and <code>max()</code>. In SQL world we would call them aggregate functions. </p>
+<p>Is there any way to obtain results of both without buffering the iterator output?</p>
+<p>To do it, we would need to pause and resume aggregate function execution, in order to feed them both with the same values without storing them. Maybe is there a way to express it using async things without sleeps?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Let's consider how to apply two aggregate functions to the same iterator, which we can only exhaust once. The initial attempt (which hardcodes <code>sum</code> and <code>max</code> for brevity, but is trivially generalizable to an arbitrary number of aggregate functions) might look like this:</p>
+<pre><code>def max_and_sum_buffer(it):
+    content = list(it)
+    p = sum(content)
+    m = max(content)
+    return p, m
+</code></pre>
+<p>This implementation has the downside that it stores all the generated elements in memory at once, despite both functions being perfectly capable of stream processing. The question anticipates this cop-out and explicitly requests the result to be produced without buffering the iterator output. Is it possible to do this?</p>
+<h2>Serial execution: itertools.tee</h2>
+<p>It certainly <em>seems</em> possible. After all, Python iterators are <a href="http://gafter.blogspot.com/2007/07/internal-versus-external-iterators.html" rel="noreferrer">external</a>, so every iterator is already capable of suspending itself. How hard can it be to provide an adapter that splits an iterator into two new iterators that provide the same content? Indeed, this is exactly the description of <a href="https://docs.python.org/3/library/itertools.html#itertools.tee" rel="noreferrer"><code>itertools.tee</code></a>, which appears perfectly suited to parallel iteration:</p>
+<pre><code>def max_and_sum_tee(it):
+    it1, it2 = itertools.tee(it)
+    p = sum(it1)  # XXX
+    m = max(it2)
+    return p, m
+</code></pre>
+<p>The above produces the correct result, but doesn't work the way we'd like it to. The trouble is that we're not iterating in parallel. Aggregate functions like <code>sum</code> and <code>max</code> never suspend - each insists on consuming all of the iterator content before producing the result. So <code>sum</code> will exhaust <code>it1</code> before <code>max</code> has had a chance to run at all. Exhausting elements of <code>it1</code> while leaving <code>it2</code> alone will cause those elements to be accumulated inside an internal FIFO shared between the two iterators. That's unavoidable here - since <code>max(it2)</code> must see the same elements, <code>tee</code> has no choice but to accumulate them. (For more interesting details on <code>tee</code>, refer to <a href="http://pythonnotesbyajay.blogspot.com/2013/03/pythons-itertoolstee-explained-with.html?m=1" rel="noreferrer">this post.</a>)</p>
+<p>In other words, there is no difference between this implementation and the first one, except that the first one at least makes the buffering explicit. To eliminate buffering, <code>sum</code> and <code>max</code> must run in parallel, not one after the other.</p>
+<h2>Threads: concurrent.futures</h2>
+<p>Let's see what happens if we run the aggregate functions in separate threads, still using <code>tee</code> to duplicate the original iterator:</p>
+<pre><code>def max_and_sum_threads_simple(it):
+    it1, it2 = itertools.tee(it)
+
+    with concurrent.futures.ThreadPoolExecutor(2) as executor:
+        sum_future = executor.submit(lambda: sum(it1))
+        max_future = executor.submit(lambda: max(it2))
+
+    return sum_future.result(), max_future.result()
+</code></pre>
+<p>Now <code>sum</code> and <code>max</code> actually run in parallel (as much as <a href="https://wiki.python.org/moin/GlobalInterpreterLock" rel="noreferrer">the GIL</a> permits), threads being managed by the excellent <a href="https://docs.python.org/3/library/concurrent.futures.html" rel="noreferrer"><code>concurrent.futures</code></a> module. It has a fatal flaw, however: for <code>tee</code> not to buffer the data, <code>sum</code> and <code>max</code> must process their items at exactly the same rate. If one is even a little bit faster than the other, they will drift apart, and <code>tee</code> will buffer all intermediate elements. Since there is no way to predict how fast each will run, the amount of buffering is both unpredictable and has the nasty worst case of buffering everything.</p>
+<p>To ensure that no buffering occurs, <code>tee</code> must be replaced with a custom generator that buffers nothing and blocks until all the consumers have observed the previous value before proceeding to the next one. As before, each consumer runs in its own thread, but now the calling thread is busy running a producer, a loop that actually iterates over the source iterator and signals that a new value is available. Here is an implementation:</p>
+<pre><code>def max_and_sum_threads(it):
+    STOP = object()
+    next_val = None
+    consumed = threading.Barrier(2 + 1)  # 2 consumers + 1 producer
+    val_id = 0
+    got_val = threading.Condition()
+
+    def send(val):
+        nonlocal next_val, val_id
+        consumed.wait()
+        with got_val:
+            next_val = val
+            val_id += 1
+            got_val.notify_all()
+
+    def produce():
+        for elem in it:
+            send(elem)
+        send(STOP)
+
+    def consume():
+        last_val_id = -1
+        while True:
+            consumed.wait()
+            with got_val:
+                got_val.wait_for(lambda: val_id != last_val_id)
+            if next_val is STOP:
+                return
+            yield next_val
+            last_val_id = val_id
+
+    with concurrent.futures.ThreadPoolExecutor(2) as executor:
+        sum_future = executor.submit(lambda: sum(consume()))
+        max_future = executor.submit(lambda: max(consume()))
+        produce()
+
+    return sum_future.result(), max_future.result()
+</code></pre>
+<p>This is quite some amount of code for something so simple conceptually, but it is necessary for correct operation.</p>
+<p><code>produce()</code> loops over the outside iterator and sends the items to the consumers, one value at a time. It uses a <a href="https://docs.python.org/3/library/threading.html#barrier-objects" rel="noreferrer">barrier</a>, a convenient synchronization primitive added in Python 3.2, to wait until all consumers are done with the old value before overwriting it with the new one in <code>next_val</code>. Once the new value is actually ready, a <a href="https://docs.python.org/3/library/threading.html#condition-objects" rel="noreferrer">condition</a> is broadcast. <code>consume()</code> is a generator that transmits the produced values as they arrive, until detecting <code>STOP</code>. The code can be generalized run any number of aggregate functions in parallel by creating consumers in a loop, and adjusting their number when creating the barrier.</p>
+<p>The downside of this implementation is that it requires creation of threads (possibly alleviated by making the thread pool global) and a lot of very careful synchronization at each iteration pass. This synchronization destroys performance - this version is almost 2000 times slower than the single-threaded <code>tee</code>, and 475 times slower than the simple but non-deterministic threaded version.</p>
+<p>Still, as long as threads are used, there is no avoiding synchronization in some form. To completely eliminate synchronization, we must abandon threads and switch to cooperative multi-tasking. The question is is it possible to suspend execution of ordinary synchronous functions like <code>sum</code> and <code>max</code> in order to switch between them?</p>
+<h2>Fibers: greenlet</h2>
+<p>It turns out that the <a href="https://github.com/python-greenlet/greenlet" rel="noreferrer"><code>greenlet</code></a> third-party extension module enables exactly that. Greenlets are an implementation of <a href="https://en.wikipedia.org/wiki/Fiber_(computer_science)" rel="noreferrer">fibers</a>, lightweight micro-threads that switch between each other explicitly. This is sort of like Python generators, which use <code>yield</code> to suspend, except greenlets offer a much more flexible suspension mechanism, allowing one to choose who to suspend <em>to</em>.</p>
+<p>This makes it fairly easy to port the threaded version of <code>max_and_sum</code> to greenlets:</p>
+<pre><code>def max_and_sum_greenlet(it):
+    STOP = object()
+    consumers = None
+
+    def send(val):
+        for g in consumers:
+            g.switch(val)
+
+    def produce():
+        for elem in it:
+            send(elem)
+        send(STOP)
+
+    def consume():
+        g_produce = greenlet.getcurrent().parent
+        while True:
+            val = g_produce.switch()
+            if val is STOP:
+                return
+            yield val
+
+    sum_result = []
+    max_result = []
+    gsum = greenlet.greenlet(lambda: sum_result.append(sum(consume())))
+    gsum.switch()
+    gmax = greenlet.greenlet(lambda: max_result.append(max(consume())))
+    gmax.switch()
+    consumers = (gsum, gmax)
+    produce()
+
+    return sum_result[0], max_result[0]
+</code></pre>
+<p>The logic is the same, but with less code. As before, <code>produce</code> produces values retrieved from the source iterator, but its <code>send</code> doesn't bother with synchronization, as it doesn't need to when everything is single-threaded. Instead, it explicitly switches to every consumer in turn to do its thing, with the consumer dutifully switching right back. After going through all consumers, the producer is ready for the next iteration pass.</p>
+<p>Results are retrieved using an intermediate single-element list because greenlet doesn't provide access to the return value of the target function (and neither does <a href="https://docs.python.org/3/library/threading.html#thread-objects" rel="noreferrer"><code>threading.Thread</code></a>, which is why we opted for <code>concurrent.futures</code> above).</p>
+<p>There are downsides to using greenlets, though. First, they don't come with the standard library, you need to install the greenlet extension. Then, greenlet is inherently non-portable because the stack-switching code is <a href="https://github.com/python-greenlet/greenlet/issues/66" rel="noreferrer">not supported</a> by the OS and the compiler and can be considered somewhat of a hack (although an <a href="http://www.stackless.com/pipermail/stackless-dev/2004-March/000022.html" rel="noreferrer">extremely clever</a> one). A Python targeting <a href="http://droettboom.com/blog/2018/04/04/python-in-the-browser/" rel="noreferrer">WebAssembly</a> or <a href="http://www.jython.org/" rel="noreferrer">JVM</a> or <a href="https://www.graalvm.org/docs/reference-manual/languages/python/" rel="noreferrer">GraalVM</a> would be very unlikely to support greenlet. This is not a pressing issue, but it's definitely something to keep in mind for the long haul.</p>
+<h2>Coroutines: asyncio</h2>
+<p>As of Python 3.5, Python provides native coroutines. Unlike greenlets, and similar to generators, coroutines are distinct from regular functions and must be defined using <code>async def</code>. Coroutines can't be easily executed from synchronous code, they must instead be processed by a scheduler which drives them to completion. The scheduler is also known as an <em>event loop</em> because its other job is to receive IO events and pass them to appropriate callbacks and coroutines. In the standard library, this is the role of the <a href="https://docs.python.org/3/library/asyncio.html" rel="noreferrer"><code>asyncio</code></a> module.</p>
+<p>Before implementing an asyncio-based <code>max_and_sum</code>, we must first resolve a hurdle. Unlike greenlet, asyncio is only able to suspend execution of coroutines, not of arbitrary functions. So we need to replace <code>sum</code> and <code>max</code> with coroutines that do essentially the same thing. This is as simple as implementing them in the obvious way, only replacing <code>for</code> with <code>async for</code>, enabling the <a href="https://www.python.org/dev/peps/pep-0492/#asynchronous-iterators-and-async-for" rel="noreferrer">async iterator</a> to suspend the coroutine while waiting for the next value to arrive:</p>
+<pre><code>async def asum(it):
+    s = 0
+    async for elem in it:
+        s += elem
+    return s
+
+async def amax(it):
+    NONE_YET = object()
+    largest = NONE_YET
+    async for elem in it:
+        if largest is NONE_YET or elem &gt; largest:
+            largest = elem
+    if largest is NONE_YET:
+        raise ValueError("amax() arg is an empty sequence")
+    return largest
+
+# or, using https://github.com/vxgmichel/aiostream
+#
+#from aiostream.stream import accumulate
+#def asum(it):
+#    return accumulate(it, initializer=0)
+#def amax(it):
+#    return accumulate(it, max)
+</code></pre>
+<p>One could reasonably ask if providing a new pair of aggregate functions is cheating; after all, the previous solutions were careful to use existing <code>sum</code> and <code>max</code> built-ins. The answer will depend on the exact interpretation of the question, but I would argue that the new functions are allowed because they are in no way specific to the task at hand. They do the exact same thing the built-ins do, but consuming async iterators. I suspect that the only reason such functions don't already exist somewhere in the standard library is due to coroutines and async iterators being a relatively new feature.</p>
+<p>With that out of the way, we can proceed to write <code>max_and_sum</code> as a coroutine:</p>
+<pre><code>async def max_and_sum_asyncio(it):
+    loop = asyncio.get_event_loop()
+    STOP = object()
+
+    next_val = loop.create_future()
+    consumed = loop.create_future()
+    used_cnt = 2  # number of consumers
+
+    async def produce():
+        for elem in it:
+            next_val.set_result(elem)
+            await consumed
+        next_val.set_result(STOP)
+
+    async def consume():
+        nonlocal next_val, consumed, used_cnt
+        while True:
+            val = await next_val
+            if val is STOP:
+                return
+            yield val
+            used_cnt -= 1
+            if not used_cnt:
+                consumed.set_result(None)
+                consumed = loop.create_future()
+                next_val = loop.create_future()
+                used_cnt = 2
+            else:
+                await consumed
+
+    s, m, _ = await asyncio.gather(asum(consume()), amax(consume()),
+                                   produce())
+    return s, m
+</code></pre>
+<p>Although this version is based on switching between coroutines inside a single thread, just like the one using greenlet, it looks different. asyncio doesn't provide explicit switching of coroutines, it bases task switching on the <code>await</code> suspension/resumption primitive. The target of <code>await</code> can be another coroutine, but also an abstract "future", a value placeholder which will be filled in later by some other coroutine. Once the awaited value becomes available, the event loop automatically resumes execution of the coroutine, with the <code>await</code> expression evaluating to the provided value. So instead of <code>produce</code> switching to consumers, it suspends itself by awaiting a future that will arrive once all the consumers have observed the produced value.</p>
+<p><code>consume()</code> is an <a href="https://www.python.org/dev/peps/pep-0525/" rel="noreferrer">asynchronous generator</a>, which is like an ordinary generator, except it creates an async iterator, which our aggregate coroutines are already prepared to accept by using <code>async for</code>. An async iterator's equivalent of <code>__next__</code> is called <code>__anext__</code> and is a coroutine, allowing the coroutine that exhausts the async iterator to suspend while waiting for the new value to arrive. When a running async generator suspends on an <code>await</code>, that is observed by <code>async for</code> as a suspension of the implicit <code>__anext__</code> invocation. <code>consume()</code> does exactly that when it waits for the values provided by <code>produce</code> and, as they become available, transmits them to aggregate coroutines like <code>asum</code> and <code>amax</code>. Waiting is realized using the <code>next_val</code> future, which carries the next element from <code>it</code>. Awaiting that future inside <code>consume()</code> suspends the async generator, and with it the aggregate coroutine.</p>
+<p>The advantage of this approach compared to greenlets' explicit switching is that it makes it much easier to combine coroutines that don't know of each other into the same event loop. For example, one could have two instances of <code>max_and_sum</code> running in parallel (in the same thread), or run a more complex aggregate function that invoked further async code to do calculations.</p>
+<p>The following convenience function shows how to run the above from non-asyncio code:</p>
+<pre><code>def max_and_sum_asyncio_sync(it):
+    # trivially instantiate the coroutine and execute it in the
+    # default event loop
+    coro = max_and_sum_asyncio(it)
+    return asyncio.get_event_loop().run_until_complete(coro)
+</code></pre>
+<h2>Performance</h2>
+<p>Measuring and comparing performance of these approaches to parallel execution can be misleading because <code>sum</code> and <code>max</code> do almost no processing, which over-stresses the overhead of parallelization. Treat these as you would treat any microbenchmarks, with a large grain of salt. Having said that, let's look at the numbers anyway!</p>
+<p>Measurements were produced using Python 3.6 The functions were run only once and given <code>range(10000)</code>, their time measured by subtracting <code>time.time()</code> before and after the execution. Here are the results:</p>
+<ul>
+<li><p><code>max_and_sum_buffer</code> and <code>max_and_sum_tee</code>: 0.66 ms - almost exact same time for both, with the <code>tee</code> version being a bit faster.</p></li>
+<li><p><code>max_and_sum_threads_simple</code>: 2.7 ms. This timing means very little because of non-deterministic buffering, so this might be measuring the time to start two threads and the synchronization internally performed by Python.</p></li>
+<li><p><code>max_and_sum_threads</code>: 1.29 <strong>seconds</strong>, by far the slowest option, ~2000 times slower than the fastest one. This horrible result is likely caused by a combination of the multiple synchronizations performed at each step of the iteration and their interaction with the GIL.</p></li>
+<li><p><code>max_and_sum_greenlet</code>: 25.5 ms, slow compared to the initial version, but much faster than the threaded version. With a sufficiently complex aggregate function, one can imagine using this version in production.</p></li>
+<li><p><code>max_and_sum_asyncio</code>: 351 ms, almost 14 times slower than the greenlet version. This is a disappointing result because asyncio coroutines are more lightweight than greenlets, and switching between them should be much <em>faster</em> than switching between fibers. It is likely that the overhead of running the coroutine scheduler and the event loop (which in this case is overkill given that the code does no IO) is destroying the performance on this micro-benchmark.</p></li>
+<li><p><code>max_and_sum_asyncio</code> using <a href="https://github.com/MagicStack/uvloop" rel="noreferrer"><code>uvloop</code></a>: 125 ms. This is more than twice the speed of regular asyncio, but still almost 5x slower than greenlet.</p></li>
+</ul>
+<p>Running the examples under <a href="https://pypy.org/" rel="noreferrer">PyPy</a> doesn't bring significant speedup, in fact most of the examples run slightly slower, even after running them several times to ensure JIT warmup. The asyncio function requires a <a href="https://pastebin.com/kQw791i6" rel="noreferrer">rewrite</a> not to use async generators (since PyPy as of this writing implements Python 3.5), and executes in somewhat under 100ms. This is comparable to CPython+uvloop performance, i.e. better, but not dramatic compared to greenlet.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If it holds for your aggregate functions that <code>f(a,b,c,...) == f(a, f(b, f(c, ...)))</code>,then you could just cycle through your functions and feed them one element at a time, each time combining them with the result of the previous application, like <code>reduce</code> would do, e.g. like this:</p>
+<pre><code>def aggregate(iterator, *functions):
+    first = next(iterator)
+    result = [first] * len(functions)
+    for item in iterator:
+        for i, f in enumerate(functions):
+            result[i] = f((result[i], item))
+    return result
+</code></pre>
+<p>This is considerably slower (about 10-20 times) than just materializing the iterator in a list and applying the aggregate function on the list as a whole, or using <code>itertools.tee</code> (which basically does the same thing, internally), but it has the benefit of using no additional memory.</p>
+<p>Note, however, that while this works well for functions like <code>sum</code>, <code>min</code> or <code>max</code>, it does not work for other aggregating functions, e.g. finding the mean or median element of an iterator, as <code>mean(a, b, c) != mean(a, mean(b, c))</code>. (For <code>mean</code>, you could of course just get the <code>sum</code> and divide it by the number of elements, but computing e.g. the median taking just one element at a time will be more challenging.)</p>
+</div>
+<span class="comment-copy"><code>sum(a,b,c)</code> is the same as <code>sum(a,sum(b,c))</code>, likewise for <code>max</code>. Can we assume that that's always the case? Then just apply the aggregator functions for each element in the iterator.</span>
+<span class="comment-copy">@tobias_k Nice catch! I can't speak for the OP, but assuming that does sound like a bit of a stretch because then you're really working with binary functions (<code>+</code> and the binary <code>max</code>), and not with aggregate functions. The question refers to aggregate functions in general, describing them as "accepting an iterator as the only parameter", only using <code>sum</code> and <code>max</code> as examples. In that context I would argue that an answer needs to work for aggregates that cannot be reduced to a stateless series of applications of a binary function (e.g. an aggregate that returns the median of the sequence).</span>
+<span class="comment-copy">@user4815162342 I thought it would be a nice and simple way that works with O(1) memory and without threads, but you are right; <code>average</code> would be another example. (Also, it's pretty slow.)</span>
+<span class="comment-copy">@tobias_k <i>Also, it's pretty slow.</i> I tried it out of curiosity, and for <code>sum</code> and <code>max</code> and <code>range(10000)</code> it clocks at 4.9 ms on my machine, way faster than solutions from my answer (except the initial ones that buffer everything).</span>
+<span class="comment-copy">@user4815162342 I just compared it to buffering the entire iterator with <code>list</code> or <code>tee</code>. Anyway, I posted it as an answer, maybe it's useful in some cases. At least it's simpler than the thread-based approaches.</span>
+<span class="comment-copy">An excellent answer, but why rolling back the edit to use the API of concurrent futures executor correctly?</span>
+<span class="comment-copy">@wim Thanks for the suggestion, but both versions are in fact correct. In this case a <code>lambda</code> was used intentionally to make the code consistent with the later version that changes <code>lambda: sum(it1)</code> to <code>lambda: sum(consume())</code>, and where the transformation to the positional argument wouldn't work.</span>

@@ -1,0 +1,68 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to implement a clean-up routine in a utility module I have.  In looking around for solutions to my problem, I finally settled on using a <code>weakref</code> callback to do my cleanup.  However, I'm concerned that it won't work as expected because of a strong reference to the object from within the same module.  To illustrate:</p>
+<p><code>foo_lib.py</code></p>
+<pre><code>class Foo(object):
+
+    _refs = {}
+
+    def __init__(self, x):
+
+        self.x = x
+        self._weak_self = weakref.ref(self, Foo._clean)
+        Foo._refs[self._weak_self] = x
+
+    @classmethod
+    def _clean(cls, ref):
+
+        print 'cleaned %s' % cls._refs[ref]
+
+foo = Foo()
+</code></pre>
+<p>Other classes then reference <code>foo_lib.foo</code>.  I did find an old document from 1.5.1 that sort of references my concerns (<a href="http://www.python.org/doc/essays/cleanup/" rel="nofollow">http://www.python.org/doc/essays/cleanup/</a>) but nothing that makes me fully comfortable that <code>foo</code> will be released in such a way that the callback will be triggered reliably.  Can anyone point me towards some docs that would clear this question up for me?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The right thing to do here is to explicitly release your strong reference at some point, rather than counting on shutdown to do it.</p>
+<p>In particular, <em>if</em> the module is released, its globals will be released… but it doesn't seem to be documented anywhere that the module will get released. So, there may still be a reference to your object at shutdown. And, as Martijn Pieters pointed out:</p>
+<blockquote>
+<p>It is not guaranteed that <code>__del__()</code> methods are called for objects that still exist when the interpreter exits.</p>
+</blockquote>
+<p>However, if you can ensure that there are no (non-weak) references to your object some time <em>before</em> the interpreter exits, you can guarantee that your cleanup runs.</p>
+<p>You can use <a href="http://docs.python.org/3/library/atexit.html" rel="nofollow"><code>atexit</code></a> handlers to explicitly clean up after yourself, but you can just do it explicitly before falling off the end of your main module (or calling <code>sys.exit</code>, or finishing your last non-daemon thread, or whatever). The simplest thing to do is often to take your entire <code>main</code> function and wrap it in a <code>with</code> or <code>try</code>/<code>finally</code>.</p>
+<p>Or, even more simply, don't try to put cleanup code into <code>__del__</code> methods or weakref callbacks; just put the cleanup code itself into your <code>with</code> or <code>finally</code> or <code>atexit</code>.</p>
+<hr/>
+<p>In a comment on another answer:</p>
+<blockquote>
+<p>what I'm actually trying to do is close out a subprocess that is normally kept open by a timer, but needs to be nuked when the program exits. Is the only really "reliable" way to do this to start a daemonic subprocess to monitor and kill the other process separately?</p>
+</blockquote>
+<p>The usual way to do this kind of thing is to replace the timer with something signalable from outside. Without knowing your app architecture and what kind of timer you're using (e.g., a single-threaded async server where the reactor kicks the timer vs. a single-threaded async GUI app where an OS timer message kicks the timer vs. a multi-threaded app where the timer is just a thread that <code>sleep</code>s between intervals vs. …), it's hard to explain more specifically.</p>
+<p>Meanwhile, you may also want to look at whether there's a simpler way to handle your subprocesses. For example, maybe using an explicit process group, and killing your process group instead of your process (which will kill all of the children, on both Windows and Unix… although the details are very different)? Or maybe give the subprocess a pipe and have it quit when the other end of the pipe goes down?</p>
+<hr/>
+<p>Note that the documentation also gives you no guarantees about the order in which left-over references are deleted, if they are. In fact, if you're using CPython, <a href="http://docs.python.org/3.3/c-api/init.html#Py_Finalize" rel="nofollow"><code>Py_Finalize</code></a> specifically says that it's "done in random order".</p>
+<p><a href="http://hg.python.org/cpython/file/3.3/Python/pythonrun.c#l471" rel="nofollow">The source</a> is interesting. It's obviously not explicitly randomized, and it's not even entirely arbitrary. First it does GC collect until nothing is left, then it finalizes the GC itself, then it does a <code>PyImport_Cleanup</code> (which is basically just <code>sys.modules.clear()</code>), then there's another collect commented out (with some discussion as to why), and finally a <code>_PyImport_Fini</code> (which is defined only as "For internal use only").</p>
+<p>But this means that, assuming your module really is holding the only (non-weak) reference(s) to your object, and there are no unbreakable cycles involving the module itself, your module will get cleaned up at shutdown, which will drop the last reference to your object, causing it to get cleaned up as well. (Of course you cannot count on anything other than builtins, extension modules, and things you have a direct reference to still existing at this point… but your code above should be fine, because <code>foo</code> can't be cleaned up before <code>Foo</code>, and it doesn't rely on any other non-builtins.)</p>
+<p>Keep in mind that this is CPython-specific—and in fact CPython 3.3-specific; you will want to read the relevant equivalent source for your version to be sure. Again, the documentation explicitly says things get deleted "in random order", so that's what you have to expect if you don't want to rely on implementation-specific behavior.</p>
+<hr/>
+<p>Of course your cleanup code <em>still</em> isn't guaranteed to be called. For example, an unhandled signal (on Unix) or structured exception (on Windows) will kill the interpreter without giving it a chance to clean up anything. And even if you write handlers for that, someone could always pull the power cord. So, if you need a completely robust design, you need to be interruptable without cleanup at any point (by journaling, using atomic file operations, protocols with explicit acknowledgement, etc.).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Python modules are cleaned up when exiting, and any <a href="http://docs.python.org/2/reference/datamodel.html#object.__del__" rel="nofollow"><code>__del__</code> methods</a> <em>probably</em> are called:</p>
+<blockquote>
+<p>It is not guaranteed that <code>__del__()</code> methods are called for objects that still exist when the interpreter exits.</p>
+</blockquote>
+<p>Names starting with an underscore are cleared <em>first</em>:</p>
+<blockquote>
+<p>Starting with version 1.5, Python guarantees that globals whose name begins with a single underscore are deleted from their module before other globals are deleted; if no other references to such globals exist, this may help in assuring that imported modules are still available at the time when the <code>__del__()</code> method is called.</p>
+</blockquote>
+<p>Weak reference callbacks rely on the same mechanisms as <code>__del__</code> methods do; the C deallocation functions (<code>type-&gt;tp_dealloc</code>).</p>
+<p>The <code>foo</code> instance will retain a reference to the <code>Foo._clean</code> class method, but the <em>global</em> name <code>Foo</code> could be cleared already (it is assigned <code>None</code> in CPython); your method <em>should</em> be safe as it never refers to <code>Foo</code> once the callback has been registered.</p>
+</div>
+<span class="comment-copy">I don't think you want to be relying on weakref cleanup (or, equivalently, <code>__del__</code>) for whatever you're really doing, and it's hard to give a solid answer… but it's definitely an interesting question, and thanks for making me look at what interpreter finalization actually does, because there's some interesting stuff there as well.</span>
+<span class="comment-copy">What this is actually doing in my code is managing a performance optimization in a test framework.  I have a virtual display manager that starts and stops a single virtual display instance across multiple tests, and keeps track of other code reserving and releasing the display.  The timer kills the virtual display after 4 minutes of having no users reserving the display with a simple timer thread.  However, if it hasn't yet been 4 minutes when nose exits the test suite, the manager leaves the display active (if monitor is a daemon) or holds the process open till the thread times out.</span>
+<span class="comment-copy">I was actually looking at <code>atexit</code> at first, but thought it'd be nice to be more clever about it.  Maybe I'll just be less clever.  :)</span>
+<span class="comment-copy">The 'random' order stems from the fact that cleanup ordering is tied to dictionaries; with 3.3 random hashing was introduced making it that little bit more random. See <a href="http://stackoverflow.com/questions/18163697/exception-typeerror-warning-sometimes-shown-sometimes-not-when-using-throw-meth" title="exception typeerror warning sometimes shown sometimes not when using throw meth">stackoverflow.com/questions/18163697/…</a> for an example where that randomisation led to 'weird' behaviour.</span>
+<span class="comment-copy">@MartijnPieters: That makes sense… except that the bit about "random order" was there in the docs for 2.6 through 3.2 as well. I suspect it's just a CYA term meant to discourage you from relying on any order that you happen to discover. (There have been changes in previous versions, even in bugfix releases, that would change that order.) But you're right that most of the cleanup is driven by the most of <code>sys.modules</code> being cleaned up in dict-iteration order, which is more random in 3.3…</span>
+<span class="comment-copy">I specifically avoid <code>__del__</code>because of all the caveats.  I came across <a href="http://code.activestate.com/recipes/519621-object-finalization-without-" rel="nofollow noreferrer">code.activestate.com/recipes/…</a><b>del</b>-and-without-ha/ which made me think I was going in the right direction with <code>weakref</code>, but as I said, couldn't then track down any clarifying information on when the reference is released.  Is a <code>weakref</code> callback really just as reliable as <code>__del__</code>?</span>
+<span class="comment-copy">The same mechanisms call the weakref callback as would call <code>__del__</code>.</span>
+<span class="comment-copy">Where do the docs guarantee that modules are actually cleaned up when exiting? That would be a useful link to have.</span>
+<span class="comment-copy">@abarnert: I haven't found anything yet, other than the <code>object.__del__</code> documentation talking about <code>_</code> single-underscore names being cleared first.</span>
+<span class="comment-copy">Hmm.  Well, that's unfortunate.  So what I'm actually trying to do is close out a subprocess that is normally kept open by a timer, but needs to be nuked when the program exits.  Is the only really "reliable" way to do this to start a daemonic subprocess to monitor and kill the other process separately?</span>

@@ -1,0 +1,102 @@
+<div class="post-text" itemprop="text">
+<p>I'm not sure if this is the best fit for here or the Programmers Stack Exchange, but I'll try here first and cross-post this over there if it's not appropriate.</p>
+<p>I've recently developed a web service and I'm trying to create a Python-based command-line interface to make it easier to interact with. I've been using Python for a while for simple scripting purposes but I'm inexperienced at creating full-blown packages, including CLI applications.</p>
+<p>I've researched different packages to help with creating CLI apps and I've settled on using <a href="http://click.pocoo.org/5/" rel="nofollow noreferrer">click</a>. What I'm concerned about is how to structure my application to make it thoroughly <em>testable</em> before I actually go about putting it all together, and how I can use click to help with that.</p>
+<p>I have read <a href="http://click.pocoo.org/5/testing/" rel="nofollow noreferrer">click's documentation on testing</a> as well as examined the <a href="http://click.pocoo.org/5/api/#testing" rel="nofollow noreferrer">relevant part of the API</a> and while I've managed to use this for testing simple functionality (verifying <code>--version</code> and <code>--help</code> work when passed as arguments to my CLI), I'm not sure how to handle more advanced test cases.</p>
+<p>I'll provide a specific example of what I'm trying to test right now. I'm planning for my application to have the following sort of architecture...</p>
+<p><a href="https://i.stack.imgur.com/rD9MM.png" rel="nofollow noreferrer"><img alt="architecture" src="https://i.stack.imgur.com/rD9MM.png"/></a></p>
+<p>...where the <code>CommunicationService</code> encapsulates all logic involved in connecting and directly communicating with the web service over HTTP. My CLI provides defaults for the web service hostname and port but should allow users to override these either through explicit command-line arguments, writing config files or setting environment variables:</p>
+<pre><code>@click.command(cls=TestCubeCLI, help=__doc__)
+@click.option('--hostname', '-h',
+              type=click.STRING,
+              help='TestCube Web Service hostname (default: {})'.format(DEFAULT_SETTINGS['hostname']))
+@click.option('--port', '-p',
+              type=click.IntRange(0, 65535),
+              help='TestCube Web Service port (default: {})'.format(DEFAULT_SETTINGS['port']))
+@click.version_option(version=version.__version__)
+def cli(hostname, port):
+    click.echo('Connecting to TestCube Web Service @ {}:{}'.format(hostname, port))
+    pass
+
+
+def main():
+    cli(default_map=DEFAULT_SETTINGS)
+</code></pre>
+<p>I want to test that if the user specifies different hostnames and ports, then <code>Controller</code> will instantiate a <code>CommunicationService</code> using these settings and not the defaults.</p>
+<p>I imagine that the best way to do this would be something along these lines:</p>
+<pre><code>def test_cli_uses_specified_hostname_and_port():
+    hostname = '0.0.0.0'
+    port = 12345
+    mock_comms = mock(CommunicationService)
+    # Somehow inject `mock_comms` into the application to make it use that instead of 'real' comms service.
+    result = runner.invoke(testcube.cli, ['--hostname', hostname, '--port', str(port)])
+    assert result.exit_code == 0
+    assert mock_comms.hostname == hostname
+    assert mock_comms.port == port
+</code></pre>
+<p>If I can get advice on how to properly handle this case, I should hopefully be able to pick it up and use the same technique for making every other part of my CLI testable.</p>
+<p>For what it's worth, I'm currently using pytest for my tests and this is the extent of the tests I've got so far:</p>
+<pre><code>import pytest
+from click.testing import CliRunner
+
+from testcube import testcube
+
+
+# noinspection PyShadowingNames
+class TestCLI(object):
+    @pytest.fixture()
+    def runner(self):
+        return CliRunner()
+
+    def test_print_version_succeeds(self, runner):
+        result = runner.invoke(testcube.cli, ['--version'])
+
+        from testcube import version
+        assert result.exit_code == 0
+        assert version.__version__ in result.output
+
+    def test_print_help_succeeds(self, runner):
+        result = runner.invoke(testcube.cli, ['--help'])
+        assert result.exit_code == 0
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think I've found one way of doing it. I stumbled across Python's <a href="https://docs.python.org/3/library/unittest.mock.html" rel="nofollow">unittest.mock</a> module, and after a bit of playing around with it I ended up with the following.</p>
+<p>In my 'comms' module, I define <code>CommunicationService</code>:</p>
+<pre><code>class CommunicationService(object):
+    def establish_communication(self, hostname: str, port: int):
+        print('Communications service instantiated with {}:{}'.format(hostname, port))
+</code></pre>
+<p>This is a production class and the print statement will eventually get replaced with the actual communication logic.</p>
+<p>In my main module, I make my top-level command instantiate this communication service and try to establish communications:</p>
+<pre><code>def cli(hostname, port):
+    comms = CommunicationService()
+    comms.establish_communication(hostname, port)
+</code></pre>
+<p>And then the fun part. In my test suite I define this test case:</p>
+<pre><code>def test_user_can_override_hostname_and_port(self, runner):
+    hostname = 'mock_hostname'
+    port = 12345
+
+    # noinspection PyUnresolvedReferences
+    with patch.object(CommunicationService, 'establish_communication', spec=CommunicationService)\
+            as mock_establish_comms:
+        result = runner.invoke(testcube.cli,
+                               ['--hostname', hostname, '--port', str(port), 'mock.enable', 'true'])
+
+    assert result.exit_code == 0
+    mock_establish_comms.assert_called_once_with(hostname, port)
+</code></pre>
+<p>This temporarily replaces the <code>CommunicationService.establish_communication</code> method with an instance of <code>MagicMock</code>, which will perform no real logic but will record how many times it's called, with what arguments, etc. I can then invoke my CLI and make assertions about how it tried to establish communications based on the supplied command-line arguments.</p>
+<p>Having worked with projects written primarily in statically-typed languages like Java and C#, it never would have occurred to me that I could just monkey patch methods of my existing production classes, rather than create mock versions of those classes and find a way to substitute those in. It's pretty convenient.</p>
+<p>Now if I were to accidentally make it so that my CLI ignored explicit user-provided overrides for the hostname and port...</p>
+<pre><code>def cli(hostname, port):
+    comms = CommunicationService()
+    comms.establish_communication(DEFAULT_SETTINGS['hostname'], DEFAULT_SETTINGS['port'])
+</code></pre>
+<p>...then I have my handy test case to alert me:</p>
+<pre><code>&gt;           raise AssertionError(_error_message()) from cause
+E           AssertionError: Expected call: establish_communication('mock_hostname', 12345)
+E           Actual call: establish_communication('127.0.0.1', 36364)
+</code></pre>
+</div>

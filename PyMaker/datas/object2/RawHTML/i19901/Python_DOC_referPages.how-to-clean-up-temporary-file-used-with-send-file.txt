@@ -1,0 +1,117 @@
+<div class="post-text" itemprop="text">
+<p>I'm currently developing a server side json interface where several temporary files are manipulating during requests.</p>
+<p>My current solution for cleaning up these files at the end of the request looks like this: </p>
+<pre><code>@app.route("/method",methods=['POST'])
+def api_entry():
+    with ObjectThatCreatesTemporaryFiles() as object:
+        object.createTemporaryFiles()
+        return "blabalbal"
+</code></pre>
+<p>In this case, the cleanup takes lace in object.__exit__()</p>
+<p>However in a few cases I need to return a temporary files to the client, in which case the code looks like this:</p>
+<pre><code>@app.route("/method",methods=['POST'])
+def api_entry():
+    with ObjectThatCreatesTemporaryFiles() as object:
+        object.createTemporaryFiles()
+        return send_file(object.somePath)
+</code></pre>
+<p>This currently does not work, because when I the cleanup takes place flask is in the process of reading the file and sending it to the client.
+¨
+How can I solve this?</p>
+<p>Edit: I Forgot to mention that the files are located in temporary directories.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you are using Flask 0.9 or greater you can use the <a href="http://flask.pocoo.org/docs/api/#flask.after_this_request" rel="noreferrer"><code>after_this_request</code></a> decorator:</p>
+<pre><code>@app.route("/method",methods=['POST'])
+def api_entry():
+    tempcreator = ObjectThatCreatesTemporaryFiles():
+    tempcreator.createTemporaryFiles()
+
+    @after_this_request
+    def cleanup(response):
+        tempcreator.__exit__()
+        return response
+
+    return send_file(tempcreator.somePath)
+</code></pre>
+<p><strong>EDIT</strong></p>
+<p>Since that doesn't work, you could try using <a href="http://docs.python.org/2/library/stringio.html#module-cStringIO" rel="noreferrer"><code>cStringIO</code></a> instead (this assumes that your files are small enough to fit in memory):</p>
+<pre><code>@app.route("/method", methods=["POST"])
+def api_entry():
+    file_data = dataObject.createFileData()
+    # Simplest `createFileData` method:  
+    # return cStringIO.StringIO("some\ndata")
+    return send_file(file_data,
+                        as_attachment=True,
+                        mimetype="text/plain",
+                        attachment_filename="somefile.txt")
+</code></pre>
+<p>Alternately, you could create the temporary files as you do now, but <em>not</em> depend on your application to delete them.  Instead, set up a cron job (or a Scheduled Task if you are running on Windows) to run every hour or so and delete files in your temporary directory that were created more than half an hour before.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The method I've used is to use weak-references to delete the file once the response has been completed.</p>
+<pre><code>import shutil
+import tempfile
+import weakref
+
+class FileRemover(object):
+    def __init__(self):
+        self.weak_references = dict()  # weak_ref -&gt; filepath to remove
+
+    def cleanup_once_done(self, response, filepath):
+        wr = weakref.ref(response, self._do_cleanup)
+        self.weak_references[wr] = filepath
+
+    def _do_cleanup(self, wr):
+        filepath = self.weak_references[wr]
+        print('Deleting %s' % filepath)
+        shutil.rmtree(filepath, ignore_errors=True)
+
+file_remover = FileRemover()
+</code></pre>
+<p>And in the flask call I had:</p>
+<pre><code>@app.route('/method')
+def get_some_data_as_a_file():
+    tempdir = tempfile.mkdtemp()
+    filepath = make_the_data(dir_to_put_file_in=tempdir)
+    resp = send_file(filepath)
+    file_remover.cleanup_once_done(resp, tempdir)
+    return resp
+</code></pre>
+<p>This is quite general and as an approach has worked across three different python web frameworks that I've used.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I have two solutions.</p>
+<hr/>
+<p>The first solution is to delete the file in the <code>__exit__</code> method, but not close it. That way, the file-object is still accessible, and you can pass it to <code>send_file</code>.</p>
+<p>This will only work if you do not use <code>X-Sendfile</code>, because it uses the filename.</p>
+<hr/>
+<p>The second solution is to rely on the garbage collector. You can pass to <code>send_file</code> a file-object that will clean the file on deletion (<code>__del__</code> method). That way, the file is only deleted when the file-object is deleted from python. You can use <a href="http://docs.python.org/2/library/tempfile.html#tempfile.TemporaryFile" rel="nofollow"><code>TemporaryFile</code></a> for that, if you don't already.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It's a bit late, but this is what I did using <a href="https://stackoverflow.com/users/981855/madjar">madjar's</a> suggestions (in case anyone else comes across this). This is a little helper function that I use (it takes a PyExcelerate Workbook object as parameter) which you could adapt to your case. Just change the way you create/build your tempfile.TemporaryFile and you're set! Tested on Windows 8.1 and Ubuntu 12.04.</p>
+<pre><code>def xlsx_to_response(wb, filename):
+    f = tempfile.TemporaryFile()
+    wb._save(f)
+    f.seek(0)
+    response = send_file(f, as_attachment=True, attachment_filename=filename,
+                         add_etags=False)
+
+    f.seek(0, os.SEEK_END)
+    size = f.tell()
+    f.seek(0)
+    response.headers.extend({
+        'Content-Length': size,
+        'Cache-Control': 'no-cache'
+    })
+    return response
+</code></pre>
+</div>
+<span class="comment-copy">My answer feels like a dirty hack next to this one.</span>
+<span class="comment-copy">Unfortunetely it appears that flask still has the file opened at the time that @after_this_request is called :(</span>
+<span class="comment-copy">@monoceres :-(  That is to bad - I've updated my answer with some additional suggestions.</span>
+<span class="comment-copy">This solution was helpful. I have a situation where three files are created by my code. If a user chooses to download one file, the others are deleted. The selected file remains, but I think that's because I'm in a Windows environment. Thanks for this.</span>
+<span class="comment-copy">It works, and the core function is base on <code>weakref</code>, for whom not familiar with <code>weakref</code> <a href="https://docs.python.org/3/library/weakref.html" rel="nofollow noreferrer">docs.python.org/3/library/weakref.html</a> has some explaination.</span>
+<span class="comment-copy">Interesting, I will review these options, also see my edit concerning directories.</span>
+<span class="comment-copy">The first solution still works, because it is based on the fact that (on linux at least) opened file can still be read after the file is removed (unlinked). The second won't if the object that does the cleanup is the file-object.</span>
+<span class="comment-copy">Thanks a ton for this. I had done everything I could, but it wasn't working. When I saw your answer, I realized I had forgotten f.seek(0)</span>

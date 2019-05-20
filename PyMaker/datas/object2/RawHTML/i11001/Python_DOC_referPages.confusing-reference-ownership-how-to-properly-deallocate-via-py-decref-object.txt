@@ -1,0 +1,97 @@
+<div class="post-text" itemprop="text">
+<p>I was analysing the following code, which compiles and runs correctly, but generates a memory leak.</p>
+<p>The <code>cfiboheap</code> is a C implementation of a Fibonacci Heap and the following code is a Cython wrapper (a part of it) for <code>cfiboheap</code>.</p>
+<p>My doubts starts on the insert function. The object <code>data</code> has been created somewhere and passed to the function <code>insert()</code>. Since the function wants to add this object to the fiboheap it increases its reference count. But afterwards? To whom the ownership goes? In my understanding, the C function <code>fh_insertkey()</code> just borrows the ownership. Then it returns a proprietary pointer that needs to be incapsulated, and then returned by <code>insert()</code>. Cool. But my object <code>data</code> and its ref count? By creating the capsule I'm creating a new object, but I'm not decreasing the ref count of <code>data</code>. This produces the memory leak. </p>
+<p>(Note that commenting out <code>Py_INCREF</code> or adding <code>Py_DECREF</code> before the return of <code>insert()</code> results in a segmentation fault.)</p>
+<p>My questions are:</p>
+<p>1) Why is it necessary to increment the ref count of <code>data</code> during the <code>insert()</code>? </p>
+<p>2) Why is it not necessary to use a <code>Py_DECREF</code> during the <code>extract()</code>?</p>
+<p>3) More generally, how can I exactly keep track of the reference ownership when jumping between C and Python?</p>
+<p>4) How to properly deallocate an object like this FiboHeap? Should I use preventively a <code>Py_XDECREF</code> in <code>__dealloc__()</code> and, if yes, how?</p>
+<p>Thanks!</p>
+<pre><code>cimport cfiboheap
+from cpython.pycapsule cimport PyCapsule_New, PyCapsule_GetPointer
+from python_ref cimport Py_INCREF, Py_DECREF 
+
+cdef inline object convert_fibheap_el_to_pycapsule(cfiboheap.fibheap_el* element):
+    return PyCapsule_New(element, NULL, NULL)
+
+cdef class FiboHeap:
+
+    def __cinit__(FiboHeap self):
+        self.treeptr = cfiboheap.fh_makekeyheap()
+        if self.treeptr is NULL:
+            raise MemoryError()
+
+    def __dealloc__(FiboHeap self):
+        if self.treeptr is not NULL:
+            cfiboheap.fh_deleteheap(self.treeptr)
+
+    cpdef object insert(FiboHeap self, double key, object data=None):
+        Py_INCREF(data)
+        cdef cfiboheap.fibheap_el* retValue = cfiboheap.fh_insertkey(self.treeptr, key, &lt;void*&gt;data)
+        if retValue is NULL:
+            raise MemoryError()
+
+        return convert_fibheap_el_to_pycapsule(retValue)
+
+    cpdef object extract(FiboHeap self):
+        cdef void* ret = cfiboheap.fh_extractmin(self.treeptr)
+        if ret is NULL:
+            raise IndexError("FiboHeap is empty")
+
+        return &lt;object&gt; ret
+
+    cpdef object decrease_key(FiboHeap self,  object element, double newKey):
+        cdef void* ret = cfiboheap.fh_replacekey(self.treeptr, convert_pycapsule_to_fibheap_el(element), newKey)
+        if ret is NULL:
+            raise IndexError("New Key is Bigger")
+
+        return &lt;object&gt; ret 
+</code></pre>
+<p>Note that this hasn't been written by me, but I'm using this example to better understand obj referencing and to stop the leak (since I am actually using the code).</p>
+<p>The main code that makes use of <code>FiboHeap</code> (and where the leak happens) looks like this:</p>
+<pre><code>cdef dijkstra(Graph G, int start_idx, int end_idx):
+
+    cdef np.ndarray[object, ndim=1] fiboheap_nodes = np.empty([G.num_nodes], dtype=object) # holds all of our FiboHeap Nodes Pointers
+    Q = FiboHeap()
+    fiboheap_nodes[start_idx] = Q.insert(0, start_idx)
+    # Then occasionally:
+    Q.insert(...)
+    Q.decrease_key(...)
+    Q.extract()
+
+    return
+</code></pre>
+<p><code>extract</code> is not a peek, but a proper pop, so it is deleting the C element in the C fiboheap.</p>
+<p>In conclusion: it seems clear that the ref count of <code>data</code> causes a memory leak, but why? And how to stop it?  </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>1) It is necessary to increase the reference count in <code>insert</code> because its reference count will be automatically decreased at the end of insert. Cython does not know you are storing the object for later. (You can inspect the generated C code to see the <code>DECREF</code> at the end of the function). If <code>insert</code> is called with an object of reference count 1 (i.e. <code>.insert(SomeObject())</code>, then the object would be destroyed at the end of insert without the <code>INCREF</code></p>
+<p>2) If the object is removed from the <code>cfiboheap</code> during <code>extract</code> then you should do a <code>DECREF</code> to acknowledge the fact that you no longer hold it. Cast it to object first (so you still hold a reference to it)</p>
+<pre><code>   cdef void* ret = cfiboheap.fh_extractmin(self.treeptr) # refcount is 1 here (from the INCREF when it was stored)
+   if ret==NULL:
+        # ...
+
+   ret_obj = &lt;object&gt;ret
+   # reference count should be 2 here - one for being on the heap and one for ret_obj. Casting to object increases the refcount in Cython
+   Py_DECREF(ret_obj) # 1 here
+   return ret_obj
+</code></pre>
+<p>3) Honestly you try not to use <code>PyObject*</code> if you can avoid it! It's much better to let Cython do the work. If you can't avoid it then you just need to ensure <code>INCREF</code> is called once when you store the object, and <code>DECREF</code> is called once when you stop storing it.</p>
+<p>4) You do need to decref the remaining objects on the heap in <code>__dealloc__</code>. A very easy way to do that might be to all <code>extract</code> until the <code>cfiboheap</code> is empty:</p>
+<pre><code>try:
+    while True:
+        self.extract()
+except IndexError:
+    pass # ignore the error - we're done emptying the heap
+</code></pre>
+<hr/>
+<p>A comment about the use of capsules: who owns the <code>fibheap_el</code> that they point to (and when does this get destructed)? If it gets destructed when the <code>cfiboheap</code> gets destructed then you have the issue of a capsule with an invalid pointer still being alive. Using this capsule somewhere might end up causing problems. If it doesn't get destructed by the <code>cfiboheap</code> then you potentially have another memory leak.</p>
+</div>
+<span class="comment-copy">The initial (but different) question about this memory leak can be found <a href="http://stackoverflow.com/questions/38251216/how-to-deallocate-a-typed-numpy-array-is-setting-callback-free-data-a-viable-op">here</a>.</span>
+<span class="comment-copy">Why are you making a capsule at all? It seems useless and unsafe. Also, does <code>extract</code> do a peek or a pop?</span>
+<span class="comment-copy">I'm posting here since you mentioned it in your initial question - I don't think I understand what <code>fiboheap</code> does well enough to really answer this one. It'd avoid trying to use <code>PyObject*</code>s and reference counting in Cython - it's very hard to get right. The question @user2357112 asked about what <code>extract</code> does is key here....</span>
+<span class="comment-copy">The <code>extract</code> is a pop! So it destroys the element of the Heap. @user2357112 the code is not written by me, but I realized it was causing a memory leak while I was using it. I am both trying to stop the memory leak and understanding the object referencing better, since this is a kinda weird usage. I edited the question a bit.</span>
+<span class="comment-copy">@user2357112 Why there shouldn't be a capsule? The C function <code>cfiboheap.fh_insertkey</code> is returning a C pointer, which has to be passed to other Python functions afterwards, like <code>decrease_key(...)</code>.</span>
+<span class="comment-copy">Answer to point 1) is still a bit unclear. The C function <code>insert</code> should only borrow the reference of the element, so why Cython should decrease the ref count? Instead, I think the problem is related to what explained <a href="https://docs.python.org/3/extending/extending.html#thin-ice" rel="nofollow noreferrer">here</a>, that is the pointer to a valid element of the heap might get disposed during a subsequent extract, possible invalidating a subsequent insert in the same position. In this sense you are right when you say that Cython does not know that I'm storing the element for later.</span>

@@ -1,0 +1,129 @@
+<div class="post-text" itemprop="text">
+<p>Today while writing some especially terrible code, I stumbled across this mysterious behavior. The Python 3 program below prints a <em>randomly selected</em> attribute of <code>object</code>. How does this happen?</p>
+<p>An obvious suspect for the nondeterminism is the random ordering of the <code>vars(object)</code> dictionary, but I can't see how that causes the observed behavior. One hypothesis I had was that it was caused by the ordering of <code>__setattr__</code> being overridden, but this is disproved by the fact that the lambda is always called only once (checked by print debugging).</p>
+<pre><code>class TypeUnion: 
+    pass
+
+class t: 
+    pass
+
+def super_serious(obj):
+    proxy = t()
+    for name, val in vars(object).items():
+        if not callable(val) or type(val) is type: 
+            continue
+        try: 
+            setattr(t, name, lambda _, *x, **y: val)
+        except AttributeError: 
+            pass
+    return proxy
+
+print(super_serious(TypeUnion()).x)
+</code></pre>
+<p>N.B. The above program is not attempting to do anything useful; it is heavily reduced from the original.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://stackoverflow.com/a/44092507/1256452">Andrei Cioara's answer</a> is largely correct:</p>
+<ol>
+<li><p>The randomness comes from Python 3.3 and later randomizing hash order by default (see <a href="https://stackoverflow.com/q/14956313/1256452">Why is dictionary ordering non-deterministic?</a>).</p></li>
+<li><p>Accessing <code>x</code> calls the lambda function that has been bound to <code>__getattribute__</code>.</p></li>
+</ol>
+<p>See <a href="https://stackoverflow.com/q/3278077/1256452">Difference between __getattr__ vs __getattribute__</a> and <a href="https://docs.python.org/3/reference/datamodel.html#object.__getattribute__" rel="nofollow noreferrer">the Python3 datamodel reference notes for <code>object.__getattribute__</code></a>.</p>
+<p>We can make this whole thing far less obfuscated with:</p>
+<pre><code>class t(object):
+    def __getattribute__(self, name):
+        use = None
+        for val in vars(object).values():
+            if callable(val) and type(val) is not type:
+                use = val
+        return use
+
+def super_serious(obj):
+    proxy = t()
+    return proxy
+</code></pre>
+<p>which is sort of what happens with the lambda.  Note that in the loop, we don't bind / save the <em>current</em> value of <code>val</code>.<sup>1</sup>  This means that we get the <em>last</em> value that <code>val</code> has in the function.  With the original code, we do all this work at the time we create object <code>t</code>, rather than later when <code>t.__getattribute__</code> gets called—but it still boils down to: <em>Of &lt;name, value&gt; pairs in vars(object), find the last one that meets our criteria: the value must be callable, while the value's type is not itself <code>type</code>.</em></p>
+<p>Using <code>class t(object)</code> makes <code>t</code> a new-style class object even in Python2, so that this code now "works" in Python2 as well as Python3.  Of course, in Py2k, dictionary ordering is not randomized, so we always get the same thing every time:</p>
+<pre><code>$ python2 foo3.py
+&lt;slot wrapper '__init__' of 'object' objects&gt;
+$ python2 foo3.py
+&lt;slot wrapper '__init__' of 'object' objects&gt;
+</code></pre>
+<p>vs:</p>
+<pre><code>$ python3 foo3.py
+&lt;slot wrapper '__eq__' of 'object' objects&gt;
+$ python3 foo3.py
+&lt;slot wrapper '__lt__' of 'object' objects&gt;
+</code></pre>
+<p>Setting the environment variable <code>PYTHONHASHSEED</code> to <code>0</code> makes the order deterministic in Python3 as well:</p>
+<pre><code>$ PYTHONHASHSEED=0 python3 foo3.py
+&lt;method '__subclasshook__' of 'object' objects&gt;
+$ PYTHONHASHSEED=0 python3 foo3.py
+&lt;method '__subclasshook__' of 'object' objects&gt;
+$ PYTHONHASHSEED=0 python3 foo3.py
+&lt;method '__subclasshook__' of 'object' objects&gt;
+</code></pre>
+<hr/>
+<p><sup>1</sup>To see what this is about, try the following:</p>
+<pre><code>def f():
+    i = 0
+    ret = lambda: i
+    for i in range(3):
+        pass
+    return ret
+func = f()
+print('func() returns', func())
+</code></pre>
+<p>Note that it says <code>func() returns 2</code>, not <code>func() return 0</code>.  Then replace the lambda line with:</p>
+<pre><code>    ret = lambda stashed=i: stashed
+</code></pre>
+<p>and run it again.  Now the function returns 0.  This is because we saved the <em>current</em> value of <code>i</code> here.</p>
+<p>If we did this same sort of thing to the sample program, it would return the <em>first</em> <code>val</code> that meets the criteria, rather than the <em>last</em> one.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Non-determinism comes from the randomness in the <code>__dict__</code> returned by <code>vars(object)</code></p>
+<p>The print is a bit suspicious, since your TypeUnion does not have an 'x'  </p>
+<pre><code>super_serious(TypeUnion()).x 
+</code></pre>
+<p>The reason why something is returned is because your for loop overwrites <code>__getattribute__</code> and hence hijacks the dot. Adding this line would show that.</p>
+<pre><code>    if name == '__getattribute__':
+        continue
+</code></pre>
+<p>Once the <code>get</code> is compromised, the <code>set</code> is dead as well. Think of it like this</p>
+<pre><code>setattr(t, name, lambda *x, **y: val)
+</code></pre>
+<p>Is conceptually the same as  </p>
+<pre><code>t.__dict__[name] = lambda *x, **y: val
+</code></pre>
+<p>But the <code>get</code> now always returns the same reference, irrespective of the value of <code>name</code>, which is then overwritten. Therefore the final answer will be the last item in this iteration, which is random, since the for loop goes through the random order of the initial <code>__dict__</code></p>
+<p>Also, bear in mind that if your aim is to make a copy of the object, then the <code>setattr</code> is wrong. Calling the lambda would just return the original function but would not call the original function you would need something along the lines of </p>
+<pre><code>setattr(t, name, lambda *x, **y: val(*x, **y)  # Which doesn't work
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Yes, torek is correct in that your code doesn't bind the current value of <code>val</code>, so you get the last value assigned to <code>val</code>. Here is a version that "correctly" binds the value with a closure:</p>
+<pre><code>class TypeUnion: 
+    pass
+
+class t: 
+    pass
+
+def super_serious(obj):
+    proxy = t()
+    for name, val in vars(object).items():
+        if not callable(val) or type(val) is type: 
+            continue
+        try: 
+            setattr(t, name, (lambda v: lambda _, *x, **y: v)(val))
+        except AttributeError: 
+            pass
+    return proxy
+
+print(super_serious(TypeUnion()).x)
+</code></pre>
+<p>This will consistently output <code>&lt;slot wrapper '__getattribute__' of 'object' objects&gt;</code>, proving that the problem is that <code>__getattribute__</code> is hijacked.</p>
+</div>
+<span class="comment-copy">In what way does setting an attribute depending on getting it? I tried this code: <code>class c:     def __getattr__(self, a):         print('getattr')     def __getattribute__(self, a):         print('getattribute') c().x = 9</code>  and neither getter was called.</span>
+<span class="comment-copy">I might be wrong, was just trying to give some hints.</span>
+<span class="comment-copy">It's not that the <code>set</code> is <i>dead</i>, it's that the <code>get</code> gets called later, using the value last left in <code>val</code>.</span>
+<span class="comment-copy">Note, by the way, that <code>lambda _, *x, **y</code> is a bit silly: this is just a function that has one required argument and any number of optional additional positional and keyword arguments. For a true universal function we want one that takes <i>zero</i> or more positional arguments, which we might write as <code>lambda *args, **kwargs: ...</code>. Of course the whole thing is silly and meant as obfuscation, so I suppose <code>_, *x, **y</code> just makes it more-so. :-)</span>

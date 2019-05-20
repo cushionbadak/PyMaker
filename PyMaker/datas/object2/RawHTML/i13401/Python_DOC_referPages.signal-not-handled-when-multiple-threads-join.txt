@@ -1,0 +1,248 @@
+<div class="post-text" itemprop="text">
+<p>This should be very simple and I'm very surprised that I haven't been able to find this questions answered already on stackoverflow.</p>
+<p>I have a daemon like program that needs to respond to the SIGTERM and SIGINT signals in order to work well with upstart. I read that the best way to do this is to run the main loop of the program in a separate thread from the main thread and let the main thread handle the signals. Then when a signal is received the signal handler should tell the main loop to exit by setting a sentinel flag that is routinely being checked in the main loop.</p>
+<p>I've tried doing this but it is not working the way I expected. See the code below:</p>
+<pre><code>from threading import Thread
+import signal
+import time
+import sys
+
+stop_requested = False    
+
+def sig_handler(signum, frame):
+    sys.stdout.write("handling signal: %s\n" % signum)
+    sys.stdout.flush()
+
+    global stop_requested
+    stop_requested = True    
+
+def run():
+    sys.stdout.write("run started\n")
+    sys.stdout.flush()
+    while not stop_requested:
+        time.sleep(2)
+
+    sys.stdout.write("run exited\n")
+    sys.stdout.flush()
+
+signal.signal(signal.SIGTERM, sig_handler)
+signal.signal(signal.SIGINT, sig_handler)
+
+t = Thread(target=run)
+t.start()
+t.join()
+sys.stdout.write("join completed\n")
+sys.stdout.flush()
+</code></pre>
+<p>I tested this in the following two ways:</p>
+<p>1)</p>
+<pre><code>$ python main.py &gt; output.txt&amp;
+[2] 3204
+$ kill -15 3204
+</code></pre>
+<p>2)</p>
+<pre><code>$ python main.py
+ctrl+c
+</code></pre>
+<p>In both cases I expect this written to the output:</p>
+<pre><code>run started
+handling signal: 15
+run exited
+join completed
+</code></pre>
+<p>In the first case the program exits but all I see is:</p>
+<pre><code>run started
+</code></pre>
+<p>In the second case the SIGTERM signal is seemingly ignored when ctrl+c is pressed and the program doesn't exit.</p>
+<p>What am I missing here?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem is that, as explained in <a href="https://docs.python.org/3.4/library/signal.html#execution-of-python-signal-handlers">Execution of Python signal handlers</a>:</p>
+<blockquote>
+<p>A Python signal handler does not get executed inside the low-level (C) signal handler. Instead, the low-level signal handler sets a flag which tells the virtual machine to execute the corresponding Python signal handler at a later point(for example at the next bytecode instruction)</p>
+<p>… </p>
+<p>A long-running calculation implemented purely in C (such as regular expression matching on a large body of text) may run uninterrupted for an arbitrary amount of time, regardless of any signals received. The Python signal handlers will be called when the calculation finishes.</p>
+</blockquote>
+<p>Your main thread is blocked on <code>threading.Thread.join</code>, which ultimately means it's blocked in C on a <code>pthread_join</code> call. Of course that's not a "long-running calculation", it's a block on a syscall… but nevertheless, until that call finishes, your signal handler can't run.</p>
+<p>And, while on some platforms <code>pthread_join</code> will fail with <code>EINTR</code> on a signal, on others it won't. On linux, I believe it depends on whether you select BSD-style or default <code>siginterrupt</code> behavior, but the default is no.</p>
+<hr/>
+<p>So, what can you do about it?</p>
+<p>Well, I'm pretty sure the <a href="https://docs.python.org/3/whatsnew/3.3.html#signal">changes to signal handling in Python 3.3</a> actually changed the default behavior on Linux so you won't need to do anything if you upgrade; just run under 3.3+ and your code will work as you're expecting. At least it does for me with CPython 3.4 on OS X and 3.3 on Linux. (If I'm wrong about this, I'm not sure whether it's a bug in CPython or not, so you may want to raise it on python-list rather than opening an issue…)</p>
+<p>On the other hand, pre-3.3, the <code>signal</code> module definitely doesn't expose the tools you'd need to fix this problem yourself. So, if you can't upgrade to 3.3, the solution is to wait on something interruptible, like a <code>Condition</code> or an <code>Event</code>. The child thread notifies the event right before it quits, and the main thread waits on the event before it joins the child thread. This is definitely hacky. And I can't find anything that guarantees it will make a difference; it just happens to work for me in various builds of CPython 2.7 and 3.2 on OS X and 2.6 and 2.7 on Linux…</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>abarnert's answer was spot on. I'm still using Python 2.7 however. In order to solve this problem for myself I wrote an InterruptableThread class. </p>
+<p>Right now it doesn't allow passing additional arguments to the thread target. Join doesn't accept a timeout parameter either. This is just because I don't need to do that. You can add it if you want. You will probably want to remove the output statements if you use this yourself. They are just there as a way of commenting and testing.</p>
+<pre><code>import threading
+import signal
+import sys
+
+class InvalidOperationException(Exception):
+    pass    
+
+# noinspection PyClassHasNoInit
+class GlobalInterruptableThreadHandler:
+    threads = []
+    initialized = False
+
+    @staticmethod
+    def initialize():
+        signal.signal(signal.SIGTERM, GlobalInterruptableThreadHandler.sig_handler)
+        signal.signal(signal.SIGINT, GlobalInterruptableThreadHandler.sig_handler)
+        GlobalInterruptableThreadHandler.initialized = True
+
+    @staticmethod
+    def add_thread(thread):
+        if threading.current_thread().name != 'MainThread':
+            raise InvalidOperationException("InterruptableThread objects may only be started from the Main thread.")
+
+        if not GlobalInterruptableThreadHandler.initialized:
+            GlobalInterruptableThreadHandler.initialize()
+
+        GlobalInterruptableThreadHandler.threads.append(thread)
+
+    @staticmethod
+    def sig_handler(signum, frame):
+        sys.stdout.write("handling signal: %s\n" % signum)
+        sys.stdout.flush()
+
+        for thread in GlobalInterruptableThreadHandler.threads:
+            thread.stop()
+
+        GlobalInterruptableThreadHandler.threads = []    
+
+class InterruptableThread:
+    def __init__(self, target=None):
+        self.stop_requested = threading.Event()
+        self.t = threading.Thread(target=target, args=[self]) if target else threading.Thread(target=self.run)
+
+    def run(self):
+        pass
+
+    def start(self):
+        GlobalInterruptableThreadHandler.add_thread(self)
+        self.t.start()
+
+    def stop(self):
+        self.stop_requested.set()
+
+    def is_stop_requested(self):
+        return self.stop_requested.is_set()
+
+    def join(self):
+        try:
+            while self.t.is_alive():
+                self.t.join(timeout=1)
+        except (KeyboardInterrupt, SystemExit):
+            self.stop_requested.set()
+            self.t.join()
+
+        sys.stdout.write("join completed\n")
+        sys.stdout.flush()
+</code></pre>
+<p>The class can be used two different ways. You can sub-class InterruptableThread:</p>
+<pre><code>import time
+import sys
+from interruptable_thread import InterruptableThread
+
+class Foo(InterruptableThread):
+    def __init__(self):
+        InterruptableThread.__init__(self)
+
+    def run(self):
+        sys.stdout.write("run started\n")
+        sys.stdout.flush()
+        while not self.is_stop_requested():
+            time.sleep(2)
+
+        sys.stdout.write("run exited\n")
+        sys.stdout.flush()
+
+sys.stdout.write("all exited\n")
+sys.stdout.flush()
+
+foo = Foo()
+foo2 = Foo()
+foo.start()
+foo2.start()
+foo.join()
+foo2.join()
+</code></pre>
+<p>Or you can use it more like the way threading.thread works. The run method has to take the InterruptableThread object as a parameter though.</p>
+<pre><code>import time
+import sys
+from interruptable_thread import InterruptableThread
+
+def run(t):
+    sys.stdout.write("run started\n")
+    sys.stdout.flush()
+    while not t.is_stop_requested():
+        time.sleep(2)
+
+    sys.stdout.write("run exited\n")
+    sys.stdout.flush()
+
+t1 = InterruptableThread(run)
+t2 = InterruptableThread(run)
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+
+sys.stdout.write("all exited\n")
+sys.stdout.flush()
+</code></pre>
+<p>Do with it what you will.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I faced the same problem here <a href="https://stackoverflow.com/questions/32673497/signal-not-handled-when-multiple-threads-join">signal not handled when multiple threads join</a>. After reading <a href="https://stackoverflow.com/users/908494/abarnert">abarnert</a>'s answer, I changed to Python 3 and solved the problem. But I do like to change all my program to python 3. So, I solved my program by avoiding calling thread join() before signal sent. Below is my code.</p>
+<p><strong>It is not very good, but solved my program in python 2.7. My question was marked as duplicated, so I put my solution here.</strong></p>
+<pre><code>import threading, signal, time, os
+
+
+RUNNING = True
+threads = []
+
+def monitoring(tid, itemId=None, threshold=None):
+    global RUNNING
+    while(RUNNING):
+        print "PID=", os.getpid(), ";id=", tid
+        time.sleep(2)
+    print "Thread stopped:", tid
+
+
+def handler(signum, frame):
+    print "Signal is received:" + str(signum)
+    global RUNNING
+    RUNNING=False
+    #global threads
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGUSR1, handler)
+    signal.signal(signal.SIGUSR2, handler)
+    signal.signal(signal.SIGALRM, handler)
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGQUIT, handler)
+
+    print "Starting all threads..."
+    thread1 = threading.Thread(target=monitoring, args=(1,), kwargs={'itemId':'1', 'threshold':60})
+    thread1.start()
+    threads.append(thread1)
+    thread2 = threading.Thread(target=monitoring, args=(2,), kwargs={'itemId':'2', 'threshold':60})
+    thread2.start()
+    threads.append(thread2)
+    while(RUNNING):
+        print "Main program is sleeping."
+        time.sleep(30)
+    for thread in threads:
+        thread.join()
+
+    print "All threads stopped."
+</code></pre>
+</div>
+<span class="comment-copy">Try replacing <code>t.join()</code> with <code>while t.is_alive(): t.join(1)</code>.  Your main thread will wake up every second to check for signals.</span>
+<span class="comment-copy">More reading: <a href="http://snakesthatbite.blogspot.com/2010/09/cpython-threading-interrupting.html" rel="nofollow noreferrer">snakesthatbite.blogspot.com/2010/09/…</a></span>
+<span class="comment-copy">"This is definitely hacky" - I wouldn't say that generally. synchronizing your threads on a higher level of abstraction than simply using <code>join</code> is sensible. If your goal is to wait for the thread to exit (like this specific example) then <code>join</code> is the right tool; if you want to wait for the workload to finish, the a <code>Condition</code> etc. makes more sense. The workload could be executed (for example) in a pooled thread that doesn't exit immediately, after all.</span>
+<span class="comment-copy">appreciate the post but Python 2.7 is headed for doom so you might want to reconsider a solution for 3.7</span>
+<span class="comment-copy">Doesn't work on Windows and all except SIGINT are not available on Windows for Python 3.6.</span>
+<span class="comment-copy">worked for me on CentOS and python2.6</span>

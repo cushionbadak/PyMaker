@@ -1,0 +1,223 @@
+<div class="post-text" itemprop="text">
+<p>I have a python <code>multiprocessing</code> setup (i.e. <em>worker</em> processes) with custom signal handling, which prevents the worker from cleanly using <code>multiprocessing</code> itself. <em>(See extended problem description below)</em>.</p>
+<h2>The Setup</h2>
+<p>The <strong>master</strong> class that spawns all worker processes looks like the following (some parts stripped to only contain the important parts).</p>
+<p>Here, it re-binds its own <code>signal</code>s only to print <code>Master teardown</code>; actually the received signals are propagated down the process tree and must be handled by the workers themselves. This is achieved by re-binding the signals <em>after</em> workers have been spawned.</p>
+<pre class="lang-py prettyprint-override"><code>class Midlayer(object):
+    def __init__(self, nprocs=2):
+        self.nprocs = nprocs
+        self.procs = []
+
+    def handle_signal(self, signum, frame):
+        log.info('Master teardown')
+        for p in self.procs:
+            p.join()
+        sys.exit()
+
+    def start(self):
+        # Start desired number of workers
+        for _ in range(nprocs):
+            p = Worker()
+            self.procs.append(p)
+            p.start()
+
+        # Bind signals for master AFTER workers have been spawned and started
+        signal.signal(signal.SIGINT, self.handle_signal)
+        signal.signal(signal.SIGTERM, self.handle_signal)
+
+        # Serve forever, only exit on signals
+        for p in self.procs:
+            p.join()
+</code></pre>
+<p>The <strong>worker</strong> class bases <code>multiprocessing.Process</code> and implements its own <code>run()</code>-method.</p>
+<p>In this method, it connects to a distributed message queue and polls the queue for items <em>forever</em>. <em>Forever</em> should be: until the worker receives <code>SIGINT</code> or <code>SIGTERM</code>. The worker should not quit immediately; instead, it has to finish whatever calculation it does and will quit afterwards (once <code>quit_req</code> is set to <code>True</code>).</p>
+<pre class="lang-py prettyprint-override"><code>class Worker(Process):
+    def __init__(self):
+        self.quit_req = False
+        Process.__init__(self)
+
+    def handle_signal(self, signum, frame):
+        print('Stopping worker (pid: {})'.format(self.pid))
+        self.quit_req = True
+
+    def run(self):
+        # Set signals for worker process
+        signal.signal(signal.SIGINT, self.handle_signal)
+        signal.signal(signal.SIGTERM, self.handle_signal)
+
+        q = connect_to_some_distributed_message_queue()
+
+        # Start consuming
+        print('Starting worker (pid: {})'.format(self.pid))
+        while not self.quit_req:
+            message = q.poll()
+            if len(message):
+                try:
+                    print('{} handling message "{}"'.format(
+                        self.pid, message)
+                    )
+                    # Facade pattern: Pick the correct target function for the
+                    # requested message and execute it.
+                    MessageRouter.route(message)
+                except Exception as e:
+                    print('{} failed handling "{}": {}'.format(
+                        self.pid, message, e.message)
+                    )
+</code></pre>
+<h2>The Problem</h2>
+<p>So far for the basic setup, where (almost) everything works fine:</p>
+<ul>
+<li>The master process spawns the desired number of workers</li>
+<li>Each worker connects to the message queue</li>
+<li>Once a message is published, one of the workers receives it</li>
+<li>The facade pattern (using a class named <em>MessageRouter</em>) routes the received message to the respective function and executes it</li>
+</ul>
+<p>Now for the problem: Target functions (where the <code>message</code> gets directed to by the <code>MessageRouter</code> facade) may contain very complex business logic and thus <strong>may require multiprocessing</strong>.</p>
+<p>If, for example, the target function contains something like this:</p>
+<pre class="lang-py prettyprint-override"><code>nproc = 4
+# Spawn a pool, because we have expensive calculation here
+p = Pool(processes=nproc)
+# Collect result proxy objects for async apply calls to 'some_expensive_calculation'
+rpx = [p.apply_async(some_expensive_calculation, ()) for _ in range(nproc)]
+# Collect results from all processes
+res = [rpx.get(timeout=.5) for r in rpx]
+# Print all results
+print(res)
+</code></pre>
+<p>Then the processes spawned by the <code>Pool</code> will also redirect their signal handling for <code>SIGINT</code> and <code>SIGTERM</code> to the worker's <code>handle_signal</code> function (because of signal propagation to the process subtree), essentially printing <code>Stopping worker (pid: ...)</code> and not stopping at all. I know, that this happens due to the fact that I have re-bound the signals for the worker <em>before</em> its own child-processes are spawned. </p>
+<p><strong>This is where I'm stuck:</strong> I just cannot set the workers' signals <em>after</em> spawning its child processes, because I do not know whether or not it spawns some (target functions are masked and may be written by others), and because the worker stays (as designed) in its poll-loop. At the same time, I cannot expect the implementation of a target function that uses <code>multiprocessing</code> to re-bind its own signal handlers to (whatever) default values.</p>
+<p>Currently, I feel like restoring signal handlers in each loop in the worker (before the message is routed to its target function) and resetting them after the function has returned is the only option, but it simply feels wrong.</p>
+<p>Do I miss something? Do you have any advice? I'd be really happy if someone could give me a hint on how to solve the flaws of my design here!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There is not a clear approach for tackling the issue in the way you want to proceed. I often find myself in situations where I have to run unknown code (represented as Python entry point functions which might get down into some C weirdness) in multiprocessing environments.</p>
+<p>This is how I approach the problem.</p>
+<p><strong>The main loop</strong></p>
+<p>Usually the main loop is pretty simple, it fetches a task from some source (HTTP, Pipe, Rabbit Queue..) and submits it to a Pool of workers. I make sure the KeyboardInterrupt exception is correctly handled to shutdown the service.</p>
+<pre><code>try:
+    while 1:
+        task = get_next_task()
+        service.process(task)
+except KeyboardInterrupt:
+    service.wait_for_pending_tasks()
+    logging.info("Sayonara!")
+</code></pre>
+<p><strong>The workers</strong></p>
+<p>The workers are managed by a Pool of workers from either <code>multiprocessing.Pool</code> or from <code>concurrent.futures.ProcessPoolExecutor</code>. If I need more advanced features such as timeout support I either use <a href="https://pypi.python.org/pypi/billiard" rel="nofollow noreferrer">billiard</a> or <a href="https://pypi.python.org/pypi/Pebble/3.1.17" rel="nofollow noreferrer">pebble</a>.</p>
+<p>Each worker will ignore SIGINT as recommended <a href="http://noswap.com/blog/python-multiprocessing-keyboardinterrupt" rel="nofollow noreferrer">here</a>. SIGTERM is left as default.</p>
+<p><strong>The service</strong></p>
+<p>The service is controlled either by systemd or <a href="http://supervisord.org/" rel="nofollow noreferrer">supervisord</a>. In either cases, I make sure that the termination request is <strong>always</strong> delivered as a SIGINT (CTL+C).</p>
+<p>I want to keep SIGTERM as an emergency shutdown rather than relying only on SIGKILL for that. SIGKILL is not portable and some platforms do not implement it.</p>
+<p><em>"I whish it was that simple"</em></p>
+<p>If things are more complex, I'd consider the use of frameworks such as <a href="https://github.com/spotify/luigi" rel="nofollow noreferrer">Luigi</a> or <a href="http://www.celeryproject.org/" rel="nofollow noreferrer">Celery</a>. </p>
+<p>In general, reinventing the wheel on such things is quite detrimental and gives little gratifications. Especially if someone else will have to look at that code.</p>
+<p>The latter sentence does not apply if your aim is to learn how these things are done of course.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I was able to do this using Python 3 and <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.set_start_method" rel="nofollow noreferrer"><code>set_start_method(method)</code></a> with the <a href="https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods" rel="nofollow noreferrer"><code>'forkserver'</code> flavour</a>. Another way Python 3 &gt; Python 2!</p>
+<p>Where by "this" I mean:</p>
+<ol>
+<li>Have a main process with its own signal handler which just joins the children.</li>
+<li>Have some worker processes with a signal handler which <em>may</em> spawn...</li>
+<li>further subprocesses which <strong>do not</strong> have a signal handler.</li>
+</ol>
+<p>The behaviour on Ctrl-C is then:</p>
+<ol>
+<li>manager process waits for workers to exit.</li>
+<li>workers run their signal handlers, (an maybe set a <code>stop</code> flag and continue executing to finish their job, although I didn't bother in my example, I just joined the child I knew I had) and then exit.</li>
+<li>all children of the workers die immediately.</li>
+</ol>
+<p>Of course note that if your intention is for the children of the workers not to crash you will need to install some ignore handler or something for them in your worker process <code>run()</code> method, or somewhere.</p>
+<p>To mercilessly lift from the docs:</p>
+<blockquote>
+<p>When the program starts and selects the forkserver start method, a server process is started. From then on, whenever a new process is needed, the parent process connects to the server and requests that it fork a new process. The fork server process is single threaded so it is safe for it to use os.fork(). No unnecessary resources are inherited.</p>
+<p>Available on Unix platforms which support passing file descriptors over Unix pipes.</p>
+</blockquote>
+<p>The idea is therefore that the "server process" inherits the default signal handling behaviour <em>before</em> you install your new ones, so all its children also have default handling.</p>
+<p>Code in all its glory:</p>
+<pre><code>from multiprocessing import Process, set_start_method
+import sys
+from signal import signal, SIGINT
+from time import sleep
+
+
+class NormalWorker(Process):
+
+    def run(self):
+        while True:
+            print('%d %s work' % (self.pid, type(self).__name__))
+            sleep(1)
+
+
+class SpawningWorker(Process):
+
+    def handle_signal(self, signum, frame):
+        print('%d %s handling signal %r' % (
+            self.pid, type(self).__name__, signum))
+
+    def run(self):
+
+        signal(SIGINT, self.handle_signal)
+        sub = NormalWorker()
+        sub.start()
+        print('%d joining %d' % (self.pid, sub.pid))
+        sub.join()
+        print('%d %s joined sub worker' % (self.pid, type(self).__name__))
+
+
+def main():
+    set_start_method('forkserver')
+
+    processes = [SpawningWorker() for ii in range(5)]
+
+    for pp in processes:
+        pp.start()
+
+    def sig_handler(signum, frame):
+        print('main handling signal %d' % signum)
+        for pp in processes:
+            pp.join()
+        print('main out')
+        sys.exit()
+
+    signal(SIGINT, sig_handler)
+
+    while True:
+        sleep(1.0)
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since my previous answer was python 3 only, I thought I'd also suggest a more dirty method for fun which should work on both python 2 and python 3. Not Windows though...</p>
+<p><code>multiprocessing</code> just uses <code>os.fork()</code> under the covers, so patch it to reset the signal handling in the child:</p>
+<pre><code>import os
+from signal import SIGINT, SIG_DFL
+
+def patch_fork():
+
+    print('Patching fork')
+    os_fork = os.fork
+
+    def my_fork():
+        print('Fork fork fork')
+        cpid = os_fork()
+        if cpid == 0:
+            # child
+            signal(SIGINT, SIG_DFL)
+        return cpid
+
+    os.fork = my_fork
+</code></pre>
+<p>You can call that at the start of the run method of your <code>Worker</code> processes (so that you don't affect the Manager) and so be sure that any children will ignore those signals.</p>
+<p>This might seem crazy, but if you're not too concerned about portability it might actually not be a bad idea as it's simple and probably pretty resilient over different python versions. </p>
+</div>
+<span class="comment-copy">There is a lot of discussion about this, and I too have not found a clean solution. So what I do is ignore the signal in the worker processes, and have the master process catch it and notify all the workers (via <code>multiprocessing.Pipe</code> or <code>multiprocessing.Event</code> or a message queue like redis). The workers poll the pipe or queue or whatever every now and then, and exit according to the command they get.</span>
+<span class="comment-copy">This would mean to establish a proprietary signalling structure besides the OS signalling, which feels awkward (and may quickly get flawed). Thanks for your hints, mate! I'll see what I can do and update this question in case I finde something useful.</span>
+<span class="comment-copy">Thanks for sharing your experience! Been using celery before more and more was migrated to hadoop where now kafka has taken rabbitmq's place. I'll see whether your hints suit to fix my recent problem and comment on that later (and reward you, if it does!) -- for the future, I will definitely have a look at Luigi (which I found out is working well with Amazon's batch).</span>
+<span class="comment-copy">Thaks for your response! Sadly, I am not able to use python 3 right away. I see that we should migrate to a newer python version, but sometimes it's not as easy as that :/</span>
+<span class="comment-copy">Sure. If you're looking for a python 2 specific solution you should specify that in your question / tags though :-)</span>
+<span class="comment-copy">Right. Sorry, I somehow missed that :/ I'll update..</span>
+<span class="comment-copy">And probably I shouldn't have provided a python 3 only solution to a problem not tagged as such! But hopefully it was useful to be aware of.</span>
+<span class="comment-copy">It was! However, the solution of noxdafox suits better. Thanks for your effort anyhow!</span>

@@ -1,0 +1,170 @@
+<div class="post-text" itemprop="text">
+<p>I have a python client connected to an embedded server, which we communicate using c structure, am able to send the structure to the server and he is able to receive and parse my structure, the socket response is again a structure which I am unable to parse, there is no change in the structure format.</p>
+<pre><code>from ctypes import *
+
+class CommonMessage(Structure):
+        _pack_ = 1
+        _fields_ = [
+            ("sof", c_uint), ("request_id", c_uint),
+            ("interface", c_uint), ("msg_type", c_uint),
+            ("response", c_uint),
+            ("data_len", c_int), 
+            ("data", c_ubyte * msg_length)
+        ]
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server_address = ('192.168.98.64', 7000)
+sock.connect(server_address)
+sock.sendall(message_proto)
+sz = sizeof(message_proto)
+data = sock.recv(sz)
+print(data)
+b'\xcc\xdd\xee\xff~Y\xd4\x0b\x02\xb9\xa9\x00i\x02\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00'
+parsed_data = CommonMessage.from_buffer_copy(data)
+</code></pre>
+<p>while trying to parse the struct data getting an error</p>
+<p><strong>Buffer size too small (24 instead of at least 93 bytes)</strong></p>
+<p>Please do help....</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Starting with the <em>ctypes</em> doc page: <a href="https://docs.python.org/3/library/ctypes.html#module-ctypes" rel="nofollow noreferrer">[Python]: ctypes - A foreign function library for Python</a>.</p>
+<p>There's a design problem here. Imagine the following scenario: the other part sends the header + data (2 times) like:</p>
+<ol>
+<li>15 bytes (<code>data_len</code> = 15), and 15 extra bytes after the ones corresponding to the <em>struct</em></li>
+<li>25 bytes (<code>data_len</code> = 25), and 25 extra bytes after the ones corresponding to the <em>struct</em></li>
+</ol>
+<p><strong>You can't model that scenario with a <code>CommonMessage</code> defined <em>statically</em></strong>. What you need to do, is split it in 2 (<em>header</em> and <em>data</em>) sections, and every time you want to get a message:</p>
+<ol>
+<li>Read the header</li>
+<li>Look in the header for <code>data_len</code></li>
+<li>Read <strong>exactly</strong> <code>data_len</code> bytes as data</li>
+</ol>
+<p>This is the general solution, which works for all such cases. If there are particularities in your situation, other approaches - which are either simpler (from code <em>PoV</em>) either faster - could be used, but those will only work for those particularities. But since the question doesn't mention any such particularities (it's not even a <em>mcve</em> - 
+ as the code doesn't compile <em>OOTB</em>), I'm going to stick with the general solution. <br/>Note that it's the same as <a href="https://stackoverflow.com/questions/30615187/multiple-send-from-server-to-client-python/30615690#30615690">[SO]: multiple send from server to client python
+ (@CristiFati's answer)</a>.</p>
+<p><em>code.py</em>:</p>
+<pre><code>import sys
+import ctypes
+
+
+#              b"\xcc\xdd\xee\xff~Y\xd4\x0b\x02\xb9\xa9\x00i\x02\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00"  # Original buffer
+INPUT_BUFFER = b"\xcc\xdd\xee\xff~Y\xd4\x0b\x02\xb9\xa9\x00i\x02\x00\x00\x01\x00\x00\x00\x0F\x00\x00\x00\x01\x02\x03\x04\x05Dummy TextIGNORED PART"  # At the end, there are bytes for data
+#                                                                                         ^ - Modified data length to 15
+
+
+class CommonMessageHeader(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("sof", ctypes.c_uint),
+        ("request_id", ctypes.c_uint),
+        ("interface", ctypes.c_uint),
+        ("msg_type", ctypes.c_uint),
+        ("response", ctypes.c_uint),
+        ("data_len", ctypes.c_int),
+    ]
+
+
+def print_ctypes_instance_info(obj, indent="", metadata="", max_array_items=10, indent_increment="    "):
+    if metadata:
+        print("{:s}{:s}: {:}".format(indent, metadata, obj))
+    else:
+        print("{:s}[{:}]: {:}".format(indent, type(obj), obj))
+    if isinstance(obj, ctypes.Structure):
+
+        for field_name, field_type in obj._fields_:
+            print_ctypes_instance_info(getattr(obj, field_name),indent=indent + indent_increment, metadata="[{:}] {:s}".format(field_type, field_name))
+    elif isinstance(obj, ctypes.Array):
+
+        if max_array_items &lt; len(obj):
+            items_len, extra_line = max_array_items, True
+        else:
+            items_len, extra_line = len(obj), False
+        for idx in range(items_len):
+            print_ctypes_instance_info(obj[idx], indent=indent + indent_increment, metadata="[{:d}]".format(idx))
+        if extra_line:
+            print("{:s}...".format(indent + indent_increment))
+
+
+def get_instance_from_buffer(buffer):
+    header_len = ctypes.sizeof(CommonMessageHeader)
+    if header_len &gt; len(buffer):
+        raise ValueError(-1, "Buffer smaller than header")
+    header = CommonMessageHeader.from_buffer_copy(buffer)
+    required_buf_len = header_len + header.data_len
+    if required_buf_len &gt; len(buffer):
+        raise ValueError(-2, "Buffer smaller than header and data")
+
+    class CommonMessage(ctypes.Structure):
+        _pack_ = 1
+        _fields_ = [
+            ("header", CommonMessageHeader),
+            ("data", ctypes.c_ubyte * header.data_len)
+        ]
+
+    return CommonMessage.from_buffer_copy(buffer), required_buf_len
+
+
+def main():
+    print("sizeof(CommonMessageHeader): {:d}".format(ctypes.sizeof(CommonMessageHeader)))
+    print("Input buffer len: {:d}\n".format(len(INPUT_BUFFER)))
+    inst, inst_len = get_instance_from_buffer(INPUT_BUFFER)
+    print_ctypes_instance_info(inst)
+    print("\nOutput data as a string ({:d}): [{:s}]".format(len(inst.data), "".join([repr(chr(item))[1:-1] for item in inst.data])))
+    print("The rest of the buffer: [{:}]".format(INPUT_BUFFER[inst_len:]))
+
+
+if __name__ == "__main__":
+    print("Python {:s} on {:s}\n".format(sys.version, sys.platform))
+    main()
+</code></pre>
+<p><strong>Notes</strong>:</p>
+<ul>
+<li>The largest function (<code>print_ctypes_instance_info</code>) is just used for printing an object</li>
+<li>I modified a bit your original buffer to actually have something to work with</li>
+<li><code>get_instance_from_buffer</code> is the function that attempts to convert the existing buffer into an <code>CommonMessage</code> (which is different than the one in the question which is now <code>CommonMessageHeader</code>) instance:
+
+<ul>
+<li>It expects a buffer (meaning that it's already read). That is because I didn't want to create a whole server / client app and exchange messages. Actually I got rid of all the socket related code (as the protocol that I'm trying to illustrate doesn't really depend on it). <br/>Probably the final implementation should rely on a socket instead of a buffer, and only read the required amount of data from it</li>
+<li>The <code>CommonMessage</code> class is created on the fly for each message (it's not global like <code>CommonMessageHeader</code> for example) since <code>ctypes.Structure._fields_</code> <strong>can only be set once</strong></li>
+<li>If the buffer is too small <code>ValueError</code> is raised</li>
+<li>The 2<sup>nd</sup> value returned is the number of bytes that were "consumed" for this instance; if for example the input buffer is longer, the remaining ones might belong to the next message</li>
+</ul></li>
+</ul>
+<p><strong>Output</strong>:</p>
+<blockquote>
+<pre><code>(py35x64_test) e:\Work\Dev\StackOverflow\q051086829&gt;"e:\Work\Dev\VEnvs\py35x64_test\Scripts\python.exe" code.py
+Python 3.5.4 (v3.5.4:3f56838, Aug  8 2017, 02:17:05) [MSC v.1900 64 bit (AMD64)] on win32
+
+sizeof(CommonMessageHeader): 24
+Input buffer len: 51
+
+[&lt;class '__main__.get_instance_from_buffer.&lt;locals&gt;.CommonMessage'&gt;]: &lt;__main__.get_instance_from_buffer.&lt;locals&gt;.CommonMessage object at 0x000002106F1BBBC8&gt;
+    [&lt;class '__main__.CommonMessageHeader'&gt;] header: &lt;__main__.CommonMessageHeader object at 0x000002106F1BBB48&gt;
+        [&lt;class 'ctypes.c_ulong'&gt;] sof: 4293844428
+        [&lt;class 'ctypes.c_ulong'&gt;] request_id: 198465918
+        [&lt;class 'ctypes.c_ulong'&gt;] interface: 11122946
+        [&lt;class 'ctypes.c_ulong'&gt;] msg_type: 617
+        [&lt;class 'ctypes.c_ulong'&gt;] response: 1
+        [&lt;class 'ctypes.c_long'&gt;] data_len: 15
+    [&lt;class '__main__.c_ubyte_Array_15'&gt;] data: &lt;__main__.c_ubyte_Array_15 object at 0x000002106F1BBB48&gt;
+        [0]: 1
+        [1]: 2
+        [2]: 3
+        [3]: 4
+        [4]: 5
+        [5]: 68
+        [6]: 117
+        [7]: 109
+        [8]: 109
+        [9]: 121
+        ...
+
+Output data as a string (15): [\x01\x02\x03\x04\x05Dummy Text]
+The rest of the buffer: [b'IGNORED PART']
+</code></pre>
+</blockquote>
+</div>
+<span class="comment-copy">where is <code>msg_length</code> defined?</span>
+<span class="comment-copy">TCP is byte-oriented.  You have to verify that you received at least 93 bytes (in this case) before parsing it.  Better to design a protocol to send the size of the data and then the data...buffer your received data and extract only complete messages.</span>
+<span class="comment-copy">message length is the length of the string   msg_length = len(serialized_string)</span>
+<span class="comment-copy">Did this answer your question?</span>

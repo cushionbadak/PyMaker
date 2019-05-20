@@ -1,0 +1,90 @@
+<div class="post-text" itemprop="text">
+<p>I want to understand more about Cython's awesome <a href="https://cython.readthedocs.io/en/stable/src/userguide/memoryviews.html" rel="nofollow noreferrer">typed-memoryviews</a> and the memory layout <code>indirect_contiguous</code>.</p>
+<p>According to the <a href="https://cython.readthedocs.io/en/stable/src/userguide/memoryviews.html#specifying-more-general-memory-layouts" rel="nofollow noreferrer">documentation</a> <code>indirect_contiguous</code> is used when <em>"the list of pointers is contiguous"</em>.</p>
+<p>There's also an example usage:
+</p>
+<pre><code># contiguous list of pointers to contiguous lists of ints
+cdef int[::view.indirect_contiguous, ::1] b
+</code></pre>
+<p>So pls correct me if I'm wrong but I assume a <em>"contiguous list of pointers to contiguous lists of ints"</em> means something like the array created by the following c++ dummy-code:</p>
+<pre class="lang-c prettyprint-override"><code>// we want to create a 'contiguous list of pointers to contiguous lists of ints'
+
+int** array;
+// allocate row-pointers
+// This is the 'contiguous list of pointers' related to the first dimension:
+array = new int*[ROW_COUNT]
+
+// allocate some rows, each row is a 'contiguous list of ints'
+array[0] = new int[COL_COUNT]{1,2,3}
+</code></pre>
+<p>So if I understand correctly then in my Cython code it should be possible to get a memoryview from a <code>int**</code> like this:</p>
+<pre class="lang-py prettyprint-override"><code>cdef int** list_of_pointers = get_pointers()
+cdef int[::view.indirect_contiguous, ::1] view = &lt;int[:ROW_COUNT:view.indirect_contiguous,COL_COUNT:1]&gt; list_of_pointers
+</code></pre>
+<p>But I get Compile-errors:  </p>
+<pre><code>cdef int[::view.indirect_contiguous, ::1] view = &lt;int[:ROW_COUNT:view.indirect_contiguous,:COL_COUNT:1]&gt; list_of_pointers
+                                                                                                        ^                                                                                                                              
+------------------------------------------------------------
+
+memview_test.pyx:76:116: Pointer base type does not match cython.array base type
+</code></pre>
+<p>what did I do wrong?
+Am I missing any casts or did I misunderstand the concept of indirect_contiguous?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Let's set the record straight: typed memory view can be only used with objects which implement <a href="https://docs.python.org/3/c-api/buffer.html#buffer-protocol" rel="nofollow noreferrer">buffer-protocol</a>.</p>
+<p>Raw C-pointers obviously don't implement the buffer-protocol. But you might ask, why something like the following quick&amp;dirty code works:</p>
+<pre><code>%%cython    
+from libc.stdlib cimport calloc
+def f():
+    cdef int* v=&lt;int *&gt;calloc(4, sizeof(int))
+    cdef int[:] b = &lt;int[:4]&gt;v
+    return b[0] # leaks memory, so what?
+</code></pre>
+<p>Here, a pointer (<code>v</code>) is used to construct a typed memory view (<code>b</code>). There is however more, going under the hood (as can be seen in the cythonized c-file):</p>
+<ul>
+<li>a <a href="https://github.com/cython/cython/blob/692a742127681b86cf4edcaa5cfa981b59e175cd/Cython/Utility/MemoryView.pyx#L105" rel="nofollow noreferrer">cython-array</a> (i.e. <code>cython.view.array</code>) is constructed, which wraps the raw pointer and can expose it via buffer-protocol</li>
+<li>this array is used for the creation of typed memory view.</li>
+</ul>
+<p>Your understanding what <code>view.indirect_contiguous</code> is used for is right - it is exactly what you desire. However, the problem is <code>view.array</code>, which just cannot handle this type of data-layout.</p>
+<p><code>view.indirect</code>  and <code>view.indirect_contiguous</code> correspond to  <a href="https://docs.python.org/3/c-api/buffer.html#c.PyBUF_INDIRECT" rel="nofollow noreferrer"><code>PyBUF_INDIRECT</code></a> in protocol-buffer parlance and for this the field <a href="https://docs.python.org/3/c-api/buffer.html#c.Py_buffer.suboffsets" rel="nofollow noreferrer"><code>suboffsets</code></a> must contain some meaningful values (i.e <code>&gt;=0</code> for some dimensions). However, as can be see in the <a href="https://github.com/cython/cython/blob/692a742127681b86cf4edcaa5cfa981b59e175cd/Cython/Utility/MemoryView.pyx#L105" rel="nofollow noreferrer">source-code</a> <code>view.array</code> doesn't have this member at all - there is no way it can represent the complex memory layout at all!</p>
+<p>Where does it leave us? As pointed out by @chrisb and @DavidW in your other question, you will have to implement a wrapper which can expose your data-structure via protocol-buffer.</p>
+<p>There are data structures in Python, which use the indirect memory layout - most prominently the PIL-arrays. A good starting point to understand, how <code>suboffsets</code> are supposed to work is <a href="https://docs.python.org/3/c-api/buffer.html#pil-style-shape-strides-and-suboffsets" rel="nofollow noreferrer">this piece of documenation</a>:</p>
+<pre><code>void *get_item_pointer(int ndim, void *buf, Py_ssize_t *strides,
+                       Py_ssize_t *suboffsets, Py_ssize_t *indices) {
+    char *pointer = (char*)buf;    // A
+    int i;
+    for (i = 0; i &lt; ndim; i++) {
+        pointer += strides[i] * indices[i]; // B
+        if (suboffsets[i] &gt;=0 ) {
+            pointer = *((char**)pointer) + suboffsets[i];  // C
+        }
+    }
+    return (void*)pointer;  // D
+}
+</code></pre>
+<p>In your case <code>strides</code> and <code>offsets</code> would be</p>
+<ul>
+<li><code>strides=[sizeof(int*), sizeof(int)]</code> (i.e. <code>[8,4]</code> on usual <code>x86_64</code> machines)</li>
+<li><code>offsets=[0,-1]</code>, i.e. only the first dimension is indirect.</li>
+</ul>
+<p>Getting the address of element <code>[x,y]</code> would then happen as follows:</p>
+<ul>
+<li>in the line <code>A</code>, <code>pointer</code> is set to <code>buf</code>, let's assume <code>BUF</code>.</li>
+<li>first dimension:
+
+<ul>
+<li>in line <code>B</code>, <code>pointer</code> becomes <code>BUF+x*8</code>, and points to the location of the pointer to x-th row.</li>
+<li>because <code>suboffsets[0]&gt;=0</code>, we dereference the pointer in line <code>C</code> and thus it shows to address <code>ROW_X</code> - the start of the x-th row.</li>
+</ul></li>
+<li>second dimension:
+
+<ul>
+<li>in line <code>B</code> we get the address of the <code>y</code> element using <code>strides</code>, i.e. <code>pointer=ROW_X+4*y</code></li>
+<li>second dimension is direct (signaled by <code>suboffset[1]&lt;0</code>), so no dereferencing is needed.</li>
+</ul></li>
+<li>we are done, <code>pointer</code> points to the desired address and is returned in line <code>D</code>.</li>
+</ul>
+</div>
+<span class="comment-copy">This might not be possible with just a cast - see for example <a href="https://stackoverflow.com/questions/10465091/assembling-a-cython-memoryview-from-numpy-arrays" title="assembling a cython memoryview from numpy arrays">stackoverflow.com/questions/10465091/…</a> which seems to construct the buffer-interface manually</span>
+<span class="comment-copy">allright, thank you very much for the detailed explaination. I'm going to dig into the details of the buffer-protocol</span>

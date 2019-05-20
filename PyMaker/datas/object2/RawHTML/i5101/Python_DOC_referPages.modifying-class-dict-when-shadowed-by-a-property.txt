@@ -1,0 +1,164 @@
+<div class="post-text" itemprop="text">
+<p>I am attempting to modify a value in a class <code>__dict__</code> directly using something like <code>X.__dict__['x'] += 1</code>. It is impossible to do the modification like that because a class <code>__dict__</code> is actually a <code>mappingproxy</code> object that does not allow direct modification of values. The reason for attempting direct modification or equivalent is that I am trying to hide the class attribute behind a property defined on the metaclass with the same name. Here is an example:</p>
+<pre><code>class Meta(type):
+    def __new__(cls, name, bases, attrs, **kwargs):
+        attrs['x'] = 0
+        return super().__new__(cls, name, bases, attrs)
+    @property
+    def x(cls):
+        return cls.__dict__['x']
+
+class Class(metaclass=Meta):
+    def __init__(self):
+        self.id = __class__.x
+        __class__.__dict__['x'] += 1
+</code></pre>
+<p>This is example shows a scheme for creating an auto-incremented ID for each instance of <code>Class</code>. The line <code>__class__.__dict__['x'] += 1</code> can not be replaced by <code>setattr(__class__, 'x', __class__.x + 1)</code> because <code>x</code> is a <code>property</code> with no setter in <code>Meta</code>. It would just change a <code>TypeError</code> from <code>mappingproxy</code> into an <code>AttributeError</code> from <code>property</code>.</p>
+<p>I have tried messing with <code>__prepare__</code>, but that has no effect. The implementation in <code>type</code> already returns a mutable <code>dict</code> for the namespace. The immutable <code>mappingproxy</code> seems to get set in <code>type.__new__</code>, which I don't know how to avoid.</p>
+<p>I have also attempted to rebind the entire <code>__dict__</code> reference to a mutable version, but that failed as well: <a href="https://ideone.com/w3HqNf" rel="nofollow noreferrer">https://ideone.com/w3HqNf</a>, implying that perhaps the <code>mappingproxy</code> is not created in <code>type.__new__</code>.</p>
+<p>How can I modify a class <code>dict</code> value directly, even when shadowed by a metaclass property? While it <em>may</em> be effectively impossible, <code>setattr</code> is able to do it somehow, so I would expect that there is a solution.</p>
+<p>My main requirement is to have a class attribute that appears to be read only and does not use additional names anywhere. I am not absolutely hung up on the idea of using a metaclass <code>property</code> with an eponymous class <code>dict</code> entry, but that is usually how I hide read only values in regular instances.</p>
+<p><strong>EDIT</strong></p>
+<p>I finally figured out where the class <code>__dict__</code> becomes immutable. It is described in the last paragraph of the <a href="https://docs.python.org/3/reference/datamodel.html#creating-the-class-object" rel="nofollow noreferrer">"Creating the Class Object"</a> section of the <a href="https://docs.python.org/3/reference/datamodel.html" rel="nofollow noreferrer">Data Model</a> reference:</p>
+<blockquote>
+<p>When a new class is created by <code>type.__new__</code>, the object provided as the namespace parameter is copied to a new ordered mapping and the original object is discarded. The new copy is wrapped in a read-only proxy, which becomes the <code>__dict__</code> attribute of the class object.</p>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<p>Probably the best way: just pick another name. Call the property <code>x</code> and the dict key <code>'_x'</code>, so you can access it the normal way.</p>
+<p>Alternative way: add another layer of indirection:</p>
+<pre><code>class Meta(type):
+    def __new__(cls, name, bases, attrs, **kwargs):
+        attrs['x'] = [0]
+        return super().__new__(cls, name, bases, attrs)
+    @property
+    def x(cls):
+        return cls.__dict__['x'][0]
+
+class Class(metaclass=Meta):
+    def __init__(self):
+        self.id = __class__.x
+        __class__.__dict__['x'][0] += 1
+</code></pre>
+<p>That way you don't have to modify the actual entry in the class dict.</p>
+<p>Super-hacky way that might outright segfault your Python: access the underlying dict through the <code>gc</code> module.</p>
+<pre><code>import gc
+
+class Meta(type):
+    def __new__(cls, name, bases, attrs, **kwargs):
+        attrs['x'] = 0
+        return super().__new__(cls, name, bases, attrs)
+    @property
+    def x(cls):
+        return cls.__dict__['x']
+
+class Class(metaclass=Meta):
+    def __init__(self):
+        self.id = __class__.x
+        gc.get_referents(__class__.__dict__)[0]['x'] += 1
+</code></pre>
+<p>This bypasses critical work <code>type.__setattr__</code> does to maintain internal invariants, particularly in things like CPython's type attribute cache. It is a terrible idea, and I'm only mentioning it so I can put this warning here, because if someone else comes up with it, they might not know that messing with the underlying dict is legitimately dangerous.</p>
+<p>It is very easy to end up with dangling references doing this, and I have segfaulted Python quite a few times experimenting with this. Here's one simple case that <a href="https://ideone.com/P5rC3h" rel="nofollow noreferrer">crashed on Ideone</a>:</p>
+<pre><code>import gc
+
+class Foo(object):
+    x = []
+
+Foo().x
+gc.get_referents(Foo.__dict__)[0]['x'] = []
+
+print(Foo().x)
+</code></pre>
+<p>Output:</p>
+<pre class="lang-none prettyprint-override"><code>*** Error in `python3': double free or corruption (fasttop): 0x000055d69f59b110 ***
+======= Backtrace: =========
+/lib/x86_64-linux-gnu/libc.so.6(+0x70bcb)[0x2b32d5977bcb]
+/lib/x86_64-linux-gnu/libc.so.6(+0x76f96)[0x2b32d597df96]
+/lib/x86_64-linux-gnu/libc.so.6(+0x7778e)[0x2b32d597e78e]
+python3(+0x2011f5)[0x55d69f02d1f5]
+python3(+0x6be7a)[0x55d69ee97e7a]
+python3(PyCFunction_Call+0xd1)[0x55d69efec761]
+python3(PyObject_Call+0x47)[0x55d69f035647]
+... [it continues like that for a while]
+</code></pre>
+<p>And <a href="https://ideone.com/bQNhi3" rel="nofollow noreferrer">here's a case</a> with wrong results and no noisy error message to alert you to the fact that something has gone wrong:</p>
+<pre><code>import gc
+
+class Foo(object):
+    x = 'foo'
+
+print(Foo().x)
+
+gc.get_referents(Foo.__dict__)[0]['x'] = 'bar'
+
+print(Foo().x)
+</code></pre>
+<p>Output:</p>
+<pre><code>foo
+foo
+</code></pre>
+<p>I make absolutely no guarantees as to any safe way to use this, and even if things happen to work out on one Python version, they may not work on future versions. It can be fun to fiddle with, but it's not something to actually use. Seriously, don't do it. Do you <em>want</em> to explain to your boss that your website went down or your published data analysis will need to be retracted because you took this bad idea and used it?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This probably counts as an "additional name" you don't want, but I've implemented this using a dictionary in the metaclass where the keys are the classes. The <code>__next__</code> method on the metaclass makes the class itself iterable, such that you can just do <code>next()</code> to get the next ID. The dunder method also keeps the method from being available through the instances. The dictionary storing the next id has a name starting with a double underscore, so it's not easily discoverable from any of the classes that use it. The incrementing ID functionality is thus entirely contained in the metaclass. </p>
+<p>I tucked the assignment of the id into a <code>__new__</code> method on a base class, so you don't have to worry about it in <code>__init__</code>. This also allows you to <code>del Meta</code> so all the machinery is a little harder to get to.</p>
+<pre><code>class Meta(type):
+    __ids = {}
+
+    @property
+    def id(cls):
+        return __class__.__ids.setdefault(cls, 0)
+
+    def __next__(cls):
+        id = __class__.__ids.setdefault(cls, 0)
+        __class__.__ids[cls] += 1
+        return id
+
+class Base(metaclass=Meta):
+    def __new__(cls, *args, **kwargs):
+        self = object.__new__(cls)
+        self.id = next(cls)
+        return self
+
+del Meta
+
+class Class(Base):
+    pass
+
+class Brass(Base):
+    pass
+
+c0 = Class()
+c1 = Class()
+
+b0 = Brass()
+b1 = Brass()
+
+assert (b0.id, b1.id, c0.id, c1.id) == (0, 1, 0, 1)
+assert (Class.id, Brass.id) == (2, 2)
+assert not hasattr(Class, "__ids")
+assert not hasattr(Brass, "__ids")
+</code></pre>
+<p>Note that I've used the same name for the attribute on both the class and the object. That way <code>Class.id</code> is the number of instances you've created, while <code>c1.id</code> is the ID of that specific instance.</p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>My main requirement is to have a class attribute that appears to be read only and does not use additional names anywhere. I am not absolutely hung up on the idea of using a metaclass <code>property</code> with an eponymous class <code>dict</code> entry, but that is usually how I hide read only values in regular instances.</p>
+</blockquote>
+<p>What you are asking for is a contradiction: If your example worked, then <code>__class__.__dict__['x']</code> would be an "additional name" for the attribute.  So clearly we need a more specific definition of "additional name."  But to come up with that definition, we need to know what you are trying to accomplish (NB: The following goals are <em>not</em> mutually exclusive, so you may want to do all of these things):</p>
+<ul>
+<li>You want to make the value completely untouchable, except within the <code>Class.__init__()</code> method (and the same method of any subclasses): This is unPythonic and quite impossible.  If <code>__init__()</code> can modify the value, then so can anyone else.  You <em>might</em> be able to accomplish something like this if the modifying code lives in <code>Class.__new__()</code>, which the metaclass dynamically creates in <code>Meta.__new__()</code>, but that's extremely ugly and hard to understand.</li>
+<li>You want the code that manipulates the value to be "nicely encapsulated": Write a method in the metaclass that increments the private value (or does whatever other modification you need), and provide a read-only metaclass <code>property</code> that accesses it under the public name.</li>
+<li>You are concerned about a subclass accidentally clashing names with the private name: Prefix the private name with a double underscore to invoke <a href="https://docs.python.org/3/reference/expressions.html#atom-identifiers" rel="nofollow noreferrer">automatic name mangling</a>.  While this is usually seen as a bit unPythonic, it is appropriate for cases where name collisions may be less obvious to subclass authors, such as the internal names of a metaclass colliding with the internal names of a regular class instantiated from it.</li>
+</ul>
+</div>
+<span class="comment-copy">That <code>gc</code> hack is beautiful and scary...</span>
+<span class="comment-copy">I like this answer very much. It starts out with the usual "don't do it" caveat no OP really wants to hear, and spirals out to increasingly hacky ways of acheiving what I want. +1, and I will use a modified version of the indirection option, just with a custom class for mutable integers.</span>
+<span class="comment-copy">@MadPhysicist: I'm glad to hear you didn't pick option 3, at least.</span>
+<span class="comment-copy">@user2357112. My plan was to play with it until I understand it well enough to really use it :)</span>
+<span class="comment-copy">I feel like using <code>__next__</code> instead of a regular method doesn't really add much benefit.</span>
+<span class="comment-copy">It keeps the method from being visible from the instances, You could also do it with a method on the metaclass, but if you want to hide it, it's harder to call it.</span>
+<span class="comment-copy">not that calling <code>next(Class)</code> increments the class id as well (could be undesirable)</span>
+<span class="comment-copy">The <code>x</code> property in the original code would do the same thing if the OP were able to modify it, no? But the class <code>id</code> does serve a slightly different purpose. You could rename it e.g. <code>count</code> to make this clearer.</span>
+<span class="comment-copy">Given that there are two excellent answers already up, whose authors understood my question and provided legitimate solutions, I think that yours is a bit out of place.</span>
+<span class="comment-copy">@MadPhysicist: You're welcome to your opinion.  But I certainly hope I will not need to read your code in the future, if this is the kind of guidance which you choose to ignore.</span>

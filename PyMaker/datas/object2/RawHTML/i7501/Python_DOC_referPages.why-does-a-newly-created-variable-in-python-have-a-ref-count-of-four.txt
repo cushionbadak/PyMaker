@@ -1,0 +1,99 @@
+<div class="post-text" itemprop="text">
+<p>I've been working on a presentation for colleagues to explain the basic behavior of and reasoning behind the GIL, and found something I couldn't explain while putting together a quick explanation of reference counting. It appears that newly declared variables have four references, instead of the one I would expect. For example, the following code:</p>
+<pre><code>the_var = 'Hello World!'
+print('Var created: {} references'.format(sys.getrefcount(the_var)))
+</code></pre>
+<p>Results in the this output:</p>
+<pre><code>Var created: 4 references
+</code></pre>
+<p>I validated that the output was the same if I used an integer &gt; 100 (&lt; 100 are pre-created and have a larger ref-count) or a float and if I declared the variable within a function scope or in a loop. The outcome was the same. The behavior also seems to be the same in 2.7.11 and 3.5.1.</p>
+<p>I attempted to debug sys.getrefcount to see whether it was creating additional references, but was unable to step into the function (I'm assuming it is a direct thunk down to the C layer).</p>
+<p>I know I'm gonna get at least one question on this when I present, and I'm actually pretty puzzled by the output anyway. Can anyone explain this behavior to me?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There are several scenarios that will yield a different reference count. The most straightforward is the REPL console:</p>
+<pre><code>&gt;&gt;&gt; import sys
+&gt;&gt;&gt; the_var = 'Hello World!'
+&gt;&gt;&gt; print(sys.getrefcount(the_var))
+2
+</code></pre>
+<p>Understanding this result is pretty straight-forward - there is one reference in the local stack and another temporary/local to the <code>sys.getrefcount()</code> function (even the <a href="https://docs.python.org/3/library/sys.html#sys.getrefcount" rel="noreferrer">documentation</a> warns about it - <code>The count returned is generally one higher than you might expect</code>). But when you run it as a standalone script:</p>
+<pre><code>import sys
+
+the_var = 'Hello World!'
+print(sys.getrefcount(the_var))
+# 4
+</code></pre>
+<p>as you've noticed, you get a <code>4</code>. So what gives? Well, lets investigate... There is a very helpful interface to the garbage collector - the <code>gc</code> module - so if we run it in the REPL console:</p>
+<pre><code>&gt;&gt;&gt; import gc
+&gt;&gt;&gt; the_var = 'Hello World!'
+&gt;&gt;&gt; gc.get_referrers(the_var)
+[{'__builtins__': &lt;module '__builtin__' (built-in)&gt;, '__package__': None, 'the_var': 'Hello 
+World!', 'gc': &lt;module 'gc' (built-in)&gt;, '__name__': '__main__', '__doc__': None}]
+</code></pre>
+<p>No wonders there, - that's essentially just the current namespace (<code>locals()</code>) as the variable doesn't exist anywhere else. But what happens when we run that as a standalone script:</p>
+<pre><code>import gc
+import pprint
+
+the_var = 'Hello World!'
+pprint.pprint(gc.get_referrers(the_var))
+</code></pre>
+<p>this prints out (YMMV, based on your Python version):</p>
+<pre><code>[['gc',
+  'pprint',
+  'the_var',
+  'Hello World!',
+  'pprint',
+  'pprint',
+  'gc',
+  'get_referrers',
+  'the_var'],
+ (-1, None, 'Hello World!'),
+ {'__builtins__': &lt;module '__builtin__' (built-in)&gt;,
+  '__doc__': None,
+  '__file__': 'test.py',
+  '__name__': '__main__',
+  '__package__': None,
+  'gc': &lt;module 'gc' (built-in)&gt;,
+  'pprint': &lt;module 'pprint' from 'D:\Dev\Python\Py27-64\lib\pprint.pyc'&gt;,
+  'the_var': 'Hello World!'}]
+</code></pre>
+<p>Sure enough, we have two more references in the list just as <code>sys.getrefcount()</code> told us, but what the hell are those? Well, when Python interpreter is parsing your script it first needs to <a href="https://github.com/python/cpython/blob/master/Python/compile.c" rel="noreferrer">compile</a> it to bytecode - and while it does, it stores all the strings in a list which, since it mentions your variable as well, is declared as a reference to it.</p>
+<p>The second more cryptic entry (<code>(-1, None, 'Hello World!')</code>) comes from the <a href="http://akaptur.com/blog/2014/08/02/the-cpython-peephole-optimizer-and-you/" rel="noreferrer">peep-hole optimizer</a> and is there just optimize access (string reference in this case).</p>
+<p>Both of those are purely temporary and optional - REPL console is doing context separation so you don't see these references, if you were to 'outsource' your compiling from your current context:</p>
+<pre><code>import gc
+import pprint
+
+exec(compile("the_var = 'Hello World!'", "&lt;string&gt;", "exec"))
+pprint.pprint(gc.get_referrers(the_var))
+</code></pre>
+<p>you'd get:</p>
+<pre><code>[{'__builtins__': &lt;module '__builtin__' (built-in)&gt;,
+  '__doc__': None,
+  '__file__': 'test.py',
+  '__name__': '__main__',
+  '__package__': None,
+  'gc': &lt;module 'gc' (built-in)&gt;,
+  'pprint': &lt;module 'pprint' from 'D:\Dev\Python\Py27-64\lib\pprint.pyc'&gt;,
+  'the_var': 'Hello World!'}]
+</code></pre>
+<p>and if you were to go back to the original attempt at getting the reference count via <code>sys.getreferencecount()</code>:</p>
+<pre><code>import sys
+
+exec(compile("the_var = 'Hello World!'", "&lt;string&gt;", "exec"))
+print(sys.getrefcount(the_var))
+# 2
+</code></pre>
+<p>just like in the REPL console, and just as expected. The extra reference due to the peep-hole optimizing, since it happens in-place, can be immediately discarded by forcing garbage collection (<code>gc.collect()</code>) before counting your references.</p>
+<p>However, the string list that is created during compilation cannot be released until the whole file has been parsed and compiled, which is why if you were to import your script in an another script and then count the references to <code>the_var</code> from it you'd get <code>3</code> instead of <code>4</code> just when you thought it cannot confuse you any more ;)</p>
+</div>
+<span class="comment-copy">Are you typing that straight into a python or ipython shell?  or running it as a standalone script?  I get 2 references in plain python shell.</span>
+<span class="comment-copy">When I run your code in 2.7.13 I get <code>Var created: 2 references</code>.</span>
+<span class="comment-copy">I would expect 2 references in interactive mode, and 3 as a script (one extra for the reference from the code object's constants), but not 4. You may have done something else to create another reference.</span>
+<span class="comment-copy">Consider using a mutable object like <code>[]</code> instead of an immutable one for your demo. Mutable objects cannot be subject to a number of caching and constant-folding optimizations that may have unexpected effects on reference counts.</span>
+<span class="comment-copy">I'm running via a PyCharm scratch file, so running as a script, as far as I know. Could well be the immutable object element getting me the extra unexpected references, since using <code>[]</code> instead of <code>'Hello World'</code> gets me down to two refs.</span>
+<span class="comment-copy">I can't reproduce the output you're seeing - the <code>4</code>, or the extra <code>gc.get_referrers()</code> entries. What are you using to run this code?</span>
+<span class="comment-copy">@user2357112 - unless something has changed in latest CPython versions, this should be the default behavior for standard <code>python test_script.py</code> execution. Of course, if you compile your script to a PYC and run it you won't be getting <code>4</code> - the whole extra references are due to compile/optimization procedures. I'll take a look at the latest CPython source when I get the time, but I don't imagine this has changed significantly.</span>
+<span class="comment-copy">Trying it on 3.6 (since I forgot Ideone was on 3.5) reproduces the <code>4</code> and the list, but not the <code>(-1, None, 'Hello World!')</code> tuple.</span>
+<span class="comment-copy">3.6.0, that is. This may be dependent on version differences down to the micro-release.</span>
+<span class="comment-copy">@user2357112 - if the garbage collector kicks-in (or you call it explicitly) it won't show up (although <code>sys.getrefcount()</code> will still count it). And maybe they've changed something with the peephole optimizer, but I'm not aware of that. I'll see if I can spare some time to investigate the latest changes in the following days and report back accordingly.</span>

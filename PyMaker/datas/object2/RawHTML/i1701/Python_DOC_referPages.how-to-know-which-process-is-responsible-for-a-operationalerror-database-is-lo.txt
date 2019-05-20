@@ -1,0 +1,126 @@
+<div class="post-text" itemprop="text">
+<p>I sometimes randomly encounter:</p>
+<blockquote>
+<p>OperationalError: database is locked</p>
+</blockquote>
+<p>in a process that updates a SQLite database, but I find it difficult to reproduce the error: </p>
+<ul>
+<li>no other process is inserting / deleting rows at the same time</li>
+<li>just one process might do some read-only queries (<code>SELECT</code>, etc.) here and there, but no committing</li>
+</ul>
+<p>I've already read <a href="https://stackoverflow.com/questions/3172929/operationalerror-database-is-locked">OperationalError: database is locked</a> </p>
+<p><strong>Question: Is there a way, when this error happens, to log which other process ID is responsible for the lock?</strong></p>
+<p>More generally, how to debug a <code>OperationalError: database is locked</code>?</p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>Is there a way, when this error happens, to log which other process ID is responsible for the lock?</p>
+</blockquote>
+<p>No, that information is not recorded when the exception occurs. The <code>OperationalError: database is locked</code> exception is usually raised after a timeout (5 minutes is the default) when trying to obtain a mutex and and a file lock in the SQLite internals, at which point SQLite returns <code>SQLITE_BUSY</code>, but <code>SQLITE_BUSY</code> can also be reported at other points. SQLite error codes do not carry any further context such as the PID of another process that held a lock, and it is conceivable that the lock was passed between two other processes before the current process gave up trying to get hold of it!</p>
+<p>At best you can enumerate what processes are currently accessing the file by using <code>lsof &lt;filename of database&gt;</code>, but that won't get you any closer to figuring out which one of these is actually taking too long to commit.</p>
+<p>I would, instead, instrument your code with explicit transactions and detailed logging as to when you start and commit transactions. Then, when you do run into <code>OperationalError</code> exceptions, you can check the logs for what was happening where within that time window.</p>
+<p>A Python context manager that could be used for this is:</p>
+<pre><code>import logging
+import sys
+import time
+import threading
+from contextlib import contextmanager
+from uuid import uuid4
+
+logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def logged_transaction(con, stack_info=False, level=logging.DEBUG):
+    """Manage a transaction and log start and end times.
+
+    Logged messages include a UUID transaction ID for ease of analysis.
+
+    If trace is set to True, also log all statements executed.
+    If stack_info is set to True, a stack trace is included to record
+    where the transaction was started (the last two lines will point to this
+    context manager).
+
+    """
+    transaction_id = uuid4()
+    thread_id = threading.get_ident()
+
+    def _trace_callback(statement):
+        logger.log(level, '(txid %s) executing %s', transaction_id, statement)
+    if trace:
+        con.set_trace_callback(_trace_callback)
+
+    logger.log(level, '(txid %s) starting transaction', transaction_id, stack_info=stack_info)
+
+    start = time.time()
+    try:
+        with con:
+            yield con
+    finally:
+        # record exception information, if an exception is active
+        exc_info = sys.exc_info()
+        if exc_info[0] is None:
+            exc_info = None
+        if trace:
+            con.set_trace_callback(None)
+        logger.log(level, '(txid %s) transaction closed after %.6f seconds', transaction_id, time.time() - start, exc_info=exc_info)
+</code></pre>
+<p>The above will create start and end entries, include exception information if there is any,  optionally trace all statements that are being executed on the connection and can include a stack trace that will tell you the location where the context manager was used. Do make sure to <a href="https://docs.python.org/3/howto/logging.html#displaying-the-date-time-in-messages" rel="nofollow noreferrer">include the date and time in when formatting log messages</a> so you can track when transactions started.</p>
+<p>I'd use it around any code using the connection, so you can time selects as well:</p>
+<pre><code>with logged_transaction(connection):
+    cursor = connection.cursor()
+    # ...
+</code></pre>
+<p>It may be that <em>just using this context manager</em> makes your issue disappear, at which point you'd have to analyse why the code without this context manager leaves open a transaction without committing.</p>
+<p>You may also want to use a lower <code>timeout</code> value in <code>sqlite3.connect()</code> calls to speed up the process; you may not have to wait a full 5 minutes to detect the situation.</p>
+<p>Note on threading: when enabling tracing it is assumed that you use separate connections for separate threads. If this is not the case, then you'll need to permanently register a trace callback that then sorts out what transaction id to use for the current thread.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Solution: <strong>Always close the <code>cursor</code> for (even read-only) queries!</strong></p>
+<p>First, here is a way to reproduce the problem:</p>
+<ol>
+<li><p>First run this code, once: </p>
+<pre><code>import sqlite3
+conn = sqlite3.connect('anothertest.db')
+conn.execute("CREATE TABLE IF NOT EXISTS mytable (id int, description text)")
+for i in range(100):
+    conn.execute("INSERT INTO mytable VALUES(%i, 'hello')" % i)
+conn.commit()
+</code></pre>
+<p>to initialize the test.</p></li>
+<li><p>Then begin a <strong>read-only</strong> query:</p>
+<pre><code>import sqlite3, time
+conn = sqlite3.connect('anothertest.db')
+c = conn.cursor()
+c.execute('SELECT * FROM mytable')
+item = c.fetchone()
+print(item)
+print('Sleeping 60 seconds but the cursor is not closed...')
+time.sleep(60)
+</code></pre>
+<p>and keep this script running <strong>while executing the next step</strong>:</p></li>
+<li><p>Then try to delete some content and commit:</p>
+<pre><code>import sqlite3
+conn = sqlite3.connect('anothertest.db')
+conn.execute("DELETE FROM mytable WHERE id &gt; 90")
+conn.commit()
+</code></pre>
+<p>It will trigger this error indeed:</p>
+<blockquote>
+<p>sqlite3.OperationalError: database is locked</p>
+</blockquote></li>
+</ol>
+<p>Why? Because it's not possible to delete data that is currently accessed by a read-query: if the cursor it's still open, it means the data could still be fetched with <code>fetchone</code> or <code>fetchall</code>.</p>
+<p>Here is how to solve the error: in step #2, just add:</p>
+<pre><code>item = c.fetchone()
+print(item)
+c.close()
+time.sleep(60)
+</code></pre>
+<p>Then while this is still running, start script #3, you will see there is no more error.</p>
+</div>
+<span class="comment-copy">Haven't used sqlite in decades, but could it be I/O to disk locking the database? For instance, a large <code>INSERT</code> that triggers the disk to lock the database for a bit if the OS is doing some other heavy/maintenance load on the disk? I doubt that there's sqlite tools for this. It's inherently light weight for a reason. If possible, I would have considered moving over to an actual database engine <i>(PostgreSQL or something)</i> if this becomes a problem.</span>
+<span class="comment-copy">This particular exception is raised when the SQLite API signals <code>SQLITE_BUSY</code>, and there is <b>no context</b> with that signal. You can't determine what PID might have been the reason that caused SQLite to return that response.</span>
+<span class="comment-copy">Put differently, read up on the <i>what is the PID of the process that causes <code>SQLITE_BUSY</code></i> questions already here.</span>
+<span class="comment-copy">The process that updates the SQLite database is probably at fault here. Put timings around the transactions; record the time when a transaction starts, and log the duration when you commit. Something is taking 5 second or longer here (the default <code>timeout</code> value for the <code>sqlite3.connect()</code> call).</span>
+<span class="comment-copy">If your OS is supported by <code>lsof</code> you can use it to find every process that has the file opened and see which one has a lock - probably the one that's in the middle of a select. If you want database readers to not block database writers and vs versa, look into WAL journal mode.</span>

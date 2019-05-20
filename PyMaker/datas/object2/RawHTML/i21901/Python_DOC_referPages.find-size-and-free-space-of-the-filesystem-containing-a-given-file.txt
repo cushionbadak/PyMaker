@@ -1,0 +1,256 @@
+<div class="post-text" itemprop="text">
+<p>I'm using Python 2.6 on Linux. What is the fastest way:</p>
+<ul>
+<li><p>to determine which partition contains a given directory or file?</p>
+<p>For example, suppose that <code>/dev/sda2</code> is mounted on <code>/home</code>, and <code>/dev/mapper/foo</code> is mounted on <code>/home/foo</code>. From the string <code>"/home/foo/bar/baz"</code> I would like to recover the pair <code>("/dev/mapper/foo", "home/foo")</code>.</p></li>
+<li><p>and then, to get usage statistics of the given partition? For example, given <code>/dev/mapper/foo</code> I would like to obtain the size of the partition and the free space available (either in bytes or approximately in megabytes).</p></li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p><em>If you just need the free space on a device, see the answer using <code>os.statvfs()</code> below.</em></p>
+<p>If you also need the device name and mount point associated with the file, you should call an external program to get this information. <code>df</code> will provide all the information you need -- when called as <code>df filename</code> it prints a line about the partition that contains the file.</p>
+<p>To give an example:</p>
+<pre><code>import subprocess
+df = subprocess.Popen(["df", "filename"], stdout=subprocess.PIPE)
+output = df.communicate()[0]
+device, size, used, available, percent, mountpoint = \
+    output.split("\n")[1].split()
+</code></pre>
+<p>Note that this is rather brittle, since it depends on the exact format of the <code>df</code> output, but I'm not aware of a more robust solution.  (There are a few solutions relying on the <code>/proc</code> filesystem below that are even less portable than this one.)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This doesn't give the name of the partition, but you can get the filesystem statistics directly using the <code>statvfs</code> Unix system call. To call it from Python, use <a href="http://docs.python.org/release/2.6.8/library/os.html#os.statvfs" rel="noreferrer"><code>os.statvfs('/home/foo/bar/baz')</code></a>.</p>
+<p>The relevant fields in the result, <a href="http://pubs.opengroup.org/onlinepubs/009695399/basedefs/sys/statvfs.h.html" rel="noreferrer">according to POSIX</a>:</p>
+<blockquote>
+<pre><code>unsigned long f_frsize   Fundamental file system block size. 
+fsblkcnt_t    f_blocks   Total number of blocks on file system in units of f_frsize. 
+fsblkcnt_t    f_bfree    Total number of free blocks. 
+fsblkcnt_t    f_bavail   Number of free blocks available to 
+                         non-privileged process.
+</code></pre>
+</blockquote>
+<p>So to make sense of the values, multiply by <code>f_frsize</code>:</p>
+<pre><code>import os
+statvfs = os.statvfs('/home/foo/bar/baz')
+
+statvfs.f_frsize * statvfs.f_blocks     # Size of filesystem in bytes
+statvfs.f_frsize * statvfs.f_bfree      # Actual number of free bytes
+statvfs.f_frsize * statvfs.f_bavail     # Number of free bytes that ordinary users
+                                      # are allowed to use (excl. reserved space)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>import os
+
+def get_mount_point(pathname):
+    "Get the mount point of the filesystem containing pathname"
+    pathname= os.path.normcase(os.path.realpath(pathname))
+    parent_device= path_device= os.stat(pathname).st_dev
+    while parent_device == path_device:
+        mount_point= pathname
+        pathname= os.path.dirname(pathname)
+        if pathname == mount_point: break
+        parent_device= os.stat(pathname).st_dev
+    return mount_point
+
+def get_mounted_device(pathname):
+    "Get the device mounted at pathname"
+    # uses "/proc/mounts"
+    pathname= os.path.normcase(pathname) # might be unnecessary here
+    try:
+        with open("/proc/mounts", "r") as ifp:
+            for line in ifp:
+                fields= line.rstrip('\n').split()
+                # note that line above assumes that
+                # no mount points contain whitespace
+                if fields[1] == pathname:
+                    return fields[0]
+    except EnvironmentError:
+        pass
+    return None # explicit
+
+def get_fs_freespace(pathname):
+    "Get the free space of the filesystem containing pathname"
+    stat= os.statvfs(pathname)
+    # use f_bfree for superuser, or f_bavail if filesystem
+    # has reserved space for superuser
+    return stat.f_bfree*stat.f_bsize
+</code></pre>
+<p>Some sample pathnames on my computer:</p>
+<pre><code>path 'trash':
+  mp /home /dev/sda4
+  free 6413754368
+path 'smov':
+  mp /mnt/S /dev/sde
+  free 86761562112
+path '/usr/local/lib':
+  mp / rootfs
+  free 2184364032
+path '/proc/self/cmdline':
+  mp /proc proc
+  free 0
+</code></pre>
+<h3>PS</h3>
+<p>if on Python ≥3.3, there's <code>shutil.disk_usage(path)</code> which returns a named tuple of <code>(total, used, free)</code> expressed in bytes.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This should make everything you asked:</p>
+<pre><code>import os
+from collections import namedtuple
+
+disk_ntuple = namedtuple('partition',  'device mountpoint fstype')
+usage_ntuple = namedtuple('usage',  'total used free percent')
+
+def disk_partitions(all=False):
+    """Return all mountd partitions as a nameduple.
+    If all == False return phyisical partitions only.
+    """
+    phydevs = []
+    f = open("/proc/filesystems", "r")
+    for line in f:
+        if not line.startswith("nodev"):
+            phydevs.append(line.strip())
+
+    retlist = []
+    f = open('/etc/mtab', "r")
+    for line in f:
+        if not all and line.startswith('none'):
+            continue
+        fields = line.split()
+        device = fields[0]
+        mountpoint = fields[1]
+        fstype = fields[2]
+        if not all and fstype not in phydevs:
+            continue
+        if device == 'none':
+            device = ''
+        ntuple = disk_ntuple(device, mountpoint, fstype)
+        retlist.append(ntuple)
+    return retlist
+
+def disk_usage(path):
+    """Return disk usage associated with path."""
+    st = os.statvfs(path)
+    free = (st.f_bavail * st.f_frsize)
+    total = (st.f_blocks * st.f_frsize)
+    used = (st.f_blocks - st.f_bfree) * st.f_frsize
+    try:
+        percent = ret = (float(used) / total) * 100
+    except ZeroDivisionError:
+        percent = 0
+    # NB: the percentage is -5% than what shown by df due to
+    # reserved blocks that we are currently not considering:
+    # http://goo.gl/sWGbH
+    return usage_ntuple(total, used, free, round(percent, 1))
+
+
+if __name__ == '__main__':
+    for part in disk_partitions():
+        print part
+        print "    %s\n" % str(disk_usage(part.mountpoint))
+</code></pre>
+<p>On my box the code above prints:</p>
+<pre><code>giampaolo@ubuntu:~/dev$ python foo.py 
+partition(device='/dev/sda3', mountpoint='/', fstype='ext4')
+    usage(total=21378641920, used=4886749184, free=15405903872, percent=22.9)
+
+partition(device='/dev/sda7', mountpoint='/home', fstype='ext4')
+    usage(total=30227386368, used=12137168896, free=16554737664, percent=40.2)
+
+partition(device='/dev/sdb1', mountpoint='/media/1CA0-065B', fstype='vfat')
+    usage(total=7952400384, used=32768, free=7952367616, percent=0.0)
+
+partition(device='/dev/sr0', mountpoint='/media/WB2PFRE_IT', fstype='iso9660')
+    usage(total=695730176, used=695730176, free=0, percent=100.0)
+
+partition(device='/dev/sda6', mountpoint='/media/Dati', fstype='fuseblk')
+    usage(total=914217758720, used=614345637888, free=299872120832, percent=67.2)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>As of Python 3.3, there an easy and direct way to do this with the standard library:</p>
+<pre><code>$ cat free_space.py 
+#!/usr/bin/env python3
+
+import shutil
+
+total, used, free = shutil.disk_usage(__file__)
+print(total, used, free)
+
+$ ./free_space.py 
+1007870246912 460794834944 495854989312
+</code></pre>
+<p>These numbers are in bytes.  See <a href="https://docs.python.org/3/library/shutil.html#shutil.disk_usage" rel="nofollow noreferrer">the documentation</a> for more info.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The simplest way to find out it.</p>
+<pre><code>import os
+from collections import namedtuple
+
+DiskUsage = namedtuple('DiskUsage', 'total used free')
+
+def disk_usage(path):
+    """Return disk usage statistics about the given path.
+
+    Will return the namedtuple with attributes: 'total', 'used' and 'free',
+    which are the amount of total, used and free space, in bytes.
+    """
+    st = os.statvfs(path)
+    free = st.f_bavail * st.f_frsize
+    total = st.f_blocks * st.f_frsize
+    used = (st.f_blocks - st.f_bfree) * st.f_frsize
+    return DiskUsage(total, used, free)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>For the first point, you can try using <a href="http://docs.python.org/library/os.path.html#os.path.realpath" rel="noreferrer"><code>os.path.realpath</code></a> to get a canonical path, check it against <code>/etc/mtab</code> (I'd actually suggest calling <code>getmntent</code>, but I can't find a normal way to access it) to find the longest match. (to be sure, you should probably <code>stat</code> both the file and the presumed mountpoint to verify that they are in fact on the same device)</p>
+<p>For the second point, use <a href="http://docs.python.org/library/os.html#os.statvfs" rel="noreferrer"><code>os.statvfs</code></a> to get block size and usage information.</p>
+<p>(Disclaimer: I have tested none of this, most of what I know came from the coreutils sources)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>For the second part of your question, "get usage statistics of the given partition", <a href="https://psutil.readthedocs.io/en/latest/" rel="nofollow noreferrer">psutil</a> makes this easy with the <a href="https://psutil.readthedocs.io/en/latest/#psutil.disk_usage" rel="nofollow noreferrer">disk_usage(path)</a> function. Given a path, <code>disk_usage()</code> returns a named tuple including total, used, and free space expressed in bytes, plus the percentage usage.</p>
+<p>Simple example from documentation:</p>
+<pre><code>&gt;&gt;&gt; import psutil
+&gt;&gt;&gt; psutil.disk_usage('/')
+sdiskusage(total=21378641920, used=4809781248, free=15482871808, percent=22.5)
+</code></pre>
+<p>Psutil works with Python versions from 2.6 to 3.6 and on Linux, Windows, and OSX among other platforms.</p>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>import os
+
+def disk_stat(path):
+    disk = os.statvfs(path)
+    percent = (disk.f_blocks - disk.f_bfree) * 100 / (disk.f_blocks -disk.f_bfree + disk.f_bavail) + 1
+    return percent
+
+
+print disk_stat('/')
+print disk_stat('/data')
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Usually the <code>/proc</code> directory contains such information in Linux, it is a virtual filesystem. For example, <code>/proc/mounts</code> gives information about current mounted disks; and you can parse it directly. Utilities like <code>top</code>, <code>df</code> all make use of <code>/proc</code>. </p>
+<p>I haven't used it, but this might help too, if you want a wrapper: <a href="http://bitbucket.org/chrismiles/psi/wiki/Home" rel="nofollow">http://bitbucket.org/chrismiles/psi/wiki/Home</a></p>
+</div>
+<span class="comment-copy">Are you taking symlinks into account? While you may have /home and /mnt/somedisk , /home/foo/x may be a symlink to directory /mnt/somedisk/xyzzy - so it appears under /home, but actually lives at /mnt/somedisk</span>
+<span class="comment-copy">@Piskvor: No - for the time being I don't need to follow symlinks, they're just plain directories. The first question is basically asking "find the closest ancestor directory that has a partition mounted on it".</span>
+<span class="comment-copy">See also <a href="http://stackoverflow.com/questions/3274354/how-to-find-out-mount-partition-a-directory-or-file-is-on-linux-server" title="how to find out mount partition a directory or file is on linux server">stackoverflow.com/questions/3274354/…</a></span>
+<span class="comment-copy">The <code>commands</code> module is superseded by <code>subprocess</code>.  And I would not do the output parsing in bash when I can do it in Python :)</span>
+<span class="comment-copy">I didn't know about the "filename" argument to df. "df -B MB filename" will do. Thanks a lot.</span>
+<span class="comment-copy">-1 for not using the proper statvfs API.</span>
+<span class="comment-copy">this method does not always work. In my environment, the output consumes more than one line. In that case the script gets <code>ValueError('need more than 5 values to unpack'</code>, because device column and other infomations is in the different lines.</span>
+<span class="comment-copy">@liuyix This answer is for Linux and <code>df</code> from GNU coreutils specifically.  If you don't need the device name and the mount point, please use the code from the next answer.</span>
+<span class="comment-copy">@Andrew, the <code>statvfs</code> module is deprecated (and removed in Python 3), not <code>os.statvfs</code>: <a href="http://docs.python.org/3.3/library/os.html" rel="nofollow noreferrer">docs.python.org/3.3/library/os.html</a></span>
+<span class="comment-copy">os.fstatvfs is an alternative for python 3. I prefer this answer because calling a system command df is over-engineered.</span>
+<span class="comment-copy">I just had this fail on me on an embedded system with ubifs. It resulted in 100MB free where only 10 was available. I'm unsure where the 100 came from.</span>
+<span class="comment-copy">Just to be clear - os.statvfs has not been removed in python3; the OP used the statvfs module which is different. os.statvfs and os.fstatvfs are both available in Python3: <a href="https://docs.python.org/3.3/library/os.html#os.statvfs" rel="nofollow noreferrer">docs.python.org/3.3/library/os.html#os.statvfs</a></span>
+<span class="comment-copy">As noted above: I just had this method using statvfs fail on me on an embedded system with ubifs. It resulted in 100MB free where only 10 was available. I'm unsure where the 100 came from.</span>
+<span class="comment-copy">Also, take a look at this recipe: <a href="http://code.activestate.com/recipes/577972-disk-usage/" rel="nofollow noreferrer">code.activestate.com/recipes/577972-disk-usage</a></span>
+<span class="comment-copy">A minor nitpick - <code>all</code> is a built-in function and should not be used as a variable in a function.</span>
+<span class="comment-copy">Can this be represented in Gigabytes ?</span>
+<span class="comment-copy">used = total - free ?</span>
+<span class="comment-copy">re getmntent: well, there's always the possibility of <code>import ctypes; ctypes.cdll.LoadLibrary("libc.so.6").getmntent</code>, but it's not that straightforward…</span>
+<span class="comment-copy">I'm curious as to why this got a downvote, a comment would have been appreciated</span>
+<span class="comment-copy">While this code may answer the question, providing additional context regarding how and/or why it solves the problem would improve the answer's long-term value.</span>
+<span class="comment-copy"><code>disk_stat</code> method doesn't take any arguments. But, the idea to use <code>os.statvfs</code> is good.</span>

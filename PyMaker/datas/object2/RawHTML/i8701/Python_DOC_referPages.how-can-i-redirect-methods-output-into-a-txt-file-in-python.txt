@@ -1,0 +1,310 @@
+<div class="post-text" itemprop="text">
+<p>How do I redirect stdout to an arbitrary file in Python?</p>
+<p>When a long-running Python script (e.g, web application) is started from within the ssh session and backgounded, and the ssh session is closed, the application will raise IOError and fail the moment it tries to write to stdout. I needed to find a way to make the application and modules output to a file rather than stdout to prevent failure due to IOError. Currently, I employ nohup to redirect output to a file, and that gets the job done, but I was wondering if there was a way to do it without using nohup, out of curiosity.</p>
+<p>I have already tried <code>sys.stdout = open('somefile', 'w')</code>, but this does not seem to prevent some external modules from still outputting to terminal (or maybe the <code>sys.stdout = ...</code> line did not fire at all). I know it should work from simpler scripts I've tested on, but I also didn't have time yet to test on a web application yet.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you want to do the redirection within the Python script, set <code>sys.stdout</code> to an file object does the trick:</p>
+<pre><code>import sys
+sys.stdout = open('file', 'w')
+print('test')
+</code></pre>
+<p>A far more common method is to use shell redirection when executing (same on Windows and Linux):</p>
+<pre><code>$ python foo.py &gt; file
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>There is <a href="http://docs.python.org/3.4/library/contextlib.html#contextlib.redirect_stdout" rel="noreferrer"><code>contextlib.redirect_stdout()</code> function</a> in Python 3.4:</p>
+<pre><code>from contextlib import redirect_stdout
+
+with open('help.txt', 'w') as f:
+    with redirect_stdout(f):
+        print('it now prints to `help.text`')
+</code></pre>
+<p>It is similar to:</p>
+<pre><code>import sys
+from contextlib import contextmanager
+
+@contextmanager
+def redirect_stdout(new_target):
+    old_target, sys.stdout = sys.stdout, new_target # replace sys.stdout
+    try:
+        yield new_target # run some code with the replaced stdout
+    finally:
+        sys.stdout = old_target # restore to the previous value
+</code></pre>
+<p>that can be used on earlier Python versions. The latter version is not <a href="http://docs.python.org/3.4/library/contextlib.html#reusable-cms" rel="noreferrer">reusable</a>. It can be made one if desired.</p>
+<p>It doesn't redirect the stdout at the file descriptors level e.g.:</p>
+<pre><code>import os
+from contextlib import redirect_stdout
+
+stdout_fd = sys.stdout.fileno()
+with open('output.txt', 'w') as f, redirect_stdout(f):
+    print('redirected to a file')
+    os.write(stdout_fd, b'not redirected')
+    os.system('echo this also is not redirected')
+</code></pre>
+<p><code>b'not redirected'</code> and <code>'echo this also is not redirected'</code> are not redirected to the <code>output.txt</code> file. </p>
+<p>To redirect at the file descriptor level, <code>os.dup2()</code> could be used:</p>
+<pre><code>import os
+import sys
+from contextlib import contextmanager
+
+def fileno(file_or_fd):
+    fd = getattr(file_or_fd, 'fileno', lambda: file_or_fd)()
+    if not isinstance(fd, int):
+        raise ValueError("Expected a file (`.fileno()`) or a file descriptor")
+    return fd
+
+@contextmanager
+def stdout_redirected(to=os.devnull, stdout=None):
+    if stdout is None:
+       stdout = sys.stdout
+
+    stdout_fd = fileno(stdout)
+    # copy stdout_fd before it is overwritten
+    #NOTE: `copied` is inheritable on Windows when duplicating a standard stream
+    with os.fdopen(os.dup(stdout_fd), 'wb') as copied: 
+        stdout.flush()  # flush library buffers that dup2 knows nothing about
+        try:
+            os.dup2(fileno(to), stdout_fd)  # $ exec &gt;&amp;to
+        except ValueError:  # filename
+            with open(to, 'wb') as to_file:
+                os.dup2(to_file.fileno(), stdout_fd)  # $ exec &gt; to
+        try:
+            yield stdout # allow code to be run with the redirected stdout
+        finally:
+            # restore stdout to its previous value
+            #NOTE: dup2 makes stdout_fd inheritable unconditionally
+            stdout.flush()
+            os.dup2(copied.fileno(), stdout_fd)  # $ exec &gt;&amp;copied
+</code></pre>
+<p>The same example works now if <code>stdout_redirected()</code> is used instead of <code>redirect_stdout()</code>:</p>
+<pre><code>import os
+import sys
+
+stdout_fd = sys.stdout.fileno()
+with open('output.txt', 'w') as f, stdout_redirected(f):
+    print('redirected to a file')
+    os.write(stdout_fd, b'it is redirected now\n')
+    os.system('echo this is also redirected')
+print('this is goes back to stdout')
+</code></pre>
+<p>The output that previously was printed on stdout now goes to <code>output.txt</code> as long as <code>stdout_redirected()</code> context manager is active.</p>
+<p>Note: <code>stdout.flush()</code> does not flush 
+C stdio buffers on Python 3 where I/O is implemented directly on <code>read()</code>/<code>write()</code> system calls. To flush all open C stdio output streams, you could call <code>libc.fflush(None)</code> explicitly if some C extension uses stdio-based I/O:</p>
+<pre><code>try:
+    import ctypes
+    from ctypes.util import find_library
+except ImportError:
+    libc = None
+else:
+    try:
+        libc = ctypes.cdll.msvcrt # Windows
+    except OSError:
+        libc = ctypes.cdll.LoadLibrary(find_library('c'))
+
+def flush(stream):
+    try:
+        libc.fflush(None)
+        stream.flush()
+    except (AttributeError, ValueError, IOError):
+        pass # unsupported
+</code></pre>
+<p>You could use <code>stdout</code> parameter to redirect other streams, not only <code>sys.stdout</code> e.g., to merge <code>sys.stderr</code> and <code>sys.stdout</code>:</p>
+<pre><code>def merged_stderr_stdout():  # $ exec 2&gt;&amp;1
+    return stdout_redirected(to=sys.stdout, stdout=sys.stderr)
+</code></pre>
+<p>Example:</p>
+<pre><code>from __future__ import print_function
+import sys
+
+with merged_stderr_stdout():
+     print('this is printed on stdout')
+     print('this is also printed on stdout', file=sys.stderr)
+</code></pre>
+<p>Note: <code>stdout_redirected()</code> mixes buffered I/O (<code>sys.stdout</code> usually) and unbuffered I/O (operations on file descriptors directly). Beware, there could be <a href="https://stackoverflow.com/q/13932932/4279">buffering</a> <a href="https://stackoverflow.com/q/22417010/4279">issues</a>.</p>
+<p>To answer, your edit: you could use <a href="https://pypi.python.org/pypi/python-daemon/" rel="noreferrer"><code>python-daemon</code></a> to daemonize your script and use <code>logging</code> module (as <a href="https://stackoverflow.com/questions/4675728/redirect-stdout-to-a-file-in-python/22434262#comment31368129_4675728">@erikb85 suggested</a>) instead of <code>print</code> statements and  merely redirecting stdout for your long-running Python script that you run using <code>nohup</code> now. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>you can try this too much better</p>
+<pre><code>import sys
+
+class Logger(object):
+    def __init__(self, filename="Default.log"):
+        self.terminal = sys.stdout
+        self.log = open(filename, "a")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+
+sys.stdout = Logger("yourlogfilename.txt")
+print "Hello world !" # this is should be saved in yourlogfilename.txt
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The other answers didn't cover the case where you want forked processes to share your new stdout.</p>
+<p>To do that:</p>
+<pre><code>from os import open, close, dup, O_WRONLY
+
+old = dup(1)
+close(1)
+open("file", O_WRONLY) # should open on 1
+
+..... do stuff and then restore
+
+close(1)
+dup(old) # should dup to 1
+close(old) # get rid of left overs
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Quoted from <a href="http://www.python.org/dev/peps/pep-0343/" rel="nofollow noreferrer">PEP 343 -- The "with" Statement</a> (added import statement): </p>
+<p>Redirect stdout temporarily:</p>
+<pre><code>import sys
+from contextlib import contextmanager
+@contextmanager
+def stdout_redirected(new_stdout):
+    save_stdout = sys.stdout
+    sys.stdout = new_stdout
+    try:
+        yield None
+    finally:
+        sys.stdout = save_stdout
+</code></pre>
+<p>Used as follows:</p>
+<pre><code>with open(filename, "w") as f:
+    with stdout_redirected(f):
+        print "Hello world"
+</code></pre>
+<p>This isn't thread-safe, of course, but neither is doing this same dance manually.  In single-threaded programs (for example in scripts) it is a popular way of doing things.</p>
+<p></p>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>import sys
+sys.stdout = open('stdout.txt', 'w')
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You need a terminal multiplexer like either <a href="https://tmux.github.io/" rel="nofollow noreferrer">tmux</a> or <a href="https://www.gnu.org/software/screen/" rel="nofollow noreferrer">GNU screen</a></p>
+<p>I'm surprised that a small comment by Ryan Amos' to the original question is the only mention of a solution far preferable to all the others on offer, no matter how clever the python trickery may be and how many upvotes they've received. Further to Ryan's comment, tmux is a nice alternative to GNU screen.</p>
+<p>But the principle is the same: if you ever find yourself wanting to leave a terminal job running while you log-out, head to the cafe for a sandwich, pop to the bathroom, go home (etc) and then later, reconnect to your terminal session from anywhere or any computer as though you'd never been away, terminal multiplexers are <em>the</em> answer. Think of them as VNC or remote desktop for terminal sessions. Anything else is a workaround. As a bonus, when the boss and/or partner comes in and you inadvertently ctrl-w / cmd-w your terminal window instead of your browser window with its dodgy content, you won't have lost the last 18 hours-worth of processing!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Based on this answer: <a href="https://stackoverflow.com/a/5916874/1060344">https://stackoverflow.com/a/5916874/1060344</a>, here is another way I figured out which I use in one of my projects. For whatever you replace <code>sys.stderr</code> or <code>sys.stdout</code> with, you have to make sure that the replacement complies with <code>file</code> interface, especially if this is something you are doing because stderr/stdout are used in some other library that is not under your control. That library may be using other methods of file object.</p>
+<p>Check out this way where I still let everything go do stderr/stdout (or any file for that matter) and also send the message to a log file using Python's logging facility (but you can really do anything with this):</p>
+<pre><code>class FileToLogInterface(file):
+    '''
+    Interface to make sure that everytime anything is written to stderr, it is
+    also forwarded to a file.
+    '''
+
+    def __init__(self, *args, **kwargs):
+        if 'cfg' not in kwargs:
+            raise TypeError('argument cfg is required.')
+        else:
+            if not isinstance(kwargs['cfg'], config.Config):
+                raise TypeError(
+                    'argument cfg should be a valid '
+                    'PostSegmentation configuration object i.e. '
+                    'postsegmentation.config.Config')
+        self._cfg = kwargs['cfg']
+        kwargs.pop('cfg')
+
+        self._logger = logging.getlogger('access_log')
+
+        super(FileToLogInterface, self).__init__(*args, **kwargs)
+
+    def write(self, msg):
+        super(FileToLogInterface, self).write(msg)
+        self._logger.info(msg)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Programs written in other languages (e.g. C) have to do special magic (called double-forking) expressly to detach from the terminal (and to prevent zombie processes). So, I think the best solution is to emulate them.</p>
+<p>A plus of re-executing your program is, you can choose redirections on the command-line, e.g. <code>/usr/bin/python mycoolscript.py 2&gt;&amp;1 1&gt;/dev/null</code></p>
+<p>See this post for more info: <a href="https://stackoverflow.com/questions/881388/what-is-the-reason-for-performing-a-double-fork-when-creating-a-daemon">What is the reason for performing a double fork when creating a daemon?</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://stackoverflow.com/users/89806/marcog">@marcog</a> </p>
+<p>The second option is only good if script get excuted in a go .Or script should get executed completely only then the output goes into that file And infinite loops should`nt be present(optimally). Best solution if it is a simple script.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here is a variation of <em>Yuda Prawira</em> answer:</p>
+<ul>
+<li>implement <code>flush()</code> and all the file attributes</li>
+<li>write it as a contextmanager</li>
+<li>capture <code>stderr</code> also</li>
+</ul>
+<p>.</p>
+<pre><code>import contextlib, sys
+
+@contextlib.contextmanager
+def log_print(file):
+    # capture all outputs to a log file while still printing it
+    class Logger:
+        def __init__(self, file):
+            self.terminal = sys.stdout
+            self.log = file
+
+        def write(self, message):
+            self.terminal.write(message)
+            self.log.write(message)
+
+        def __getattr__(self, attr):
+            return getattr(self.terminal, attr)
+
+    logger = Logger(file)
+
+    _stdout = sys.stdout
+    _stderr = sys.stderr
+    sys.stdout = logger
+    sys.stderr = logger
+    try:
+        yield logger.log
+    finally:
+        sys.stdout = _stdout
+        sys.stderr = _stderr
+
+
+with log_print(open('mylogfile.log', 'w')):
+    print('hello world')
+    print('hello world on stderr', file=sys.stderr)
+
+# you can capture the output to a string with:
+# with log_print(io.StringIO()) as log:
+#   ....
+#   print('[captured output]', log.getvalue())
+</code></pre>
+</div>
+<span class="comment-copy">That's not really a python thing, it's a shell function. Just run your script like <code>script.p &gt; file</code></span>
+<span class="comment-copy">I currently solve the problem using nohup, but I thought there might be something more clever...</span>
+<span class="comment-copy">@foxbunny:  nohup?  Why simply <code>someprocess | python script.py</code>?  Why involve <code>nohup</code>?</span>
+<span class="comment-copy">Rewrite the <code>print</code> statements to apply the <code>logging</code> module from the stdlib. Then you can redirect output everywhere, have control over how much output you want etc. In most cases production code should not <code>print</code> but <code>log</code>.</span>
+<span class="comment-copy">Perhaps a better solution for this problem is the screen command, which will save your bash session and allow you to access it from different runs.</span>
+<span class="comment-copy">If you're on Windows watch out for Windows bug - <a href="http://stackoverflow.com/questions/3018848/">Cannot redirect output when I run Python script on Windows using just script's name</a></span>
+<span class="comment-copy">It doesn't work with <code>from sys import stdout</code>, maybe because it creates a local copy. Also you can use it with <code>with</code>, e.g. <code>with open('file', 'w') as sys.stdout: functionThatPrints()</code>. You can now implement <code>functionThatPrints()</code> using normal <code>print</code> statements.</span>
+<span class="comment-copy">It's best to keep a local copy, <code>stdout = sys.stdout</code> so you can put it back when you're done, <code>sys.stdout = stdout</code>. That way if you're being called from a function that uses <code>print</code> you don't screw them up.</span>
+<span class="comment-copy">@Jan: <code>buffering=0</code> disables buffering (it may negatively affect performance (10-100 times)). <code>buffering=1</code> enables line buffering so that you could use <code>tail -f</code> for a line-oriented output.</span>
+<span class="comment-copy">@mgold or you can use <code>sys.stdout = sys.__stdout__</code> to get it back.</span>
+<span class="comment-copy"><code>stdout_redirected</code> is helpful.  Be aware this doesn't work inside doctests, since the special <code>SpoofOut</code> handler doctest uses to replace <code>sys.stdout</code> doesn't have a <code>fileno</code> attribute.</span>
+<span class="comment-copy">@ChrisJohnson: If it doesn't raise <code>ValueError("Expected a file (`.fileno()`) or a file descriptor")</code> then it is a bug. Are you sure it doesn't raise it?</span>
+<span class="comment-copy">It does raise that error, which is what make it not usable within a doctest.  To use your function within a doctest, it appears necessary to specify <code>doctest.sys.__stdout__</code> where we would normally use <code>sys.stdout</code>.  This isn't a problem with your function, just an accommodation required for doctest since it replaces stdout with an object that doesn't have all the attributes a true file would.</span>
+<span class="comment-copy"><code>stdout_redirected()</code> has <code>stdout</code> parameter, you could set it to <code>sys.__stdout__</code> if you want to redirect the original python stdout (that should have a valid <code>.fileno()</code> in most cases). It does nothing for the current <code>sys.stdout</code> if they are different. Don't use <code>doctest.sys</code>; it is available by accident.</span>
+<span class="comment-copy">This really works well, i.e. redirect stdout and stderr to a fd:  <code>with stdout_redirected(to=fd):</code> <code>with merged_stderr_stdout():</code> <code>print('...'); print('...', file=sys.stderr)</code></span>
+<span class="comment-copy">Any suggestions for piping to <code>logger</code> or <code>syslog</code>?</span>
+<span class="comment-copy">If you want to edit a file this isn't very useful. Anyway +1 for the nice trick</span>
+<span class="comment-copy">This will have consequences for code which assumes sys.stdout is a full fledged file object with methods such as fileno() (which includes code in the python standard library).  I would add a __getattr__(self, attr) method to that which defers attribute lookup to self.terminal.  <code>def __getattr__(self, attr):     return getattr(self.terminal, attr)</code></span>
+<span class="comment-copy">You have to add <code>def flush(self):</code> method as well to class <code>Logger</code>.</span>
+<span class="comment-copy">This helped me setup logging to both stdout and a file: <a href="https://docs.python.org/3/howto/logging-cookbook.html" rel="nofollow noreferrer">docs.python.org/3/howto/logging-cookbook.html</a></span>
+<span class="comment-copy">one needs to replace the 'w' attribute with, os.O_WRONLY|os.O_CREATE ... can't send strings into the "os" commands!</span>
+<span class="comment-copy">Insert a <code>sys.stdout.flush()</code> before the <code>close(1)</code> statement to make sure the redirect <code>'file'</code> file gets the output. Also, you can use a <code>tempfile.mkstemp()</code> file in place of <code>'file'</code>. And be careful you don't have other threads running that can steal the os's first file handle after the <code>os.close(1)</code> but before the <code>'file'</code> is opened to use the handle.</span>
+<span class="comment-copy">its os.O_WRONLY | os.O_CREAT ... there is no E on there.</span>
+<span class="comment-copy">+1. You could also use <a href="http://stackoverflow.com/a/22434262/4279"><code>os.dup2()</code> and wrap it into a context manager as shown in my answer</a></span>
+<span class="comment-copy">@Ch'marr It's O_CREAT, not O_CREATE.</span>
+<span class="comment-copy">+1. Note: it doesn't work for subprocesses e.g., <code>os.system('echo not redirected')</code>. <a href="http://stackoverflow.com/a/22434262/4279">My answer shows how to redirect such output</a></span>
+<span class="comment-copy">while it is a good answer for the part of the question appeared after the edit; it does not answer the question in the title (most people come here from google for the title)</span>
+<span class="comment-copy">That's a fair point, and one I hadn't considered.</span>
+<span class="comment-copy">It looks like tmux has moved to <a href="https://tmux.github.io/" rel="nofollow noreferrer">tmux.github.io</a></span>
+<span class="comment-copy">Eh... can't say I'm a fan of processes managing their own double-forking. It's so common an idiom, and so easy to code wrong if you aren't careful. Better to write your process to run in the foreground, and use a system background task manager (<code>systemd</code>, <code>upstart</code>) or other utility (<code>daemon(1)</code>) to handle the forking boilerplate.</span>

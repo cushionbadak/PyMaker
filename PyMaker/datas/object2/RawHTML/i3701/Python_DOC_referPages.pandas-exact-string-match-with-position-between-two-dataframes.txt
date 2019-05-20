@@ -1,0 +1,107 @@
+<div class="post-text" itemprop="text">
+<p>Let's say I have the two dataframes below. </p>
+<p>In reality, both dataframes will be around a million rows each, so I would like to find the most efficient way to compare:</p>
+<ul>
+<li>each df2["BaseCall"] with each df1["seq"] </li>
+<li>return a dataframe that contains a list of positions on each df1["gene"] 
+where any df2["BaseCall"] was found   </li>
+</ul>
+<p>The overall goal is to count the number of times each feature_id is found in a gene, and capture the position information for use downstream. </p>
+<pre><code>    # break fasta_df sequences and mutation seqs up into kmers
+    data = [{"gene":"pik3ca", "start":"179148724", "stop":"179148949","seq":"TTTGCTTTATCTTTTGTTTTTGCTTTAGCTGAAGTATTTTAAAGTCAGTTACAG"},
+    {"gene":"brca1", "start":"179148724", "stop":"179148949","seq":"CAATATCTACCATTTGTTAACTTTGTTCTATTATCATAACTACCAAAATTAACAGA"},
+    {"gene":"kras1", "start":"179148724", "stop":"179148949","seq":"AAAACCCAGTAGATTTTCAAATTTTCCCAACTCTTCCACCAATGTCTTTTTACATCT"}] 
+
+    # test dataframe with input seq    
+    df1 = pd.DataFrame(data)
+
+    data2 = [{"FeatureID":"1_1_15", "BaseCall":"TTTGTT"},
+         {"FeatureID":"1_1_15", "BaseCall":"AATATC"},
+         {"FeatureID":"1_1_16", "BaseCall":"GTTTTT"},
+         {"FeatureID":"1_1_16", "BaseCall":"GTTCTA"},
+         ]
+
+    df2= pd.DataFrame(data2)
+</code></pre>
+<p>The output should look something like: </p>
+<pre><code>|  gene  |   feature_id   |   BaseCall   |   Position 
+| pik3ca |   1_1_15       |   TTTGTT     |    12
+| pik3ca |   1_1_16       |   GTTTTT     |    15
+| brca1  |   1_1_16       |   GTTCTA     |    24
+| brca1  |   1_1_15       |   AATATC     |    1
+| brca1  |   1_1_15       |   TTTGTT     |    12
+| brca1  |   1_1_15       |   TTTGTT     |    21
+</code></pre>
+<p>This ngram function seems to work great when I use just one test basecall on one seq, but I'm having trouble figuring out the most efficient way to use the apply method with one argument coming from two different dataframes. Or perhaps there is an even better way to find matching strings/positions between two dataframes?  </p>
+<pre><code> def ngrams(string, target):
+    ngrams = zip(*[string[i:] for i in range(6)])
+    output = [''.join(ngram)for ngram in ngrams]
+    indices = [(i,x) for i, x in enumerate(output) if x == target]
+    return indices
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Account for possible multiple occurrences of same <code>BaseCall</code> in a given <code>seq</code>, using <a href="https://docs.python.org/3/library/re.html#re.finditer" rel="nofollow noreferrer"><code>re.finditer()</code></a> and <a href="https://stackoverflow.com/a/39955283/2799941">some Pandas hacking</a>:</p>
+<pre><code>import re
+
+def match_basecall(pattern, string):
+    match = re.finditer(pattern, string)
+    start_pos = [m.start() for m in match]
+    if not start_pos:
+        return None
+    return start_pos
+
+matches = df2.BaseCall.apply(lambda bc: df1.seq.apply(lambda x: match_basecall(bc, x)))
+matches.columns = df1.gene
+
+merged = matches.merge(df2, left_index=True, right_index=True)
+
+melted = merged.melt(id_vars=["FeatureID", "BaseCall"], 
+                     var_name="gene", 
+                     value_name="Position").dropna()
+
+melted
+  FeatureID BaseCall    gene  Position
+0    1_1_15   TTTGTT  pik3ca      [12]
+2    1_1_16   GTTTTT  pik3ca      [15]
+4    1_1_15   TTTGTT   brca1  [12, 21]
+5    1_1_15   AATATC   brca1       [1]
+7    1_1_16   GTTCTA   brca1      [24]
+</code></pre>
+<p>Multiple <code>BaseCall</code> matches are represented as list items in <code>Position</code>, but our desired output puts each match on a separate row.  We can use <code>apply(pd.Series)</code> to explode a column of lists into multiple columns, and then <code>stack()</code> to swing the columns into rows:</p>
+<pre><code>stacked = (pd.DataFrame(melted.Position.apply(pd.Series).stack())
+             .reset_index(level=1, drop=True)
+             .rename(columns={0:"Position"}))
+
+final = melted.drop("Position", 1).merge(stacked, left_index=True, right_index=True)
+
+final
+  FeatureID BaseCall    gene  Position
+0    1_1_15   TTTGTT  pik3ca      12.0
+2    1_1_16   GTTTTT  pik3ca      15.0
+4    1_1_15   TTTGTT   brca1      12.0
+4    1_1_15   TTTGTT   brca1      21.0
+5    1_1_15   AATATC   brca1       1.0
+7    1_1_16   GTTCTA   brca1      24.0
+</code></pre>
+<p>We can <code>groupby</code> <code>FeatureID</code> and <code>gene</code> to get occurrence totals:</p>
+<pre><code>final.groupby(["FeatureID", "gene"]).Position.count()
+
+FeatureID  gene  
+1_1_15     brca1     3
+           pik3ca    1
+1_1_16     brca1     1
+           pik3ca    1
+</code></pre>
+<p>Notes: Per OP output, combinations with no matches are excluded.<br/>
+Also, assuming here that <code>BaseCall</code> is just one column, and that there are not both <code>Basecall</code> and <code>BaseCall</code> separate columns.</p>
+</div>
+<span class="comment-copy">Question: I don't see the point of storing the data in dataframe2. Shouldn't that just be a simple dictionary where keys are BaseCall and values FeatureID? Something like <code>s = pd.Series({item['BaseCall']: item['FeatureID'] for item in data2})</code></span>
+<span class="comment-copy">(1) How is <code>Position</code> computed in your output?  Can you show a specific example?  (2) Is that your complete expected output?  Seems like there are additional matches.  (3) Is is <code>Basecall</code> or <code>BaseCall</code>, or do you actually have both spellings in your data?</span>
+<span class="comment-copy">Df2 is created from many other steps in a long pipeline. I'm not opposed to other data structures if that's more efficient.</span>
+<span class="comment-copy">Andrew, position is currently committed l computed using the enumerate function shown on the last line in the ngrams function to return position on the string, which I can then subtract from df1.start.</span>
+<span class="comment-copy">And yes, that was not a complete output. I wasn't sure if extra info was helpful, I'll update it.</span>
+<span class="comment-copy">Thanks so much for the quick response. Unfortunately, position will be required for downstream coverage analysis which is why I need to track it here.</span>
+<span class="comment-copy">Ok, then good to be clear in your post about the requirements for your output.  ("Overall goal" is what I was working with.)  Will add <code>position</code> shortly.</span>
+<span class="comment-copy">@SummerEla does this look right?</span>
+<span class="comment-copy">Thank you so much, @andrew_reece, and thanks for being patient with my messy post!</span>

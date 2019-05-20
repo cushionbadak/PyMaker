@@ -1,0 +1,127 @@
+<div class="post-text" itemprop="text">
+<p>I'm writing a Python extension in C++, wrapping a third-party library I do not control.  That library creates a thread Python knows nothing about, and from that thread, calls a C++ callback I provide to the library.  I want that callback to call a Python function, but I get a deadlock using the approach I read from the docs.  Here's my interpretation of those.</p>
+<pre><code>void Wrapper::myCallback()
+{
+   PyGILState_STATE gstate=PyGILState_Ensure();
+   PyObject *result=PyObject_CallMethod(_pyObj,"callback",nullptr);
+   if (result) Py_DECREF(result);
+   PyGILState_Release(gstate);
+}
+</code></pre>
+<p>My code does nothing else related to threads, though I've tried a number of other things that have.  Based on <a href="https://stackoverflow.com/q/28557947/3350050" title="this">this</a>, for example, I tried calling <code>PyEval_InitThreads()</code>, but it's not obvious where that call should be made for an extension.  I put it in the <code>PyMODINIT_FUNC</code>.  These attempts have all lead to deadlock, crashes, or mysterious fatal errors from Python, e.g., <em>PyEval_ReleaseThread: wrong thread state</em>.</p>
+<p>This is on Linux with Python 3.6.1.  Any ideas how I can get this "simple" callback to work?</p>
+<h2>Likely Culprit</h2>
+<p>I didn't realize that in another thread, the library was in a busy/wait loop waiting on the callback's thread.  In <code>gdb</code>, <code>info threads</code> made this apparent.  The only solution I can see is to skip those particular calls to the callback; I don't see a way to make them safe, given the busy/wait loop.  In this case, that's acceptable, and doing so eliminates the deadlock.</p>
+<p>Also, it appears that I do need to also call <code>PyEval_InitThreads()</code> before any of this.  In a C++ extension, it's not clear where that should go though.  One of the replies suggested doing it indirectly in Python by creating and deleting a throwaway <code>threading.Thread</code>.  That didn't seem to fix it, triggering instead a <em>Fatal Python error: take_gil: NULL tstate</em>, which I think means there's still no GIL.  My guess, based on <a href="https://bugs.python.org/issue26003" rel="nofollow noreferrer" title="this">this</a> and the issue it refers to, is that <code>PyEval_InitThreads()</code> causes the current thread to become the main thread for the GIL.  If that call is made in the short-lived throwaway thread, maybe that's a problem.  Yeah, I'm only guessing and would appreciate an explanation from someone who doesn't have to.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This answer is only for Python &gt;= 3.0.0. I don't know if it would work for earlier Pythons or not.</p>
+<p>Wrap your C++ module in a Python module that looks something like this:</p>
+<pre><code>import threading
+t = threading.Thread(target=lambda: None, daemon=True)
+t.run()
+del t
+from your_cpp_module import *
+</code></pre>
+<p>From my reading of the documentation, that should force threading to be initialized before your module is imported. Then the callback function you have written up there should work.</p>
+<p>I'm less confident of this working, but your module init function could instead do this:</p>
+<pre><code>if (!PyEval_ThreadsInitialized())
+{
+    PyEval_InitThreads();
+}
+</code></pre>
+<p>that should work because your module init function should be being executed by the only Python thread in existence if <code>PyEval_ThreadsInitialized()</code> isn't true, and holding the GIL is the right thing to do then.</p>
+<p>These are guesses on my part. I've never done anything like this as is evidenced by my clueless comments on your question. But from my reading of the documentation, both of these approaches should work.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'm new to StackOverflow, but I've been working on embedding python in a multithreaded C++ system for the last few days and run into a fair number of situations where the code has deadlocked itself. Here's the solution that I've been using to ensure thread safety:</p>
+<pre><code>class PyContextManager {
+   private:
+      static volatile bool python_threads_initialized;
+   public:
+      static std::mutex pyContextLock;
+      PyContextManager(/* if python_threads_initialized is false, call PyEval_InitThreads and set the variable to true */);
+      ~PyContextManager();
+};
+
+#define PY_SAFE_CONTEXT(expr)                   \
+{                                               \
+   std::unique_lock&lt;std::mutex&gt;(pyContextLock); \
+   PyGILState_STATE gstate;                     \
+   gstate = PyGILState_Ensure();                \
+      expr;                                     \
+   PyGILState_Release(gstate);                  \
+}
+</code></pre>
+<p>Initializing the boolean and the mutex in the .cpp file.</p>
+<p>I've noticed that without the mutex, the PyGILState_Ensure() command can cause a thread to deadlock. Likewise, calling PySafeContext within the expr of another PySafeContext will cause the thread to brick while it waits on its mutex.</p>
+<p>Using these functions, I believe your callback function would look like this:</p>
+<pre><code>void Wrapper::myCallback()
+{
+   PyContextManager cm();
+   PY_SAFE_CONTEXT(
+       PyObject *result=PyObject_CallMethod(_pyObj,"callback",nullptr);
+       if (result) Py_DECREF(result);
+   );
+}
+</code></pre>
+<p>If you don't believe that your code is likely to ever need more than one multithreaded call to Python, you can easily expand the macro and take the static variables out of a class structure. This is just how I've handled an unknown thread starting and determining whether it needs to start up the system, and dodging the tedium of writing out the GIL functions repeatedly.</p>
+<p>Hope this helps!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I have wrapped C++ observers in Python. If you are using boost then you can call PyEval_InitThreads() in BOOST_PYTHON_MODULE:</p>
+<pre><code>BOOST_PYTHON_MODULE(eapipy)
+{
+     boost::shared_ptr&lt;Python::InitialisePythonGIL&gt; gil(new Python::InitialisePythonGIL());
+....
+}
+</code></pre>
+<p>Then I use a class to control calling back into Python from C++.</p>
+<pre><code>struct PyLockGIL
+{
+
+    PyLockGIL()
+        : gstate(PyGILState_Ensure())
+    { 
+    }
+
+    ~PyLockGIL()
+    {
+        PyGILState_Release(gstate);
+    }
+
+    PyLockGIL(const PyLockGIL&amp;) = delete;
+    PyLockGIL&amp; operator=(const PyLockGIL&amp;) = delete;
+
+    PyGILState_STATE gstate;
+};
+</code></pre>
+<p>If you are calling into C++ for any length of time you can also relinquish the GIL:</p>
+<pre><code>struct PyRelinquishGIL
+{
+    PyRelinquishGIL()
+        : _thread_state(PyEval_SaveThread())
+    {
+    }
+    ~PyRelinquishGIL()
+    {
+        PyEval_RestoreThread(_thread_state);
+    }
+
+    PyRelinquishGIL(const PyLockGIL&amp;) = delete;
+    PyRelinquishGIL&amp; operator=(const PyLockGIL&amp;) = delete;
+
+    PyThreadState* _thread_state;
+};
+</code></pre>
+<p>Our code is multi-threaded and this approach works well.</p>
+</div>
+<span class="comment-copy">Doing this from a thread Python knows nothing about isn't an approach that will work very well. Partly because Python moved to having very tight management over the threads it controls to make sure only one is ever running at a time.</span>
+<span class="comment-copy">I would recommend having a queue with one endpoint being a Python thread that sits in a tight loop and grabs a semaphore on the queue having something in it. Then it pulls things from the queue and executes the callback function.</span>
+<span class="comment-copy">Which version of Python?</span>
+<span class="comment-copy">This might be of interest here: <a href="https://docs.python.org/3/whatsnew/3.2.html#multi-threading" rel="nofollow noreferrer">docs.python.org/3/whatsnew/3.2.html#multi-threading</a></span>
+<span class="comment-copy">This is with Python 3.6.1 on Linux.Based on <a href="https://docs.python.org/3/c-api/init.html#non-python-created-threads" rel="nofollow noreferrer">this</a>, I conclude Python 3 can work with threads it didn't create.</span>
+<span class="comment-copy">I added that to the module's <code>__init__.py</code>, but I still deadlock.  Before posting, I also tried the <code>PyEval_InitThreads()</code>, etc. calls.  I think your <code>threading.Thread</code> idea is equivalent though.</span>
+<span class="comment-copy">Looking at Python source, and assuming I understand what I see there, <code>PyEval_InitThreads()</code> does the moral equivalent of <code>PyEval_ThreadsInitialized()</code>, so that much is unnecessary.  Also, I'm editing my answer with what I think is the likely culprit.  In short, I didn't realize the library, in a different thread, was waiting on this thread.</span>
+<span class="comment-copy">@Jim - If I didn't have a task I was being paid to do at this moment, I would be diving into this and figuring out what the heck is going on, starting with trying to reproduce your problem with a very simple module. :-) Maybe you could try that approach. Create a simple module that has a function that takes a callback and then starts another thread that calls the callback every second. If that works, that's a huge clue. If it doesn't, it's lots easier to figure out why it isn't.</span>
+<span class="comment-copy">@Jim - Oh, interesting! I was kinda guessing that it must be something specific about how your program is using threads.</span>

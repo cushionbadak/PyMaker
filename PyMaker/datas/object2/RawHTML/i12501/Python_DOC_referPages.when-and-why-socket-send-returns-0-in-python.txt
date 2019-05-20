@@ -1,0 +1,97 @@
+<div class="post-text" itemprop="text">
+<p>The python3 <a href="https://docs.python.org/3/howto/sockets.html#using-a-socket" rel="noreferrer">socket programming howto</a> presents this code snippet</p>
+<pre><code>class MySocket:
+    """demonstration class only
+      - coded for clarity, not efficiency
+    """
+
+    def __init__(self, sock=None):
+        if sock is None:
+            self.sock = socket.socket(
+                            socket.AF_INET, socket.SOCK_STREAM)
+        else:
+            self.sock = sock
+
+    def connect(self, host, port):
+        self.sock.connect((host, port))
+
+    def mysend(self, msg):
+        totalsent = 0
+        while totalsent &lt; MSGLEN:
+            sent = self.sock.send(msg[totalsent:])
+            if sent == 0:
+                raise RuntimeError("socket connection broken")
+            totalsent = totalsent + sent
+
+    def myreceive(self):
+        chunks = []
+        bytes_recd = 0
+        while bytes_recd &lt; MSGLEN:
+            chunk = self.sock.recv(min(MSGLEN - bytes_recd, 2048))
+            if chunk == b'':
+                raise RuntimeError("socket connection broken")
+            chunks.append(chunk)
+            bytes_recd = bytes_recd + len(chunk)
+        return b''.join(chunks)
+</code></pre>
+<p>where the send loop is interrupted if the socket <a href="https://docs.python.org/3/library/socket.html#socket.socket.send" rel="noreferrer"><code>send</code></a> method returns 0. </p>
+<p>The logic behind this snippet is that when the <code>send</code> method returns '0 bytes sent', the sending side of a socket connection should give up its efforts to send data. This is for sure true for the <a href="https://docs.python.org/3/library/socket.html#socket.socket.recv" rel="noreferrer"><code>recv</code></a> method, where zero bytes read for a socket in blocking mode should be interpreted as <code>EOF</code>, and therefore the reading side should give up.</p>
+<p>However I cannot understand under which situations the <code>send</code> method could return zero. My understanding of python sockets is that <code>send</code> returns immediately due to buffering at the OS level. If the buffer is full <code>send</code> will block, or if the connections is closed at the remote side, an exception is raised. </p>
+<p>Finally suppose <code>send</code> returns zero without raising an exception: does this really indicate that all future <code>send</code> calls will return zero?</p>
+<p>I've done some testing (although using only socket connected to <code>::1</code> on OS X) and was not able to find a situation in which <code>send</code> returns 0.</p>
+<p><strong>Edit</strong></p>
+<p>The HOWTO states:</p>
+<blockquote>
+<p>But if you plan to reuse your socket for further transfers, you need
+  to realize that there is no EOT on a socket. I repeat: if a socket
+  send or recv returns after handling 0 bytes, the connection has been
+  broken. If the connection has not been broken, you may wait on a recv
+  forever, because the socket will not tell you that there’s nothing
+  more to read (for now).</p>
+</blockquote>
+<p>It is pretty easy to find a situation in which <code>recv</code> returns 0: when the remote (sending) side calls <a href="https://docs.python.org/3/library/socket.html#socket.socket.shutdown" rel="noreferrer"><code>socket.shutdown(SHUT_WR)</code></a>, further <code>recv</code> on the receiving side will return <code>0</code> and not raise any exception. </p>
+<p>I'm looking for a concrete example where you can show that receiving 0 zero from <code>send</code> indicates a <em>broken connection</em> (which will continue to return 0 on send.)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Upon seeing the question I was somehow stunned, because a <code>send</code> C call can return 0 bytes and the connection is of course still alive (the socket cannot simply send more bytes at that given moment in time)</p>
+<ul>
+<li><a href="https://github.com/python/cpython/blob/master/Modules/socketmodule.c" rel="nofollow">https://github.com/python/cpython/blob/master/Modules/socketmodule.c</a></li>
+</ul>
+<p>I decided to "use the source" and unless I am very wrong (which can always be and often is) this is a bug in the HOWTO.</p>
+<p>Chain:</p>
+<ul>
+<li><code>send</code> is an alias for <code>sock_send</code></li>
+<li><code>sock_send</code> calls in turn <code>sock_call</code></li>
+<li><code>sock_call</code> calls in turn <code>sock_call_ex</code></li>
+<li><code>sock_call</code> calls in turn <code>sock_send_impl</code> (which has been passed down the chain starting with <code>sock_send</code>)</li>
+</ul>
+<p>Unwinding:</p>
+<ul>
+<li><p><code>sock_send_impl</code> returns <code>true</code> or <code>false</code> (1 or 0) with <code>return (ctx-&gt;result &gt;= 0)</code></p></li>
+<li><p><code>sock_call_ex</code> returns</p>
+<ul>
+<li><code>-1</code> if <code>sock_send_impl</code> returns <code>false</code></li>
+<li><code>0</code> if <code>sock_send_impl</code> returns <code>true</code></li>
+</ul></li>
+<li><p><code>sock_call</code> returns this value transparently.</p></li>
+<li><p><code>sock_send</code></p>
+<ul>
+<li><p>returns <code>NULL</code> for a <code>-1</code> (because an error has been set and an exception will be raised)</p></li>
+<li><p>returns <code>ctx-&gt;result</code> for <code>0</code>from <code>sock_call</code></p>
+<p>And <code>ctx-&gt;result</code> is the number of bytes written by the C call <code>send</code> in <code>sock_send_impl</code>.</p></li>
+</ul></li>
+</ul>
+<p>The chain shows that if <code>0</code> bytes have been sent, there is no error and this actually is a potential real life socket situation.</p>
+<p>If my logic is wrong, someone please let me know.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I might be wrong, but I think you are looking for an impossible situation...</p>
+<p>As @mementum has shown in his answer, it is theoretically possible for a socket to return zero when there is no error, but also no data sent.  </p>
+<p>However, as shown <a href="https://stackoverflow.com/questions/3081952/with-c-tcp-sockets-can-send-return-zero">elsewhere on SO</a> this can only happen in very specific scenarios.  In my experience (and also covered in the comments to the accepted answer) you would only ever get a zero result on a <em>non-blocking</em> socket when the network is congested.  Now Python sockets are <em>blocking</em> by default, which means that the kernel should wait until there is room to take some more data then return how many bytes were queued.  By definition, this can never be zero.</p>
+<p>So, putting it all together, since your snippet doesn't reset the socket type - e.g. using the <code>set_blocking</code> function - it is using blocking sockets and so cannot return zero and thus cannot hit the path mementum identified.</p>
+<p>This is backed up by the fact that you have been unable to trigger the specific line of code no matter what you do.</p>
+</div>
+<span class="comment-copy">The HOWTO also explains, "But if you plan to reuse your socket for further transfers, you need to realize that there is no EOT on a socket. I repeat: if a socket send or recv returns after handling 0 bytes, the connection has been broken."</span>
+<span class="comment-copy">@J.J.Hakala I tried my best to create a situation where <code>send</code> returns after handling 0 bytes, but was not able to find it. I tried almost everything on the receiving side (closing, various combinations of shutdown, etc.) and never the <code>send</code> method returned 0. So my question is really which are the exceptional situations where <code>send</code> returns 0?</span>
+<span class="comment-copy">So you agree that the test in the code sample <code>if sent == 0</code> is indeed unnecessary?</span>
+<span class="comment-copy">As best as I understand it, yes.</span>

@@ -1,0 +1,83 @@
+<div class="post-text" itemprop="text">
+<hr/>
+<p>I have a main process that is eating data from many different markets. It does some preliminary processing on the message and then passes it into a multiprocessing Queue (each unique market has its own dedicated process, call it <code>Parse</code>, on the other end of the Queue). Then the main process calls <code>mp.Event.set()</code> for the particular market involved. </p>
+<p>Within <code>Parse</code> is a call to <code>mp.Event.wait()</code>, which pauses the process unless there is data being fed into the queue. At the end of <code>Parse</code> it calls <code>mp.Event.clear().</code> I do this because I am using a <code>while True</code> loop to catch data the moment it comes through the queue. If I don't pause <code>Parse</code> it will use 100% of the CPU and I don't have enough cores for that (not to mention it's massively wasteful).</p>
+<p>This evening I realized that <code>Parse</code> is taking WAY too long to run, from .3 to 18 seconds. Market data messages can come in every 12 milliseconds so clearly this is unworkable. Every aspect of <code>Parse</code> is very fast, except for <code>mp.Event.wait()</code>. This call accounts for almost 100% of the run time. </p>
+<p>I am storing all the <code>mp.Event</code> objects in a dictionary, defined in a config file. I fear that one of two things is happening:</p>
+<ol>
+<li><p>Each instance of setting and clearing the Event blocks all the other ones, in a way similar to how <code>mp.Manager</code> works with shared objects. </p></li>
+<li><p><code>mp.Event</code> is just slow, and takes a long time for its state to propagate across processes...</p></li>
+</ol>
+<p>I am thinking of solving this by piping the data with <code>zmq</code> (ZeroMQ) rather than a <code>mp.Queue</code>, but before I set that up I thought to ask the smart people. </p>
+<p>Am I doing something obviously wrong here? Is there any way to speed up the <code>mp.Event</code> flagging?  </p>
+<p><strong>EDIT</strong></p>
+<p>In response to the comment, here is an example: </p>
+<p>In the <code>config.py</code> file, I define the dictionary like so:</p>
+<pre><code>E,Q={},{}
+for m in all_markets:
+    E[m] = mp.Event()
+    Q[m] = mp.Queue()
+</code></pre>
+<p>Then in the main process which reads the data, I call <code>sort</code>, which looks something like this: </p>
+<pre><code>def sort(message, m):
+    if message satisfies condition1:
+        define some args
+        Q[m].put(message, *args)
+        E[m].set()
+    if message satisfies condition2:
+        #basically the same
+</code></pre>
+<p>Then finally in <code>Parse</code>, which is started upon program startup:</p>
+<pre><code>def Parse(message,m,Q,E):
+    while True:
+        E[m].wait()
+        message = Q[m].get()
+        #do a bunch of processing on the message
+        #put the results in some other queues
+        E[m].clear()
+</code></pre>
+<p><strong>EDIT2</strong></p>
+<p>Procs are spawned and started like this: </p>
+<pre><code>def mitosis():
+    mp.Process(target=main).start()
+
+def pstart(m,func,**kwargs):
+    if func=='parser':
+        p = mp.Process(target=parser, args=(m, Q, E, *args) )
+        p.start()
+
+def main():
+    PROCS={}
+    for m in all_markets:
+        for procs in proclist:
+        PROCS[(m,proc)] = pstart(m,proc,**kwargs)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think your problem is that your <code>Event</code> code is broken.</p>
+<p>Imagine this scenario:</p>
+<ul>
+<li>main process calls <code>sort</code> for <code>m</code>.</li>
+<li><code>sort</code> calls <code>Q[m].put</code> and <code>E[m].set</code>.</li>
+<li><code>Parse</code> wakes up, does <code>Q[m].get</code>, and starts processing.</li>
+<li>main process calls <code>sort</code> again for the same <code>m</code>.</li>
+<li><code>sort</code> calls <code>Q[m].put</code> and <code>E[m].set</code>.</li>
+<li><code>Parse</code> finishes processing the first message, calls <code>E[m].clear</code>.</li>
+</ul>
+<p>Now <code>Parse</code> is just waiting around for the <code>Event</code> to be set again. Which may not happen for quite a while. And, even if it happens quickly, it's still not going to catch up; it only does one <code>Q[m].get</code> for each <code>Event.wait</code>.</p>
+<p>So, what you end up with is <code>Parse</code> appearing to fall farther and farther behind. And when you try to profile it to figure out why, you see that it's spending all its time waiting on <code>E[m].wait</code>. But this isn't because <code>E[m].wait</code> is slow, it's just because the event trigger got lost.</p>
+<p>This isn't the <em>only</em> race condition here, it's just the most obvious one.</p>
+<p>The general problem is that you can't use event objects this way. Normally, you solve it by using a <code>Condition</code> instead, or one-shot triggering and self-resetting <code>Event</code>s, plus looping over the <code>Q[m].get(block=False)</code> after each <code>Event</code>.</p>
+<p>But really, there is no need to do this in the first place. If you just remove the <code>Event</code> entirely, when <code>Parse</code> calls <code>Q[m].get</code>, that blocks until there's something there. So, when <code>sort</code> calls <code>Q[m].put</code>, that wakes up <code>Parse</code>, and there's nothing else needed.</p>
+<p>In fact, the whole point of <code>Queue</code> is that it's inherently self-synchronized. If you don't want that, use a <code>Pipe</code>, and then you can use a <code>Condition</code> for signaling. But in the simple case, that's just a less efficient version of a <code>Queue</code>.</p>
+</div>
+<span class="comment-copy">Is that dictionary of events a <code>Manager.dict</code>? If so, then it sounds like (1) is not just similar to what's happening, but exactly what's happening. If not, how is that dictionary shared? Is it immutable? Is it just fork-shared? If you can provide a <a href="http://stackoverflow.com/help/mcve">minimal, complete, verifiable example</a> instead of making us guess and ask a bunch of questions, it would be a lot easier.</span>
+<span class="comment-copy">Also, if you've already got a queue, why do you need an event? Why not just do a blocking wait on the queue? (If you need the event for bidirectional signaling, you can use a <code>JoinableQueue</code> for that, but it doesn't sound like that's relevant here.)</span>
+<span class="comment-copy">OK, in your code: <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Queue.get" rel="nofollow noreferrer"><code>Q[m].get()</code></a> blocks until there's something there, so the <code>Event</code> is adding nothing—or, if it is, there's some deeper problem here. (Also, <code>Parse</code> is started after the last <code>Q[m] = …</code>, not while they're still going on, right? And you're using the fork spawnmethod, right?)</span>
+<span class="comment-copy">I've added an example in response to your first comment. I hope it meets the three criteria at least approximately. Re your second comment, is there a specific method or type of queue which I can use for it to do a blocking wait? I looked at the docs and found under <code>Queue.get()</code> <i>If optional args block is True (the default) and timeout is None (the default), block if necessary until an item is available.</i> Is this what you are describing? If it is the default behavior, I am confused. I tested the code without <code>E.wait</code> and every process used 100% of its CPU. With <code>E.wait</code> they dropped to 2%</span>
+<span class="comment-copy"><code>Parse</code> is officially started about two lines after the module containing it is imported. That module imports the config file, so I think <code>Parse</code> cannot start until all the <code>Q[m]</code>s are defined. As for creation, I'm not sure which method I'm using (don't know what fork spawnmethod is), but I will add another edit to try to make this clear.</span>
+<span class="comment-copy">I didn't even think of that possibility, because <code>Parse</code> was supposed to finish in way less than the minimum time between messages. If it doesn't, what you say is completely true. Nice answer. I am going to comment out the <code>Events</code> and see what happens.</span>
+<span class="comment-copy">So deleting <code>Event</code> did not max out my CPUs, which is confusing but great. I think I have also discovered the actual problem.  <code>Parse</code> itself takes about .7 milliseconds to complete, however <code>Q[m].get()</code> is now taking all the time that <code>E[m].wait()</code> was taking before. This means that what you describe above is, indeed, happening, but the reason <code>E[m].set</code> is getting lost is that getting from the queue takes so long. Now I am wondering -- is this because pickling is slow (the <code>message</code> is a trio of dictionaries with different dtypes in, but it's quite small)?</span>
+<span class="comment-copy">@Wapiti: Can you reproduce the problem with a smaller program with constant values? That would be a lot easier to debug.</span>
+<span class="comment-copy">@Wapiti: Also, if you have messages getting <code>put</code> on the queue every 12ms, and each <code>put</code> only takes 0.7ms, but each <code>get</code> is waiting for 300ms, then you should be able to <code>print(Q[m].qsize())</code> and see it getting larger and larger, to verify that this really is the problem. (Unless you're on a Unix platform that only has the minimal semaphore API, in which case it may just raise an exception… but try it and see.)</span>
+<span class="comment-copy">So I slept on it and figured it out pretty quick in the morning. The massive compute times for <code>Parse</code> are actually just the times between messages, because the queue blocks. Before that, the event was blocking. However, there is a piece of code in <code>Parse</code> that depends nonlinearly on the input size of the message, so very rarely, when a large message is followed quickly by another message (i.e. during busy periods), the race condition will come into effect and the event flagging will break. Taking out Event pretty much solves everything. Thanks for your expertise. Awesome!</span>

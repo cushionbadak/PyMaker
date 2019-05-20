@@ -1,0 +1,107 @@
+<div class="post-text" itemprop="text">
+<p>I've been hunting for something that could be relatively stupid to some people, but to me very interesting! :-)</p>
+<p>Input and output errors have been merged with <code>OSError</code> in Python 3.3, so there's a change in the exception class hierarchy. One interesting feature about the builtin class <code>OSError</code> is that, it returns a subclass of it when passed <code>errno</code> and <code>strerror</code></p>
+<pre><code>&gt;&gt;&gt; OSError(2, os.strerror(2))
+FileNotFoundError(2, 'No such file or directory')
+
+&gt;&gt;&gt; OSError(2, os.strerror(2)).errno
+2
+&gt;&gt;&gt; OSError(2, os.strerror(2)).strerror
+'No such file or directory'
+</code></pre>
+<p>As you can see passing <code>errno</code> and <code>strerror</code> to the constructor of <code>OSError</code> returns <code>FileNotFoundError</code> instance which is a subclass of <code>OSError</code>.</p>
+<p><em>Python Doc:</em> </p>
+<blockquote>
+<p>The constructor often actually returns a subclass of OSError, as described in OS <a href="https://docs.python.org/3/library/exceptions.html#os-exceptions" rel="nofollow">exceptions</a> below. The particular subclass depends on the final errno value. <strong>This behaviour only occurs when constructing OSError directly or via an alias, and is not inherited when subclassing.</strong></p>
+</blockquote>
+<p>I wanted to code a subclass that would behave in this way. It's mostly curiosity and not real world code. I'm also trying to know, where's the logic that creates the subclass object, is it coded in <code>__new__</code> for example? If <code>__new__</code> contains the logic for creating the instances of the subclasses, then inheriting from <code>OSError</code> would typically return this behavior, unless if there's some sort of type checking in <code>__new__</code>:</p>
+<pre><code>&gt;&gt;&gt; class A(OSError): pass 
+&gt;&gt;&gt; A(2, os.strerror(2))
+A(2, 'No such file or directory')
+</code></pre>
+<p>There must be type checking then: </p>
+<pre><code># If passed OSError, returns subclass instance
+&gt;&gt;&gt; A.__new__(OSError, 2, os.strerror(2))         
+FileNotFoundError(2, 'No such file or directory')
+
+# Not OSError? Return instance of A
+&gt;&gt;&gt; A.__new__(A, 2, os.strerror(2)
+A(2, 'No such file or directory')
+</code></pre>
+<p>I've been digging through C code to find out where's this code is placed exactly and since I'm not an expert in C, I suspect this is really the logic and (I'm quite skeptical about that to be frank): </p>
+<p><a href="https://hg.python.org/cpython/file/5ae8756a1ae0/Objects/exceptions.c" rel="nofollow">exceptions.c</a></p>
+<pre><code>if (myerrno &amp;&amp; PyLong_Check(myerrno) &amp;&amp;
+    errnomap &amp;&amp; (PyObject *) type == PyExc_OSError) {
+    PyObject *newtype;
+    newtype = PyDict_GetItem(errnomap, myerrno);
+    if (newtype) {
+        assert(PyType_Check(newtype));
+        type = (PyTypeObject *) newtype;
+    }
+    else if (PyErr_Occurred())
+        goto error;
+}
+}
+</code></pre>
+<p>Now I'm wondering about the possibility of expanding <code>errnomap</code> from Python itself without playing with C code, so that <code>OSErro</code> can make instances of user-defined classes, if you ask me why would you do that? I would say, just for fun. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You're correct that <code>errnomap</code> is the variable that holds the mapping from errno values to <code>OSError</code> subclasses, but unfortunately it's not exported outside the <code>exceptions.c</code> source file, so there's no portable way to modify it.</p>
+<hr/>
+<p>It <em>is</em> possible to access it using <strong>highly</strong> non-portable hacks, and I present one possible method for doing so (using a debugger) below purely in a spirit of fun. This should work on any x86-64 Linux system.</p>
+<pre><code>&gt;&gt;&gt; import os, sys
+&gt;&gt;&gt; os.system("""gdb -p %d \
+-ex 'b PyDict_GetItem if (PyLong_AsLongLong($rsi) == -1 ? \
+(PyErr_Clear(), 0) : PyLong_AsLongLong($rsi)) == 0xbaadf00d' \
+-ex c \
+-ex 'call PySys_SetObject("errnomap", $rdi)' --batch &gt;/dev/null 2&gt;&amp;1 &amp;""" % os.getpid()) 
+0
+&gt;&gt;&gt; OSError(0xbaadf00d, '')
+OSError(3131961357, '')
+&gt;&gt;&gt; sys.errnomap
+{32: &lt;class 'BrokenPipeError'&gt;, 1: &lt;class 'PermissionError'&gt; [...]}
+&gt;&gt;&gt; class ImATeapotError(OSError):
+    pass
+&gt;&gt;&gt; sys.errnomap[99] = ImATeapotError
+&gt;&gt;&gt; OSError(99, "I'm a teapot")
+ImATeapotError(99, "I'm a teapot")
+</code></pre>
+<p>Quick explanation of how this works:</p>
+<p><code>gdb -p %d [...] --batch &gt;/dev/null 2&gt;&amp;1 &amp;</code></p>
+<p>Attach a debugger to the current Python process (<code>os.getpid()</code>), in unattended mode (<code>--batch</code>), discarding output (<code>&gt;/dev/null 2&gt;&amp;1</code>) and in the background (<code>&amp;</code>), allowing Python to continue running.</p>
+<p><code>b PyDict_GetItem if (PyLong_AsLongLong($rsi) == -1 ? (PyErr_Clear(), 0) : PyLong_AsLongLong($rsi)) == 0xbaadf00d</code></p>
+<p>When the Python program <a href="https://docs.python.org/3/c-api/dict.html#c.PyDict_GetItem" rel="noreferrer">accesses <em>any</em> dictionary</a>, break if the key <a href="https://docs.python.org/3/c-api/long.html#c.PyLong_AsLongLong" rel="noreferrer">is an <code>int</code></a> with a magic value (used as <code>OSError(0xbaadf00d, '')</code> later); if it isn't an int, we've just raised <code>TypeError</code>, so <a href="https://docs.python.org/3/c-api/exceptions.html#c.PyErr_Clear" rel="noreferrer">suppress it</a>.</p>
+<p><code>call PySys_SetObject("errnomap", $rdi)</code></p>
+<p>When this happens, we know the dictionary being looked up in is the <code>errnomap</code>; <a href="https://docs.python.org/3/c-api/sys.html#system-functions" rel="noreferrer">store it as an attribute on the <code>sys</code> module</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can't change the behavior of <code>OSError</code> from Python because it's not implemented in Python.</p>
+<p>For classes implemented in Python, you can write <code>__new__</code> so it only returns a subclass if it's being called on the base class. Then the behavior won't be inherited.</p>
+<pre><code>class MyClass(object):
+    def __new__(cls, sub=0, _subtypes={}):
+        if cls is MyClass:
+             if sub not in _subtypes:
+                 _subtypes[sub] = type("MyClass(%s)" % sub, (MyClass,), {})
+             return _subtypes[sub](sub)
+        return object.__new__(cls, sub)
+    def __init__(self, sub):
+        assert type(self).__name__ == "MyClass(%s)" % sub
+
+class SubClass(MyClass):
+     def __init__(self, sub=None):
+         assert type(self).__name__ == "SubClass"
+
+print(MyClass(1))    # &lt;__main__.MyClass(1) object at 0x01EB1EB0&gt;
+print(SubClass())    # &lt;__main__.SubClass object at 0x01EB1CD0&gt;
+</code></pre>
+</div>
+<span class="comment-copy">You'd have to monkeypatch <code>OSError.__new__</code>, but you <code>can't set attributes of built-in/extension type</code>. So essentially you'd have to subclass OSError and do monkeypatching there, but I guess that's not what you want. To sum up, doing it on user defined class? Not so hard. Doing it on built-in - well, not so easy.</span>
+<span class="comment-copy">Also, you may want to rephrase the question, <i>Where's the logic that returns an instance of a subclass of OSError exception class?</i> well, you've found it already. Does doing it on built-in is critical? Or general concept of doing it on user-defined class would be fine?</span>
+<span class="comment-copy">@ŁukaszRogalski I agree, I should probably change the title, but I'm not sure what how to coin the question for now.</span>
+<span class="comment-copy">It should come with <i>don't try this at home</i> warning. Nice one.</span>
+<span class="comment-copy">Yeesh, that's even nastier than the crap I tried with <code>gc.get_referrers</code> (which didn't work, probably due to problems with untracked objects).</span>
+<span class="comment-copy">@user2357112 yeah, that's what I tried first :) - unfortunately an object created in and owned by a C module is invisible to the GC unless it's explicitly tracked.</span>
+<span class="comment-copy">Nah, <a href="http://ideone.com/wHdlE1" rel="nofollow noreferrer">you see the same thing if you create a dict like <code>errnomap</code> in Python code</a>. The trigger for CPython to track a dict is when a key or value is stored that <code>_PyObject_GC_MAY_BE_TRACKED</code> says could be tracked, and neither the <code>int</code> keys nor the built-in exception class values trigger that condition.</span>
+<span class="comment-copy">@user2357112 ah, right, that makes sense. Thanks!</span>
+<span class="comment-copy">You can extend it just fine from Python, although it might not be a good idea. You just (mostly) can't modify it.</span>
+<span class="comment-copy">Sorry, that's more what I meant. OP wants to actually change the behavior of OSError. Of course you can extend it with subclassing. Edited.</span>

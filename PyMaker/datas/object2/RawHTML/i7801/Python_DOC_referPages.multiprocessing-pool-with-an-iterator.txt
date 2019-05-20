@@ -1,0 +1,167 @@
+<div class="post-text" itemprop="text">
+<p>I would like to use multiprocessing pool with an iterator in order to execute a function in a thread splitting the iterator in N elements until the iterator is finish.</p>
+<pre><code>import arcpy
+from multiprocessing import Pool
+
+def insert(rows):
+    with arcpy.da.InsertCursor("c:\temp2.gdb\test" fields=["*"]) as i_cursor:
+        #i_cursor is an iterator
+        for row in rows:
+            i_cursor.insertRow(row)
+
+input_rows = []
+count = 0
+pool = Pool(4)
+with arcpy.da.SearchCursor("c:\temp.gdb\test", fields=["*"]) as s_cursor:
+    #s_cursor is an iterator
+    for row in s_cursor:
+        if (count &lt; 100):
+            input_rows.append(row)
+            count += 1
+        else:
+            #send 100 rows to the insert function in a new thread
+            pool.apply_async(insert, input_rows)
+            #reset count and input_rows
+            count = 1
+            input_rows = [row]
+
+
+pool.join()
+pool.close()
+</code></pre>
+<p>My question, is this script the right way to do it? Is there a better way?</p>
+<p>Probably something is wrong with that script, because I got the following AssertionError at the <code>pool.join()</code></p>
+<pre><code>Traceback (most recent call last):
+  File "G:\Maxime\truncate_append_pool.py", line 50, in &lt;module&gt;
+    pool.join()
+  File "C:\App\Python27\ArcGIS10.3\lib\multiprocessing\pool.py", line 460, in join
+    assert self._state in (CLOSE, TERMINATE)
+AssertionError
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If I have to guess what's primarily wrong with your code, I'd say it's in passing your <code>input_rows</code> to your process function <code>insert()</code> - the way <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.Pool.apply_async" rel="nofollow noreferrer"><code>multiprocessing.Pool.apply_async()</code></a> works is to unpack the arguments passed to it, so your <code>insert()</code> function actually retreives <code>100</code> arguments instead of one argument with a list of <code>100</code> elements. This causes an immediate error before your process function even gets the chance to start. If you change your call to <code>pool.apply_async(insert, [input_rows])</code> it might start working... You also would be defeating the purpose of iterators and you just might convert your whole input iterator into a list and feed slices of <code>100</code> to <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.Pool.map" rel="nofollow noreferrer"><code>multiprocessing.Pool.map()</code></a> and be done with it.</p>
+<p>But you asked if there is a 'better' way to do it. While 'better' is a relative category, in an ideal world, <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.Pool" rel="nofollow noreferrer"><code>multiprocessing.Pool</code></a> comes with a handy <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.Pool.imap" rel="nofollow noreferrer"><code>imap()</code></a> (and <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.Pool.imap_unordered" rel="nofollow noreferrer"><code>imap_unordered()</code></a>) method intended to consume iterables and spread them over the selected pool in a lazy fashion (so no running over the whole iterator before processing), so all you need to build are your iterator slices and pass it to it for processing, i.e.:</p>
+<pre><code>import arcpy
+import itertools
+import multiprocessing
+
+# a utility function to get us a slice of an iterator, as an iterator
+# when working with iterators maximum lazyness is preferred 
+def iterator_slice(iterator, length):
+    iterator = iter(iterator)
+    while True:
+        res = tuple(itertools.islice(iterator, length))
+        if not res:
+            break
+        yield res
+
+def insert(rows):
+    with arcpy.da.InsertCursor("c:\temp2.gdb\test" fields=["*"]) as i_cursor:
+        for row in rows:
+            i_cursor.insertRow(row)
+
+if __name__ == "__main__":  # guard for multi-platform use
+    with arcpy.da.SearchCursor("c:\temp.gdb\test", fields=["*"]) as s_cursor:
+        pool = multiprocessing.Pool(processes=4)  # lets use 4 workers
+        for result in pool.imap_unordered(insert, iterator_slice(s_cursor, 100)):
+            pass  # do whatever you want with your result (return from your process function)
+        pool.close()  # all done, close cleanly
+</code></pre>
+<p>(btw. your code wouldn't give you the last slice for all <code>s_cursor</code> sizes that are not multiples of 100)</p>
+<p>But... it would be wonderful if it actually worked as advertised. While a lot of it has been fixed over the years, <code>imap_unordered()</code> will still take a <strong>large sample</strong> of your iterator (far larger than the actual pool processes' number) when producing its own iterator, so if that's a concern you'll have to get down and dirty yourself, and you're on the right track - <code>apply_async()</code> is the way to go when you want to control how to feed your pool, you just need to make sure you <em>feed</em> your pool properly:</p>
+<pre><code>if __name__ == "__main__":
+    with arcpy.da.SearchCursor("c:\temp.gdb\test", fields=["*"]) as s_cursor:
+        pool = multiprocessing.Pool(processes=4)  # lets use 4 workers
+        cursor_iterator = iterator_slice(s_cursor, 100)  # slicer from above, for convinience
+        queue = []  # a queue for our current worker async results, a deque would be faster
+        while cursor_iterator or queue:  # while we have anything to do...
+            try:
+                # add our next slice to the pool:
+                queue.append(pool.apply_async(insert, [next(cursor_iterator)])) 
+            except (StopIteration, TypeError):  # no more data, clear out the slice iterator
+                cursor_iterator = None
+            # wait for a free worker or until all remaining finish
+            while queue and (len(queue) &gt;= pool._processes or not cursor_iterator):
+                process = queue.pop(0)  # grab a process response from the top
+                process.wait(0.1)  # let it breathe a little, 100ms should be enough
+                if not process.ready():  # a sub-process has not finished execution
+                    queue.append(process)  # add it back to the queue
+                else:
+                    # you can use process.get() to get the result if needed
+                    pass
+        pool.close()
+</code></pre>
+<p>And now your <code>s_cursor</code> iterator will be called only when the next 100 results are needed (when your <code>insert()</code> process function exits cleanly or not).</p>
+<p><strong>UPDATE</strong> - The previously posted code had a bug in it on closing queues in the end if a captured result is desired, this one should do the job nicely. We can easily test it with some mock functions:</p>
+<pre><code>import random
+import time
+
+# just an example generator to prove lazy access by printing when it generates
+def get_counter(limit=100):
+    for i in range(limit):
+        if not i % 3:  # print every third generation to reduce verbosity
+            print("Generated: {}".format(i))
+        yield i
+
+# our process function, just prints what's passed to it and waits for 1-6 seconds
+def test_process(values):
+    time_to_wait = 1 + random.random() * 5
+    print("Processing: {}, waiting: {:0.2f} seconds".format(values, time_to_wait))
+    time.sleep(time_to_wait)
+    print("Processed: {}".format(values))
+</code></pre>
+<p>Now we can intertwine them like:</p>
+<pre><code>if __name__ == "__main__":
+    pool = multiprocessing.Pool(processes=2)  # lets use just 2 workers
+    count = get_counter(30)  # get our counter iterator set to iterate from 0-29
+    count_iterator = iterator_slice(count, 7)  # we'll process them in chunks of 7
+    queue = []  # a queue for our current worker async results, a deque would be faster
+    while count_iterator or queue:
+        try:
+            # add our next slice to the pool:
+            queue.append(pool.apply_async(test_process, [next(count_iterator)]))
+        except (StopIteration, TypeError):  # no more data, clear out the slice iterator
+            count_iterator = None
+        # wait for a free worker or until all remaining workers finish
+        while queue and (len(queue) &gt;= pool._processes or not count_iterator):
+            process = queue.pop(0)  # grab a process response from the top
+            process.wait(0.1)  # let it breathe a little, 100ms should be enough
+            if not process.ready():  # a sub-process has not finished execution
+                queue.append(process)  # add it back to the queue
+            else:
+                # you can use process.get() to get the result if needed
+                pass
+    pool.close()
+</code></pre>
+<p>And the result is (of course, it will differ from system to system):</p>
+<pre><code>Generated: 0
+Generated: 3
+Generated: 6
+Generated: 9
+Generated: 12
+Processing: (0, 1, 2, 3, 4, 5, 6), waiting: 3.32 seconds
+Processing: (7, 8, 9, 10, 11, 12, 13), waiting: 2.37 seconds
+Processed: (7, 8, 9, 10, 11, 12, 13)
+Generated: 15
+Generated: 18
+Processing: (14, 15, 16, 17, 18, 19, 20), waiting: 1.85 seconds
+Processed: (0, 1, 2, 3, 4, 5, 6)
+Generated: 21
+Generated: 24
+Generated: 27
+Processing: (21, 22, 23, 24, 25, 26, 27), waiting: 2.55 seconds
+Processed: (14, 15, 16, 17, 18, 19, 20)
+Processing: (28, 29), waiting: 3.14 seconds
+Processed: (21, 22, 23, 24, 25, 26, 27)
+Processed: (28, 29)
+</code></pre>
+<p>Proving that our generator/iterator is used to collect data only when there's a free slot in the pool to do the work ensuring a minimal memory usage (and/or I/O pounding if your iterators ultimately do that). You won't get it much more streamlined than this. The only additional, albeit marginal, speed up you can obtain is to reduce the wait time (but your main process will then eat more resources) and to increase the allowed <code>queue</code> size (at the expense of memory) which is locked to the number of processes in the above code - if you use <code>while queue and (len(queue) &gt;= pool._processes + 3 or not count_iterator):</code> it will load 3 more iterator slices ensuring lesser latency in situations when a process ends and a slot in the pool frees up.</p>
+</div>
+<span class="comment-copy">Why do you want an iterator? The sole purpose of an iterator is to not have to load the full list into memory, but read it when required (via next). You could, however, use an iterator to fill a queue that is then consumed by your function. Maybe you can explain your goal a bit more in detail.</span>
+<span class="comment-copy">It's not that I want an iterator, it's just a fact that the cursors are iterators, so maybe someone could use iterators functionality to answer the question</span>
+<span class="comment-copy">What did the error say?</span>
+<span class="comment-copy">@JohnZwinck see the edit please</span>
+<span class="comment-copy">Thank you for your answer, that's really helpful. I am trying your "dirty" solution with apply_async and in the task manager I see that only one instance of python is doing cpu calculation at a time and the memory usage is not resetted when the job is done. It increases each time the thread is doing a new job. Is this normal?</span>
+<span class="comment-copy">@BelowtheRadar - check the update, there was a minor bug in the previous code although it shouldn't behave the way you're describing even with the previous code. I've attached a test case as well to prove that it works. Now, if there is some multi-processing synchronization or data caching within <code>arcpy</code> - that's a problem with <code>arcpy</code>, the multiprocessing part should work as expected.</span>
+<span class="comment-copy">Great job! Very instructive answer!</span>

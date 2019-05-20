@@ -1,0 +1,70 @@
+<div class="post-text" itemprop="text">
+<p>Here's a little bench-marking code to illustrate my question:</p>
+<pre><code>import numpy as np
+import multiprocessing as mp
+# allocate memory
+%time temp = mp.RawArray(np.ctypeslib.ctypes.c_uint16, int(1e8))
+Wall time: 46.8 ms
+# assign memory, very slow
+%time temp[:] = np.arange(1e8, dtype = np.uint16)
+Wall time: 10.3 s
+# equivalent numpy assignment, 100X faster
+%time a = np.arange(1e8, dtype = np.uint16)
+Wall time: 111 ms
+</code></pre>
+<p>Basically I want a numpy array to be shared between multiple processes because it's big and read-only. <a href="http://thousandfold.net/cz/2014/05/01/sharing-numpy-arrays-between-processes-using-multiprocessing-and-ctypes/" rel="nofollow noreferrer">This method</a> works great, no extra copies are made and the actual computation time on the processes is good. But the overhead of <em>creating</em> the shared array is immense.</p>
+<p><a href="https://stackoverflow.com/questions/33853543/demystifying-sharedctypes-performance">This post</a> offered some great insight into why certain ways of initializing the array are slow (note that in the example above I'm using the faster method). But the post doesn't really describe how to really improve the speed to numpy like performance.</p>
+<p>Does anyone have any suggestions on how to improve the speed? Would some cython code make sense to allocate the array?</p>
+<p>I'm working on a Windows 7 x64 system.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is slow for the reasons given in <a href="https://stackoverflow.com/questions/33853543/demystifying-sharedctypes-performance">your second link</a>, and the solution is actually pretty simple: <strong>Bypass the (slow) <code>RawArray</code> slice assignment code</strong>, which in this case is inefficiently reading one raw C value at a time from the source array to create a Python object, then converts it straight back to raw C for storage in the shared array, then discards the temporary Python object, and repeats <code>1e8</code> times.</p>
+<p>But you don't need to do it that way; like most C level things, <code>RawArray</code> implements the buffer protocol, which means you can convert it to a <a href="https://docs.python.org/3/library/stdtypes.html#memoryview" rel="noreferrer"><code>memoryview</code>, a view of the underlying raw memory that implements most operations in C-like ways</a>, using raw memory operations if possible. So instead of doing:</p>
+<pre><code># assign memory, very slow
+%time temp[:] = np.arange(1e8, dtype = np.uint16)
+Wall time: 9.75 s  # Updated to what my machine took, for valid comparison
+</code></pre>
+<p>use <code>memoryview</code> to manipulate it as a raw bytes-like object and assign that way (<code>np.arange</code> already implements the buffer protocol, and <code>memoryview</code>'s slice assignment operator seamlessly uses it):</p>
+<pre><code># C-like memcpy effectively, very fast
+%time memoryview(temp)[:] = np.arange(1e8, dtype = np.uint16)
+Wall time: 74.4 ms  # Takes 0.76% of original time!!!
+</code></pre>
+<p>Note, the time for the latter is milliseconds, not seconds; copying using <code>memoryview</code> wrapping to perform raw memory transfers takes less than 1% of the time to do it the plodding way <code>RawArray</code> does it by default!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Just put a numpy array around the shared array:</p>
+<pre><code>import numpy as np
+import multiprocessing as mp
+
+sh = mp.RawArray('i', int(1e8))
+x = np.arange(1e8, dtype=np.int32)
+sh_np = np.ctypeslib.as_array(sh)
+</code></pre>
+<p>then time:</p>
+<pre><code>%time sh[:] = x
+CPU times: user 10.1 s, sys: 132 ms, total: 10.3 s
+Wall time: 10.2 s
+
+%time memoryview(sh).cast('B').cast('i')[:] = x
+CPU times: user 64 ms, sys: 132 ms, total: 196 ms
+Wall time: 196 ms
+
+%time sh_np[:] = x
+CPU times: user 92 ms, sys: 104 ms, total: 196 ms
+Wall time: 196 ms
+</code></pre>
+<p>No need to figure out how to cast the memoryview (as I had to in python3 Ubuntu 16) and mess with reshaping (if <code>x</code> has more dimensions, since <code>cast()</code> flattens). And use <code>sh_np.dtype.name</code> to double check data types just like any numpy array.  :)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>On ms-windows when you create a <code>Process</code>, a new Python interpreter will be spawned which then <em>imports</em> your program as a module. (This is why on ms-windows you should only create <code>Process</code> and <code>Pool</code> from within a <code>if __name__ is "__main__"</code> block.) This will recreate your array, which should take about the same time as creating it originally did. See the <a href="https://docs.python.org/3/library/multiprocessing.html#programming-guidelines" rel="nofollow">programming guidelines</a>, especially concerning the <code>spawn</code> start method which has to be used on ms-windows.</p>
+<p>So probably a better way is to create a memory mapped numpy array using <a href="http://docs.scipy.org/doc/numpy-1.10.0/reference/generated/numpy.memmap.html" rel="nofollow"><code>numpy.memmap</code></a>. Write the array to disk in the parent process. (On ms-windows this <em>must</em> be done in the <code>if __name__ is "__main__"</code> block, so it's only called <em>once</em>). Then in the <code>target</code> function use <code>numpy.memmap</code> in read-only mode to read the data.</p>
+</div>
+<span class="comment-copy">Note that when performing "raw" data copies, the element sizes must match; If they don't, you'll get a <code>TypeError</code> from <code>memoryview</code> complaining about "mismatching item sizes"; if the objects can't be created with matching sizes to start, it's usually fairly cheap to convert between different <code>numpy</code> array types, so on 64 bit system, if <code>temp</code> was made of <code>ctypes.uint</code> (4 bytes on most systems) and you had a <code>numpy</code> array of type <code>np.uint</code> to assign (8 bytes on 64 bit), you could just use <code>memoryview(temp)[:] = np.array(toobigarray, dtype=np.uint32)</code> to convert first, then <code>memcpy</code>.</span>
+<span class="comment-copy">Awesome, thanks! One problem I'm having is that trying this method throws an error: <code>NotImplementedError: memoryview: unsupported format &lt;H</code>. Is this a windows specific error? Is there an easy way to get around it?</span>
+<span class="comment-copy">@DavidHoffman: Looks like on Python 3, <code>memoryview</code> is finicky about <code>temp</code> being explicitly little endian byte order (<code>&lt;H</code>) on little endian machines, while the <code>numpy</code> <code>array</code> is native byte order (<code>H</code>, or equivalently, <code>@H</code>). In this case, they're the same, so you can shut up <code>memoryview</code> by casting first: <code>memoryview(temp).cast('B').cast('H')[:] = np.arange(1e8, dtype = np.uint16)</code>. This <i>will</i> hide errors if it turns out that the sizes mismatch, you might check that <code>memoryview(temp).format.lstrip('@=&lt;&gt;!') == memoryview(np.arange(dtype=np.uint16)).format.lstrip('@=&lt;&gt;!')</code> to be sure.</span>
+<span class="comment-copy">Unless I'm missing something obvious, like this doesn't work in Windows?</span>
+<span class="comment-copy">This is exactly what I needed, thanks.</span>
+<span class="comment-copy">Passing it to a <code>Process</code> constructor as arguments will <code>pickle</code> it and send it to the child to deserialize a copy, it won't get the "free" copy-on-write <code>fork</code> semantics (it won't be "inherited"), even if you're on a <code>fork</code> supporting OS. If you are on a <code>fork</code> supporting OS and are okay with not supporting other OSes, you'd want to initialize the object in a global variable some time before you spawned the <code>Process</code> and the children can access it as normal. You wouldn't want it defined in a <code>main</code> function, because then it isn't visible outside of <code>main</code>, even in the child processes.</span>
+<span class="comment-copy">I've done some extra reading, and on ms-windows I think that using <code>numpy.memmap</code> is a better solution. Hence the changed answer.</span>
+<span class="comment-copy"><code>memmap</code>s will work, that's the implementation that <a href="https://pypi.python.org/pypi/joblib" rel="nofollow noreferrer">joblib</a> uses to share data between processes. But if you access the shared data regularly its painfully slow and the speed-ups are minimal at best.</span>
+<span class="comment-copy">I've never used joblib, and my platform of choice is UNIX rather than ms-windows. On UNIX memory mapped files are quite fast. Assuming you have enough RAM, of course.</span>

@@ -1,0 +1,167 @@
+<div class="post-text" itemprop="text">
+<p>I have a little HTTPServer implementation I'm spinning up to listen for a callback from an API.  In testing, this implimentation is keeping the innermost thread alive.  Here's the server:</p>
+<pre><code>import http
+import uuid
+from http import server
+
+class Server(server.HTTPServer):
+
+    RequestLog:list = []
+    ErrorList:list = []
+    Serve:bool = True
+
+    def __init__(self, server_address, RequestHandlerClass):
+
+        self.RequestLog = []
+        self.ErrorList = []
+        self.Serve:bool = True
+
+        return super().__init__(server_address, RequestHandlerClass)
+
+    def LogRequest(self, clientAddress, success, state, params:dict={}):
+        """docstring"""
+
+        uid = uuid.uuid1()
+        logItem = {"RequestID" : uid,
+                   "ClientAddress" : clientAddress,
+                   "Success" : success,
+                   "State" : state,
+                   "Params" : params}
+
+        self.RequestLog.append(logItem)
+
+    def GetRequestItem(self, state):
+        """docstring"""
+
+        logItem = {}
+        if self.RequestLog and len(self.RequestLog):
+            logItem = [d for d in self.RequestLog if d["State"] == state][0]
+
+        return logItem
+
+    def service_actions(self):
+
+        try:
+            if not self.Serve:
+                self.shutdown()
+                self.server_close()
+        except Exception as e:
+            err = e
+            raise e
+
+        return super().service_actions()
+
+    def handle_error(self, request, client_address):
+
+
+        logItem = {"clientAddress" : client_address,
+                   "success" : False,
+                   "state" : None,
+                   "params" : None}
+
+        try:
+            self.LogRequest(**logItem)
+            x = request
+        except Exception as e:
+            self.shutdown()
+            err = e
+            raise e
+
+        return super().handle_error(request, client_address)
+</code></pre>
+<p>So what the server implementation above does, is log information about requests in the <code>ResquestLog:list</code> and then provided a method <code>GetRequestItem</code> that can be used to pull for the existence of a logged request.  In the test I'm throwing and error and catching it with the <code>handle_error()</code> override.  Here is the calling function that spins up the server, polls for request, and then shutdowns the sever by setting its <code>Server.Serve</code> method to <code>False</code></p>
+<pre><code>def AwaitCallback(self, server_class=Server,
+                     handler_class=OAuthGrantRequestHandler):
+        """docstring"""
+
+        server_address = ("127.0.0.1", 8080)
+        self.Httpd = server_class(server_address, handler_class)
+        self.Httpd.timeout = 200
+        t1 = threading.Thread(target=self.Httpd.serve_forever)
+
+        try:
+            t1.start()
+
+            #poll for request result
+            result = {}
+            x = 0
+            while x &lt; self.Timeout:
+                if len(self.Httpd.RequestLog) &gt; 0:
+                    break
+                time.sleep(.5)
+
+        finally:
+            #Terminate Server
+            if self.Httpd:
+                self.Httpd.Serve = False
+            if t1:
+                t1.join()
+    return
+</code></pre>
+<p>The above method sticks on the <code>t1.join()</code> call.  Inspecting the <code>self.Httpd</code> object when its hung tells me that the servers <code>serve_forever()</code> loop is shutdown but the thread still shows its a live when calling <code>t1.is_alive()</code>.  So what's going on?  The only thing I can think of is that when <code>self.shutdown()</code> is called in the t1 thread it really yeilds the loop instead of shutting it down and keeps the tread alive?  Documentation on shutdown just says <code>shutdown() : Tell the serve_forever() loop to stop and wait until it does.</code> Nice and murky. Any ideas? </p>
+<p><strong>Edit 1:</strong>
+the answer suggested at <a href="https://stackoverflow.com/questions/268629/how-to-stop-basehttpserver-serve-forever-in-a-basehttprequesthandler-subclass">How to stop BaseHTTPServer.serve_forever() in a BaseHTTPRequestHandler subclass?</a> is entirly different.  They're suggesting overriding all the native functionality of the socketserver.BaseServer.serve_forever() loop with a simpler implementation whereas I'm trying to correctly use the native implementation.  To the best of my understanding so far, the example of my working code above, should achieve the same thing that answer is suggesting, but the child thread isn't terminating.  Thus this question. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I need OP to verify this, but the problem here is that <code>http.server.HTTPServer</code> is based on processes, not threads, and zombie process may be created. As a matter of fact, the forkingMixIn <a href="https://docs.python.org/3/library/socketserver.html#socketserver.BaseServer.serve_forever" rel="nofollow noreferrer">explicitly handles this issue</a>:</p>
+<blockquote>
+<p>serve_forever(poll_interval=0.5)</p>
+<p>Handle requests until an explicit shutdown() request. Poll for shutdown every poll_interval seconds. Ignores the timeout attribute.
+  It also calls service_actions(), which may be used by a subclass or
+  mixin to provide actions specific to a given service. <strong>For example, the
+  ForkingMixIn class uses service_actions() to clean up zombie child
+  processes.</strong></p>
+</blockquote>
+<p>This involves iterating all <code>active_children</code>, and calling the <code>discard</code> function. You can check the source code for <code>socketserver.ForkingMixIn.collect_children</code> (see bottom of post). The quickest solution may be to use <a href="https://docs.python.org/3/library/http.server.html#http.server.ThreadingHTTPServer" rel="nofollow noreferrer">ThreadingHTTPServer</a>:</p>
+<blockquote>
+<p>class http.server.ThreadingHTTPServer(server_address,
+  RequestHandlerClass)</p>
+<p>This class is identical to HTTPServer but uses threads to handle requests by using the ThreadingMixIn. <strong>This is useful to handle web
+  browsers pre-opening sockets, on which HTTPServer would wait
+  indefinitely.</strong></p>
+</blockquote>
+<p><strong>In case you want to stick with the regular server</strong></p>
+<p>You will need to create and handle <code>active_children</code>, and implement something similar to the method ForkingMixIn calls on service_actions:</p>
+<pre><code>def collect_children(self):
+    """Internal routine to wait for children that have exited."""
+    if self.active_children is None:
+        return
+
+    # If we're above the max number of children, wait and reap them until
+    # we go back below threshold. Note that we use waitpid(-1) below to be
+    # able to collect children in size(&lt;defunct children&gt;) syscalls instead
+    # of size(&lt;children&gt;): the downside is that this might reap children
+    # which we didn't spawn, which is why we only resort to this when we're
+    # above max_children.
+    while len(self.active_children) &gt;= self.max_children:
+        try:
+            pid, _ = os.waitpid(-1, 0)
+            self.active_children.discard(pid)
+        except ChildProcessError:
+            # we don't have any children, we're done
+            self.active_children.clear()
+        except OSError:
+            break
+
+    # Now reap all defunct children.
+    for pid in self.active_children.copy():
+        try:
+            pid, _ = os.waitpid(pid, os.WNOHANG)
+            # if the child hasn't exited yet, pid will be 0 and ignored by
+            # discard() below
+            self.active_children.discard(pid)
+        except ChildProcessError:
+            # someone else reaped it
+            self.active_children.discard(pid)
+        except OSError:
+            pass
+</code></pre>
+</div>
+<span class="comment-copy">@kabanus the answer provided in that question is what i'm already doing here.  Something is hanging my thread, even thought I'm shutting down my server properly, the poster of the other question doesn't seem to know how to shut down the server.</span>
+<span class="comment-copy">Did you override <code>serve_forever</code>? How are you stopping it from another thread? If you could post a shorter snippet of the part that is properly shutting down the server as well that would be great.</span>
+<span class="comment-copy">No, I specifically don't want override <code>server_forever</code>.  I'm using the parent thread in my AwaitCallback method to set the <code>self.Serve</code> attribute of the http <code>Server</code> instance to False.  The overridden <code>service_actions</code> method in the <code>Server</code> instance then polls the the <code>self.Serve</code> attribute in the child thread when it is called from the native <code>serve_forever</code> loop.  It's essentially what your link is doing, with the exception that I'm trying to keep as much native functionality as possible, where in the link the answer is overriding everything with simpler implementations.</span>
+<span class="comment-copy">I'm not finding that HTTPServer has a property <code>collect_children</code> for monitoring active processes.  Perhaps that's only in the <code>ThreadingHTTPServer</code>?</span>
+<span class="comment-copy">@JamieMarshall Good chance it doesn't, since it does not care about clean up. You would need to subclass it and handle the processes. I really would not go with this solution.</span>
+<span class="comment-copy">@JamieMarshall I tried going into the code, I am not sure even when the process is being created (probably <code>bind</code> in the <code>__init__</code> call, but I would have to go deeper.</span>
+<span class="comment-copy">Use the <code>ThreadingHTTPServer</code>, let me know how it goes.</span>
+<span class="comment-copy">Found it, it looks like because i'm using the regular <code>HTTPServer</code> there is no subprocess, it's all done via thread.  However you got me looking in the right place. The source for <code>socket.BaseServer.shutdown()</code> actually waits the thread after setting the attribute <code>self._BaseServer__shutdown_request</code> to <code>True</code>.  Since i'm overriding <code>service_actions</code> in my server implementation that means the thread is waiting its self.  The solution is to remove <code>self.shutdown</code> from <code>service_actions</code> and replace it with <code>self._BaseServer__shutdown_request = True</code>  Also need to remover the <code>self.server_close</code></span>

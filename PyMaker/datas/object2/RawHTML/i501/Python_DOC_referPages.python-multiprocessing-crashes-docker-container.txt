@@ -1,0 +1,147 @@
+<div class="post-text" itemprop="text">
+<p>There is simple python multiprocessing code that works like a charm, when I run it in console:</p>
+<pre><code># mp.py
+import multiprocessing as mp
+
+
+def do_smth():
+    print('something')
+
+
+if __name__ == '__main__':
+    ctx = mp.get_context("spawn")
+    p = ctx.Process(target=do_smth, args=tuple())
+    p.start()
+    p.join()
+</code></pre>
+<p>Result:</p>
+<pre><code>&gt; $ python3 mp.py
+something
+</code></pre>
+<p>Then I've created a simple Docker container with Dockerfile:</p>
+<pre><code>FROM python:3.6
+
+ADD . /app
+WORKDIR /app
+</code></pre>
+<p>And docker-compose.yml:</p>
+<pre><code>version: '3.6'
+
+services:
+  bug:
+    build:
+      context: .
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: su -c "python3.6 forever.py"
+</code></pre>
+<p>Where <code>forever.py</code> is:</p>
+<pre><code>from time import sleep
+
+if __name__ == '__main__':
+    i = 0
+    while True:
+        sleep(1.0)
+        i += 1
+        print(f'hello {i:3}')
+</code></pre>
+<p>Now I run <code>forever.py</code> with docker compose:</p>
+<pre><code>&gt; $ docker-compose build &amp;&amp; docker-compose up 
+...
+some output
+...
+Attaching to mpbug_bug_1
+bug_1  | hello   1
+bug_1  | hello   2
+bug_1  | hello   3
+bug_1  | hello   4
+</code></pre>
+<p>Up to this moment everything is good and understandable. But when I'm trying to run <code>mp.py</code> in the docker container it crashes without any message:</p>
+<pre><code>&gt; $ docker exec -it mpbug_bug_1 /bin/bash
+root@09779ec47f9d:/app# python mp.py 
+something
+root@09779ec47f9d:/app# % 
+</code></pre>
+<p>Gist with the code can be found here: <a href="https://gist.github.com/ilalex/83649bf21ef50cb74a2df5db01686f18" rel="noreferrer">https://gist.github.com/ilalex/83649bf21ef50cb74a2df5db01686f18</a></p>
+<p>Can you explain why docker container is crashed and how to do it without crashing?</p>
+<p>Thank you in advance!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>for a quick fix, do not use <code>spawn</code> start method, and/or do not use <code>su -c ...</code>, both are unnecessary IMO. change to:</p>
+<pre><code>p = mp.Process(target=do_smth, args=tuple())
+</code></pre>
+<p>or you could start container with <code>--init</code> option.</p>
+<p>with <code>spawn</code> start method, Python will also start a <a href="https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods" rel="nofollow noreferrer">semaphore tracker process</a> to prevent semaphore leaking, you could see this process by pausing <code>mp.py</code> in the middle, it looks like:</p>
+<pre><code>472   463 /usr/local/bin/python3 -c from multiprocessing.semaphore_tracker import main;main(3)
+</code></pre>
+<p>this process is started by <code>mp.py</code> but exited after <code>mp.py</code>, thus it will not be reaped by <code>mp.py</code>, but is supposed to be reaped by <code>init</code> by design.</p>
+<p>the problem is there is no <code>init</code> in this container(namespace), instead of <code>init</code>, PID 1 is <code>su -c</code>, therefore the dead semaphore tracker process is adopted by <code>su</code>.</p>
+<p>it appears that <code>su</code> consider the dead child process is the command process(<code>forever.py</code>) mistakenly, without checking the relationship, so <code>su</code> exit blindly, as PID 1 exit, kernel kills all other processes in the container, including <code>forever.py</code>.</p>
+<p>this behavior could be observed with <code>strace</code>:</p>
+<pre><code>docker run --security-opt seccomp:unconfined --rm -it ex_bug strace -e trace=process -f su -c 'python3 forever.py'
+</code></pre>
+<p>will output error message like:</p>
+<pre><code>strace: Exit of unknown pid 14 ignored
+</code></pre>
+<p>ref: <a href="https://news.ycombinator.com/item?id=8916785" rel="nofollow noreferrer">Docker and the PID 1 zombie reaping problem (phusion.nl)</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>mp.py</code> doesn't look like an equivalent of <code>forever.py</code>. <code>mp.py</code> will run new worker process, which will just print <code>something</code> and then it will exit =&gt; <code>join()</code> in the main process will exit immediately, when this worker process is done.</p>
+<p>Better equivalent of <code>forever.py</code>: worker process prints hello message in the infinite loop and main process will be waiting for this worker process exit in <code>join()</code> - <code>forever-mp.py</code>:</p>
+<pre><code>import multiprocessing as mp
+from time import sleep
+
+def do_smth():
+    i = 0
+    while True:
+        sleep(1.0)
+        i += 1
+        print(f'hello {i:3}')
+
+if __name__ == '__main__':
+    ctx = mp.get_context("spawn")
+    p = ctx.Process(target=do_smth, args=tuple())
+    p.start()
+    p.join()
+</code></pre>
+<p>Updated <code>docker-compose.yml</code>:</p>
+<pre><code>version: '3.6'
+
+services:
+  bug:
+    build:
+      context: .
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: su -c "python3.6 forever-mp.py"
+</code></pre>
+<p>Test:</p>
+<pre><code>$ docker-compose build &amp;&amp; docker-compose up 
+...
+some output
+...
+Attaching to multiprcs_bug_1_72681117a752
+bug_1_72681117a752 | hello   1
+bug_1_72681117a752 | hello   2
+bug_1_72681117a752 | hello   3
+bug_1_72681117a752 | hello   4
+</code></pre>
+<p>Check processes in the container:</p>
+<pre><code>$ docker top multiprcs_bug_1_72681117a752
+UID                 PID                 PPID                C                   STIME               TTY                 TIME                CMD
+root                38235               38217               0                   21:36               ?                   00:00:00            su -c python3.6 forever-mp.py
+root                38297               38235               0                   21:36               ?                   00:00:00            python3.6 forever-mp.py
+root                38300               38297               0                   21:36               ?                   00:00:00            /usr/local/bin/python3.6 -c from multiprocessing.semaphore_tracker import main;main(3)
+root                38301               38297               0                   21:36               ?                   00:00:00            /usr/local/bin/python3.6 -c from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=4, pipe_handle=6) --multiprocessing-fork
+</code></pre>
+</div>
+<span class="comment-copy">Doesn't look like it crashed. Just looks like it exited. Containers exit when they're done executing their scripts.</span>
+<span class="comment-copy">@Neil But <code>forever.py</code> can't be exited without crash. Or can?</span>
+<span class="comment-copy">If you are <code>exec</code>-ing <i>into</i> the container that <code>forever.py</code> is running in, then you are stopping that process and starting <code>bash</code></span>
+<span class="comment-copy">@C.Nivs When <code>exec</code>-ing into the container, logs show that <code>forever.py</code> is still working and prints hello-message until I run <code>mp.py</code></span>
+<span class="comment-copy">Hm okay. One more question, what is the output of "docker ps" a) Before your exec in and run mp.py and b) After the containers exits.</span>
+<span class="comment-copy">Of course they are not equivalent to each other. The question is about unexpectedly stopping of container when we run python multiprocessing. See the gist for steps to reproduce.</span>
+<span class="comment-copy">Your <code>mp.py</code> doesn't run forever - it will print 'something' and it will finish with exit code 0. So why you are expecting that container will be running forever?</span>
+<span class="comment-copy">I expect that <code>forever.py</code> will not stop running when I run <code>mp.py</code>. There is no logical connection between them. Why container stops <code>forever.py</code>? That's my question.</span>
+<span class="comment-copy">Can you reproduce stopping of <code>forever.py</code> when you run simultaneously <code>mp.py</code>?</span>
+<span class="comment-copy">No, I can't reproduce it.</span>

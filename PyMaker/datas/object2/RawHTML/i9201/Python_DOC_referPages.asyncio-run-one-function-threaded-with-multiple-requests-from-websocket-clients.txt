@@ -1,0 +1,194 @@
+<div class="post-text" itemprop="text">
+<p>I have a websocket server <em>(python 3.x)</em> taking requests where each is a url variable. It runs just fine except it only executes each request in serial, after one another. <em>While the function is running it also blocks the client(s) trying to connect.</em> Non-blocking is what i want!</p>
+<ul>
+<li>Asyncronous <del>multiprocessed</del> threading of both websocket and subprocess function.</li>
+<li><del>The ability to set the number of cores to use. This is not obligatory though.</del></li>
+</ul>
+<p><del>Here's what i've got:</del></p>
+<hr/>
+<h2>ANSWER (illustration and <code>asyncio.subprocess</code> in accepted answer)</h2>
+<p>So, I didn't get very far with this frustration. I reverted back to my original code and as it turns out, you need to sleep the function with <code>await asyncio.sleep(.001)</code>. Now it runs perfectly fine, I tested with multiple clients at the same time and it handles it asynchronously.</p>
+<pre><code>import asyncio, websockets, json
+async def handler(websocket, path):
+    print("New client connected.")
+    await websocket.send('CONNECTED')
+    try:
+        while True:
+            inbound = await websocket.recv()
+            if inbound is None:
+                break
+            while inbound != None:
+                import time
+                for line in range(10):
+                    time.sleep(1)
+                    data = {}
+                    data['blah'] = line
+                    await asyncio.sleep(.000001) # THIS
+                    print(data)
+                    await websocket.send(json.dumps(data))
+                await websocket.send(json.dumps({'progress': 'DONE'}))
+                break
+    except websockets.exceptions.ConnectionClosed:
+        print("Client disconnected.")
+if __name__ == "__main__":
+    server = websockets.serve(handler, '0.0.0.0', 8080)
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(server)
+    loop.run_forever()
+</code></pre>
+<p><strong>Update:</strong> as suggested by <strong>@udi</strong>, if you want a slow external process, the way to go is asyncio.subprocess and not subprocess. Reading from pipe with a blocking call stalls the other threads, which is what asyncio.subprocess takes care of.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>time.sleep()</code> is blocking.</p>
+<p>Try:</p>
+<pre><code># blocking_server.py
+import asyncio
+import time
+
+import websockets
+
+x = 0
+
+
+async def handler(websocket, path):
+    global x
+    x += 1
+    client_id = x
+
+    try:
+        print("[#{}] Connected.".format(client_id))
+
+        n = int(await websocket.recv())
+        print("[#{}] Got: {}".format(client_id, n))
+        for i in range(1, n + 1):
+            print("[#{}] zzz...".format(client_id))
+            time.sleep(1)
+            print("[#{}] woke up!".format(client_id))
+            await asyncio.sleep(.001)
+            msg = "*" * i
+            print("[#{}] sending: {}".format(client_id, msg))
+            await websocket.send(msg)
+
+        msg = "bye!"
+        print("[#{}] sending: {}".format(client_id, msg))
+        await websocket.send(msg)
+
+        print("[#{}] Done.".format(client_id, msg))
+
+    except websockets.exceptions.ConnectionClosed:
+        print("[#{}] Disconnected!.".format(client_id))
+
+
+if __name__ == "__main__":
+    port = 8080
+    server = websockets.serve(handler, '0.0.0.0', port)
+    print("Started server on port {}".format(port))
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(server)
+    loop.run_forever()
+</code></pre>
+<p>With this test client:</p>
+<pre><code># test_client.py
+import asyncio
+import time
+
+import websockets
+
+
+async def client(client_id, n):
+    t0 = time.time()
+    async with websockets.connect('ws://localhost:8080') as websocket:
+        print("[#{}] &gt; {}".format(client_id, n))
+        await websocket.send(str(n))
+        while True:
+            resp = await websocket.recv()
+            print("[#{}] &lt; {}".format(client_id, resp))
+            if resp == "bye!":
+                break
+
+    print("[#{}] Done in {:.2f} seconds".format(client_id, time.time() - t0))
+
+
+tasks = [client(i + 1, 3) for i in range(4)]
+loop = asyncio.get_event_loop()
+loop.run_until_complete(asyncio.wait(tasks))
+loop.close()
+</code></pre>
+<p>Now compare the result when <code>time.sleep(x)</code> is replaced with <code>await asyncio.sleep(x)</code>!</p>
+<p>If you need to run a slow external process via asyncio, try <a href="https://docs.python.org/3/library/asyncio-subprocess.html" rel="nofollow noreferrer"><code>asynico.subprocess</code></a>:</p>
+<p>An example external program:</p>
+<pre><code># I am `slow_writer.py`
+import sys
+import time
+
+n = int(sys.argv[1])
+
+for i in range(1, n + 1):
+    time.sleep(1)
+    print("*" * i)
+</code></pre>
+<p>with this server:</p>
+<pre><code># nonblocking_server.py
+
+import asyncio
+import sys
+
+import websockets
+
+x = 0
+
+
+async def handler(websocket, path):
+    global x
+    x += 1
+    client_id = x
+
+    try:
+        print("[#{}] Connected.".format(client_id))
+
+        n = int(await websocket.recv())
+
+        print("[#{}] Got: {}. Running subprocess..".format(client_id, n))
+
+        cmd = (sys.executable, 'slow_writer.py', str(n))
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE)
+
+        async for data in proc.stdout:
+            print("[#{}] got from subprocess, sending: {}".format(
+                client_id, data))
+            await websocket.send(data.decode().strip())
+
+        return_value = await proc.wait()
+        print("[#{}] Subprocess done.".format(client_id))
+
+        msg = "bye!"
+        print("[#{}] sending: {}".format(client_id, msg))
+        await websocket.send(msg)
+
+        print("[#{}] Done.".format(client_id, msg))
+
+    except websockets.exceptions.ConnectionClosed:
+        print("[#{}] Disconnected!.".format(client_id))
+
+
+if __name__ == "__main__":
+
+    if sys.platform == 'win32':
+        loop = asyncio.ProactorEventLoop()
+        asyncio.set_event_loop(loop)
+
+    port = 8080
+    server = websockets.serve(handler, '0.0.0.0', port)
+    print("Started server on port {}".format(port))
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(server)
+    loop.run_forever()
+</code></pre>
+</div>
+<span class="comment-copy">I don't know enough about <code>asyncio</code> to be able to put together a working example, but I think you want to be using <code>concurrent.futures.ThreadPoolExecutor</code> or <code>concurrent.futures.ProcessPoolExecutor</code> to handle your blocking jobs. The <code>asyncio</code> event loop has a method <code>run_in_executor</code>, which you can pass a task and a executor, which is probably what you want to do in your <code>ws</code> coroutine instead of directly yielding from <code>download</code>.</span>
+<span class="comment-copy">I tried your suggestion but i didn't get it to work. As it turns out, i went back to my original code, did a little edit and now it works asynchronous. Although I cant figure out how to set the number of cores, i'm fine with this. Thanks anyway.</span>
+<span class="comment-copy">Yes, this is a great example. I was not using <code>sleep()</code> from either <code>time</code> nor <code>asyncio</code>. <code>asyncio.subprocess</code> looks interesting, but I need <code>universal_newline</code> which <code>asyncio.subprocess</code> doesn't support. It seems to be no noticeable difference using <code>subprocess</code> instead. I have no explanation for this though. I guess <code>asyncio.sleep()</code> allows the waiting thread to pass GIL?</span>
+<span class="comment-copy"><code>asyncio.sleep</code> schedules the task to for future execution; Meanwhile other tasks can take control.</span>
+<span class="comment-copy"><code>async for data in proc.stdout: text = data.decode()</code> should convert your data to str instead of <code>universal_newlines</code>.</span>
+<span class="comment-copy">Oh, so by doing that other tasks utilize GIL? Yeah, I did <code>data.decode()</code> with no luck in parsing a progress bar in the output, but with a <code>split('\r')</code> in <code>for</code> loop it was no problem. Great, much better! I read up on <code>asyncio.subprocess</code> and it seems to be the way to go with asyncio. Thank you.</span>

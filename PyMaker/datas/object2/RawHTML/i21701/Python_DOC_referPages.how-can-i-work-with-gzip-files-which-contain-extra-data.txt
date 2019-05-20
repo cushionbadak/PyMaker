@@ -1,0 +1,111 @@
+<div class="post-text" itemprop="text">
+<p>I'm writing a script which will work with data coming from instrumentation as gzip streams.  In about 90% of cases, the <code>gzip</code> module works perfectly, but some of the streams cause it to produce <code>IOError: Not a gzipped file</code>.  If the gzip header is removed and the deflate stream fed directly to <code>zlib</code>, I instead get <code>Error -3 while decompressing data: incorrect header check</code>.  After about half a day of banging my head against the wall, I discovered that the streams which are having problems contain a seemingly-random number of extra bytes (which are not part of the gzip data) appended to the end.</p>
+<p>It strikes me as odd that Python cannot work with these files for two reasons:</p>
+<ol>
+<li>Both Gzip and 7zip are able to open these "padded" files without issue.  (Gzip produces the message <code>decompression OK, trailing garbage ignored</code>, 7zip succeeds silently.)</li>
+<li><p>Both the Gzip and Python docs seem to indicate that this should work: (emphasis mine)</p>
+<p><a href="http://www.gzip.org/format.txt" rel="noreferrer">Gzip's format.txt</a>:</p>
+<blockquote>
+<p>It must be possible to
+  detect the end of the compressed data with any compression method,
+  regardless of the actual size of the compressed data. <strong>In particular,
+  the decompressor must be able to detect and skip extra data appended
+  to a valid compressed file</strong> on a record-oriented file system, or when
+  the compressed data can only be read from a device in multiples of a
+  certain block size.</p>
+</blockquote>
+<p><a href="http://docs.python.org/library/gzip.html#gzip.GzipFile" rel="noreferrer">Python's gzip.GzipFile`</a>:</p>
+<blockquote>
+<p>Calling a <code>GzipFile</code> object’s <code>close()</code> method does not close <em>fileobj</em>, <strong>since you might wish to append more material after the compressed data</strong>. This also allows you to pass a <code>StringIO</code> object opened for writing as <em>fileobj</em>, and retrieve the resulting memory buffer using the <code>StringIO</code> object’s <code>getvalue()</code> method.</p>
+</blockquote>
+<p><a href="http://docs.python.org/library/zlib.html#zlib.Decompress.unused_data" rel="noreferrer">Python's <code>zlib.Decompress.unused_data</code></a>:</p>
+<blockquote>
+<p>A string which contains any bytes past the end of the compressed data. That is, this remains <code>""</code> until the last byte that contains compression data is available. <strong>If the whole string turned out to contain compressed data, this is <code>""</code>, the empty string.</strong></p>
+<p>The only way to determine where a string of compressed data ends is by actually decompressing it. This means that when compressed data is contained part of a larger file, you can only find the end of it by <strong>reading data and feeding it followed by some non-empty string into a decompression object’s <code>decompress()</code></strong> method until the <code>unused_data</code> attribute is no longer the empty string.</p>
+</blockquote></li>
+</ol>
+<p>Here are the four approaches I've tried.  (These examples are Python 3.1, but I've tested 2.5 and 2.7 and had the same problem.)</p>
+<pre><code># approach 1 - gzip.open
+with gzip.open(filename) as datafile:
+    data = datafile.read()
+
+# approach 2 - gzip.GzipFile
+with open(filename, "rb") as gzipfile:
+    with gzip.GzipFile(fileobj=gzipfile) as datafile:
+        data = datafile.read()
+
+# approach 3 - zlib.decompress
+with open(filename, "rb") as gzipfile:
+    data = zlib.decompress(gzipfile.read()[10:])
+
+# approach 4 - zlib.decompressobj
+with open(filename, "rb") as gzipfile:
+    decompressor = zlib.decompressobj()
+    data = decompressor.decompress(gzipfile.read()[10:])
+</code></pre>
+<p>Am I doing something wrong?</p>
+<p><strong>UPDATE</strong></p>
+<p>Okay, while the problem with <code>gzip</code> seems to be a bug in the module, my <code>zlib</code> problems are self-inflicted.  ;-)</p>
+<p>While digging into <code>gzip.py</code> I realized what I was doing wrong — by default, <code>zlib.decompress</code> et al. expect zlib-wrapped streams, not bare deflate streams.  By passing in a negative value for <code>wbits</code>, you can tell <code>zlib</code> to skip the zlib header and decrompress the raw stream.  Both of these work:</p>
+<pre><code># approach 5 - zlib.decompress with negative wbits
+with open(filename, "rb") as gzipfile:
+    data = zlib.decompress(gzipfile.read()[10:], -zlib.MAX_WBITS)
+
+# approach 6 - zlib.decompressobj with negative wbits
+with open(filename, "rb") as gzipfile:
+    decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+    data = decompressor.decompress(gzipfile.read()[10:])
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is a bug.  The quality of the gzip module in Python falls far short of the quality that should be required in the Python standard library.</p>
+<p>The problem here is that the gzip module assumes that the file is a stream of gzip-format files.  At the end of the compressed data, it starts from scratch, expecting a new gzip header; if it doesn't find one, it raises an exception.  This is wrong.</p>
+<p>Of course, it <em>is</em> valid to concatenate two gzip files, eg:</p>
+<pre><code>echo testing &gt; test.txt
+gzip test.txt
+cat test.txt.gz test.txt.gz &gt; test2.txt.gz
+zcat test2.txt.gz
+# testing
+# testing
+</code></pre>
+<p>The gzip module's error is that it should not raise an exception if there's no gzip header the second time around; it should simply end the file.  It should <em>only</em> raise an exception if there's no header the first time.</p>
+<p>There's no clean workaround without modifying the gzip module directly; if you want to do that, look at the bottom of the <code>_read</code> method.  It should set another flag, eg. <code>reading_second_block</code>, to tell <code>_read_gzip_header</code> to raise <code>EOFError</code> instead of <code>IOError</code>.</p>
+<p>There are other bugs in this module.  For example, it seeks unnecessarily, causing it to fail on nonseekable streams, such as network sockets.  This gives me very little confidence in this module: a developer who doesn't know that gzip needs to function without seeking is badly unqualified to implement it for the Python standard library.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I had a similar problem in the past. I wrote a <a href="http://code.google.com/p/pycopia/source/browse/trunk/aid/pycopia/gzip.py" rel="noreferrer">new module</a> that works better with streams. You can try that out and see if it works for you.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I had exactly this problem, but none of this answers resolved my issue. So, here is what I did to solve the problem:</p>
+<pre><code>#for gzip files
+unzipped = zlib.decompress(gzip_data, zlib.MAX_WBITS|16)
+
+#for zlib files
+unzipped = zlib.decompress(gzip_data, zlib.MAX_WBITS)
+
+
+#automatic header detection (zlib or gzip):
+unzipped = zlib.decompress(gzip_data, zlib.MAX_WBITS|32)
+</code></pre>
+<p>Depending on your case, it might be necessary to decode your data, like:</p>
+<pre><code>unzipped = unzipped.decode()
+</code></pre>
+<p><a href="https://docs.python.org/3/library/zlib.html" rel="nofollow noreferrer">https://docs.python.org/3/library/zlib.html</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I couldn't make it to work with the above mentioned techniques. so made a work around using zipfile package </p>
+<pre><code>import zipfile 
+from io import BytesIO
+mock_file = BytesIO(data) #data is the compressed string
+z = zipfile.ZipFile(file = mock_file)
+neat_data = z.read(z.namelist()[0])
+</code></pre>
+<p>Works perfect</p>
+</div>
+<span class="comment-copy">You might consider adding your own answer, as opposed to an "update" that reads like one. See <a href="https://meta.stackoverflow.com/questions/336441/when-is-it-cool-to-summarize-answers-in-question-edit">When is it cool to summarize answers in question edit?</a>, <a href="https://meta.stackoverflow.com/questions/262806/is-it-ok-for-users-to-edit-the-accepted-answer-into-their-question">Is it okay for users to edit the accepted answer into their own question?</a>, and similar discussion on <a href="https://meta.stackoverflow.com">Meta Stack Overflow</a>.</span>
+<span class="comment-copy">I'd actually mucked about a bit with <code>gzip</code>'s internals while debugging the problem, but it hadn't occurred to me to fix the problem there and package the modified module with my script.  It's ugly as hell, but it sounds like it may still be the best available option.  :-/</span>
+<span class="comment-copy">@Ben: It's self-contained enough that it's not a major cost, at least; just one file.  It's more annoying with native modules.</span>
+<span class="comment-copy">As a work around, assuming it doesn't break size or time constraints on your code, you can read in a byte at a time after receiving the error. Append each byte in a list, when you receive another IOError with a 'Not a gzipped file' parameter, you've reached the end of the data, ''.join it and return</span>
+<span class="comment-copy">how do re-gzip the file from Unix to workaround this bug?</span>
+<span class="comment-copy">Ever considered merging your fixes into the standard gzip module?</span>
+<span class="comment-copy">I considered it, but as it is it does have a dependency on the another part of the framework that it's in. That one should be easy to fix, however.</span>

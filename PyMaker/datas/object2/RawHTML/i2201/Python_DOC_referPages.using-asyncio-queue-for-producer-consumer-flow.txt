@@ -1,0 +1,111 @@
+<div class="post-text" itemprop="text">
+<p>I'm confused about how to use <code>asyncio.Queue</code> for a particular producer-consumer pattern in which both the producer and consumer operate concurrently and independently.</p>
+<p>First, consider this example, which closely follows that from the <a href="https://docs.python.org/3/library/asyncio-queue.html#examples" rel="nofollow noreferrer">docs for <code>asyncio.Queue</code></a>:</p>
+<pre><code>import asyncio
+import random
+import time
+
+async def worker(name, queue):
+    while True:
+        sleep_for = await queue.get()
+        await asyncio.sleep(sleep_for)
+        queue.task_done()
+        print(f'{name} has slept for {sleep_for:0.2f} seconds')
+
+async def main(n):
+    queue = asyncio.Queue()
+    total_sleep_time = 0
+    for _ in range(20):
+        sleep_for = random.uniform(0.05, 1.0)
+        total_sleep_time += sleep_for
+        queue.put_nowait(sleep_for)
+    tasks = []
+    for i in range(n):
+        task = asyncio.create_task(worker(f'worker-{i}', queue))
+        tasks.append(task)
+    started_at = time.monotonic()
+    await queue.join()
+    total_slept_for = time.monotonic() - started_at
+    for task in tasks:
+        task.cancel()
+    # Wait until all worker tasks are cancelled.
+    await asyncio.gather(*tasks, return_exceptions=True)
+    print('====')
+    print(f'3 workers slept in parallel for {total_slept_for:.2f} seconds')
+    print(f'total expected sleep time: {total_sleep_time:.2f} seconds')
+
+if __name__ == '__main__':
+    import sys
+    n = 3 if len(sys.argv) == 1 else sys.argv[1]
+    asyncio.run(main())
+</code></pre>
+<p>There is one finer detail about this script: the items are put into the queue synchronously, with <code>queue.put_nowait(sleep_for)</code> over a conventional for-loop.</p>
+<p>My goal is to create a script that uses <code>async def worker()</code> (or <code>consumer()</code>) and <code>async def producer()</code>.  Both should be scheduled to run concurrently.  No one consumer coroutine is explicitly tied to or chained from a producer.</p>
+<p>How can I modify the program above so that the producer(s) is its own coroutine that can be scheduled concurrently with the consumers/workers?</p>
+<hr/>
+<p><sub>There is a second example from <a href="https://pymotw.com/3/asyncio/synchronization.html#queues" rel="nofollow noreferrer">PYMOTW</a>.  It requires the producer to know the number of consumers ahead of time, and uses <code>None</code> as a signal to the consumer that production is done.</sub></p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>How can I modify the program above so that the producer(s) is its own coroutine that can be scheduled concurrently with the consumers/workers?</p>
+</blockquote>
+<p>The example can be generalized without changing its essential logic:</p>
+<ul>
+<li>Move the insertion loop to a separate producer coroutine.</li>
+<li>Start the consumers in the background, letting them process the produced items.</li>
+<li>Wait for the producer(s) to finish by <code>await</code>ing them, as with <code>await producer()</code> or <code>await gather(*producers)</code>, etc.</li>
+<li>Once all producers are done, wait for the remaining produced items to be processed with <code>await queue.join()</code></li>
+<li>Cancel the consumers, all of which are now idly waiting for the next queued item which will never arrive.</li>
+</ul>
+<p>Here is an example implementing the above:</p>
+<pre><code>import asyncio, random, time
+
+async def rnd_sleep(t):
+    # sleep for T seconds on average
+    await asyncio.sleep(t * random.random() * 2)
+
+async def producer(queue):
+    while True:
+        token = random.random()
+        print(f'produced {token}')
+        if token &lt; .05:
+            break
+        await queue.put(token)
+        await rnd_sleep(.1)
+
+async def consumer(queue):
+    while True:
+        token = await queue.get()
+        await rnd_sleep(.3)
+        queue.task_done()
+        print(f'consumed {token}')
+
+async def main():
+    queue = asyncio.Queue()
+
+    # fire up the both producers and consumers
+    producers = [asyncio.create_task(producer(queue))
+                 for _ in range(3)]
+    consumers = [asyncio.create_task(consumer(queue))
+                 for _ in range(10)]
+
+    # with both producers and consumers running, wait for
+    # the producers to finish
+    await asyncio.gather(*producers)
+    print('---- done producing')
+
+    # wait for the remaining tasks to be processed
+    await queue.join()
+
+    # cancel the consumers, which are now idle
+    for c in consumers:
+        c.cancel()
+
+asyncio.run(main())
+</code></pre>
+</div>
+<span class="comment-copy">I'm writing about asyncio with <code>aiohttp</code> &amp; <a href="https://github.com/Tinche/aiofiles" rel="nofollow noreferrer"><code>aiofiles</code></a> and want to mention queues in a section---do you mind if I link to &amp; cite this answer?</span>
+<span class="comment-copy">@BradSolomon Sure, go ahead!</span>
+<span class="comment-copy">I'm trying to adapt this to test if files exist in a directory, but it doesn't seem to interleave producers and consumers asynchronously.  All producers are first generated, followed by consumers.  How do I modify this to work on cpu-bound processes like <code>if pathlib.Path().exists(): ...</code>.</span>
+<span class="comment-copy">@pylang If your code is CPU-bound (or blocking in some other way not handled by asyncio), asyncio will not interleave it automatically. In that case, use <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.run_in_executor" rel="nofollow noreferrer"><code>run_in_executor</code></a> to off-load the blocking code to a thread pool. Then you'd write <code>if await loop.run_in_executor(None, lambda: pathlib.Path(...).exists()): ...</code></span>
+<span class="comment-copy">I think that will be the right approach according to this blog <a href="https://giuseppeciotta.net/threadpoolexecutor-and-processpoolexecutor-modern-python-idioms.html" rel="nofollow noreferrer">giuseppeciotta.net/…</a>.  Many thanks.</span>

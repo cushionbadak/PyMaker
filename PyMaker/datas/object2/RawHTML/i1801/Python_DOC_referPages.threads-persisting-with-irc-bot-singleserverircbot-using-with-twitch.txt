@@ -1,0 +1,98 @@
+<div class="post-text" itemprop="text">
+<p>What is the correct way to send a disconnect signal to a thread containing a <code>SingleServerIRCBot</code>?</p>
+<p>I am instantiating bots that connect to twitch with </p>
+<pre><code>import threading
+import irc.bot
+class MyBot(irc.bot.SingleServerIRCBot):
+    ...
+bot = MyBot(...)
+threads = []
+t = threading.Thread(target=bot.start()
+threads.append(t)
+t.start()
+</code></pre>
+<p>When the stream no longer exists, no matter what I've tried, I haven't been able to get the thread to successfully end. How should I go about sending a signal to the thread that tells it to exit the channel kill the bot and then itself?</p>
+<p>The code for the <code>.start</code> method can be found here <a href="https://github.com/jaraco/irc/blob/master/irc/bot.py#L331" rel="nofollow noreferrer">https://github.com/jaraco/irc/blob/master/irc/bot.py#L331</a></p>
+<p>My first thought is to override that method with a while loop that has an exit condition. I haven't had any luck with that so far though.</p>
+<p>Furthermore, there is a <code>.die</code> method here <a href="https://github.com/jaraco/irc/blob/master/irc/bot.py#L269" rel="nofollow noreferrer">https://github.com/jaraco/irc/blob/master/irc/bot.py#L269</a> but how can I call that method when the thread is executing an infinite loop?</p>
+<p>Trying to kill the threads directly ends up with them persisting, and eventually throwing errors about the total number of threads that my process is running.</p>
+<p>Edit for the bounty: I would also accept an answer that describes a better way to handle multiple IRC bots at once.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I don't think you could (or should) kill a thread directly, but you could stop the task running on that thread. Then the thread would be inactive and you could remove it from the threads list, if you like. I'm not familiar with <code>SingleServerIRCBot</code>, but I'll use the class below as an example.  </p>
+<pre><code>import time
+
+class MyTask:
+    def __init__(self):
+        self._active = True
+
+    def start(self):
+        while self._active:
+            print('running')
+            time.sleep(1)
+
+    def die(self):
+        self._active = False
+</code></pre>
+<hr/>
+<p>In Python3, threads have a <code>_target</code> attribute, from which we can access the target function/method. We could use this attribute to access the target's object and call the <code>die</code> method (eg: <code>thread._target.__self__.die()</code>). However I think it would be best to subclass <code>Thread</code> and store the the target object in a variable, as <code>_target</code> is a private attribute, and also for compatibility reasons.</p>
+<pre><code>import threading
+
+class MyThread(threading.Thread):
+    def __init__(self, target, args=()):
+        super(MyThread, self).__init__()
+        self.target = target
+        self.args = args
+
+    def run(self):
+        self.target.start(*self.args)
+
+    def stop_task(self):
+        self.target.die()
+</code></pre>
+<p>Using this class we would pass a <code>MyTask</code> object as a target, and the <code>start</code> method would be called from <code>MyThread.run</code>. Now we can use <code>MyThread.stop_task</code> to stop the task running on this thread.  </p>
+<pre><code>o = MyTask()
+t = MyThread(target=o)
+t.start()
+t.stop_task()
+time.sleep(1.1)
+print(t.is_alive())
+</code></pre>
+<p>Note that I'm waiting 1.1 sec to test if the thread is alive. That's because the target (<code>MyTask.start</code>) will take up to one second to stop. This method doesn't kill the thread, but calls <code>MyTask.die</code> and waits for the task to finish. If you want to end the task immediately (and loose any resources used by the task) you could use a <code>Process</code> and end it with <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Process.terminate" rel="nofollow noreferrer"><code>.terminate</code></a>. You should also choose multiprocessing over multithreading if your task is performing more CPU operations than IO operations, because processes are not limited by the <a href="https://wiki.python.org/moin/GlobalInterpreterLock" rel="nofollow noreferrer">GIL</a>.  </p>
+<hr/>
+<p>Afrer stydying the source code, I noticed that <code>.die()</code> calls <code>sys.exit</code>, so we can't use it to terminate the task because it would stop the program. It seems the reason for this is that <a href="https://github.com/jaraco/irc/blob/master/irc/bot.py#L331" rel="nofollow noreferrer"><code>.start()</code></a> calls the parent object's <a href="https://github.com/jaraco/irc/blob/master/irc/client.py#L1186" rel="nofollow noreferrer"><code>.start()</code></a>, which then calls the <a href="https://github.com/jaraco/irc/blob/master/irc/client.py#L827" rel="nofollow noreferrer"><code>.process_forever()</code></a> method of a <code>Reactor</code> object. This method starts running <a href="https://github.com/jaraco/irc/blob/master/irc/client.py#L806" rel="nofollow noreferrer"><code>Reactor.process_once()</code></a> in an infinite loop with no break condition.   </p>
+<p>A possible solution is to subclass <code>SingleServerIRCBot</code> and use a boolean variabe to break the loop. This class should override <code>.start()</code> and <code>.die()</code>, in order to stop the bot running on a thread. The <code>.die()</code> method would set the flag to false, and <code>.start()</code> would call <code>Reactor.process_once()</code> in a loop.</p>
+<pre><code>import irc.bot
+
+class MyBot(irc.bot.SingleServerIRCBot):
+    def __init__(self, channel, nickname, server, port=6667):
+        super(MyBot, self).__init__([(server, port)], nickname, nickname)
+        self.channel = channel
+        self._active = True
+
+    def start(self):
+        self._connect()
+        while self._active:
+            self.reactor.process_once(timeout=0.2)
+
+    def die(self, msg="Bye, cruel world!"):
+        self.connection.disconnect(msg)
+        self._active = False
+</code></pre>
+<p>Now we can stop the bot either by calling <code>.stop_task()</code> on the thread running the bot, or by calling the <code>.die()</code> method of the bot directly.</p>
+<pre><code>host, port = 'irc.freenode.net', 6667
+nick = 'My-Bot'
+channel = '#python'
+
+bot = MyBot(channel, nick, host, port)
+t = MyThread(bot)
+t.start()
+t.stop_task()
+#bot.die()
+</code></pre>
+</div>
+<span class="comment-copy">Unfortunately, I'm not sure how to override the start method in that class. I'm not entirely sure how it's working.  Also I can't use multiprocessing because I need to pass objects that can't be pickled between threads.</span>
+<span class="comment-copy">I'm not suggesting that you should override the <code>SingleServerIRCBot.start</code> method, the <code>MyTask</code> class I used is just an example. What I'm saying is that you could subclass <code>Thread</code>, so that you can control the <code>SingleServerIRCBot</code> object from the thread it's running on - calling <code>MyThread.stop_task</code> would call the bot's <code>die</code> method. If the bot is performing  mostly network IO operations then multiprocessing is not necessary.</span>
+<span class="comment-copy">It turns out you may have to override <code>.start()</code> and <code>.die()</code> because <code>.die()</code> calls <code>sys.exit</code>. I will update with a possible solution, however I haven't installed this module, so I can't test if it works.</span>
+<span class="comment-copy">Thanks for your help on this. I decided to just go ahead and code my own irc client from scratch so I could have easier access to the event loop. I'll go ahead and give you the bounty for the effort though :)</span>
+<span class="comment-copy">Thanks for the bounty, but I'd like to help resolve this, if I can. I've tested tis code and it seems that it works - meaning that it stops the thread running the bot. If you could provide some feedback, I may be able to help more. Cheers!</span>

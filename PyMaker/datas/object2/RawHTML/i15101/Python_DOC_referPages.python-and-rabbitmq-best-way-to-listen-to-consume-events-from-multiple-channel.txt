@@ -1,0 +1,224 @@
+<div class="post-text" itemprop="text">
+<p>I have two, separate RabbitMQ instances.  I'm trying to find the best way to listen to events from both.</p>
+<p>For example, I can consume events on one with the following:</p>
+<pre><code>credentials = pika.PlainCredentials(user, pass)
+connection = pika.BlockingConnection(pika.ConnectionParameters(host="host1", credentials=credentials))
+channel = connection.channel()
+result = channel.queue_declare(Exclusive=True)
+self.channel.queue_bind(exchange="my-exchange", result.method.queue, routing_key='*.*.*.*.*')
+channel.basic_consume(callback_func, result.method.queue, no_ack=True)
+self.channel.start_consuming()
+</code></pre>
+<p>I have a second host, "host2", that I'd like to listen to as well.  I thought about creating two separate threads to do this, but from what I've read, pika isn't thread safe.  Is there a better way?  Or would creating two separate threads, each listening to a different Rabbit instance (host1, and host2) be sufficient?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The answer to "what is the best way" depends heavily on your usage pattern of queues and what you mean by "best". Since I can't comment on questions yet, I'll just try to suggest some possible solutions.</p>
+<p>In each example I'm going to assume exchange is already declared.</p>
+<h1>Threads</h1>
+<p>You can consume messages from two queues on separate hosts in single process using <a href="http://pika.readthedocs.org/" rel="noreferrer"><code>pika</code></a>.</p>
+<p>You are right - as <a href="http://pika.readthedocs.org/en/latest/faq.html" rel="noreferrer">its own FAQ states</a>, <code>pika</code> is not thread safe, but it can be used in multi-threaded manner by creating connections to RabbitMQ hosts per thread. Making this example run in threads using <a href="https://docs.python.org/2/library/threading.html" rel="noreferrer"><code>threading</code></a> module looks as follows:</p>
+<pre><code>import pika
+import threading
+
+
+class ConsumerThread(threading.Thread):
+    def __init__(self, host, *args, **kwargs):
+        super(ConsumerThread, self).__init__(*args, **kwargs)
+
+        self._host = host
+
+    # Not necessarily a method.
+    def callback_func(self, channel, method, properties, body):
+        print("{} received '{}'".format(self.name, body))
+
+    def run(self):
+        credentials = pika.PlainCredentials("guest", "guest")
+
+        connection = pika.BlockingConnection(
+            pika.ConnectionParameters(host=self._host,
+                                      credentials=credentials))
+
+        channel = connection.channel()
+
+        result = channel.queue_declare(exclusive=True)
+
+        channel.queue_bind(result.method.queue,
+                           exchange="my-exchange",
+                           routing_key="*.*.*.*.*")
+
+        channel.basic_consume(self.callback_func,
+                              result.method.queue,
+                              no_ack=True)
+
+        channel.start_consuming()
+
+
+if __name__ == "__main__":
+    threads = [ConsumerThread("host1"), ConsumerThread("host2")]
+    for thread in threads:
+        thread.start()
+</code></pre>
+<p>I've declared <code>callback_func</code> as a method purely to use <code>ConsumerThread.name</code> while printing message body. It might as well be a function outside the <code>ConsumerThread</code> class.</p>
+<h1>Processes</h1>
+<p>Alternatively, you can always just run one process with consumer code per queue you want to consume events. </p>
+<pre><code>import pika
+import sys
+
+
+def callback_func(channel, method, properties, body):
+    print(body)
+
+
+if __name__ == "__main__":
+    credentials = pika.PlainCredentials("guest", "guest")
+
+    connection = pika.BlockingConnection(
+        pika.ConnectionParameters(host=sys.argv[1],
+                                  credentials=credentials))
+
+    channel = connection.channel()
+
+    result = channel.queue_declare(exclusive=True)
+
+    channel.queue_bind(result.method.queue,
+                       exchange="my-exchange",
+                       routing_key="*.*.*.*.*")
+
+    channel.basic_consume(callback_func, result.method.queue, no_ack=True)
+
+    channel.start_consuming()
+</code></pre>
+<p>and then run by:</p>
+<pre><code>$ python single_consume.py host1
+$ python single_consume.py host2  # e.g. on another console
+</code></pre>
+<p>If the work you're doing on messages from queues is <a href="http://en.wikipedia.org/wiki/CPU-bound" rel="noreferrer">CPU-heavy</a> and as long as number of cores in your CPU &gt;= number of consumers, it is generally better to use this approach - unless your queues are empty most of the time and consumers won't utilize this CPU time*.</p>
+<h1>Async</h1>
+<p>Another alternative is to involve some asynchronous framework (for example <a href="https://twistedmatrix.com/" rel="noreferrer"><code>Twisted</code></a>) and running whole thing in single thread.</p>
+<p>You can no longer use <code>BlockingConnection</code> in asynchronous code; fortunately, <code>pika</code> has adapter for <code>Twisted</code>:</p>
+<pre><code>from pika.adapters.twisted_connection import TwistedProtocolConnection
+from pika.connection import ConnectionParameters
+from twisted.internet import protocol, reactor, task
+from twisted.python import log
+
+
+class Consumer(object):
+    def on_connected(self, connection):
+        d = connection.channel()
+        d.addCallback(self.got_channel)
+        d.addCallback(self.queue_declared)
+        d.addCallback(self.queue_bound)
+        d.addCallback(self.handle_deliveries)
+        d.addErrback(log.err)
+
+    def got_channel(self, channel):
+        self.channel = channel
+
+        return self.channel.queue_declare(exclusive=True)
+
+    def queue_declared(self, queue):
+        self._queue_name = queue.method.queue
+
+        self.channel.queue_bind(queue=self._queue_name,
+                                exchange="my-exchange",
+                                routing_key="*.*.*.*.*")
+
+    def queue_bound(self, ignored):
+        return self.channel.basic_consume(queue=self._queue_name)
+
+    def handle_deliveries(self, queue_and_consumer_tag):
+        queue, consumer_tag = queue_and_consumer_tag
+        self.looping_call = task.LoopingCall(self.consume_from_queue, queue)
+
+        return self.looping_call.start(0)
+
+    def consume_from_queue(self, queue):
+        d = queue.get()
+
+        return d.addCallback(lambda result: self.handle_payload(*result))
+
+    def handle_payload(self, channel, method, properties, body):
+        print(body)
+
+
+if __name__ == "__main__":
+    consumer1 = Consumer()
+    consumer2 = Consumer()
+
+    parameters = ConnectionParameters()
+    cc = protocol.ClientCreator(reactor,
+                                TwistedProtocolConnection,
+                                parameters)
+    d1 = cc.connectTCP("host1", 5672)
+    d1.addCallback(lambda protocol: protocol.ready)
+    d1.addCallback(consumer1.on_connected)
+    d1.addErrback(log.err)
+
+    d2 = cc.connectTCP("host2", 5672)
+    d2.addCallback(lambda protocol: protocol.ready)
+    d2.addCallback(consumer2.on_connected)
+    d2.addErrback(log.err)
+
+    reactor.run()
+</code></pre>
+<p>This approach would be even better, the more queues you would consume from and the less CPU-bound the work performing by consumers is*.</p>
+<h1>Python 3</h1>
+<p>Since you've mentioned <code>pika</code>, I've restricted myself to Python 2.x-based solutions, because <code>pika</code> is not yet ported.</p>
+<p>But in case you would want to move to &gt;=3.3, one possible option is to use <a href="https://docs.python.org/3/library/asyncio.html" rel="noreferrer"><code>asyncio</code></a> with one of AMQP protocol (the protocol you speak in with RabbitMQ) , e.g. <a href="https://github.com/benjamin-hodgson/asynqp" rel="noreferrer"><code>asynqp</code></a> or <a href="https://github.com/polyconseil/aioamqp" rel="noreferrer"><code>aioamqp</code></a>.</p>
+<p>* - please note that these are very shallow tips - in most cases choice is not that obvious; what will be the best for you depends on queues "saturation" (messages/time), what work do you do upon receiving these messages, what environment you run your consumers in etc.; there's no way to be sure other than to benchmark all implementations</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Below is an example of how I use one rabbitmq instance to listen to 2 queues at the same time:</p>
+<pre><code>import pika
+import threading
+
+threads=[]
+def client_info(channel):    
+   channel.queue_declare(queue='proxy-python')
+   print (' [*] Waiting for client messages. To exit press CTRL+C')
+
+
+   def callback(ch, method, properties, body):
+       print (" Received %s" % (body))
+
+   channel.basic_consume(callback, queue='proxy-python', no_ack=True)
+   channel.start_consuming()
+
+def scenario_info(channel):    
+   channel.queue_declare(queue='savi-virnet-python')
+   print (' [*] Waiting for scenrio messages. To exit press CTRL+C')
+
+
+   def callback(ch, method, properties, body):
+      print (" Received %s" % (body))
+
+   channel.basic_consume(callback, queue='savi-virnet-python', no_ack=True)
+   channel.start_consuming()
+
+def manager():
+   connection1= pika.BlockingConnection(pika.ConnectionParameters
+  (host='localhost'))
+   channel1 = connection1.channel()
+  connection2= pika.BlockingConnection(pika.ConnectionParameters
+  (host='localhost'))
+   channel2 = connection2.channel()
+   t1 = threading.Thread(target=client_info, args=(channel1,))
+   t1.daemon = True
+   threads.append(t1)
+   t1.start()  
+
+   t2 = threading.Thread(target=scenario_info, args=(channel2,))
+   t2.daemon = True
+   threads.append(t2)
+
+
+   t2.start()
+   for t in threads:
+     t.join()
+
+
+ manager()
+</code></pre>
+</div>
+<span class="comment-copy">Thanks, very helpful.</span>
+<span class="comment-copy">You're welcome. :) I've also pointed out one more thing in the edit.</span>

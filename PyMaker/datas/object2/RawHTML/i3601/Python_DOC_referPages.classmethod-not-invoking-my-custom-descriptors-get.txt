@@ -1,0 +1,147 @@
+<div class="post-text" itemprop="text">
+<p>I have a decorator called <code>Special</code> that turns a function into two versions of itself: one that can be called directly and prefixes the result with <code>'regular '</code> and one that can be called with <code>.special</code> and prefixes the results with <code>'special '</code>:</p>
+<pre><code>class Special:
+    def __init__(self, func):
+        self.func = func
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+        return Special(self.func.__get__(instance, owner))
+
+    def special(self, *args, **kwargs):
+        return 'special ' + self.func(*args, **kwargs)
+
+    def __call__(self, *args, **kwargs):
+        return 'regular ' + self.func(*args, **kwargs)
+</code></pre>
+<p>It works fine with regular methods and static methods - but <code>.special</code> does not work with class methods:</p>
+<pre><code>class Foo:
+    @Special
+    def bar(self):
+        return 'bar'
+
+    @staticmethod
+    @Special
+    def baz():
+        return 'baz'
+
+    @classmethod
+    @Special
+    def qux(cls):
+        return 'qux'
+
+assert Foo().bar() == 'regular bar'
+assert Foo().bar.special() == 'special bar'
+
+assert Foo.baz() == 'regular baz'
+assert Foo.baz.special() == 'special baz'
+
+assert Foo.qux() == 'regular qux'
+assert Foo.qux.special() == 'special qux'  # TypeError: qux() missing 1 required positional argument: 'cls'
+</code></pre>
+<ul>
+<li><p><code>Foo().bar</code> is invoking <code>__get__</code>, which binds the underlying function and passes the bound method to a new instance of <code>Special</code> - which is why both <code>Foo().bar()</code> and <code>Foo().bar.special()</code> work.</p></li>
+<li><p><code>Foo.baz</code> is simply returning the original <code>Special</code> instance - where both the regular and the special calls are simple.</p></li>
+<li><p><code>Foo.qux</code> is binding without calling my <code>__get__</code>.</p>
+<ul>
+<li>The new bound object knows to pass the class as the first argument when being called directly - so <code>Foo.qux()</code> works.</li>
+<li><code>Foo.qux.special</code> is simply calling the <code>.special</code> of the underlying function (<code>classmethod</code> does not know how to bind it) - so <code>Foo.qux.special()</code> is invoking an unbound function, hence the <code>TypeError</code>.</li>
+</ul></li>
+</ul>
+<p>Is there any way for <code>Foo.qux.special</code> to know it's being called from a <code>classmethod</code>? Or some other way around this problem?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>classmethod</code> is a descriptor that returns a bound method. It doesn't invoke your <code>__get__</code> method in this process because it can't do so without breaking some contracts of the descriptor protocol. (Namely, the fact that <code>instance</code> should be an instance, not a class.) So your <code>__get__</code> method not being called is completely expected.</p>
+<p>So how do you make it work? Well, think about it: You want both <code>some_instance.bar</code> and <code>SomeClass.bar</code> to return a <code>Special</code> instance. In order to achieve that, you simply apply the <code>@Special</code> decorator <em>last</em>:</p>
+<pre><code>class Foo:
+    @Special
+    @staticmethod
+    def baz():
+        return 'baz'
+
+    @Special
+    @classmethod
+    def qux(cls):
+        return 'qux'
+</code></pre>
+<p>This gives you full control over if/when/how the decorated function's descriptor protocol is invoked. Now you just need to remove the <code>if instance is None:</code> special case in your <code>__get__</code> method, because it prevents classmethods from working correctly. (The reason is that classmethod objects are not callable; you have to invoke the descriptor protocol to turn the classmethod object into a function that can be called.) In other words, the <code>Special.__get__</code> method has to unconditionally call the decorated function's <code>__get__</code> method, like this:</p>
+<pre><code>def __get__(self, instance=None, owner=None):
+    return Special(self.func.__get__(instance, owner))
+</code></pre>
+<p>And now all your assertions will pass.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem is that <code>classmethod.__get__</code> doesn't call the wrapped function's <code>__get__</code>—because that's basically the whole point of <code>@classmethod</code>. You can look at the pure-Python equivalent to <code>classmethod</code> in <a href="https://docs.python.org/3/howto/descriptor.html#static-methods-and-class-methods" rel="nofollow noreferrer">the Descriptors HOWTO</a>, or the actual CPython C source in <a href="https://github.com/python/cpython/blob/master/Objects/funcobject.c#L686" rel="nofollow noreferrer"><code>funcobject.c</code></a>, for details, but you'll see that there's really no way around this.</p>
+<hr/>
+<p>Of course if you just <code>@Special</code> a <code>@classmethod</code>, instead of the other way around, everything will work fine when called on an instance:</p>
+<pre><code>class Foo:
+    @Special
+    @classmethod
+    def spam(cls):
+        return 'spam'
+
+assert Foo().spam() == 'regular spam'
+assert Foo().spam.special() == 'special spam'
+</code></pre>
+<p>… but now it won't work when called on the class:</p>
+<pre><code>assert Foo.spam() == 'regular spam'
+assert Foo.spam.special() == 'special spam'
+</code></pre>
+<p>… because you're trying to call a <code>classmethod</code> object, which isn't callable.</p>
+<hr/>
+<p>But this problem, unlike the previous one, is fixable. In fact, the only reason this fails is this part:</p>
+<pre><code>if instance is None:
+    return self
+</code></pre>
+<p>When you try to bind a <code>Special</code> instance to a class, it just returns <code>self</code> instead of binding its wrapped object. Which means it ends up as just a wrapper around a <code>classmethod</code> object rather than a wrapper around a bound class method, and of course you can't call a <code>classmethod</code> object.</p>
+<p>But if you just leave that out, it'll let the underlying <code>classmethod</code> bind the same way a normal function does, which does exactly the right thing, and now everything works:</p>
+<pre><code>class Special:
+    def __init__(self, func):
+        self.func = func
+
+    def __get__(self, instance, owner=None):
+        return Special(self.func.__get__(instance, owner))
+
+    def special(self, *args, **kwargs):
+        return 'special ' + self.func(*args, **kwargs)
+
+    def __call__(self, *args, **kwargs):
+        return 'regular ' + self.func(*args, **kwargs)
+
+class Foo:
+    @Special
+    def bar(self):
+        return 'bar'
+
+    @Special
+    @staticmethod
+    def baz():
+        return 'baz'
+
+    @Special
+    @classmethod
+    def qux(cls):
+        return 'qux'
+
+assert Foo().bar() == 'regular bar'
+assert Foo().bar.special() == 'special bar'
+
+assert Foo.baz() == 'regular baz'
+assert Foo.baz.special() == 'special baz'
+assert Foo().baz() == 'regular baz'
+assert Foo().baz.special() == 'special baz'
+
+assert Foo.qux() == 'regular qux'
+assert Foo.qux.special() == 'special qux'
+assert Foo().qux() == 'regular qux'
+assert Foo().qux.special() == 'special qux'
+</code></pre>
+<hr/>
+<p>Of course this will cause problems with wrapping unbound method objects in Python 2.7, but I think your design already breaks for normal methods in 2.7, and hopefully you only care about 3.x here anyway.</p>
+</div>
+<span class="comment-copy">Thanks. I'd prefer to be able to apply <code>@classmethod</code> last (it makes more sense), but I guess that'll have to do...</span>
+<span class="comment-copy">This does pass all of his tests, but it will fail on <code>Foo().qux</code>. In other words, a special classmethod doesn't act like a classmethod.</span>
+<span class="comment-copy">@abarnert Not sure what you mean. <code>Foo().qux()</code> returns "regular qux" and <code>Foo().qux.special()</code> returns "special qux". What doesn't work?</span>
+<span class="comment-copy">@Aran-Fey Sorry, got it backward. It works for <code>Foo().qux</code>, but <a href="https://repl.it/repls/ScaryLavenderCone" rel="nofollow noreferrer">it doesn't work for <code>Foo.qux()</code></a>. See my answer for the explanation of why.</span>
+<span class="comment-copy">@abarnert Yeah, it's because you didn't remove the <code>if instance is None: return self</code> in <code>__get__</code>. I guess I should try to clarify that part of the answer.</span>

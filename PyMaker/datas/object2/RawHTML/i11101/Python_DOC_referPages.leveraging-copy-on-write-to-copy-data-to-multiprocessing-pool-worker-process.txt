@@ -1,0 +1,120 @@
+<div class="post-text" itemprop="text">
+<p>I have a bit of <code>multiprocessing</code> Python code that looks a bit like this:</p>
+<pre><code>import time
+from multiprocessing import Pool
+import numpy as np
+
+class MyClass(object):
+    def __init__(self):
+        self.myAttribute = np.zeros(100000000) # basically a big memory struct
+
+    def my_multithreaded_analysis(self):
+        arg_lists = [(self, i) for i in range(10)]
+        pool = Pool(processes=10)
+        result = pool.map(call_method, arg_lists)
+        print result
+
+    def analyze(self, i):
+        time.sleep(10)
+        return i ** 2
+
+def call_method(args):
+    my_instance, i = args
+    return my_instance.analyze(i)
+
+
+if __name__ == '__main__':
+    my_instance = MyClass()
+    my_instance.my_multithreaded_analysis()
+</code></pre>
+<p>After reading answers about how memory works in other StackOverflow answers such as this one <a href="https://stackoverflow.com/questions/14749897/python-multiprocessing-memory-usage">Python multiprocessing memory usage</a> I was under the impression that this would not use memory in proportion to how many processes I used for multiprocessing, since it is copy-on-write and I have not modified any of the attributes of <code>my_instance</code>. However, I do see high memory for all processes when I run top it says most of my processes are using a lot of memory (this is top output from OSX, but I can replicate on Linux). </p>
+<p>My question is basically, am I interpreting this correctly in that my instance of <code>MyClass</code> is actually duplicated across the pool? And if so, how can I prevent this; should I just not use a construction like this? My goal is to reduce memory usage for a computational analysis. </p>
+<pre><code>PID   COMMAND      %CPU  TIME     #TH    #WQ  #PORT MEM    PURG   CMPRS  PGRP PPID STATE
+2494  Python       0.0   00:01.75 1      0    7     765M   0B     0B     2484 2484 sleeping
+2493  Python       0.0   00:01.85 1      0    7     765M   0B     0B     2484 2484 sleeping
+2492  Python       0.0   00:01.86 1      0    7     765M   0B     0B     2484 2484 sleeping
+2491  Python       0.0   00:01.83 1      0    7     765M   0B     0B     2484 2484 sleeping
+2490  Python       0.0   00:01.87 1      0    7     765M   0B     0B     2484 2484 sleeping
+2489  Python       0.0   00:01.79 1      0    7     167M   0B     597M   2484 2484 sleeping
+2488  Python       0.0   00:01.77 1      0    7     10M    0B     755M   2484 2484 sleeping
+2487  Python       0.0   00:01.75 1      0    7     8724K  0B     756M   2484 2484 sleeping
+2486  Python       0.0   00:01.78 1      0    7     9968K  0B     755M   2484 2484 sleeping
+2485  Python       0.0   00:01.74 1      0    7     171M   0B     594M   2484 2484 sleeping
+2484  Python       0.1   00:16.43 4      0    18    775M   0B     12K    2484 2235 sleeping
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Anything sent to <code>pool.map</code> (and related methods) isn't actually using shared copy-on-write resources. The values are <a href="https://docs.python.org/3/library/pickle.html" rel="noreferrer">"pickled" (Python's serialization mechanism)</a>, sent over pipes to the worker processes and unpickled there, which reconstructs the object in the child from scratch. Thus, each child in this case ends up with a copy-on-write version of the original data (which it never uses, because it was told to use the copy sent via IPC), and a personal recreation of the original data that was reconstructed in the child and is not shared.</p>
+<p>If you want to take advantage of forking's copy-on-write benefits, you can't send data (or objects referencing the data) over the pipe. You have to store them in a location that can be found from the child by accessing their own globals. So for example:</p>
+<pre><code>import time
+from multiprocessing import Pool
+import numpy as np
+
+class MyClass(object):
+    def __init__(self):
+        self.myAttribute = np.zeros(100000000) # basically a big memory struct
+
+    def my_multithreaded_analysis(self):
+        arg_lists = list(range(10))  # Don't pass self
+        pool = Pool(processes=10)
+        result = pool.map(call_method, arg_lists)
+        print result
+
+    def analyze(self, i):
+        time.sleep(10)
+        return i ** 2
+
+def call_method(i):
+    # Implicitly use global copy of my_instance, not one passed as an argument
+    return my_instance.analyze(i)
+
+# Constructed globally and unconditionally, so the instance exists
+# prior to forking in commonly accessible location
+my_instance = MyClass()
+
+
+if __name__ == '__main__':
+    my_instance.my_multithreaded_analysis()
+</code></pre>
+<p>By not passing <code>self</code>, you avoid making copies, and just use the single global object that was copy-on-write mapped into the child. If you needed more than one object, you might make a global <code>list</code> or <code>dict</code> mapping to instances of the object prior to creating the pool, then pass the index or key that can look up the object as part of the argument(s) to <code>pool.map</code>. The worker function then uses the index/key (which had to be pickled and sent to the child over IPC) to look up the value (copy-on-write mapped) in the global dict (also copy-on-write mapped), so you copy cheap information to lookup expensive data in the child without copying it.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Alternatively, to take advantage of forking's copy-on-write benefits, while preserving some semblance of encapsulation, you could <a href="http://thelaziestprogrammer.com/python/multiprocessing-pool-a-global-solution" rel="nofollow noreferrer">leverage class-attributes and @classmethods over pure <code>globals</code></a>. </p>
+<pre><code>import time
+from multiprocessing import Pool
+import numpy as np
+
+class MyClass(object):
+
+    myAttribute = np.zeros(100000000) # basically a big memory struct
+    # myAttribute is a class-attribute
+
+    @classmethod
+    def my_multithreaded_analysis(cls):
+        arg_list = [i for i in range(10)]
+        pool = Pool(processes=10)
+        result = pool.map(analyze, arg_list)
+        print result
+
+    @classmethod
+    def analyze(cls, i):
+        time.sleep(10)
+        # If you wanted, you could access cls.myAttribute w/o worry here.
+        return i ** 2
+
+""" We don't need this proxy step !
+    def call_method(args):
+        my_instance, i = args
+        return my_instance.analyze(i)
+"""
+
+if __name__ == '__main__':
+    my_instance = MyClass()
+    # Note that now you can instantiate MyClass anywhere in your app,
+    # While still taking advantage of copy-on-write forking
+    my_instance.my_multithreaded_analysis()
+</code></pre>
+<p><em><strong>Note 1:</strong> Yes, I admit that <code>class-attributes</code> and <code>class-methods</code> are glorified globals. But it buys a bit of encapsulation...</em></p>
+<p><em><strong>Note 2:</strong> Rather than explicitly creating your <code>arg_lists</code> above, you can <a href="http://thelaziestprogrammer.com/python/a-multiprocessing-pool-pickle" rel="nofollow noreferrer">implicitly pass the instance (self)</a> to each task created by <code>Pool</code>, by passing the bound-instance method <code>analyze(self)</code> to <code>Pool.map()</code>, and shoot yourself in the foot even easier!</em></p>
+</div>
+<span class="comment-copy">Also note: If the objects are smallish, they'll end up copied even if you don't write to them. CPython is reference counted, and the reference count appears in the common object header and is updated constantly, just by referring to the object, even if it's a logically non-mutating reference. So small objects (and all the other objects allocated in the same page of memory) will be written, and therefore copied. For large objects (your hundred million element <code>numpy</code> array), most of it would remain shared as long as you didn't write to it, since the header only occupies one of many pages.</span>

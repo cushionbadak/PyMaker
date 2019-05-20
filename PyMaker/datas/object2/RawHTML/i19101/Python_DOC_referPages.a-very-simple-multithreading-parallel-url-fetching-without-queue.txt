@@ -1,0 +1,202 @@
+<div class="post-text" itemprop="text">
+<p>I spent a whole day looking for the simplest possible multithreaded URL fetcher in Python, but most scripts I found are using queues or multiprocessing or complex libraries.</p>
+<p>Finally I wrote one myself, which I am reporting as an answer. Please feel free to suggest any improvement.</p>
+<p>I guess other people might have been looking for something similar.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Simplifying your original version as far as possible:</p>
+<pre><code>import threading
+import urllib2
+import time
+
+start = time.time()
+urls = ["http://www.google.com", "http://www.apple.com", "http://www.microsoft.com", "http://www.amazon.com", "http://www.facebook.com"]
+
+def fetch_url(url):
+    urlHandler = urllib2.urlopen(url)
+    html = urlHandler.read()
+    print "'%s\' fetched in %ss" % (url, (time.time() - start))
+
+threads = [threading.Thread(target=fetch_url, args=(url,)) for url in urls]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+
+print "Elapsed Time: %s" % (time.time() - start)
+</code></pre>
+<p>The only new tricks here are:</p>
+<ul>
+<li>Keep track of the threads you create.</li>
+<li>Don't bother with a counter of threads if you just want to know when they're all done; <code>join</code> already tells you that.</li>
+<li>If you don't need any state or external API, you don't need a <code>Thread</code> subclass, just a <code>target</code> function.</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>multiprocessing</code> has a thread pool that doesn't start other processes:</p>
+<pre><code>#!/usr/bin/env python
+from multiprocessing.pool import ThreadPool
+from time import time as timer
+from urllib2 import urlopen
+
+urls = ["http://www.google.com", "http://www.apple.com", "http://www.microsoft.com", "http://www.amazon.com", "http://www.facebook.com"]
+
+def fetch_url(url):
+    try:
+        response = urlopen(url)
+        return url, response.read(), None
+    except Exception as e:
+        return url, None, e
+
+start = timer()
+results = ThreadPool(20).imap_unordered(fetch_url, urls)
+for url, html, error in results:
+    if error is None:
+        print("%r fetched in %ss" % (url, timer() - start))
+    else:
+        print("error fetching %r: %s" % (url, error))
+print("Elapsed Time: %s" % (timer() - start,))
+</code></pre>
+<p>The advantages compared to <code>Thread</code>-based solution:</p>
+<ul>
+<li><code>ThreadPool</code> allows to limit the maximum number of concurrent connections (<code>20</code> in the code example)</li>
+<li>the output is not garbled because all output is in the main thread </li>
+<li>errors are logged</li>
+<li>the code works on both Python 2 and 3 without changes (assuming <code>from urllib.request import urlopen</code> on Python 3).</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>The main example in the <a href="http://docs.python.org/3/library/concurrent.futures.html#threadpoolexecutor-example" rel="noreferrer"><code>concurrent.futures</code></a> does everything you want, a lot more simply. Plus, it can handle huge numbers of URLs by only doing 5 at a time, and it handles errors much more nicely.</p>
+<p>Of course this module is only built in with Python 3.2 or later… but if you're using 2.5-3.1, you can just install the backport, <a href="https://pypi.python.org/pypi/futures" rel="noreferrer"><code>futures</code></a>, off PyPI. All you need to change from the example code is to search-and-replace <code>concurrent.futures</code> with <code>futures</code>, and, for 2.x, <code>urllib.request</code> with <code>urllib2</code>.</p>
+<p>Here's the sample backported to 2.x, modified to use your URL list and to add the times:</p>
+<pre><code>import concurrent.futures
+import urllib2
+import time
+
+start = time.time()
+urls = ["http://www.google.com", "http://www.apple.com", "http://www.microsoft.com", "http://www.amazon.com", "http://www.facebook.com"]
+
+# Retrieve a single page and report the url and contents
+def load_url(url, timeout):
+    conn = urllib2.urlopen(url, timeout=timeout)
+    return conn.readall()
+
+# We can use a with statement to ensure threads are cleaned up promptly
+with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    # Start the load operations and mark each future with its URL
+    future_to_url = {executor.submit(load_url, url, 60): url for url in urls}
+    for future in concurrent.futures.as_completed(future_to_url):
+        url = future_to_url[future]
+        try:
+            data = future.result()
+        except Exception as exc:
+            print '%r generated an exception: %s' % (url, exc)
+        else:
+            print '"%s" fetched in %ss' % (url,(time.time() - start))
+print "Elapsed Time: %ss" % (time.time() - start)
+</code></pre>
+<hr/>
+<p>But you can make this even simpler. Really, all you need is:</p>
+<pre><code>def load_url(url):
+    conn = urllib2.urlopen(url, timeout)
+    data = conn.readall()
+    print '"%s" fetched in %ss' % (url,(time.time() - start))
+    return data
+
+with futures.ThreadPoolExecutor(max_workers=5) as executor:
+    pages = executor.map(load_url, urls)
+
+print "Elapsed Time: %ss" % (time.time() - start)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I am now publishing a different solution, by <strong>having the worker threads not-deamon and joining them to the main thread</strong> (which means blocking the main thread until all worker threads have finished) instead of notifying the end of execution of each worker thread with a callback to a global function (as I did in the previous answer), as in some comments it was noted that such way is not thread-safe.</p>
+<pre><code>import threading
+import urllib2
+import time
+
+start = time.time()
+urls = ["http://www.google.com", "http://www.apple.com", "http://www.microsoft.com", "http://www.amazon.com", "http://www.facebook.com"]
+
+class FetchUrl(threading.Thread):
+    def __init__(self, url):
+        threading.Thread.__init__(self)
+        self.url = url
+
+    def run(self):
+        urlHandler = urllib2.urlopen(self.url)
+        html = urlHandler.read()
+        print "'%s\' fetched in %ss" % (self.url,(time.time() - start))
+
+for url in urls:
+    FetchUrl(url).start()
+
+#Join all existing threads to main thread.
+for thread in threading.enumerate():
+    if thread is not threading.currentThread():
+        thread.join()
+
+print "Elapsed Time: %s" % (time.time() - start)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This script fetches the content from a set of URLs defined in an array. It spawns a thread for each URL to be fetch, so it is meant to be used for a limited set of URLs.</p>
+<p>Instead of using a queue object, each thread is notifying its end with a callback to a global function, which keeps count of the number of threads running.</p>
+<pre><code>import threading
+import urllib2
+import time
+
+start = time.time()
+urls = ["http://www.google.com", "http://www.apple.com", "http://www.microsoft.com", "http://www.amazon.com", "http://www.facebook.com"]
+left_to_fetch = len(urls)
+
+class FetchUrl(threading.Thread):
+    def __init__(self, url):
+        threading.Thread.__init__(self)
+        self.setDaemon = True
+        self.url = url
+
+    def run(self):
+        urlHandler = urllib2.urlopen(self.url)
+        html = urlHandler.read()
+        finished_fetch_url(self.url)
+
+
+def finished_fetch_url(url):
+    "callback function called when a FetchUrl thread ends"
+    print "\"%s\" fetched in %ss" % (url,(time.time() - start))
+    global left_to_fetch
+    left_to_fetch-=1
+    if left_to_fetch==0:
+        "all urls have been fetched"
+        print "Elapsed Time: %ss" % (time.time() - start)
+
+
+for url in urls:
+    "spawning a FetchUrl thread for each url to fetch"
+    FetchUrl(url).start()
+</code></pre>
+</div>
+<span class="comment-copy">just to add:in Python case, multithreading is not native to core due to GIL.</span>
+<span class="comment-copy">It stills looks that fetching the URLs in parallel is faster than doing it serially. Why is that? is it due to the fact that (I assume) the Python interpreter is not running continuously during an HTTP request?</span>
+<span class="comment-copy">What about if I want to parse the content of those web pages I fetch? Is it better to do the parsing within each thread, or should I do it sequentially after joining the worker threads to the main thread?</span>
+<span class="comment-copy">I made sure to claim that this was simplified "as far as possible", because that's the best way to make sure someone clever comes along and finds a way to simplify it even further just to make me look silly. :)</span>
+<span class="comment-copy">I believe it's not easy to beat that! :-) it's a great improvement since the first version I published here</span>
+<span class="comment-copy">maybe we can combine the first 2 loops into one? by instantiating and starting the threads in the same <code>for</code> loop?</span>
+<span class="comment-copy">@DanieleB: Well, then you have to change the list comprehension into an explicit loop around <code>append</code>, like <a href="http://pastebin.com/eYe7MCKn" rel="nofollow noreferrer">this</a>. Or, alternatively, write a wrapper which creates, starts, and returns a thread, like <a href="http://pastebin.com/pVLSiNW2" rel="nofollow noreferrer">this</a>. Either way, I think it's less simple (although the second one is a useful way to refactor complicated cases, it doesn't work when things are already simple).</span>
+<span class="comment-copy">@DanieleB: In a different language, however, you could do that. If <code>thread.start()</code> returned the thread, you could put the creation and start together into a single expression. In C++ or JavaScript, you'd probably do that. The problem is that, while method chaining and other "fluent programming" techniques make things more concise, they can also breaks down the expression/statement boundary, and are often ambiguous. so Python goes in almost the exact opposite direction, and almost <i>no</i> methods or operators return the object they operate on. See <a href="http://en.wikipedia.org/wiki/Fluent_interface" rel="nofollow noreferrer">en.wikipedia.org/wiki/Fluent_interface</a>.</span>
+<span class="comment-copy">I have a question regarding the code: does the print in the fourth line from the bottom really return the time it took to fetch the url or the time it takes to return the url from the 'results' object? In my understanding the timestamp should be printed in the fetch_url() function, not in the result printing part.</span>
+<span class="comment-copy">@UweZiegenhagen <code>imap_unordered()</code> returns the result as soon as it is ready. I assume the overhead is negligible compared to the time it takes to make the http request.</span>
+<span class="comment-copy">Thank you, I am using it in a modified form to compile LaTeX files in parallel: <a href="http://uweziegenhagen.de/?p=3501" rel="nofollow noreferrer">uweziegenhagen.de/?p=3501</a></span>
+<span class="comment-copy">This is by far the best, fastest and simplest way to go. I have been trying twisted, scrapy and others using both python 2 and python 3, and this is simpler and better</span>
+<span class="comment-copy">Thanks! Is there a way to add a delay between the calls?</span>
+<span class="comment-copy">This will work, but it isn't the way you want to do it. If a later version of your program creates any other threads (daemon, or joined by some other code), it will break. Also, <code>thread is threading.currentThread()</code> isn't guaranteed to work (I think it always will for any CPython version so far, on any platform with real threads, if used in the main thread… but still, better not to assume). Safer to store all the <code>Thread</code> objects in a list (<code>threads = [FetchUrl(url) for url in urls]</code>), then start them, then join them with <code>for thread in threads: thread.join()</code>.</span>
+<span class="comment-copy">Also, for simple cases like this, you can simplify it even farther: Don't bother creating a <code>Thread</code> subclass unless you have some kind of state to store or some API to interact with the threads from outside, just write a simple function, and do <code>threading.Thread(target=my_thread_function, args=[url])</code>.</span>
+<span class="comment-copy">do you mean that if I have the same script running twice at the same time on the same machine 'for thread in threading.enumerate():' would include the threads of both executions?</span>
+<span class="comment-copy">See <a href="http://pastebin.com/Z5MdeB5x" rel="nofollow noreferrer">pastebin.com/Z5MdeB5x</a>, which I think is about as simple as you're going to get for an explicit-threaded URL-fetcher.</span>
+<span class="comment-copy"><code>threading.enumerate()</code> only includes the threads in the current process, so running multiple copies of the same script in separate instances of Python running as separate process isn't a problem. It's just that if you later decide to expand on this code (or use it in some other project) you may have daemon threads created in another part of the code, or what's now the main code may even be code running in some background thread.</span>
+<span class="comment-copy">I can see this being extremely useful!  Thanks :)</span>
+<span class="comment-copy">It isn't thread-safe to modify shared globals without a lock. And it's <i>especially</i> dangerous to do things like <code>urlsToFetch-=1</code>. Inside the interpreter, that compiles into three separate steps to load <code>urlsToFetch</code>, subtract one, and store <code>urlsToFetch</code>. If the interpreter switches threads between the load and the store, you'll end up with thread 1 loading a 2, then thread 2 loading the same 2, then thread 2 storing a 1, then thread 1 storing a 1.</span>
+<span class="comment-copy">hi abarnert, thanks for your answer can you please suggest a solution for thread-safe? many thanks</span>
+<span class="comment-copy">You can put a <code>threading.Lock</code> around every access to the variable, or lots of other possibilities (use a counted semaphore instead of a plain integer, or use a barrier instead of counting explicitly, …), but you really don't need this global at all. Just <code>join</code> all the threads instead of daemonizing them, and it's done when you've joined them all.</span>
+<span class="comment-copy">In fact… daemonizing the threads like this and then not waiting on anything means your program quits, terminating all of the worker threads, before most of them can finish. On a fastish MacBook Pro with a slowish network connection, I often don't get <i>any</i> finished before it quits.</span>

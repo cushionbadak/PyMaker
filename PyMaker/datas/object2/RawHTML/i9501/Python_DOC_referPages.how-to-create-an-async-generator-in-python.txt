@@ -1,0 +1,135 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to rewrite this Python2.7 code to the new async world order:</p>
+<pre><code>def get_api_results(func, iterable):
+    pool = multiprocessing.Pool(5)
+    for res in pool.map(func, iterable):
+        yield res
+</code></pre>
+<p><code>map()</code> blocks until all results have been computed, so I'm trying to rewrite this as an async implementation that will yield results as soon as they are ready. Like <code>map()</code>, return values must be returned in the same order as <code>iterable</code>. I tried this (I need <code>requests</code> because of legacy auth requirements):</p>
+<pre><code>import requests
+
+def get(i):
+    r = requests.get('https://example.com/api/items/%s' % i)
+    return i, r.json()
+
+async def get_api_results():
+    loop = asyncio.get_event_loop()
+    futures = []
+    for n in range(1, 11):
+        futures.append(loop.run_in_executor(None, get, n))
+    async for f in futures:
+        k, v = await f
+        yield k, v
+
+for r in get_api_results():
+    print(r)
+</code></pre>
+<p>but with Python 3.6 I'm getting:</p>
+<pre><code>  File "scratch.py", line 16, in &lt;module&gt;
+    for r in get_api_results():
+TypeError: 'async_generator' object is not iterable
+</code></pre>
+<p>How can I accomplish this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Regarding your older (2.7) code - multiprocessing is considered a powerful drop-in replacement for the much simpler threading module for concurrently processing CPU intensive tasks, where threading does not work so well.  Your code is probably not CPU bound - since it just needs to make HTTP requests - and threading might have been enough for solving your problem. </p>
+<p>However, instead of using <code>threading</code> directly, Python 3+ has a nice module called <a href="https://docs.python.org/3/library/concurrent.futures.html" rel="noreferrer">concurrent.futures</a> that with a cleaner API via cool <code>Executor</code> classes.  This module is available also for python 2.7 as an <a href="http://pythonhosted.org/futures/" rel="noreferrer">external package</a>.  </p>
+<p>The following code works on python 2 and python 3:</p>
+<pre><code># For python 2, first run:
+#
+#    pip install futures
+#
+from __future__ import print_function
+
+import requests
+from concurrent import futures
+
+URLS = [
+    'http://httpbin.org/delay/1',
+    'http://httpbin.org/delay/3',
+    'http://httpbin.org/delay/6',
+    'http://www.foxnews.com/',
+    'http://www.cnn.com/',
+    'http://europe.wsj.com/',
+    'http://www.bbc.co.uk/',
+    'http://some-made-up-domain.coooom/',
+]
+
+
+def fetch(url):
+    r = requests.get(url)
+    r.raise_for_status()
+    return r.content
+
+
+def fetch_all(urls):
+    with futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_url = {executor.submit(fetch, url): url for url in urls}
+        print("All URLs submitted.")
+        for future in futures.as_completed(future_to_url):
+            url = future_to_url[future]
+            if future.exception() is None:
+                yield url, future.result()
+            else:
+                # print('%r generated an exception: %s' % (
+                # url, future.exception()))
+                yield url, None
+
+
+for url, s in fetch_all(URLS):
+    status = "{:,.0f} bytes".format(len(s)) if s is not None else "Failed"
+    print('{}: {}'.format(url, status))
+</code></pre>
+<p>This code uses <code>futures.ThreadPoolExecutor</code>, based on threading.  A lot of the magic is in <code>as_completed()</code> used here.</p>
+<p>Your python 3.6 code above, uses <a href="https://docs.python.org/3/library/asyncio-eventloop.html#executor" rel="noreferrer"><code>run_in_executor()</code></a> which creates a <code>futures.ProcessPoolExecutor()</code>, and does not really use asynchronous IO!!</p>
+<p>If you really want to go forward with asyncio, you will need to use an HTTP client that supports asyncio, such as <a href="http://aiohttp.readthedocs.io/en/stable/" rel="noreferrer">aiohttp</a>.  Here is an example code:</p>
+<pre><code>import asyncio
+
+import aiohttp
+
+
+async def fetch(session, url):
+    print("Getting {}...".format(url))
+    async with session.get(url) as resp:
+        text = await resp.text()
+    return "{}: Got {} bytes".format(url, len(text))
+
+
+async def fetch_all():
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch(session, "http://httpbin.org/delay/{}".format(delay))
+                 for delay in (1, 1, 2, 3, 3)]
+        for task in asyncio.as_completed(tasks):
+            print(await task)
+    return "Done."
+
+
+loop = asyncio.get_event_loop()
+resp = loop.run_until_complete(fetch_all())
+print(resp)
+loop.close()
+</code></pre>
+<p>As you can see, <code>asyncio</code> also has an <code>as_completed()</code>, now using real asynchronous IO, utilizing only one thread on one process.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You put your event loop in another co-routine. Don't do that. The event loop is the outermost 'driver' of async code, and should be run synchronous.</p>
+<p>If you need to process the fetched results, write more coroutines that do so. They could take the data from a queue, or could be driving the fetching directly.</p>
+<p>You could have a main function that fetches and processes results, for example:</p>
+<pre><code>async def main(loop): 
+    for n in range(1, 11):
+        future = loop.run_in_executor(None, get, n)
+        k, v = await future
+        # do something with the result
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main(loop))
+</code></pre>
+<p>I'd make the <code>get()</code> function properly async too using an async library like <a href="http://aiohttp.readthedocs.io/en/stable/" rel="noreferrer"><code>aiohttp</code></a> so you don't have to use the executor at all.</p>
+</div>
+<span class="comment-copy">Don't put the event loop in an async code block, async code must be run by the event loop, not the other way around.</span>
+<span class="comment-copy">Thanks! Surely, I'm missing something here. All event loop examples I have seen use loop.run_until_complete(get_api_results()) which in my understanding would both make the call blocking and lose the results.</span>
+<span class="comment-copy">You normally would have more coroutines handling the results, with the event loop driving those.</span>
+<span class="comment-copy">also, <code>requests.get()</code> is a blocking call, not something you can await on.</span>
+<span class="comment-copy">Yes, that's why I wrapped it in <code>loop.run_in_executor()</code> as suggested in <a href="http://stackoverflow.com/questions/22190403/how-could-i-use-requests-in-asyncio" title="how could i use requests in asyncio">stackoverflow.com/questions/22190403/…</a></span>
+<span class="comment-copy"><code>Since coroutines are generators, it is not possible to use simple "yield"s in them.</code>  It's possible. <a href="https://stackoverflow.com/a/37550568/2908138">stackoverflow.com/a/37550568/2908138</a></span>
+<span class="comment-copy">@im7mortal: thank you,  I have removed this part from the answer.</span>

@@ -1,0 +1,121 @@
+<div class="post-text" itemprop="text">
+<p>I have a strange problem with using mmap in python when writing to memory (/dev/mem).
+To be clear, reading is done in the same manner and it works OK.
+But when it comes to writing, it seems that every second byte is unwritable.</p>
+<p>ex.</p>
+<pre><code> when I read i get 
+ addr 0x200 val 0x1234
+ but when I try to write
+ addr 0x200 val 0x4321
+ what really is written is
+ addr 0x200 val 0x0021
+</code></pre>
+<p>When I try to write byte by byte, the same happens.
+ex.</p>
+<pre><code>write:
+addr 0x200 0x43
+addr 0x201 0x21
+I get
+addr 0x200 0x00
+addr 0x201 0x21
+</code></pre>
+<p>Code:</p>
+<pre><code>class Pydump:
+    def __init__(self, addr, length = 1, word_size = 4, filename = '/dev/mem'):
+        if addr &lt; 0 or length &lt; 0: raise ValueError('Address or length invalid')
+        self._verbose = verbose
+
+        self.word_size = word_size
+        self.mask = ~(self.word_size - 1)
+        self.base_addr = addr &amp; ~(mmap.PAGESIZE - 1)
+        self.addr_offset = addr - self.base_addr
+        self.word_length = length
+        self.no_of_bytes = self.word_length * self.word_size
+
+        # align length to full words
+        end_addr = addr + self.no_of_bytes
+        if end_addr % self.mask:
+            end_addr = (end_addr + self.word_size) &amp; self.mask
+
+        self.map_length = end_addr - self.base_addr
+        self.fname = filename
+
+        self.fd = os.open(self.fname, os.O_RDWR | os.O_SYNC)
+        self.mem = mmap.mmap(self.fd, self.map_length, mmap.MAP_SHARED,
+                             mmap.PROT_READ | mmap.PROT_WRITE,
+                             offset=self.base_addr)
+
+    def read(self):
+        mem = self.mem
+        virt_base_addr = self.addr_offset &amp; self.mask
+        mem.seek(virt_base_addr)
+
+        data = []
+        for i in range(self.no_of_bytes):
+            data.append(struct.unpack('B', mem.read_byte())[0])
+
+        abs_addr = self.base_addr + virt_base_addr
+        return PydumpBuffer(abs_addr, data, self.word_size)
+
+    def write(self, data):
+        mem = self.mem
+        virt_base_addr = self.addr_offset &amp; self.mask
+        mem.seek(virt_base_addr)
+
+        if self.word_size == 1:
+            mem.write(struct.pack('B', data))
+        elif self.word_size == 2:
+            mem.write(struct.pack('H', data))
+        elif self.word_size == 4:
+            mem.write(struct.pack('I', data))
+        else:
+            raise ValueError('Invalid word size')
+
+    def write_bytes(self, bytes):
+        if len(bytes) != self.no_of_bytes: raise ValueError('Wrong number of bytes given')
+        mem = self.mem
+        virt_base_addr = self.addr_offset &amp; self.mask
+        mem.seek(virt_base_addr)
+
+        for byte in bytes:
+            mem.write_byte(byte)
+</code></pre>
+<p>Example run (I prepared the memory with other memdump tool [bin] to be 0xEEEEEEEE):</p>
+<pre><code>&gt;&gt;&gt; from pydump import Pydump as memdump
+&gt;&gt;&gt; memdump(0x18007C20, 1, 4).read()
+0xEEEEEEEE
+&gt;&gt;&gt; memdump(0x18007C20, 1, 4).write(0x12345678)
+&gt;&gt;&gt; memdump(0x18007C20, 1, 4).read()
+0x00340078
+&gt;&gt;&gt; memdump(0x18007C20, 1, 4).write(0x87654321)
+&gt;&gt;&gt; memdump(0x18007C20, 1, 4).read()
+0x00650021
+</code></pre>
+<p>Example no 2 (I could not write even 2 bytes at 'first' byte place):</p>
+<pre><code>&gt;&gt;&gt; memdump(0x18007C20, 1, 2).write(0xABCD)
+&gt;&gt;&gt; memdump(0x18007C20, 1, 4).read()
+0x00650021
+&gt;&gt;&gt; memdump(0x18007C21, 1, 1).write(0xCD)
+&gt;&gt;&gt; memdump(0x18007C20, 1, 4).read()
+0x00650021
+&gt;&gt;&gt; memdump(0x18007C22, 1, 1).write(0xCD)
+&gt;&gt;&gt; memdump(0x18007C20, 1, 4).read()
+0x00CDCD00
+</code></pre>
+<p>Any thoughts on what could be the problem ?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I know what is wrong now.
+The answer is that it's fault as well of python as my specific hardware/driver.</p>
+<p>I looked through the implementation of mmap and it uses <strong>memcpy</strong>, which as we know copies byte by byte. In C implemention this did not happen, when we needed to write 4 bytes, 4 bytes were written.
+So here comes the limitation of my hardware/driver which is that every register must be written in full (I did not know this at the time of stating the question), thus when writing byte by byte I will get weird behaviour. </p>
+<p>Some registers are 16bit and some are 32bit.
+When I was writing 0xFFFF to 16bit register I ended up having 0x00FF. So memcpy was copying 0xFF twice. My driver got write(0xFF) then write(0xFF), so what I was actually doing (because of the python) was two writes to register of byte 0xFF :)
+Probably the same happened with 32bit registers, although it looked different (but also the driver may behave different).</p>
+<p>For it to work I would have to change the implementation of python mmap :(</p>
+</div>
+<span class="comment-copy">What Python version are you using? BTW, <code>bytes</code> is not a good variable name as it shadows the built-in <a href="https://docs.python.org/3/library/functions.html#bytes" rel="nofollow noreferrer"><code>bytes</code></a> type. Note that in Python 2 <code>bytes</code> is essentially a synonym for <code>str</code>.</span>
+<span class="comment-copy">I'm using python 2.7.10.</span>
+<span class="comment-copy">What is this memory that you're writing to? Is it a memory-mapped device? They could have special requirements and thus you could try ctypes for writing there.</span>
+<span class="comment-copy">Yes, it's memory-mapped device. Actually those are registers mapped to memory. How ctypes would be better if all I want is write specific words ?</span>
+<span class="comment-copy">Add a more complete code sample. Your write code is fragmentary and we can't see exactly what you're doing.</span>

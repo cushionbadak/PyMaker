@@ -1,0 +1,113 @@
+<div class="post-text" itemprop="text">
+<p>I have a simple aiohttp-server with two handlers.
+First one does some computations in the <code>async for</code> loop. Second one just returns text response. <code>not_so_long_operation</code> returns 30-th fibonacci number with the slowest recursive implementation, which takes something about one second.</p>
+<pre><code>def not_so_long_operation():
+    return fib(30)
+
+class arange:
+    def __init__(self, n):
+        self.n = n
+        self.i = 0
+
+    async def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        i = self.i
+        self.i += 1
+        if self.i &lt;= self.n:
+            return i
+        else:
+            raise StopAsyncIteration
+
+# GET /
+async def index(request):
+    print('request!')
+    l = []
+    async for i in arange(20):
+        print(i)
+        l.append(not_so_long_operation())
+
+    return aiohttp.web.Response(text='%d\n' % l[0])
+
+# GET /lol/
+async def lol(request):
+    print('request!')
+    return aiohttp.web.Response(text='just respond\n')
+</code></pre>
+<p>When I'm trying to fetch <code>/</code> and then <code>/lol/</code>, it gives me response for the second one only when the first one gets finished.<br/>
+What am I doing wrong and how to make index handler release the ioloop on each iteration?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your example has no <em>yield points</em> (<code>await</code> statements) for switching between tasks.
+Asynchronous iterator <strong>allows</strong> to use <code>await</code> inside <code>__aiter__</code>/<code>__anext__</code> but don't insert it automatically into your code.</p>
+<p>Say,</p>
+<pre><code>class arange:
+    def __init__(self, n):
+        self.n = n
+        self.i = 0
+
+    async def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        i = self.i
+        self.i += 1
+        if self.i &lt;= self.n:
+            await asyncio.sleep(0)  # insert yield point
+            return i
+        else:
+            raise StopAsyncIteration
+</code></pre>
+<p>should work as you expected.</p>
+<p>In real application most likely you don't need <code>await asyncio.sleep(0)</code> calls because you will wait on database access and similar activities.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since, <code>fib(30)</code> is CPU bound and sharing little data, you should probably use a <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ProcessPoolExecutor" rel="nofollow"><code>ProcessPoolExecutor</code></a> (as opposed to a <code>ThreadPoolExecutor</code>):</p>
+<pre><code>async def index(request):
+    loop = request.app.loop
+    executor = request.app["executor"]
+    result = await loop.run_in_executor(executor, fib, 30)
+    return web.Response(text="%d" % result)
+</code></pre>
+<p>Setup <code>executor</code> when you create the <code>app</code>:</p>
+<pre><code>app = Application(...)
+app["exector"] = ProcessPoolExector()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>An asynchronous iterator is not really needed here. Instead you can simply give the control back to the event loop inside your loop. In python 3.4, this is done by using a simple <code>yield</code>:</p>
+<pre><code>@asyncio.coroutine
+def index(self):
+    for i in range(20):
+        not_so_long_operation()
+        yield
+</code></pre>
+<p>In python 3.5, you can define an <code>Empty</code> object that basically does the same thing:</p>
+<pre><code>class Empty:
+    def __await__(self):
+        yield
+</code></pre>
+<p>Then use it with the <code>await</code> syntax:</p>
+<pre><code>async def index(request):
+    for i in range(20):
+        not_so_long_operation()
+        await Empty()
+</code></pre>
+<p>Or simply use <a href="https://docs.python.org/3.4/library/asyncio-task.html#asyncio.sleep" rel="nofollow">asyncio.sleep(0)</a> that has been <a href="https://github.com/python/asyncio/commit/f11cc8f1ed12ffaca656ddae35594425c0a86145" rel="nofollow">recently optimized</a>:</p>
+<pre><code>async def index(request):
+    for i in range(20):
+        not_so_long_operation()
+        await asyncio.sleep(0)
+</code></pre>
+<p>You could also run the <code>not_so_long_operation</code> in a thread using the <a href="https://docs.python.org/3/library/asyncio-eventloop.html#executor" rel="nofollow">default executor</a>:</p>
+<pre><code>async def index(request, loop):
+    for i in range(20):
+        await loop.run_in_executor(None, not_so_long_operation)
+</code></pre>
+</div>
+<span class="comment-copy">So, as far as I understood, according to <a href="https://www.python.org/dev/peps/pep-0492/#why-stopasynciteration" rel="nofollow noreferrer">PEP-492</a>, <code>async for</code> was added to avoid collisions with <code>StopIteration</code>, used in coroutines internally?</span>
+<span class="comment-copy">Not exactly. <code>async for</code> uses <code>__aiter__</code>/<code>__anext__</code> pair of coroutines. Let's assume we read bulk of data from DB (like <a href="https://github.com/aio-libs/aioredis/blob/master/aioredis/commands/generic.py#L210-L220" rel="nofollow noreferrer">redis iscan command</a> ). It fetches a bulk of data, returns it item by item and fetch next bulk on data  exhausting. You may perform I/O in <code>__aiter__</code> coroutine with help of <code>await</code> statement but cannot do it in old-good <code>__iter__</code> method.</span>
+<span class="comment-copy"><code>fib(30)</code> is just an example of operation, which runs not so long once, but long enough while running in the loop. CPU-bound operation was not the best idea, but thank you for your snippet!</span>
+<span class="comment-copy">is it necessary to construct Empty object each time? Is it ok to create <code>next_tick = Empty()</code> and then use it with <code>await next_tick</code>?</span>
+<span class="comment-copy">@MichaelIhnatenko Sure it's fine, though I'm surprised there's no standard way to give the control back to the event loop in python 3.5.</span>

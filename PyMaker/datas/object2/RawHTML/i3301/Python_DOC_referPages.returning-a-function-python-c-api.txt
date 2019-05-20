@@ -1,0 +1,57 @@
+<div class="post-text" itemprop="text">
+<p>I am  creating Python bindings for a C library.  </p>
+<p>In C the code to use the functions would look like this:</p>
+<pre><code>Ihandle *foo;
+foo = MethFunc();
+SetArribute(foo, 's');
+</code></pre>
+<p>I am trying to get this into Python. Where I have <code>MethFunc()</code> and <code>SetAttribute()</code> functions that could be used in my Python code:</p>
+<pre><code>import mymodule
+foo = mymodule.MethFunc()
+mymodule.SetAttribute(foo)
+</code></pre>
+<p>So far my C code to return the function looks like this:</p>
+<pre><code>static PyObject * _MethFunc(PyObject *self, PyObject *args) {
+    return Py_BuildValue("O", MethFunc());
+}
+</code></pre>
+<p>But that fails by crashing (no errors)</p>
+<p>I have also tried <code>return MethFunc();</code> but that failed.  </p>
+<p>How can I return the function <code>foo</code> (or if what I am trying to achieve is completely wrong, how should I go about passing <code>MethFunc()</code> to <code>SetAttribute()</code>)?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem here is that <code>MethFunc()</code> returns an <code>IHandle *</code>, but you're telling Python to treat it as a <code>PyObject *</code>. Presumably those are completely unrelated types. </p>
+<p>A <code>PyObject *</code> (or any <code>struct</code> you or Python defines that starts with an appropriate <a href="https://docs.python.org/3/c-api/structures.html#c.PyObject_HEAD" rel="nofollow noreferrer"><code>HEAD</code></a> macro) begins with pointers to a refcount and a type, and the first thing Python is going to do with any object you hand it is deal with those pointers. So, if you give it an object that instead starts with, say, two <code>int</code>s, Python is going to end up trying to access a type at <code>0x00020001</code> or similar, which is almost certain to segfault. </p>
+<p>If you need to pass around a pointer to some C object, you have to wrap it up in a Python object. There are three ways to do this, from hackiest to most solid.</p>
+<hr/>
+<p>First, you can just cast the <code>IHandle *</code> to a <code>size_t</code>, then <code>PyLong_FromSize_t</code> it.</p>
+<p>This is dead simple to implement. But it means these objects are going to look exactly like numbers from the Python side, because that's all they are.</p>
+<p>Obviously you can't attach a method to this number; instead, your API has to be a free function that takes a number, then casts that number back to an <code>IHandle*</code> and calls a method.</p>
+<p>It's more like, e.g., C's <code>stdio</code>, where you have to keep passing <code>stdin</code> or <code>f</code> as an argument to <code>fread</code>, instead of Python's <code>io</code>, where you call methods on <code>sys.stdin</code> or <code>f</code>.</p>
+<p>But even worse, because there's no type checking, static or dynamic, to protect you from some Python code accidentally passing you the number <code>42</code>. Which you'll then cast to an <code>IHandle *</code> and try to dereference, leading to a segfault…</p>
+<p>And if you were hoping Python's garbage collector would help you know when the object is still referenced, you're out of luck. You need to make your users manually keep track of the number and call some <code>CloseHandle</code> function when they're done with it.</p>
+<p>Really, this isn't that much better than accessing your code from <code>ctypes</code>, so hopefully that inspires you to keep reading.</p>
+<hr/>
+<p>A better solution is to cast the <code>IHandle *</code> to a <code>void *</code>, then <code>PyCapsule_New</code> it.</p>
+<p>If you haven't read about <a href="https://docs.python.org/3/c-api/capsule.html" rel="nofollow noreferrer">capsules</a>, you need to at least skim the main chapter. But the basic idea is that it wraps up a <code>void*</code> as a Python object.</p>
+<p>So, it's almost as simple as passing around numbers, but solves most of the problems. Capsules are opaque values which your Python users can't accidentally do arithmetic on; they can't send you <code>42</code> in place of a capsule; you can attach a function that gets called when the last reference to a capsule goes away; you can even give it a nice name to show up in the <code>repr</code>.</p>
+<p>But you still can't attach any behavior to capsules. </p>
+<p>So, your API will still have to be a <code>MethSetAttribute(mymodule, foo)</code> instead of <code>mymeth.SetAttribute(foo)</code> if <code>mymodule</code> is a capsule, just as if it's an <code>int</code>. (Except now it's type-safe.)</p>
+<hr/>
+<p>Finally, you can build a new Python extension type for a struct that contains an <code>IHandle *</code>.</p>
+<p>This is a lot more work. And if you haven't read the tutorial on <a href="https://docs.python.org/3/extending/newtypes_tutorial.html" rel="nofollow noreferrer">Defining Extension Types</a>, you need to go thoroughly read through that whole chapter.</p>
+<p>But it means that you have an actual Python type, with everything that goes with it.</p>
+<p>You can give it a <code>SetAttribute</code> method, and Python code can just call that method. You can give it whatever <code>__str__</code> and <code>__repr__</code> you want. You can give it a <code>__doc__</code>. Python code can do <code>isinstance(mymodule, MyMeth)</code>. And so on.</p>
+<hr/>
+<p>If you're willing to use C++, or D, or Rust instead of C, there are some great libraries (PyCxx, boost::python, Pyd, rust-python, etc.) that can do most of the boilerplate for you. You just declare that you want a Python class and how you want its attributes and methods bound to your C attributes and methods and you get something you can use like a C++ class, except that it's actually a <code>PyObject *</code> under the covers. (And it'll even takes care of all the refcounting cruft for you via RAII, which will save you endless weekends debugging segfaults and memory leaks…)</p>
+<p>Or you can use <a href="http://cython.org" rel="nofollow noreferrer">Cython</a>, which lets you write C extension modules in a language that's basically Python, but extended to interface with C code. So your wrapper class is just a <code>class</code>, but with a special private <code>cdef</code> attribute that holds the <code>IHandle *</code>, and your <code>SetAttribute(self, s)</code> can just call the C <code>SetAttribute</code> function with that private attribute.</p>
+<p>Or, as suggested by user, you can also use <a href="http://www.swig.org/" rel="nofollow noreferrer">SWIG</a> to generate the C bindings for you. For simple cases, it's pretty trivial—just feed it your C API, and it gives you back the code to build your Python <code>.so</code>. For less simple cases, I personally find it a lot more painful than something like PyCxx, but it definitely has a lower learning curve if you don't already know C++.</p>
+</div>
+<span class="comment-copy">You may want to look into generating bindings with <a href="http://www.swig.org/" rel="nofollow noreferrer">SWIG</a>. It's probably a lot more convenient than writing up an extension module and defining a bunch of extension types yourself, or going through ctypes for everything.</span>
+<span class="comment-copy">Ctypes is definitly not an option.  I would prefer to use the standard api if possibl, but thank you for the advice</span>
+<span class="comment-copy">It's also worth looking into lower-level libraries like PyCxx, boost::python, Pyd, rust-python, etc. Instead of writing code to drive an interface generator like SWIG, you write code in a general-purpose language like C++ or D or Rust that can talk directly to C, and there are templates/macros/etc. that generate Python types, manage Python refcounting, etc. so you don't have to deal with all of that boilerplate (and all of the annoying bugs that you're going to face in doing this).</span>
+<span class="comment-copy"><code>long</code> and <code>PyLong_FromLong</code> should probably be <code>size_t</code> and <code>PyLong_FromSize_t</code>, since <code>long</code> might not be big enough. (That option is still a bad idea even with <code>size_t</code>, though.)</span>
+<span class="comment-copy">@user2357112 Fixed. But anyway, the point of that section is really to scare people into understanding why they want to do all the hard work of writing a real extension type (or, better, letting PyCxx do it for them). Anyone who looks at that and says, "Yes, that's what I want, Python objects that can't be inspected, and that regularly cause segfaults" is probably beyond help…</span>
+<span class="comment-copy">@Simon One more option to consider: can you use Cython? It lets you write C extension modules in a language that’s basically Python, except that it can directly interface with C. So your wrapper class looks more like a Python class with a special private member variable than like a bunch of functions using <code>PyArgs</code> calls and a couple of structs to tie them together.</span>
+<span class="comment-copy">I don't know what you mean by "runtimes". Do you mean .so/.dylib/.dll files? If so, then yes, Cython can deal with those. It may make the <code>setup.py</code> slightly more complicated, and of course you need to distribute those shared libs together with your module, but otherwise, it doesn't really matter whether the C code you're linking to is in <code>.c</code> files, <code>.o</code>/<code>.obj</code> files, or shared libs.</span>
+<span class="comment-copy">@Simon It's definitely worth learning how to write a C extension module—including at least one real extension type—from scratch. But once you've learned it, it's often worth doing whatever you can (Cython, PyCxx, ctypes/cffi, SWIG, …) to avoid doing it again. :)</span>

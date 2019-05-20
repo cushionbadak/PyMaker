@@ -1,0 +1,174 @@
+<div class="post-text" itemprop="text">
+<p>Let's assume I have the following code:</p>
+<pre><code>import asyncio
+import threading
+
+queue = asyncio.Queue()
+
+def threaded():
+    import time
+    while True:
+        time.sleep(2)
+        queue.put_nowait(time.time())
+        print(queue.qsize())
+
+@asyncio.coroutine
+def async():
+    while True:
+        time = yield from queue.get()
+        print(time)
+
+loop = asyncio.get_event_loop()
+asyncio.Task(async())
+threading.Thread(target=threaded).start()
+loop.run_forever()
+</code></pre>
+<p>The problem with this code is that the loop inside <code>async</code> coroutine is never finishing the first iteration, while <code>queue</code> size is increasing.</p>
+<p><strong>Why is this happening this way and what can I do to fix it?</strong></p>
+<p>I can't get rid of separate thread, because in my real code I use a separate thread to communicate with a serial device, and I haven't find a way to do that using <code>asyncio</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>asyncio.Queue</code> <a href="https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue" rel="noreferrer">is not thread-safe</a>, so you can't use it directly from more than one thread. Instead, you can use <a href="https://github.com/aio-libs/janus" rel="noreferrer"><code>janus</code></a>, which is a third-party library that provides a thread-aware <code>asyncio</code> queue:</p>
+<pre><code>import asyncio
+import threading
+import janus
+
+def threaded(squeue):
+    import time
+    while True:
+        time.sleep(2)
+        squeue.put_nowait(time.time())
+        print(squeue.qsize())
+
+@asyncio.coroutine
+def async(aqueue):
+    while True:
+        time = yield from aqueue.get()
+        print(time)
+
+loop = asyncio.get_event_loop()
+queue = janus.Queue(loop=loop)
+asyncio.Task(asyncio.ensure_future(queue.async_q))
+threading.Thread(target=threaded, args=(queue.sync_q,)).start()
+loop.run_forever()
+</code></pre>
+<p>There is also <a href="https://github.com/dano/aioprocessing" rel="noreferrer"><code>aioprocessing</code></a> (full-disclosure: I wrote it), which provides process-safe (and as a side-effect, thread-safe) queues as well, but that's overkill if you're not trying to use <code>multiprocessing</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you do not want to use another library you can schedule a coroutine from the thread. Replacing the <code>queue.put_nowait</code> with the following works fine.</p>
+<pre><code>asyncio.run_coroutine_threadsafe(queue.put(time.time()), loop)
+</code></pre>
+<p>The variable <code>loop</code> represents the event loop in the main thread. </p>
+<p>EDIT:</p>
+<p>The reason why your <code>async</code> coroutine is not doing anything is that
+the event loop never gives it a chance to do so. The queue object is
+not threadsafe and if you dig through the cpython code you find that
+this means that <code>put_nowait</code> wakes up consumers of the queue through
+the use of a future with the <code>call_soon</code> method of the event loop. If
+we could make it use <code>call_soon_threadsafe</code> it should work. The major
+difference between <code>call_soon</code> and <code>call_soon_threadsafe</code>, however, is
+that <code>call_soon_threadsafe</code> wakes up the event loop by calling <a href="https://github.com/python/cpython/blob/5f908005ce16b06d5af7b413264009c4b062f33c/Lib/asyncio/base_events.py#L626" rel="nofollow noreferrer"><code>loop._write_to_self()</code></a> . So let's call it ourselves:</p>
+<pre><code>import asyncio
+import threading
+
+queue = asyncio.Queue()
+
+def threaded():
+    import time
+    while True:
+        time.sleep(2)
+        queue.put_nowait(time.time())
+        queue._loop._write_to_self()
+        print(queue.qsize())
+
+@asyncio.coroutine
+def async():
+    while True:
+        time = yield from queue.get()
+        print(time)
+
+loop = asyncio.get_event_loop()
+asyncio.Task(async())
+threading.Thread(target=threaded).start()
+loop.run_forever()
+</code></pre>
+<p>Then, everything works as expected. </p>
+<p>As for the threadsafe aspect of
+accessing shared objects,<code>asyncio.queue</code> uses under the hood
+<code>collections.deque</code> which has threadsafe <code>append</code> and <code>popleft</code>.
+Maybe checking for queue not empty and popleft is not atomic, but if
+you consume the queue only in one thread (the one of the event loop)
+it could be fine.</p>
+<p>The other proposed solutions, <code>loop.call_soon_threadsafe</code> from Huazuo
+Gao's answer and my <code>asyncio.run_coroutine_threadsafe</code> are just doing
+this, waking up the event loop.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>BaseEventLoop.call_soon_threadsafe</code> is at hand. See <a href="https://docs.python.org/3/library/asyncio-dev.html#concurrency-and-multithreading" rel="nofollow"><code>asyncio</code> doc</a> for detail.</p>
+<p>Simply change your <code>threaded()</code> like this:</p>
+<pre><code>def threaded():
+    import time
+    while True:
+        time.sleep(1)
+        loop.call_soon_threadsafe(queue.put_nowait, time.time())
+        loop.call_soon_threadsafe(lambda: print(queue.qsize()))
+</code></pre>
+<p>Here's a sample output:</p>
+<pre><code>0
+1443857763.3355968
+0
+1443857764.3368602
+0
+1443857765.338082
+0
+1443857766.3392274
+0
+1443857767.3403943
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>What about just using threading.Lock with asyncio.Queue?</p>
+<pre><code>class ThreadSafeAsyncFuture(asyncio.Future):
+    """ asyncio.Future is not thread-safe
+    https://stackoverflow.com/questions/33000200/asyncio-wait-for-event-from-other-thread
+    """
+    def set_result(self, result):
+        func = super().set_result
+        call = lambda: func(result)
+        self._loop.call_soon_threadsafe(call)  # Warning: self._loop is undocumented
+
+
+class ThreadSafeAsyncQueue(queue.Queue):
+    """ asyncio.Queue is not thread-safe, threading.Queue is not awaitable
+    works only with one putter to unlimited-size queue and with several getters
+    TODO: add maxsize limits
+    TODO: make put corouitine
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.lock = threading.Lock()
+        self.loop = asyncio.get_event_loop()
+        self.waiters = []
+
+    def put(self, item):
+        with self.lock:
+            if self.waiters:
+                self.waiters.pop(0).set_result(item)
+            else:
+                super().put(item)
+
+    async def get(self):
+        with self.lock:
+            if not self.empty():
+                return super().get()
+            else:
+                fut = ThreadSafeAsyncFuture()
+                self.waiters.append(fut)
+        result = await fut
+        return result
+</code></pre>
+<p>See also - <a href="https://stackoverflow.com/questions/33000200/asyncio-wait-for-event-from-other-thread">asyncio: Wait for event from other thread</a></p>
+</div>
+<span class="comment-copy"><code>"I can't get rid of separate thread, because in my real code I use a separate thread to communicate with a serial device"</code> -- Have you tried using <code>loop.run_in_executor</code> to do any blocking interaction with the serial device?</span>
+<span class="comment-copy"><code>NameError: name 'async' is not defined</code> given at <code>asyncio.Task(async(queue.async_q))</code>. What shall I do?</span>
+<span class="comment-copy">@StamKaly Sorry, use <code>asyncio.async</code>,  or even better,  <code>asyncio.ensure_future</code>, because <code>asyncio.async</code> is now deprecated.</span>

@@ -1,0 +1,69 @@
+<div class="post-text" itemprop="text">
+<p>Consider this Python script:</p>
+<pre><code>for i in range(4000):
+    print(i)
+</code></pre>
+<p>and this Perl script:</p>
+<pre><code>for my $i (0..4000-1) {
+    print $i, "\n";
+}
+</code></pre>
+<p><code>python3 pipe.py | head -n3000 &gt;/dev/null</code> produces an error:</p>
+<pre><code>Exception ignored in: &lt;_io.TextIOWrapper name='&lt;stdout&gt;' mode='w' encoding='UTF-8'&gt;
+BrokenPipeError: [Errno 32] Broken pipe
+</code></pre>
+<p>but</p>
+<p><code>perl pipe.pl | head -n3000 &gt;/dev/null</code> produces no error (in Perl v5.26.1).</p>
+<p>Why such a discrepancy between Python and Perl? How to make Perl to produce a similar error message?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>What's going on here is that in both cases you have a process writing to a pipe whose read end was closed (by <code>head</code> exiting after a certain number of bytes).</p>
+<p>This causes a <code>SIGPIPE</code> signal to be sent to the writing process. By default this kills the process. The process can ignore the signal if it wants to, which just makes the <code>write</code> call fail with an <code>EPIPE</code> error.</p>
+<p><a href="https://docs.python.org/3/whatsnew/3.3.html#pep-3151" rel="noreferrer">Starting with version 3.3</a>, Python raises a <code>BrokenPipeError</code> exception in this case, so it looks like Python 1) ignores <code>SIGPIPE</code> by default and 2) translates <code>EPIPE</code> to a <code>BrokenPipeError</code> exception.</p>
+<p>Perl does not ignore or handle signals by default. That means it gets killed by <code>SIGPIPE</code> in your example, but because it is not the last command in a pipeline (that would be <code>head</code> here), the shell just ignores it. You can make it more visible by not using a pipeline:</p>
+<pre><code>perl pipe.pl &gt; &gt;(head -n3000 &gt;/dev/null)
+</code></pre>
+<p>This piece of bash trickery makes perl write to a pipe, but not as part of a shell pipeline. I can't test it now, but at minimum this will set <code>$?</code> (the command exit status) to <code>141</code> in the shell (128 + signal number, which for <code>SIGPIPE</code> is 13), and it may also report a <code>Broken pipe</code>.</p>
+<p>You can deal with it manually in the Perl code, though:</p>
+<ul>
+<li><p>Variant 1: Throw an error from the signal handler</p>
+<pre><code>$SIG{PIPE} = sub { die "BrokenPipeError" };
+</code></pre></li>
+<li><p>Variant 2: Ignore the signal, handle write errors</p>
+<pre><code>$SIG{PIPE} = 'IGNORE';
+...
+print $i, "\n" or die "Can't print: $!";
+</code></pre>
+<p>Note that in this case you have to think about buffering, however. If you don't enable autoflush (as in <code>STDOUT-&gt;autoflush(1)</code>) and output is going to a pipe or file, Perl will collect the text in an internal buffer first (and the <code>print</code> call will succeed). Only when the buffer gets full (or when the filehandle is closed, whichever happens first) is the text actually written out and the buffer emptied. This is why <code>close</code> can also report write errors.</p></li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>The python exception is raised since the reading process (<code>head</code>) closes its end so the script receives <code>SIGPIPE</code> the next time it attempts to write; see <a href="https://stackoverflow.com/q/26692284/4653379">this post</a>. This involved decisions in Python community, to change defaults so to inform the user (see the linked post).</p>
+<p>This is not seen in Perl because it gets killed by that signal (what is its disposition) without saying anything. So you could override that</p>
+<pre><code>use warnings;
+
+$| = 1;
+
+$SIG{PIPE} = sub { die $! };
+
+for my $i (0..4_000-1) {
+    print $i, "\n";
+}
+</code></pre>
+<p>(without the <code>$| = 1</code> I need more than <code>5_000</code> above for it to happen.)</p>
+<p>Or, rather issue a <code>warn</code>ing (instead of <code>die</code>) so that the program continues</p>
+<pre><code>local $SIG{PIPE} = sub { warn "Ignoring $_[0]: $!" };
+</code></pre>
+<p><strong>Update</strong>   Given the clarification provided in a comment I'd recommend this handler to be global in fact. It can still be overriden with a <code>local</code> one in particular scopes. Besides, there is nothing wrong with surviving a <code>SIGPIPE</code> instead of being terminated, as long as there is a warning.</p>
+<p>Note that even without that the exit status of the Perl process will show the problem. Run <code>echo $?</code> after the process "completes" (is quietly terminated); I get <code>32</code> on my system.</p>
+<p>To mimic Python's behavior further you could issue a <code>die</code> in the signal handler and handle that exception, by putting it all in <code>eval</code>.</p>
+<p>Thanks to <a href="https://stackoverflow.com/users/1848654/melpomene">melpomene</a> and <a href="https://stackoverflow.com/users/589924/ikegami">ikegami</a> for comments.</p>
+</div>
+<span class="comment-copy">Can you explain why you think  the Perl code should generate an error?</span>
+<span class="comment-copy">@toolic Because the stdout is closed while Perl still writes to it</span>
+<span class="comment-copy">@porton, That leads to SIGPIPE being sent to the process, and the default behaviour of SIGPIPE is to kill the receiving process. The exit status of the <code>perl</code> process will reflect this. Python must change the default.</span>
+<span class="comment-copy">I'm pretty sure perl is not supposed to handle SIGPIPE by default.</span>
+<span class="comment-copy">@melpomene Perhaps in particular situations? If it gets a <code>SIGPIPE</code> it must do something or it would be killed.  I think we'd be upset if scripts printed to STDERR for over 4kB.  Apparently there was a good deliberation in Python community about informing the user, etc.</span>
+<span class="comment-copy">I'm also pretty sure it is getting killed.</span>
+<span class="comment-copy">OK, I got it -- it appears that it does killed, quietly.  (Of course I get output since that's when it gets killed!) .... testing before edit ...</span>
+<span class="comment-copy">But some of our Perl scripts (after upgrading to a newer version of Perl) produces "Unable to flush stdout: Broken pipe" in the logs. What in Perl can cause this message? (This is the very question I need to answer. I was assigned the task to localize and eliminate this error, given that we don't yet know which of our Perl scripts causes this.)</span>

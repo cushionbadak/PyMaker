@@ -1,0 +1,148 @@
+<div class="post-text" itemprop="text">
+<p>I am trying to understand pythons asynico module and came across the following piece of code at <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task" rel="nofollow noreferrer">https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task</a></p>
+<pre><code>import time
+import asyncio
+
+async def say_after(delay, what):
+    await asyncio.sleep(delay)
+    print(what)
+
+async def main():
+    task1 = asyncio.create_task(
+        say_after(1, 'hello'))
+
+    task2 = asyncio.create_task(
+        say_after(2, 'world'))
+
+    print('started at', time.strftime('%X'))
+
+    # Wait until both tasks are completed (should take
+    # around 2 seconds.)
+    await task1
+    await task2
+
+    print('finished at', time.strftime('%X'))
+
+asyncio.run(main())
+</code></pre>
+<p>It turns out that  <code>await task2</code>, (or <code>task1</code>, but not both) can simply be removed and the code appears to be doing exactly the same. I find this very counterintuitive, what is happening here?
+Thank you for your time.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>await</code> does not start the coroutines in the tasks, it simply tells the coroutine <code>main</code> to <em>wait</em> for those two coros. The event loop is implicitly started with <code>run_until_complete</code> which in turn means it will wait for the coro passed to it (<code>main</code>) to complete. It is up to that coro to extend its own lifetime (by <code>await</code>ing) long enough to ensure that the tasks created from inside it can complete.</p>
+<pre><code>async def main():
+    task1 = asyncio.create_task(
+        say_after(1, 'hello'))
+    task2 = asyncio.create_task(
+        say_after(2, 'world'))
+    #await task1
+    #await task2
+    print(asyncio.all_tasks(asyncio.get_event_loop()))
+
+# will print (added line breaks and shortened paths for readibility):
+{
+    &lt;Task pending coro=&lt;main() running at C:/Users/.../lmain.py:17&gt; cb=[_run_until_complete_cb() at C:...\lib\asyncio\base_events.py:150]&gt;, 
+    &lt;Task pending coro=&lt;say_after() running at C:/Users/.../lmain.py:5&gt;&gt;, 
+    &lt;Task pending coro=&lt;say_after() running at C:/Users/.../lmain.py:5&gt;&gt;
+}
+</code></pre>
+<p>As you see, all three coros are running without <code>await</code>ing anything. It's just that the two <code>say_after</code> coros will take longer than the <code>main</code> that implicitly controls how long the event loop runs.</p>
+<p>If you made <code>main</code> wait for work done in the loop long enough, both tasks would complete:</p>
+<pre><code>async def main():
+    task1 = asyncio.create_task(
+        say_after(1, 'hello'))
+    task2 = asyncio.create_task(
+        say_after(2, 'world'))
+    print('started at', time.strftime('%X'))
+    #await task1
+    #await task2
+    await asyncio.sleep(5)
+    print('finished at', time.strftime('%X'))
+
+# output
+started at 15:31:48
+hello
+world
+finished at 15:31:53
+</code></pre>
+<p>So, which task, if any, completes when you test commenting out the <code>await</code>ing of <code>task1</code> and/or <code>task2</code> above is basically just a matter of timing, mainly influenced by HW, OS and possibly runtime (i.e. IDE vs. shell).</p>
+<p>P.S. Tasks only have <a href="https://github.com/python/cpython/blob/addf8afb43af58b9bf56a0ecfd0f316dd60ac0c3/Lib/asyncio/futures.py#L21-L23" rel="nofollow noreferrer">three states</a>: <code>pending</code>, <code>cancelled</code> and <code>finished</code>. Every task is in state <code>pending</code> right after its creation and remains in that state until the coroutine wrapped in it either terminates (in any way) or until it gets cancelled by the event loop controlling it.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There are three different scenarios you've posed:</p>
+<ol>
+<li>No <code>await</code> statements (comment-out both)</li>
+<li>Use only <code>await task1</code> (comment-out the second)</li>
+<li>Use only <code>await task2</code> (commment-out the first)</li>
+</ol>
+<p>Here's your script; extend the sleep time on <code>task2</code> a bit just for illustration's sake.</p>
+<pre><code># tasktest.py
+import time
+import asyncio
+
+async def say_after(delay, what):
+    await asyncio.sleep(delay)
+    print(what)
+
+async def main():
+    task1 = asyncio.create_task(
+        say_after(1, 'hello'))
+
+    task2 = asyncio.create_task(
+        say_after(3, 'world'))
+
+    print('started at', time.strftime('%X'))
+    await task1
+    # await task2
+    print('finished at', time.strftime('%X'))
+
+asyncio.run(main())
+</code></pre>
+<h3>1. No <code>await</code> statements</h3>
+<p>Here's the meat of <a href="https://github.com/python/cpython/blob/7e18deef652a9d413d5dbd19d61073ba7eb5460e/Lib/asyncio/runners.py#L8" rel="nofollow noreferrer"><code>asyncio.run()</code></a>:</p>
+<pre><code>loop = events.new_event_loop()
+try:
+    events.set_event_loop(loop)
+    loop.set_debug(debug)
+    return loop.run_until_complete(main)   # &lt; -----
+finally:
+    try:
+        _cancel_all_tasks(loop)            # &lt; -----
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    finally:
+        events.set_event_loop(None)
+        loop.close()
+</code></pre>
+<p>Importantly, the loop <em>only</em> cares that <code>main()</code> is complete, and then cancels all other tasks that are associated with the running event loop.  (Each task is <a href="https://github.com/python/cpython/blob/7e18deef652a9d413d5dbd19d61073ba7eb5460e/Lib/asyncio/tasks.py#L114" rel="nofollow noreferrer">tied to</a> an event loop when it is specified.)</p>
+<p>If you define <code>main()</code> without any <code>await</code> statements, <code>create_task()</code> schedules the tasks to be executed, but <code>main()</code> does not wait for either one of them to complete.</p>
+<h3>2. <code>await task1</code></h3>
+<p>Setup:</p>
+<pre><code>await task1
+# await task2
+</code></pre>
+<p>Output:</p>
+<pre><code>(base_py37) $ python3 tasktest.py 
+started at 11:06:46
+hello
+finished at 11:06:47
+</code></pre>
+<p>Both tasks move from pending to running, but only <code>task1</code> completes, because <code>main()</code> only awaited on a task that takes ~1 second, not long enough for <code>task2</code> to run.<sup>*</sup>  (Notice that <code>main()</code> takes only 1 second.)</p>
+<h3>3. <code>await task2</code></h3>
+<p>Setup:</p>
+<pre><code># await task1
+await task2
+</code></pre>
+<p>Output:</p>
+<pre><code>(base_py37) $ python3 tasktest.py 
+started at 11:08:37
+hello
+world
+finished at 11:08:40
+</code></pre>
+<p>Both tasks move from pending to running, and now both <code>task1</code> and <code>task2</code> complete, because <code>main()</code> awaited on a task that takes ~3 seconds, long enough for both tasks to run to completion.</p>
+<hr/>
+<p><sub>*This applies at least to my setup (Mac OSX, ...) but as mentioned in the other answer here, the timing may play out differently on another setup and, if the task run-times are similar, both may get to run in places like case # 2.</sub></p>
+</div>
+<span class="comment-copy">@BradSolomon, interesting, but for me both tasks run if <code>await task2</code> is commented out, i dont get any cancellation. I am using python 3.7 on windows</span>
+<span class="comment-copy">It is very confusing to me that one <code>await</code> can lead to both tasks being run.</span>
+<span class="comment-copy">@BradSolomon True, but in fairness the docs for <a href="https://docs.python.org/3/library/asyncio-task.html#running-an-asyncio-program" rel="nofollow noreferrer"><code>asyncio.run</code></a> and <a href="https://docs.python.org/3/library/asyncio-task.html#creating-tasks" rel="nofollow noreferrer"><code>asyncio.create_task</code></a> state that these functions are provisional as of now. Hopefully, the docs will be improved to emphasize that point if the decision is made to keep that interface.</span>

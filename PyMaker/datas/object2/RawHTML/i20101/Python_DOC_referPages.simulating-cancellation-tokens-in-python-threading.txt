@@ -1,0 +1,197 @@
+<div class="post-text" itemprop="text">
+<p>I just wrote a task queue in Python whose job is to limit the number of tasks that are run at one time. This is a little different than <code>Queue.Queue</code> because instead of limiting how many items can be in the queue, it limits how many can be taken out at one time. It still uses an unbounded <code>Queue.Queue</code> to do its job, but it relies on a <code>Semaphore</code> to limit the number of threads:</p>
+<pre><code>from Queue import Queue
+from threading import BoundedSemaphore, Lock, Thread
+
+
+class TaskQueue(object):
+    """
+    Queues tasks to be run in separate threads and limits the number
+    concurrently running tasks.
+
+    """
+
+    def __init__(self, limit):
+        """Initializes a new instance of a TaskQueue."""
+        self.__semaphore = BoundedSemaphore(limit)
+        self.__queue = Queue()
+        self.__cancelled = False
+        self.__lock = Lock()
+
+    def enqueue(self, callback):
+        """Indicates that the given callback should be ran."""
+        self.__queue.put(callback)
+
+    def start(self):
+        """Tells the task queue to start running the queued tasks."""
+        thread = Thread(target=self.__process_items)
+        thread.start()
+
+    def stop(self):
+        self.__cancel()
+        # prevent blocking on a semaphore.acquire
+        self.__semaphore.release()
+        # prevent blocking on a Queue.get
+        self.__queue.put(lambda: None)
+
+    def __cancel(self):
+        print 'canceling'
+        with self.__lock:
+            self.__cancelled = True
+
+    def __process_items(self):
+        while True:
+            # see if the queue has been stopped before blocking on acquire
+            if self.__is_canceled():
+                break
+
+            self.__semaphore.acquire()
+
+            # see if the queue has been stopped before blocking on get
+            if self.__is_canceled():
+                break
+
+            callback = self.__queue.get()
+
+            # see if the queue has been stopped before running the task
+            if self.__is_canceled():
+                break
+
+            def runTask():
+                try:
+                    callback()
+                finally:
+                    self.__semaphore.release()
+
+            thread = Thread(target=runTask)
+            thread.start()
+            self.__queue.task_done()
+
+    def __is_canceled(self):
+        with self.__lock:
+            return self.__cancelled
+</code></pre>
+<p>The Python interpreter runs forever unless I explicitly stop the task queue. This is a lot more tricky than I thought it would be. If you look at the <code>stop</code> method, you'll see that I set a <code>canceled</code> flag, <code>release</code> the semaphore and <code>put</code> a no-op callback on the queue. The last two parts are necessary because the code could be blocking on the <code>Semaphore</code> or on the <code>Queue</code>. I basically have to force these to go through so that the loop has a chance to break out.</p>
+<p>This code works. This class is useful when running a service that is trying to run thousands of tasks in parallel. In order to keep the machine running smoothly and to prevent the OS from screaming about too many active threads, this code will limit the number of threads living at any one time.</p>
+<p>I have written a similar chunk of code in C# before. What made that code particular cut 'n' dry was that .NET has something called a <code>CancellationToken</code> that just about every threading class uses. Any time there is a blocking operation, that operation takes an optional token. If the parent task is ever canceled, any child tasks blocking with that token will be immediately canceled, as well. This seems like a much cleaner way to exit than to "fake it" by releasing semaphores or putting values in a queue.</p>
+<p>I was wondering if there was an equivalent way of doing this in Python? I definitely want to be using threads instead of something like asynchronous events. I am wondering if there is a way to achieve the same thing using two <code>Queue.Queue</code>s where one is has a max size and the other doesn't - but I'm still not sure how to handle cancellation.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You seem to be creating a new thread for each task from the queue. This is wasteful in itself, and also leads you to the problem of how to limit the number of threads.</p>
+<p>Instead, a common approach is to create a fixed number of worker threads and let them freely pull tasks from the queue. To cancel the queue, you can <a href="https://stackoverflow.com/a/6518011/222914">clear it</a> and let the workers stay alive in anticipation of future work.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think your code can be simplified by using <strong>poisoning</strong> and <code>Thread.join()</code>:</p>
+<pre><code>from Queue import Queue
+from threading import Thread
+
+poison = object()
+
+class TaskQueue(object):
+
+    def __init__(self, limit):
+        def process_items():
+            while True:
+                callback = self._queue.get()
+                if callback is poison:
+                    break
+                try:
+                    callback()
+                except:
+                    pass
+                finally:
+                    self._queue.task_done()
+        self._workers = [Thread(target=process_items) for _ in range(limit)]
+        self._queue = Queue()
+
+    def enqueue(self, callback):
+        self._queue.put(callback)
+
+    def start(self):
+        for worker in self._workers:
+            worker.start()
+
+    def stop(self):
+        for worker in self._workers:
+            self._queue.put(poison)
+        while self._workers:
+            self._workers.pop().join()
+</code></pre>
+<p>Untested.</p>
+<p>I removed the comments, for brevity.</p>
+<p>Also, in this version <code>process_items()</code> is truly private.</p>
+<p>BTW: The whole point of the <code>Queue</code> module is to free you from the dreaded locking and event stuff.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I took Janne Karila's advice and created a thread pool. This eliminated the need for a semaphore. The problem is if you ever expect the queue to go away, you have to stop the worker threads from running (just a variation of what I did before). The new code is fairly similar:</p>
+<pre><code>class TaskQueue(object):
+    """
+    Queues tasks to be run in separate threads and limits the number
+    concurrently running tasks.
+
+    """
+
+    def __init__(self, limit):
+        """Initializes a new instance of a TaskQueue."""
+        self.__workers = []
+        for _ in range(limit):
+            worker = Thread(target=self.__process_items)
+            self.__workers.append(worker)
+        self.__queue = Queue()
+        self.__cancelled = False
+        self.__lock = Lock()
+        self.__event = Event()
+
+    def enqueue(self, callback):
+        """Indicates that the given callback should be ran."""
+        self.__queue.put(callback)
+
+    def start(self):
+        """Tells the task queue to start running the queued tasks."""
+        for worker in self.__workers:
+            worker.start()
+
+    def stop(self):
+        """
+        Stops the queue from processing anymore tasks. Any actively running
+        tasks will run to completion.
+
+        """
+        self.__cancel()
+        # prevent blocking on a Queue.get
+        for _ in range(len(self.__workers)):
+            self.__queue.put(lambda: None)
+            self.__event.wait()
+
+    def __cancel(self):
+        with self.__lock:
+            self.__queue.queue.clear()
+            self.__cancelled = True
+
+    def __process_items(self):
+        while True:
+            callback = self.__queue.get()
+
+            # see if the queue has been stopped before running the task
+            if self.__is_canceled():
+                break
+
+            try:
+                callback()
+            except:
+                pass
+            finally:
+                self.__queue.task_done()
+        self.__event.set()
+
+    def __is_canceled(self):
+        with self.__lock:
+            return self.__cancelled
+</code></pre>
+<p>If you look carefully, I had to do some accounting to kill off the workers. I basically wait on an <code>Event</code> for as many times as there are workers. I <code>clear</code> the underlying queue to prevent workers from being cancelled any other way. I also wait after pumping each bogus value into the queue, so only one worker can cancel out at a time.</p>
+<p>I've ran some tests on this and it appears to be working. It would still be nice to eliminate the need for bogus values.</p>
+</div>
+<span class="comment-copy">Double underscores are <b>not</b> the pythonic way of specifying privacy. A single underscore is. Double underscores cause <b>name mangling</b>. See here: <a href="http://docs.python.org/3/tutorial/classes.html?highlight=mangling#private-variables" rel="nofollow noreferrer">docs.python.org/3/tutorial/…</a></span>
+<span class="comment-copy">The problem with keeping threads alive is that it keeps the Python process alive forever. This makes it hard to write unit tests.</span>
+<span class="comment-copy">You can use <a href="http://stackoverflow.com/q/190010/222914">daemon threads</a>, they don't keep the process alive.</span>
+<span class="comment-copy">You shouldn't use double undescores the way you do. They're for name mangling, not to enforce privacy. For that you should use single underscores. That signals to other programmers: do not touch unless you know what you're doing! It won't prevent them from touching, though, but double underscores won't either, since they can be accessed by their mangled names.</span>

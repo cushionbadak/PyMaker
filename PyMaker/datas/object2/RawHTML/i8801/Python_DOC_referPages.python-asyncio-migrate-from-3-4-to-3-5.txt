@@ -1,0 +1,225 @@
+<div class="post-text" itemprop="text">
+<p>Good evening everybody, I am trying to create internet robot and I met the problem while migrating my script from python 3.4 to 3.5 or 3.6+. It uses asyncio and works good on 3.4 python but when I start it with python3.5+ I got error: <code>RuntimeError: Cannot run the event loop while another loop is running</code></p>
+<p>here is the code scheme:</p>
+<pre><code>import multiprocessing as mp
+import asyncio
+import concurrent.futures
+import aiohttp
+
+def create_proccesses(separate_loop_creator, coro):
+    proccesses = []
+    for n in range(2):
+        proc = mp.Process(target=separate_loop_creator, args=(coro,))
+        proc.start()
+        proccesses.append(proc)
+    for p in proccesses:
+        p.join()
+
+def separate_loop_creator(coro):
+    sep_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(sep_loop)
+    tasks = [asyncio.async(coro(sep_loop)) for _ in range(100)]
+    try:
+        sep_loop.run_until_complete(asyncio.wait(tasks))
+        sep_loop.close()
+    except Exception as err:
+        print(err)
+        for task in tasks:
+            task.cancel()
+        sep_loop.close()
+
+
+@asyncio.coroutine
+def manager(exe, loop):
+    # some calculations and start coros in several processes
+    loop.run_in_executor(
+        exe,
+        create_proccesses,
+        separate_loop_creator,
+        some_coro
+    )
+
+@asyncio.coroutine
+def some_work_in_mainloop():
+    while True:
+        print('Some server dealing with connections here...')
+        yield from asyncio.sleep(1)
+
+@asyncio.coroutine
+def some_coro(loop):
+    with aiohttp.ClientSession(loop=loop) as session:
+        response = yield from session.get('http://google.com')
+        yield from asyncio.sleep(2)
+        print(response.status)
+
+if __name__ == '__main__':
+    mainloop = asyncio.get_event_loop()
+    executor = concurrent.futures.ProcessPoolExecutor(5)
+    asyncio.async(some_work_in_mainloop())
+    asyncio.async(manager(executor, mainloop))
+    try:
+        mainloop.run_forever()
+    finally:
+        mainloop.close()
+</code></pre>
+<p>The exception raise in <code>separate_loop_creator()</code> coroutine and it is <code>RuntimeError: Cannot run the event loop while another loop is running</code>. I think it is because of changing <code>get_event_loop()</code> mechnics, but I do not understand what is wrong with my code. </p>
+<p>Here is what I want to do:</p>
+<pre><code>                       +--------------+
+               +-------+other service |
+    +----------+       +--------------+
+    | mainloop |
+    +----------+
+               |     +------------+
+               +-----+   executor |
+                     +------+-----+
+                            |
+                     +------+--------+
+                     |start proccess |
+                     +---+-------+---+
++-----------------+      |       |      +---------------+
+|start new loop   +------+       +------+ start new loop|
++--------+--------+                     +-------+-------+
+         |                                      |
+ +-------+-------+                       +------v-------+
+ |   run coro    |                       | run coro     |
+ +---------------+                       +--------------+
+</code></pre>
+<p>Here is trace which I get on python3.5.3:</p>
+<pre><code>Traceback (most recent call last):
+  File "tst.py", line 21, in separate_loop_creator
+    sep_loop.run_until_complete(asyncio.wait(tasks))
+  File "/root/.pyenv/versions/3.5.3/lib/python3.5/asyncio/base_events.py", line 454, in run_until_complete
+    self.run_forever()
+  File "/root/.pyenv/versions/3.5.3/lib/python3.5/asyncio/base_events.py", line 411, in run_forever
+    'Cannot run the event loop while another loop is running')
+RuntimeError: Cannot run the event loop while another loop is running
+Cannot run the event loop while another loop is running
+Traceback (most recent call last):
+  File "tst.py", line 21, in separate_loop_creator
+    sep_loop.run_until_complete(asyncio.wait(tasks))
+  File "/root/.pyenv/versions/3.5.3/lib/python3.5/asyncio/base_events.py", line 454, in run_until_complete
+    self.run_forever()
+  File "/root/.pyenv/versions/3.5.3/lib/python3.5/asyncio/base_events.py", line 411, in run_forever
+    'Cannot run the event loop while another loop is running')
+RuntimeError: Cannot run the event loop while another loop is running
+</code></pre>
+<p>Python 3.4.3 results:</p>
+<pre><code>...
+200
+Some server dealing with connections here...
+200
+200
+Some server dealing with connections here...
+200
+200
+Some server dealing with connections here...
+200
+...
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is actually a bug in asyncio in CPython 3.6.0.  There's a <a href="https://github.com/python/asyncio/pull/497" rel="noreferrer">PR</a> to fix this, so that 3.6.1 works as expected.</p>
+<p>As a workaround you can add the following piece of code in your project:</p>
+<pre class="lang-py prettyprint-override"><code>import sys
+
+if sys.version_info[:3] == (3, 6, 0):
+    import asyncio.events as _ae
+    import os as _os
+
+    _ae._RunningLoop._pid = None
+
+    def _get_running_loop():
+        if _ae._running_loop._pid == _os.getpid():
+            return _ae._running_loop._loop
+
+    def _set_running_loop(loop):
+        _ae._running_loop._pid = _os.getpid()
+        _ae._running_loop._loop = loop
+
+    _ae._get_running_loop = _get_running_loop
+    _ae._set_running_loop = _set_running_loop
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The best solution, if possible, try removing <code>multiprocessing</code> altogether from your program, and use only one event loop (Optionally using <code>ProcessPoolExecutor</code> for  isolated CPU intensive tasks).</p>
+<p>As of 2017-03-02, there is an open python bug for this issue, effecting non-windows platforms: <a href="https://bugs.python.org/issue22087" rel="nofollow noreferrer">https://bugs.python.org/issue22087</a>.</p>
+<p>Here is a shorter program to trigger the same problem:</p>
+<pre><code>import asyncio
+import multiprocessing as mp
+
+
+def create_another_loop():
+    loop = asyncio.new_event_loop()
+    loop.run_forever()
+
+
+async def create_process():
+    proc = mp.Process(target=create_another_loop)
+    proc.start()
+    proc.join()
+
+
+if __name__ == '__main__':
+    main_loop = asyncio.get_event_loop()
+    main_loop.run_until_complete(create_process())
+    main_loop.close()
+</code></pre>
+<p>A hackish workaround (Caution! Use at your own risk!) inspired from the fix suggested here <a href="https://github.com/python/asyncio/pull/497" rel="nofollow noreferrer">https://github.com/python/asyncio/pull/497</a> is to add this code to a newly created <code>Process</code>:</p>
+<pre><code>if asyncio.events._running_loop:
+    asyncio.events._running_loop._loop = None
+</code></pre>
+<p>Example:</p>
+<pre><code>import asyncio
+import multiprocessing as mp
+import time
+from concurrent.futures.process import ProcessPoolExecutor
+
+
+async def clock(label, n=5, sleep=1):
+    print(label, "start")
+    for i in range(n):
+        await asyncio.sleep(sleep)
+        print(label, i + 1)
+    print(label, "end")
+    return label
+
+
+def create_another_loop():
+    # HACK START
+    if asyncio.events._running_loop:
+        asyncio.events._running_loop._loop = None
+    # HACK END
+
+    loop = asyncio.new_event_loop()
+    loop.run_until_complete(clock("sub"))
+    loop.close()
+
+
+def create_process():
+    time.sleep(2)
+    proc = mp.Process(target=create_another_loop)
+    proc.start()
+    proc.join()
+    return "ok"
+
+
+async def create_process_in_pool():
+    return await main_loop.run_in_executor(ProcessPoolExecutor(), create_process)
+
+
+if __name__ == '__main__':
+    main_loop = asyncio.get_event_loop()
+    tasks = (
+        clock("main"),
+        create_process_in_pool(),
+    )
+    print(main_loop.run_until_complete(asyncio.gather(*tasks)))
+    main_loop.close()
+</code></pre>
+<p>Other possible workarounds: Create the processes before starting the loop or use <a href="https://docs.python.org/3/library/asyncio-subprocess.html#asyncio.create_subprocess_exec" rel="nofollow noreferrer"><code>asyncio.create_subprocess_exec</code></a> which even allows to <a href="https://docs.python.org/3/library/asyncio-subprocess.html#subprocess-using-streams" rel="nofollow noreferrer">communicate with the subprocess via a stream</a>.</p>
+</div>
+<span class="comment-copy">Thank you 1st1, probably not only 3.6.0 bug, the same error raise from 3.5.3 till 3.6.0 CPython</span>
+<span class="comment-copy">Yes, the bug was backported from 3.6.0 to 3.5.3 :)  I've pushed a fix to 3.5 and 3.6 today: <a href="https://github.com/python/cpython/pull/404" rel="nofollow noreferrer">github.com/python/cpython/pull/404</a> Good news is that Python 3.6.1 will be out mid-March.</span>
+<span class="comment-copy">Thanks Udi, shame on me I dodnt find that bug by myself, <code>asyncio.events._running_loop._loop = None</code> seams did the work, but is it realy dirty trick? Maybe migrations was not good idea.</span>
+<span class="comment-copy">Does every unix processes started with <code>multiprocessing.Process</code> has own separate memory table and <code>asyncio</code> in that memory? So changing asyncio global state in that process should not anyhow brake the loop in parent process?</span>
+<span class="comment-copy">Isnt this PR <a href="https://github.com/python/asyncio/pull/497" rel="nofollow noreferrer">github.com/python/asyncio/pull/497</a> should fix the problem right?</span>

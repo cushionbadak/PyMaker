@@ -1,0 +1,76 @@
+<div class="post-text" itemprop="text">
+<p>According to the Python 3 <a href="https://docs.python.org/3/library/ssl.html" rel="nofollow noreferrer">documentation</a>:</p>
+<blockquote>
+<p><strong>SSLSocket.shared_ciphers()</strong> </p>
+<p>Return the list of ciphers shared by the client during the handshake.</p>
+</blockquote>
+<p>I interpret that as meaning that the 'Cipher Suites' block from the TLS CLIENT_HELLO packet, the first packet of the handshake, will be returned.  Given the following openssl command:</p>
+<pre><code>openssl s_client -connect 172.16.30.3:443 -cipher ECDHE-RSA-AES128-SHA
+</code></pre>
+<p>the packet on the wire, as displayed in wireshark, is shown with that single cipher (and the RENEGOTIATION faux-cipher):</p>
+<p><a href="https://i.stack.imgur.com/UDySz.png" rel="nofollow noreferrer"><img alt="Wireshark view of TLS CLIENT_HELLO Cipher Suites" src="https://i.stack.imgur.com/UDySz.png"/></a></p>
+<p>However, when my server code calls shared_ciphers() after the handshake, it is returned the server's entire cipher suite, not what the client sent in the handshake.  Here's what the server prints:</p>
+<pre><code># ./shared_ciphers_test.py 
+Server Cipher Suite from get_ciphers():
+   ECDHE-ECDSA-AES128-SHA256
+   ECDHE-RSA-AES128-SHA
+   ECDHE-ECDSA-AES128-SHA
+   ECDHE-RSA-RC4-SHA
+Listening...
+Connection accepted from ('172.16.30.4', 32888)
+Client Cipher Suite from shared_ciphers():
+   ECDHE-ECDSA-AES128-SHA256
+   ECDHE-RSA-AES128-SHA
+   ECDHE-ECDSA-AES128-SHA
+   ECDHE-RSA-RC4-SHA
+#
+</code></pre>
+<p><strong>Questions:</strong></p>
+<ol>
+<li>Could I be mis-interpreting the documentation?</li>
+<li>Given the server code below, am I doing anything wrong that would give me this incorrect result?</li>
+<li>Is there an appropriate forum where I could report this as a potential bug?  (<a href="https://github.com/python/cpython/blob/master/Lib/ssl.py" rel="nofollow noreferrer">Github</a> seems to be the authoritative source for the module, but I don't see a forum for reporting there.  My git-fu is terrible, though.)</li>
+</ol>
+<hr/>
+<p>Here's the server code:</p>
+<pre><code>#!/usr/bin/python3
+
+import socket, ssl, sys, time
+
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(('0.0.0.0', 443))
+listener.listen(5)
+
+context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+context.load_cert_chain(certfile='certchain.pem', keyfile='keyfile.pem')
+context.set_ciphers('ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-RC4-SHA')
+
+print('Server Cipher Suite from get_ciphers():')
+for item in context.get_ciphers():
+    print('   {}'.format(item['name']))
+
+print('Listening...')
+newsocket, fromaddr = listener.accept()
+connstream = context.wrap_socket(newsocket, server_side=True)
+print('Connection accepted from {}'.format(connstream.getpeername()))
+print('Client Cipher Suite from shared_ciphers():')
+for item in connstream.shared_ciphers():
+    print('   {}'.format(item[0]))
+sys.exit(0)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is a bug.</p>
+<p>Looking at <a href="https://github.com/python/cpython/blob/master/Modules/_ssl.c" rel="nofollow noreferrer">the C implementation for the ssl module</a> one can see that both <a href="https://github.com/python/cpython/blob/v3.6.4/Modules/_ssl.c#L2867" rel="nofollow noreferrer">get_ciphers</a> and <a href="https://github.com/python/cpython/blob/v3.6.4/Modules/_ssl.c#L1677" rel="nofollow noreferrer">shared_ciphers</a> are implemented by using <a href="https://www.openssl.org/docs/man1.1.0/ssl/SSL_get_ciphers.html" rel="nofollow noreferrer">SSL_get_ciphers</a>, albeit one using the context as base and the other the SSL object from the current connection. And <code>SSL_get_ciphers</code> accesses the <code>cipher_list</code> property from the SSL or context object which seems to be the list of originally configured ciphers.</p>
+<p><strike>I think the proper function to get the shared ciphers is actually <a href="https://www.openssl.org/docs/man1.1.0/ssl/SSL_get_client_ciphers.html" rel="nofollow noreferrer">SSL_get_client_ciphers</a>. This functions accesses <code>ssl-&gt;session-&gt;ciphers</code>, same as the more clearly named (but undocumented) <code>SSL_get_shared_ciphers</code> function. <code>SSL_get_client_ciphers</code> is only available since OpenSSL 1.1.0 so one would need to directly access <code>ssl-&gt;session-&gt;ciphers</code> for older versions.</strike></p>
+<p>It looks like OpenSSL does not provide such functionality at all and thus Python cannot really provide this functionality too. The functions <a href="https://www.openssl.org/docs/man1.1.0/ssl/SSL_get_client_ciphers.html" rel="nofollow noreferrer">SSL_get_client_ciphers</a>, <code>SSL_get_shared_ciphers</code> and access to <code>ssl-&gt;session-&gt;ciphers</code> all provide access to the ciphers offered by the client, i.e. exactly what the name <code>SSL_get_client_ciphers</code> suggests and contrary to what <code>SSL_get_shared_ciphers</code> suggests. This information gets combined with the server side <code>cipher_list</code> inside the internal <code>ssl3_choose_cipher</code> function where the common cipher gets chosen. Getting the actually shared ciphers (which are additionally restricted by what kind of certificate is used) would mean to reimplement major parts of this function. </p>
+<p>Funnily, it looks like the OpenSSL developers don't even know what <code>ssl-&gt;session-&gt;ciphers</code> really contains. Since the 0.9.8 days up to the latest version of OpenSSL one can find the following documentation for the <code>ciphers</code> member of the <code>ssl_session_st</code> structure:</p>
+<pre><code> STACK_OF(SSL_CIPHER) *ciphers; /* shared ciphers? */
+</code></pre>
+<p>Based on this they seem to (wrongly) think that this structure contains the shared ciphers but they are not sure.</p>
+<hr/>
+<p>Note that I've filed a bug for Python about this wrongly implemented functionality: <a href="https://bugs.python.org/issue32813" rel="nofollow noreferrer">https://bugs.python.org/issue32813</a>. Based on what OpenSSL offers my guess is that the function should be removed entirely from Python instead of returning the wrong data. I've also filed a bug for OpenSSL about the misleading name of SSL_get_shared_ciphers: <a href="https://github.com/openssl/openssl/issues/5317" rel="nofollow noreferrer">https://github.com/openssl/openssl/issues/5317</a>. </p>
+</div>
+<span class="comment-copy">Excellent sleuthing (but, um, "argh").  Looking at that source code comment, I also think there's two ways to interpret "shared" ("what the client shared with the server" and "what the shared subset between client and server is"), neither of which match this behavior.</span>
+<span class="comment-copy">@gowenfawr: It is an interesting argument to treat <code>SSL_get_shared_ciphers</code> as the ciphers the client has shared with the server. But, given that the famous "no shared cipher" SSL problems clearly means that client and server don't share the same ciphers I think "shared ciphers" in the context of SSL should consistently mean the ciphers both client and server have in common.</span>

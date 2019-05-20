@@ -1,0 +1,126 @@
+<div class="post-text" itemprop="text">
+<p>I'm using map_async to create a pool of 4 workers. And giving it a list of image files to process [Set 1].<br/>
+At times, I need to cancel the processing in between, so that I can instead get a different set of files processed [Set 2].  </p>
+<p>So an example situation is, I gave map_async 1000 files to process. And then want to cancel the processing of remaining jobs after about 200 files have been processed.<br/>
+Additionally, I want to do this cancellation without destroying/terminating the pool. Is this possible?</p>
+<p><strong>I do not want to terminate the pool</strong>, because recreating the pool is a slow process on Windows (because it uses 'spawn', instead of 'fork'). And I need to use this same pool for processing a different set of image files [Set 2]..</p>
+<pre><code># Putting job_set1 through processing. It may consist of 1000 images
+cpu = multiprocessing.cpu_count()
+pool = Pool(processes=cpu)
+result = pool.map_async(job_set1, thumb_ts_list, chunksize=chunksize)
+</code></pre>
+<p>Now in between, I need to cancel the processing on this set 1. And move onto a different set (waiting for all 1000 images to complete processing is not an option, but I can wait for the current image being processed to finish)</p>
+<pre><code>&lt;Somehow cancel processing of job_set1&gt;
+result = pool.map_async(job_set2, thumb_ts_list, chunksize=chunksize)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>It's time for the <a href="https://en.wikipedia.org/wiki/Fundamental_theorem_of_software_engineering" rel="nofollow noreferrer">fundamental theorem of software engineering</a>: while <code>multiprocessing.Pool</code> doesn't supply cancellation as a feature, we can add it by having a <code>Pool</code> read from a carefully crafted iterable.  It's not enough, however, to have a generator that <code>yield</code>s values from a list but stops short on some signal, because the <code>Pool</code> eagerly drains any generator given to it.  So we need a <em>very</em> carefully crafted iterable.</p>
+<h1>A lazy <code>Pool</code></h1>
+<p>The generic tool we need is a way to construct tasks for a <code>Pool</code> only when a worker becomes available (or at most one task ahead, in case constructing them takes significant time).  The basic idea is to slow down the thread collecting work for the <code>Pool</code> with a semaphore upped only when a task is finished.  (We know such a thread exists from the observable behavior of <code>imap_unordered</code>.)</p>
+<pre><code>import multiprocessing
+from threading import Semaphore
+
+size=multiprocessing.cpu_count()  # or whatever Pool size to use
+
+# How many workers are waiting for work?  Add one to buffer one task.
+work=Semaphore(size)
+
+def feed0(it):
+  it=iter(it)
+  try:
+    while True:
+      # Don't ask the iterable until we have a customer, in case better
+      # instructions become available:
+      work.acquire()
+      yield next(it)
+  except StopIteration: pass
+  work.release()
+def feed(p,f,it):
+  import sys,traceback
+  iu=p.imap_unordered(f,feed0(it))
+  while True:
+    try: x=next(iu)
+    except StopIteration: return
+    except Exception: traceback.print_exception(*sys.exc_info())
+    work.release()
+    yield x
+</code></pre>
+<p>The <code>try</code> in <code>feed</code> prevents failures in the children from breaking the semaphore's count, but note that it does not protect against failures in the parent.</p>
+<h1>A cancelable iterator</h1>
+<p>Now that we have real-time control over the <code>Pool</code> input, making whatever scheduling policy is straightforward.  For example, here's something like <code>itertools.chain</code> but with the ability to asynchronously discard any remaining elements from one of the input sequences:</p>
+<pre><code>import collections,queue
+
+class Cancel:
+  closed=False
+  cur=()
+  def __init__(self): self.data=queue.Queue() # of deques
+  def add(self,d):
+    d=collections.deque(d)
+    self.data.put(d)
+    return d
+  def __iter__(self):
+    while True:
+      try: yield self.cur.popleft()
+      except IndexError:
+        self.cur=self.data.get()
+        if self.cur is None: break
+  @staticmethod
+  def cancel(d): d.clear()
+  def close(self): self.data.put(None)
+</code></pre>
+<p>This is thread-safe (in CPython at least) despite the lack of locking because operations like <code>deque.clear</code> are atomic with respect to Python inspection (and we don't separately check whether <code>self.cur</code> is empty).</p>
+<h1>Usage</h1>
+<p>Making one of these looks like</p>
+<pre><code>pool=mp.Pool(size)
+can=Cancel()
+many=can.add(range(1000))
+few=can.add(["some","words"])
+can.close()
+for x in feed(pool,assess_happiness,can):
+  if happy_with(x): can.cancel(many)  # straight onto few, then out
+</code></pre>
+<p>where of course the <code>add</code>s and <code>close</code> could themselves be in the loop.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <code>multiprocessing</code> module doesn't seem to have the concept of cancellation. You <em>can</em> use the <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ProcessPoolExecutor" rel="nofollow noreferrer"><code>concurrent.futures.ProcessPoolExecutor</code></a> wrapper and cancel the pending futures when you have enough results.</p>
+<p>Here's an example that picks out 10 JPEGs from a set of paths, and cancels pending futures while leaving the process pool usable afterwards:</p>
+<pre class="lang-python prettyprint-override"><code>import concurrent.futures
+
+
+def interesting_path(path):
+    """Gives path if is a JPEG else ``None``."""
+    with open(path, 'rb') as f:
+        if f.read(3) == b'\xff\xd8\xff':
+            return path
+        return None
+
+
+def find_interesting(paths, count=10):
+     """Yields count from paths which are 'interesting' by multiprocess task."""
+    with concurrent.futures.ProcessPoolExecutor() as pool:
+        futures = {pool.submit(interesting_path, p) for p in paths}
+        print ('Started {}'.format(len(futures)))
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            futures.remove(future)
+            if res is not None:
+                yield res
+                count -= 1
+                if count == 0:
+                    break
+        cancelled = 0
+        for future in futures:
+            cancelled += future.cancel()
+        print ('Cancelled {}'.format(cancelled))
+        concurrent.futures.wait(futures)
+        # Can still use pool here for more processing as needed
+</code></pre>
+<p>Note that picking how to break up work into futures is still tricky, a bigger set is more overhead but can also mean less wasted work. This can also be adapted to Python 3.6 async syntax easily enough.</p>
+</div>
+<span class="comment-copy">This is all very theoretical without any code, but if you want to "cancel" a job which is running in another process, you have basically two options: either kindly ask the other process to stop, by sending it a message somehow, or simply kill the process without kindly asking.</span>
+<span class="comment-copy">Following on from @zvone: is it sufficient to <i>not start</i> any more work and let existing tasks complete (even if uselessly)?</span>
+<span class="comment-copy">@zvone: So stopping a process by sending a kind message is simple. But we are talking about cancelling queued jobs in a processing job pool. Killing is not an option as I already mentioned in the question..</span>
+<span class="comment-copy">@DavisHerring: So I can wait for current image to be processed. But not wait for all the images to be processed... (since it takes quite a lot of time to finish the whole job, and I want to move onto another job)</span>
+<span class="comment-copy">@vishal: What’s easy to implement is not “current image” <i>singular</i>, but all that are in flight at the moment you decide to cancel.  Is that OK?</span>
+<span class="comment-copy">Thanks for having looked into it this deeply :) This answer would surely help me. Might not use it as it is. But simply pick up the parts that I'd need.</span>

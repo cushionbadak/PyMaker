@@ -1,0 +1,212 @@
+<div class="post-text" itemprop="text">
+<p>What's the best way to wait (without spinning) until something is available in either one of two (multiprocessing) <a href="http://docs.python.org/library/multiprocessing.html#multiprocessing.Queue" rel="noreferrer">Queues</a>, where both reside on the same system?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It doesn't look like there's an official way to handle this yet.  Or at least, not based on this:</p>
+<ul>
+<li><a href="http://bugs.python.org/issue3831" rel="noreferrer">http://bugs.python.org/issue3831</a></li>
+</ul>
+<p>You could try something like what this post is doing -- accessing the underlying pipe filehandles:</p>
+<ul>
+<li><a href="http://haltcondition.net/?p=2319" rel="noreferrer">http://haltcondition.net/?p=2319</a></li>
+</ul>
+<p>and then use select.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Actually you can use multiprocessing.Queue objects in select.select. i.e. </p>
+<pre><code>que = multiprocessing.Queue()
+(input,[],[]) = select.select([que._reader],[],[])
+</code></pre>
+<p>would select que only if it is ready to be read from. </p>
+<p>No documentation about it though. I was reading the source code of the multiprocessing.queue library (at linux it's usually sth like /usr/lib/python2.6/multiprocessing/queue.py) to find it out.</p>
+<p>With Queue.Queue I didn't have found any smart way to do this (and I would really love to).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Seems like using threads which forward incoming items to a single Queue which you then wait on is a practical choice when using multiprocessing in a platform independent manner.</p>
+<p>Avoiding the threads requires either handling low-level pipes/FDs which is both platform specific and not easy to handle consistently with the higher-level API.  </p>
+<p>Or you would need Queues with the ability to set callbacks which i think are the proper higher level interface to go for.  I.e. you would write something like:</p>
+<pre>
+  singlequeue = Queue()
+  incoming_queue1.setcallback(singlequeue.put)
+  incoming_queue2.setcallback(singlequeue.put)
+  ...
+  singlequeue.get()
+</pre>
+<p>Maybe the multiprocessing package could grow this API but it's not there yet. The concept works well with py.execnet which uses the term "channel" instead of "queues", see here <a href="http://tinyurl.com/nmtr4w" rel="nofollow noreferrer">http://tinyurl.com/nmtr4w</a> </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You could use something like the <a href="http://en.wikipedia.org/wiki/Observer_pattern" rel="nofollow noreferrer">Observer</a> pattern, wherein Queue subscribers are notified of state changes.</p>
+<p>In this case, you could have your worker thread designated as a listener on each queue, and whenever it receives a ready signal, it can work on the new item, otherwise sleep.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Not sure how well the select on a multiprocessing queue works on windows.  As select on windows listens for sockets and not file handles, I suspect there could be problems.</p>
+<p>My answer is to make a thread to listen to each queue in a blocking fashion, and to put the results all into a single queue listened to by the main thread, essentially multiplexing the individual queues into a single one.</p>
+<p>My code for doing this is:</p>
+<pre><code>"""
+Allow multiple queues to be waited upon.
+
+queue,value = multiq.select(list_of_queues)
+"""
+import queue
+import threading
+
+class queue_reader(threading.Thread):
+    def __init__(self,inq,sharedq):
+        threading.Thread.__init__(self)
+        self.inq = inq
+        self.sharedq = sharedq
+    def run(self):
+        while True:
+            data = self.inq.get()
+            print ("thread reads data=",data)
+            result = (self.inq,data)
+            self.sharedq.put(result)
+
+class multi_queue(queue.Queue):
+    def __init__(self,list_of_queues):
+        queue.Queue.__init__(self)
+        for q in list_of_queues:
+            qr = queue_reader(q,self)
+            qr.start()
+
+def select(list_of_queues):
+    outq = queue.Queue()
+    for q in list_of_queues:
+        qr = queue_reader(q,outq)
+        qr.start()
+    return outq.get()
+</code></pre>
+<p>The following test routine shows how to use it:</p>
+<pre><code>import multiq
+import queue
+
+q1 = queue.Queue()
+q2 = queue.Queue()
+
+q3 = multiq.multi_queue([q1,q2])
+
+q1.put(1)
+q2.put(2)
+q1.put(3)
+q1.put(4)
+
+res=0
+while not res==4:
+    while not q3.empty():
+        res = q3.get()[1]
+        print ("returning result =",res)
+</code></pre>
+<p>Hope this helps.</p>
+<p>Tony Wallace</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>New version of above code...</p>
+<p>Not sure how well the select on a multiprocessing queue works on windows. As select on windows listens for sockets and not file handles, I suspect there could be problems.</p>
+<p>My answer is to make a thread to listen to each queue in a blocking fashion, and to put the results all into a single queue listened to by the main thread, essentially multiplexing the individual queues into a single one.</p>
+<p>My code for doing this is:</p>
+<pre><code>"""
+Allow multiple queues to be waited upon.
+
+An EndOfQueueMarker marks a queue as
+    "all data sent on this queue".
+When this marker has been accessed on
+all input threads, this marker is returned
+by the multi_queue.
+
+"""
+import queue
+import threading
+
+class EndOfQueueMarker:
+    def __str___(self):
+        return "End of data marker"
+    pass
+
+class queue_reader(threading.Thread):
+    def __init__(self,inq,sharedq):
+        threading.Thread.__init__(self)
+        self.inq = inq
+        self.sharedq = sharedq
+    def run(self):
+        q_run = True
+        while q_run:
+            data = self.inq.get()
+            result = (self.inq,data)
+            self.sharedq.put(result)
+            if data is EndOfQueueMarker:
+                q_run = False
+
+class multi_queue(queue.Queue):
+    def __init__(self,list_of_queues):
+        queue.Queue.__init__(self)
+        self.qList = list_of_queues
+        self.qrList = []
+        for q in list_of_queues:
+            qr = queue_reader(q,self)
+            qr.start()
+            self.qrList.append(qr)
+    def get(self,blocking=True,timeout=None):
+        res = []
+        while len(res)==0:
+            if len(self.qList)==0:
+                res = (self,EndOfQueueMarker)
+            else:
+                res = queue.Queue.get(self,blocking,timeout)
+                if res[1] is EndOfQueueMarker:
+                    self.qList.remove(res[0])
+                    res = []
+        return res
+
+    def join(self):
+        for qr in self.qrList:
+            qr.join()
+
+def select(list_of_queues):
+    outq = queue.Queue()
+    for q in list_of_queues:
+        qr = queue_reader(q,outq)
+        qr.start()
+    return outq.get()
+</code></pre>
+<p>The follow code is my test routine to show how it works:</p>
+<pre><code>import multiq
+import queue
+
+q1 = queue.Queue()
+q2 = queue.Queue()
+
+q3 = multiq.multi_queue([q1,q2])
+
+q1.put(1)
+q2.put(2)
+q1.put(3)
+q1.put(4)
+q1.put(multiq.EndOfQueueMarker)
+q2.put(multiq.EndOfQueueMarker)
+res=0
+have_data = True
+while have_data:
+    res = q3.get()[1]
+    print ("returning result =",res)
+    have_data = not(res==multiq.EndOfQueueMarker)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>As of Python 3.3 you can use <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.connection.wait" rel="nofollow noreferrer">multiprocessing.connection.wait</a> to wait on multiple <code>Queue._reader</code> objects at once.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Don't do it.</p>
+<p>Put a header on the messages and send them to a common queue. This simplifies the code and will be cleaner overall. </p>
+</div>
+<span class="comment-copy">+1 Wow, nice finds! My Google-fu appears to be weak...</span>
+<span class="comment-copy">unfortunately, the second URL does not work anymore</span>
+<span class="comment-copy">@AndreHolzner there is a working version: <a href="https://web.archive.org/web/20141124021104/http://haltcondition.net:80/?p=2319" rel="nofollow noreferrer">web.archive.org/web/20141124021104/http://haltcondition.net:80/…</a></span>
+<span class="comment-copy">seems not work under windows.</span>
+<span class="comment-copy">This works great on Unix, but on Windows the <code>select.select</code> implementation can only deal with sockets, not file descriptors and therefore this fails.</span>
+<span class="comment-copy">What's the main difference between <code>Queue.Queue</code> and <code>multiprocessing.Queue</code>, and can <code>multiprocessing.Queue</code> be used for multithreading and not just multiprocessing?</span>
+<span class="comment-copy">@CMCDragonkai I think queue.Queue is a data structure of blocking queue; the synchronization around queue.Queue depends on Mutex. There is no file descriptor or anything similar beneath queue.Queue, so we cannot OS system calls like select, epoll, kqueue, to wait for it.</span>
+<span class="comment-copy">That would be a very nice interface! (Though clearly there's benefit to keeping the stdlib interfaces tight, as Jesse mentions in the @ars' referenced bug report.)</span>
+<span class="comment-copy">true but the current Queue public API doesn't handle your use case which i think is a common one.</span>
+<span class="comment-copy">If it's "common" - file a bug report + patch (with tests for the love of pete) on bugs.python.org and I can evaluate it for 2.7/3.x</span>
+<span class="comment-copy">Well, the <code>get</code> is destructive, so you can't really do observation on the queue itself as GoF describe it. The dequeue-ing thread would have to be the "observed" -- I was hoping for less overhead than two additional threads.</span>
+<span class="comment-copy">Also, if I wanted a single point of access for the calling process (like in <code>select</code>) I would need a thread-safe queue on top of those two threads.</span>

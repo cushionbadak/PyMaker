@@ -1,0 +1,547 @@
+<div class="post-text" itemprop="text">
+<p>I'm using a python script as a driver for a hydrodynamics code.  When it comes time to run the simulation, I use <code>subprocess.Popen</code> to run the code, collect the output from stdout and stderr into a <code>subprocess.PIPE</code> --- then I can print (and save to a log-file) the output information, and check for any errors.  The problem is, I have no idea how the code is progressing.  If I run it directly from the command line, it gives me output about what iteration its at, what time, what the next time-step is, etc.</p>
+<p><strong>Is there a way to both store the output (for logging and error checking), and also produce a live-streaming output?</strong></p>
+<p>The relevant section of my code:</p>
+<pre><code>ret_val = subprocess.Popen( run_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True )
+output, errors = ret_val.communicate()
+log_file.write(output)
+print output
+if( ret_val.returncode ):
+    print "RUN failed\n\n%s\n\n" % (errors)
+    success = False
+
+if( errors ): log_file.write("\n\n%s\n\n" % errors)
+</code></pre>
+<p>Originally I was piping the <code>run_command</code> through <code>tee</code> so that a copy went directly to the log-file, and the stream still output directly to the terminal -- but that way I can't store any errors (to my knowlege).</p>
+<hr/>
+<p>Edit:</p>
+<p>Temporary solution:</p>
+<pre><code>ret_val = subprocess.Popen( run_command, stdout=log_file, stderr=subprocess.PIPE, shell=True )
+while not ret_val.poll():
+    log_file.flush()
+</code></pre>
+<p>then, in another terminal, run <code>tail -f log.txt</code> (s.t. <code>log_file = 'log.txt'</code>).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You have two ways of doing this, either by creating an iterator from the <code>read</code> or <code>readline</code> functions and do:</p>
+<pre><code>import subprocess
+import sys
+with open('test.log', 'w') as f:
+    process = subprocess.Popen(your_command, stdout=subprocess.PIPE)
+    for c in iter(lambda: process.stdout.read(1), ''):  # replace '' with b'' for Python 3
+        sys.stdout.write(c)
+        f.write(c)
+</code></pre>
+<p>or</p>
+<pre><code>import subprocess
+import sys
+with open('test.log', 'w') as f:
+    process = subprocess.Popen(your_command, stdout=subprocess.PIPE)
+    for line in iter(process.stdout.readline, ''):  # replace '' with b'' for Python 3
+        sys.stdout.write(line)
+        f.write(line)
+</code></pre>
+<p>Or you can create a <code>reader</code> and a <code>writer</code> file. Pass the <code>writer</code> to the <code>Popen</code> and read from the <code>reader</code></p>
+<pre><code>import io
+import time
+import subprocess
+import sys
+
+filename = 'test.log'
+with io.open(filename, 'wb') as writer, io.open(filename, 'rb', 1) as reader:
+    process = subprocess.Popen(command, stdout=writer)
+    while process.poll() is None:
+        sys.stdout.write(reader.read())
+        time.sleep(0.5)
+    # Read the remaining
+    sys.stdout.write(reader.read())
+</code></pre>
+<p>This way you will have the data written in the <code>test.log</code> as well as on the standard output. </p>
+<p>The only advantage of the file approach is that your code doesn't block. So you can do whatever you want in the meantime and read whenever you want from the <code>reader</code> in a non-blocking way. When you use <code>PIPE</code>, <code>read</code> and <code>readline</code> functions will block until either one character is written to the pipe or a line is written to the pipe respectively.</p>
+</div>
+<div class="post-text" itemprop="text">
+<h2>Executive Summary (or "tl;dr" version): it's easy when there's at most one <code>subprocess.PIPE</code>, otherwise it's hard.</h2>
+<p>It may be time to explain a bit about how <code>subprocess.Popen</code> does its thing.</p>
+<p>(Caveat: this is for Python 2.x, although 3.x is similar; and I'm quite fuzzy on the Windows variant.  I understand the POSIX stuff much better.)</p>
+<p>The <code>Popen</code> function needs to deal with zero-to-three I/O streams, somewhat simultaneously.  These are denoted <code>stdin</code>, <code>stdout</code>, and <code>stderr</code> as usual.</p>
+<p>You can provide:</p>
+<ul>
+<li><code>None</code>, indicating that you don't want to redirect the stream.  It will inherit these as usual instead.  Note that on POSIX systems, at least, this does not mean it will use Python's <code>sys.stdout</code>, just Python's <em>actual</em> stdout; see demo at end.</li>
+<li>An <code>int</code> value.  This is a "raw" file descriptor (in POSIX at least).  (Side note: <code>PIPE</code> and <code>STDOUT</code> are actually <code>int</code>s internally, but are "impossible" descriptors, -1 and -2.)</li>
+<li>A stream—really, any object with a <code>fileno</code> method.  <code>Popen</code> will find the descriptor for that stream, using <code>stream.fileno()</code>, and then proceed as for an <code>int</code> value.</li>
+<li><code>subprocess.PIPE</code>, indicating that Python should create a pipe.</li>
+<li><code>subprocess.STDOUT</code> (for <code>stderr</code> only): tell Python to use the same descriptor as for <code>stdout</code>.  This only makes sense if you provided a (non-<code>None</code>) value for <code>stdout</code>, and even then, it is only <em>needed</em> if you set <code>stdout=subprocess.PIPE</code>.  (Otherwise you can just provide the same argument you provided for <code>stdout</code>, e.g., <code>Popen(..., stdout=stream, stderr=stream)</code>.)</li>
+</ul>
+<h3>The easiest cases (no pipes)</h3>
+<p>If you redirect nothing (leave all three as the default <code>None</code> value or supply explicit <code>None</code>), <code>Pipe</code> has it quite easy.  It just needs to spin off the subprocess and let it run.  Or, if you redirect to a non-<code>PIPE</code>—an <code>int</code> or a stream's <code>fileno()</code>—it's still easy, as the OS does all the work.  Python just needs to spin off the subprocess, connecting its stdin, stdout, and/or stderr to the provided file descriptors.</p>
+<h3>The still-easy case: one pipe</h3>
+<p>If you redirect only one stream, <code>Pipe</code> still has things pretty easy.  Let's pick one stream at a time and watch.</p>
+<p>Suppose you want to supply some <code>stdin</code>, but let <code>stdout</code> and <code>stderr</code> go un-redirected, or go to a file descriptor.  As the parent process, your Python program simply needs to use <code>write()</code> to send data down the pipe.  You can do this yourself, e.g.:</p>
+<pre><code>proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+proc.stdin.write('here, have some data\n') # etc
+</code></pre>
+<p>or you can pass the stdin data to <code>proc.communicate()</code>, which then does the <code>stdin.write</code> shown above.  There is no output coming back so <code>communicate()</code> has only one other real job: it also closes the pipe for you.  (If you don't call <code>proc.communicate()</code> you must call <code>proc.stdin.close()</code> to close the pipe, so that the subprocess knows there is no more data coming through.)</p>
+<p>Suppose you want to capture <code>stdout</code> but leave <code>stdin</code> and <code>stderr</code> alone.  Again, it's easy: just call <code>proc.stdout.read()</code> (or equivalent) until there is no more output.  Since <code>proc.stdout()</code> is a normal Python I/O stream you can use all the normal constructs on it, like:</p>
+<pre><code>for line in proc.stdout:
+</code></pre>
+<p>or, again, you can use <code>proc.communicate()</code>, which simply does the <code>read()</code> for you.</p>
+<p>If you want to capture only <code>stderr</code>, it works the same as with <code>stdout</code>.</p>
+<p>There's one more trick before things get hard.  Suppose you want to capture <code>stdout</code>, and also capture <code>stderr</code> but <em>on the same pipe as stdout:</em></p>
+<pre><code>proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+</code></pre>
+<p>In this case, <code>subprocess</code> "cheats"!  Well, it has to do this, so it's not really cheating: it starts the subprocess with both its stdout and its stderr directed into the (single) pipe-descriptor that feeds back to its parent (Python) process.  On the parent side, there's again only a single pipe-descriptor for reading the output.  All the "stderr" output shows up in <code>proc.stdout</code>, and if you call <code>proc.communicate()</code>, the stderr result (second value in the tuple) will be <code>None</code>, not a string.</p>
+<h3>The hard cases: two or more pipes</h3>
+<p>The problems all come about when you want to use at least two pipes.  In fact, the <code>subprocess</code> code itself has this bit:</p>
+<pre><code>def communicate(self, input=None):
+    ...
+    # Optimization: If we are only using one pipe, or no pipe at
+    # all, using select() or threads is unnecessary.
+    if [self.stdin, self.stdout, self.stderr].count(None) &gt;= 2:
+</code></pre>
+<p>But, alas, here we've made at least two, and maybe three, different pipes, so the <code>count(None)</code> returns either 1 or 0.  We must do things the hard way.</p>
+<p>On Windows, this uses <code>threading.Thread</code> to accumulate results for <code>self.stdout</code> and <code>self.stderr</code>, and has the parent thread deliver <code>self.stdin</code> input data (and then close the pipe).</p>
+<p>On POSIX, this uses <code>poll</code> if available, otherwise <code>select</code>, to accumulate output and deliver stdin input.  All this runs in the (single) parent process/thread.</p>
+<p>Threads or poll/select are needed here to avoid deadlock.  Suppose, for instance, that we've redirected all three streams to three separate pipes.  Suppose further that there's a small limit on how much data can be stuffed into to a pipe before the writing process is suspended, waiting for the reading process to "clean out" the pipe from the other end.  Let's set that small limit to a single byte, just for illustration.  (This is in fact how things work, except that the limit is much bigger than one byte.)</p>
+<p>If the parent (Python) process tries to write several bytes—say, <code>'go\n'</code>to <code>proc.stdin</code>, the first byte goes in and then the second causes the Python process to suspend, waiting for the subprocess to read the first byte, emptying the pipe.</p>
+<p>Meanwhile, suppose the subprocess decides to print a friendly "Hello! Don't Panic!" greeting.  The <code>H</code> goes into its stdout pipe, but the <code>e</code> causes it to suspend, waiting for its parent to read that <code>H</code>, emptying the stdout pipe.</p>
+<p>Now we're stuck: the Python process is asleep, waiting to finish saying "go", and the subprocess is also asleep, waiting to finish saying "Hello! Don't Panic!".</p>
+<p>The <code>subprocess.Popen</code> code avoids this problem with threading-or-select/poll.  When bytes can go over the pipes, they go.  When they can't, only a thread (not the whole process) has to sleep—or, in the case of select/poll, the Python process waits simultaneously for "can write" or "data available", writes to the process's stdin only when there is room, and reads its stdout and/or stderr only when data are ready.  The <code>proc.communicate()</code> code (actually <code>_communicate</code> where the hairy cases are handled) returns once all stdin data (if any) have been sent and all stdout and/or stderr data have been accumulated.</p>
+<p>If you want to read both <code>stdout</code> and <code>stderr</code> on two different pipes (regardless of any <code>stdin</code> redirection), you will need to avoid deadlock too.  The deadlock scenario here is different—it occurs when the subprocess writes something long to <code>stderr</code> while you're pulling data from <code>stdout</code>, or vice versa—but it's still there.</p>
+<hr/>
+<h3>The Demo</h3>
+<p>I promised to demonstrate that, un-redirected, Python <code>subprocess</code>es write to the underlying stdout, not <code>sys.stdout</code>.  So, here is some code:</p>
+<pre><code>from cStringIO import StringIO
+import os
+import subprocess
+import sys
+
+def show1():
+    print 'start show1'
+    save = sys.stdout
+    sys.stdout = StringIO()
+    print 'sys.stdout being buffered'
+    proc = subprocess.Popen(['echo', 'hello'])
+    proc.wait()
+    in_stdout = sys.stdout.getvalue()
+    sys.stdout = save
+    print 'in buffer:', in_stdout
+
+def show2():
+    print 'start show2'
+    save = sys.stdout
+    sys.stdout = open(os.devnull, 'w')
+    print 'after redirect sys.stdout'
+    proc = subprocess.Popen(['echo', 'hello'])
+    proc.wait()
+    sys.stdout = save
+
+show1()
+show2()
+</code></pre>
+<p>When run:</p>
+<pre><code>$ python out.py
+start show1
+hello
+in buffer: sys.stdout being buffered
+
+start show2
+hello
+</code></pre>
+<p>Note that the first routine will fail if you add <code>stdout=sys.stdout</code>, as a <code>StringIO</code> object has no <code>fileno</code>.  The second will omit the <code>hello</code> if you add <code>stdout=sys.stdout</code> since <code>sys.stdout</code> has been redirected to <code>os.devnull</code>.</p>
+<p>(If you redirect Python's file-descriptor-1, the subprocess <em>will</em> follow that redirection.  The <code>open(os.devnull, 'w')</code> call produces a stream whose <code>fileno()</code> is greater than 2.)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>We can also use the default file iterator for reading stdout instead of using iter construct with readline(). </p>
+<pre><code>import subprocess
+import sys
+process = subprocess.Popen(your_command, stdout=subprocess.PIPE)
+for line in process.stdout:
+    sys.stdout.write(line)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you're able to use third-party libraries, You might be able to use something like <a href="http://sarge.readthedocs.org/en/latest/overview.html" rel="nofollow noreferrer"><code>sarge</code></a> (disclosure: I'm its maintainer). This library allows non-blocking access to output streams from subprocesses - it's layered over the <code>subprocess</code> module.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>A good but "heavyweight" solution is to use Twisted - see the bottom.</p>
+<p>If you're willing to live with only stdout something along those lines should work:</p>
+<pre><code>import subprocess
+import sys
+popenobj = subprocess.Popen(["ls", "-Rl"], stdout=subprocess.PIPE)
+while not popenobj.poll():
+   stdoutdata = popenobj.stdout.readline()
+   if stdoutdata:
+      sys.stdout.write(stdoutdata)
+   else:
+      break
+print "Return code", popenobj.returncode
+</code></pre>
+<p>(If you use read() it tries to read the entire "file" which isn't useful, what we really could use here is something that reads all the data that's in the pipe right now)</p>
+<p>One might also try to approach this with threading, e.g.:</p>
+<pre><code>import subprocess
+import sys
+import threading
+
+popenobj = subprocess.Popen("ls", stdout=subprocess.PIPE, shell=True)
+
+def stdoutprocess(o):
+   while True:
+      stdoutdata = o.stdout.readline()
+      if stdoutdata:
+         sys.stdout.write(stdoutdata)
+      else:
+         break
+
+t = threading.Thread(target=stdoutprocess, args=(popenobj,))
+t.start()
+popenobj.wait()
+t.join()
+print "Return code", popenobj.returncode
+</code></pre>
+<p>Now we could potentially add stderr as well by having two threads.</p>
+<p>Note however the subprocess docs discourage using these files directly and recommends to use <code>communicate()</code> (mostly concerned with deadlocks which I think isn't an issue above) and the solutions are a little klunky so it really seems like <strong>the subprocess module isn't quite up to the job</strong> (also see: <a href="http://www.python.org/dev/peps/pep-3145/" rel="nofollow">http://www.python.org/dev/peps/pep-3145/</a> ) and we need to look at something else.</p>
+<p>A more involved solution is to use <a href="http://twistedmatrix.com/trac/" rel="nofollow">Twisted</a> as shown here: <a href="https://twistedmatrix.com/documents/11.1.0/core/howto/process.html" rel="nofollow">https://twistedmatrix.com/documents/11.1.0/core/howto/process.html</a></p>
+<p>The way you do this with <a href="http://twistedmatrix.com/trac/" rel="nofollow">Twisted</a> is to create your process using <code>reactor.spawnprocess()</code> and providing a <code>ProcessProtocol</code> that then processes output asynchronously.  The Twisted sample Python code is here: <a href="https://twistedmatrix.com/documents/11.1.0/core/howto/listings/process/process.py" rel="nofollow">https://twistedmatrix.com/documents/11.1.0/core/howto/listings/process/process.py</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It looks like line-buffered output will work for you, in which case something like the following might suit. (Caveat: it's untested.)  This will only give the subprocess's stdout in real time.  If you want to have both stderr and stdout in real time, you'll have to do something more complex with <code>select</code>.</p>
+<pre><code>proc = subprocess.Popen(run_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
+while proc.poll() is None:
+    line = proc.stdout.readline()
+    print line
+    log_file.write(line + '\n')
+# Might still be data on stdout at this point.  Grab any
+# remainder.
+for line in proc.stdout.read().split('\n'):
+    print line
+    log_file.write(line + '\n')
+# Do whatever you want with proc.stderr here...
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Why not set <code>stdout</code> directly to <code>sys.stdout</code>? And if you need to output to a log as well, then you can simply override the write method of f.</p>
+<pre><code>import sys
+import subprocess
+
+class SuperFile(open.__class__):
+
+    def write(self, data):
+        sys.stdout.write(data)
+        super(SuperFile, self).write(data)
+
+f = SuperFile("log.txt","w+")       
+process = subprocess.Popen(command, stdout=f, stderr=f)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here is a class which I'm using in one of my projects. It redirects output of a subprocess to the log. At first I tried simply overwriting the write-method but that doesn't work as the subprocess will never call it (redirection happens on filedescriptor level). So I'm using my own pipe, similar to how it's done in the subprocess-module. This has the advantage of encapsulating all logging/printing logic in the adapter and you can simply pass instances of the logger to <code>Popen</code>: <code>subprocess.Popen("/path/to/binary", stderr = LogAdapter("foo"))</code></p>
+<pre><code>class LogAdapter(threading.Thread):
+
+    def __init__(self, logname, level = logging.INFO):
+        super().__init__()
+        self.log = logging.getLogger(logname)
+        self.readpipe, self.writepipe = os.pipe()
+
+        logFunctions = {
+            logging.DEBUG: self.log.debug,
+            logging.INFO: self.log.info,
+            logging.WARN: self.log.warn,
+            logging.ERROR: self.log.warn,
+        }
+
+        try:
+            self.logFunction = logFunctions[level]
+        except KeyError:
+            self.logFunction = self.log.info
+
+    def fileno(self):
+        #when fileno is called this indicates the subprocess is about to fork =&gt; start thread
+        self.start()
+        return self.writepipe
+
+    def finished(self):
+       """If the write-filedescriptor is not closed this thread will
+       prevent the whole program from exiting. You can use this method
+       to clean up after the subprocess has terminated."""
+       os.close(self.writepipe)
+
+    def run(self):
+        inputFile = os.fdopen(self.readpipe)
+
+        while True:
+            line = inputFile.readline()
+
+            if len(line) == 0:
+                #no new data was added
+                break
+
+            self.logFunction(line.strip())
+</code></pre>
+<p>If you don't need logging but simply want to use <code>print()</code> you can obviously remove large portions of the code and keep the class shorter. You could also expand it by an <code>__enter__</code> and <code>__exit__</code> method and call <code>finished</code> in <code>__exit__</code> so that you could easily use it as context.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>All of the above solutions I tried failed either to separate stderr and stdout output, (multiple pipes) or blocked forever when the OS pipe buffer was full which happens when the command you are running outputs too fast (there is a warning for this on python poll() manual of subprocess). The only reliable way I found was through select, but this is a posix-only solution:</p>
+<pre><code>import subprocess
+import sys
+import os
+import select
+# returns command exit status, stdout text, stderr text
+# rtoutput: show realtime output while running
+def run_script(cmd,rtoutput=0):
+    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    poller = select.poll()
+    poller.register(p.stdout, select.POLLIN)
+    poller.register(p.stderr, select.POLLIN)
+
+    coutput=''
+    cerror=''
+    fdhup={}
+    fdhup[p.stdout.fileno()]=0
+    fdhup[p.stderr.fileno()]=0
+    while sum(fdhup.values()) &lt; len(fdhup):
+        try:
+            r = poller.poll(1)
+        except select.error, err:
+            if err.args[0] != EINTR:
+                raise
+            r=[]
+        for fd, flags in r:
+            if flags &amp; (select.POLLIN | select.POLLPRI):
+                c = os.read(fd, 1024)
+                if rtoutput:
+                    sys.stdout.write(c)
+                    sys.stdout.flush()
+                if fd == p.stderr.fileno():
+                    cerror+=c
+                else:
+                    coutput+=c
+            else:
+                fdhup[fd]=1
+    return p.poll(), coutput.strip(), cerror.strip()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>In addition to all these answer, one simple approach could also be as follows:</p>
+<pre><code>process = subprocess.Popen(your_command, stdout=subprocess.PIPE)
+
+while process.stdout.readable():
+    line = process.stdout.readline()
+
+    if not line:
+        break
+
+    print(line.strip())
+</code></pre>
+<p>Loop through the readable stream as long as it's readable and if it gets an empty result, stop it.</p>
+<p>The key here is that <code>readline()</code> returns a line (with <code>\n</code> at the end) as long as there's an output and empty if it's really at the end.</p>
+<p>Hope this helps someone.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Similar to previous answers but the following solution worked for for me on windows using Python3 to provide a common method to print and log in realtime (<a href="https://www.endpoint.com/blog/2015/01/28/getting-realtime-output-using-python" rel="nofollow noreferrer" title="getting-realtime-output-using-python">getting-realtime-output-using-python</a>):</p>
+<pre><code>def print_and_log(command, logFile):
+    with open(logFile, 'wb') as f:
+        command = subprocess.Popen(command, stdout=subprocess.PIPE, shell=True)
+
+        while True:
+            output = command.stdout.readline()
+            if not output and command.poll() is not None:
+                f.close()
+                break
+            if output:
+                f.write(output)
+                print(str(output.strip(), 'utf-8'), flush=True)
+        return command.poll()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Based on all the above I suggest a slightly modified version (python3):</p>
+<ul>
+<li>while loop calling readline (The iter solution suggested seemed to block forever for me - Python 3, Windows 7)</li>
+<li>structered so handling of read data does not need to be duplicated after poll returns not-<code>None</code></li>
+<li>stderr piped into stdout so both output outputs are read</li>
+<li>Added code to get exit value of cmd.</li>
+</ul>
+<p>Code:</p>
+<pre><code>import subprocess
+proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, universal_newlines=True)
+while True:
+    rd = proc.stdout.readline()
+    print(rd, end='')  # and whatever you want to do...
+    if not rd:  # EOF
+        returncode = proc.poll()
+        if returncode is not None:
+            break
+        time.sleep(0.1)  # cmd closed stdout, but not exited yet
+
+# You may want to check on ReturnCode here
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think that the <code>subprocess.communicate</code> method is a bit misleading: it actually fills the <em>stdout</em> and <em>stderr</em> that you specify in the <code>subprocess.Popen</code>.</p>
+<p>Yet, reading from the <code>subprocess.PIPE</code> that you can provide to the <code>subprocess.Popen</code>'s <em>stdout</em> and <em>stderr</em> parameters will eventually fill up OS pipe buffers and deadlock your app (especially if you've multiple processes/threads that must use <code>subprocess</code>).</p>
+<p>My proposed solution is to provide the <em>stdout</em> and <em>stderr</em> with files - and read the files' content instead of reading from the deadlocking <code>PIPE</code>. These files can be <code>tempfile.NamedTemporaryFile()</code> - which can also be accessed for reading while they're being written into by <code>subprocess.communicate</code>. </p>
+<p><strong>Below is a sample usage:</strong></p>
+<pre><code>        try:
+            with ProcessRunner(('python', 'task.py'), env=os.environ.copy(), seconds_to_wait=0.01) as process_runner:
+                for out in process_runner:
+                    print(out)
+        catch ProcessError as e:
+            print(e.error_message)
+            raise
+</code></pre>
+<p>And this is the source code which is <strong>ready to be used</strong> with as many comments as I could provide to explain what it does:</p>
+<p>If you're using python 2, please make sure to first install the latest version of the <em>subprocess32</em> package from pypi.</p>
+<pre><code>
+import os
+import sys
+import threading
+import time
+import tempfile
+import logging
+
+if os.name == 'posix' and sys.version_info[0] &lt; 3:
+    # Support python 2
+    import subprocess32 as subprocess
+else:
+    # Get latest and greatest from python 3
+    import subprocess
+
+logger = logging.getLogger(__name__)
+
+
+class ProcessError(Exception):
+    """Base exception for errors related to running the process"""
+
+
+class ProcessTimeout(ProcessError):
+    """Error that will be raised when the process execution will exceed a timeout"""
+
+
+class ProcessRunner(object):
+    def __init__(self, args, env=None, timeout=None, bufsize=-1, seconds_to_wait=0.25, **kwargs):
+        """
+        Constructor facade to subprocess.Popen that receives parameters which are more specifically required for the
+        Process Runner. This is a class that should be used as a context manager - and that provides an iterator
+        for reading captured output from subprocess.communicate in near realtime.
+
+        Example usage:
+
+
+        try:
+            with ProcessRunner(('python', task_file_path), env=os.environ.copy(), seconds_to_wait=0.01) as process_runner:
+                for out in process_runner:
+                    print(out)
+        catch ProcessError as e:
+            print(e.error_message)
+            raise
+
+        :param args: same as subprocess.Popen
+        :param env: same as subprocess.Popen
+        :param timeout: same as subprocess.communicate
+        :param bufsize: same as subprocess.Popen
+        :param seconds_to_wait: time to wait between each readline from the temporary file
+        :param kwargs: same as subprocess.Popen
+        """
+        self._seconds_to_wait = seconds_to_wait
+        self._process_has_timed_out = False
+        self._timeout = timeout
+        self._process_done = False
+        self._std_file_handle = tempfile.NamedTemporaryFile()
+        self._process = subprocess.Popen(args, env=env, bufsize=bufsize,
+                                         stdout=self._std_file_handle, stderr=self._std_file_handle, **kwargs)
+        self._thread = threading.Thread(target=self._run_process)
+        self._thread.daemon = True
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._thread.join()
+        self._std_file_handle.close()
+
+    def __iter__(self):
+        # read all output from stdout file that subprocess.communicate fills
+        with open(self._std_file_handle.name, 'r') as stdout:
+            # while process is alive, keep reading data
+            while not self._process_done:
+                out = stdout.readline()
+                out_without_trailing_whitespaces = out.rstrip()
+                if out_without_trailing_whitespaces:
+                    # yield stdout data without trailing \n
+                    yield out_without_trailing_whitespaces
+                else:
+                    # if there is nothing to read, then please wait a tiny little bit
+                    time.sleep(self._seconds_to_wait)
+
+            # this is a hack: terraform seems to write to buffer after process has finished
+            out = stdout.read()
+            if out:
+                yield out
+
+        if self._process_has_timed_out:
+            raise ProcessTimeout('Process has timed out')
+
+        if self._process.returncode != 0:
+            raise ProcessError('Process has failed')
+
+    def _run_process(self):
+        try:
+            # Start gathering information (stdout and stderr) from the opened process
+            self._process.communicate(timeout=self._timeout)
+            # Graceful termination of the opened process
+            self._process.terminate()
+        except subprocess.TimeoutExpired:
+            self._process_has_timed_out = True
+            # Force termination of the opened process
+            self._process.kill()
+
+        self._process_done = True
+
+    @property
+    def return_code(self):
+        return self._process.returncode
+
+
+
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>None of the Pythonic solutions worked for me.
+It turned out that <code>proc.stdout.read()</code> or similar may block forever.</p>
+<p>Therefore, I use <code>tee</code> like this:</p>
+<pre class="lang-py prettyprint-override"><code>subprocess.run('./my_long_running_binary 2&gt;&amp;1 | tee -a my_log_file.txt &amp;&amp; exit ${PIPESTATUS}', shell=True, check=True, executable='/bin/bash')
+</code></pre>
+<p>This solution is convenient if you are already using <code>shell=True</code>.</p>
+<p><code>${PIPESTATUS}</code> captures the success status of the entire command chain (only available in Bash).
+If I omitted the <code>&amp;&amp; exit ${PIPESTATUS}</code>, then this would always return zero since <code>tee</code> never fails.</p>
+<p><code>unbuffer</code> might be necessary for printing each line immediately into the terminal, instead of waiting way too long until the "pipe buffer" gets filled.
+However, unbuffer swallows the exit status of assert (SIG Abort)...</p>
+<p><code>2&gt;&amp;1</code> also logs stderror to the file.</p>
+</div>
+<span class="comment-copy">Maybe you can use <code>Popen.poll</code> as in <a href="http://stackoverflow.com/questions/2996887/how-to-replicate-tee-behavior-in-python-when-using-subprocess">a previous Stack Overflow question</a>.</span>
+<span class="comment-copy">Some commands that show progress indication (e.g., <code>git</code>) do so only if their output is a "tty device" (tested via libc <code>isatty()</code>).  In that case you may have to open a pseudo-tty.</span>
+<span class="comment-copy">@torek what's a (pseudo-)tty?</span>
+<span class="comment-copy">Devices on Unix-like systems that allow a process to pretend to be a user on a serial port.  This is how ssh (server side) works, for instance.  See <a href="http://docs.python.org/2/library/pty.html" rel="nofollow noreferrer">python pty library</a>, and also <a href="http://www.noah.org/wiki/pexpect" rel="nofollow noreferrer">pexpect</a>.</span>
+<span class="comment-copy">Re temporary solution: there's no need to call <code>flush</code>, and there <i>is</i> need to read from the stderr pipe if the subprocess produces much stderr output.  There is not room enough in a comment field to explain this...</span>
+<span class="comment-copy">Ugh :-) write to a file, read from it, and sleep in the loop?  There's also a chance the process will end before you've finished reading the file.</span>
+<span class="comment-copy">@GuySirton just add another read at the end.</span>
+<span class="comment-copy">With Python 3, you need <code>iter(process.stdout.readline, b'')</code> (i.e. the sentinel passed to <a href="https://docs.python.org/3/library/functions.html#iter" rel="nofollow noreferrer">iter</a> needs to be a binary string, since <code>b'' != ''</code>.</span>
+<span class="comment-copy">For binary streams, do this:<code>for line in iter(process.stdout.readline, b''):     sys.stdout.buffer.write(line)</code></span>
+<span class="comment-copy">Adding to @JohnMellor 's answer, in Python 3 the following modifications were needed:  <code>process = subprocess.Popen(command, stderr=subprocess.STDOUT, stdout=subprocess.PIPE)  for line in iter(process.stdout.readline, b'')     sys.stdout.write(line.decode(sys.stdout.encoding)) </code></span>
+<span class="comment-copy">Hmm.  Your demo seems to show the opposite of the claim in the end.  You're re-directing Python's stdout into the buffer but the subprocess stdout is still going to the console.  How is that useful?  Am I missing something?</span>
+<span class="comment-copy">@GuySirton: the demo shows that subprocess stdout (when not explicitly directed to <code>sys.stdout</code>) goes to <i>Python's</i> stdout, not the python <i>program</i>'s (<code>sys.</code>) stdout.  Which I admit is an ... odd distinction.  Is there a better way to phrase this?</span>
+<span class="comment-copy">that's good to know but we really want to capture the subprocess output here so changing sys.stdout is cool but doesn't help us I think.  Good observation that communicate must be using something like select(), poll or threads.</span>
+<span class="comment-copy">+1, good explanation but it lacks the concrete code examples. Here's <a href="http://stackoverflow.com/a/25960956/4279"><code>asyncio</code>-based code that implements the "hard part" (it handles multiple pipes concurrently) in a portable way</a>. You could compare it to <a href="http://stackoverflow.com/a/25755038/4279">the code that uses multiple threads (<code>teed_call()</code>) to do the same</a>.</span>
+<span class="comment-copy">I've added an implementation with select()</span>
+<span class="comment-copy">why isn't this the accepted and most voted answer?</span>
+<span class="comment-copy">The most elegant answer here!</span>
+<span class="comment-copy">Fine work on sarge, BTW. That does indeed solve the OP's requirement, but might be a bit heavy handed for that use-case.</span>
+<span class="comment-copy">Thanks!  I just tried something like this (based on @PauloAlmeida 's comment, but my call to subprocess.Popen is blocking -- i.e. it only comes to the while loop once it returns...</span>
+<span class="comment-copy">That's not what's going on.  It's entering the while loop right away then blocking on the <code>read()</code> call until the subprocess exits and the parent process receives <code>EOF</code> on the pipe.</span>
+<span class="comment-copy">@Alp interesting!  so it is.</span>
+<span class="comment-copy">Yeah, I was too quick to post this.  It actually doesn't work properly and can't be easily fixed.  back to the drawing table.</span>
+<span class="comment-copy">@zhermes: So the problem with read() is that it will try to read the entire output till EOF which isn't useful.  readline() helps and may be all you need (really long lines can also be a problem though).  You also need to watch out for buffering in the process you're launching...</span>
+<span class="comment-copy">That wouldn't work: the subprocess module forks and sets the <code>stdout</code> file descriptor to the file descriptor of the passed file object. The write-method would never be called (at least that's what subprocess does for stderr, I gues it's the same for stdout).</span>
+<span class="comment-copy">Another alternative is to spin off one thread per pipe. Each thread can do blocking I/O on the pipe, without blocking the other thread(s). But this introduces its own set of issues. All methods have annoyances, you just pick which one(s) you find least annoying. :-)</span>

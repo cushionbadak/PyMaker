@@ -1,0 +1,81 @@
+<div class="post-text" itemprop="text">
+<p>I am using the new <a href="https://docs.python.org/3/library/concurrent.futures.html"><code>concurrent.futures</code></a> module (which also has a Python 2 backport) to do some simple multithreaded I/O. I am having trouble understanding how to cleanly kill tasks started using this module.</p>
+<p>Check out the following Python 2/3 script, which reproduces the behavior I'm seeing:</p>
+<pre><code>#!/usr/bin/env python
+from __future__ import print_function
+
+import concurrent.futures
+import time
+
+
+def control_c_this():
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future1 = executor.submit(wait_a_bit, name="Jack")
+        future2 = executor.submit(wait_a_bit, name="Jill")
+
+        for future in concurrent.futures.as_completed([future1, future2]):
+            future.result()
+
+        print("All done!")
+
+
+def wait_a_bit(name):
+    print("{n} is waiting...".format(n=name))
+    time.sleep(100)
+
+
+if __name__ == "__main__":
+    control_c_this()
+</code></pre>
+<p>While this script is running it appears impossible to kill cleanly using the regular Control-C keyboard interrupt. I am running on OS X.</p>
+<ul>
+<li>On Python 2.7 I have to resort to <code>kill</code> from the command line to kill the script. Control-C is just ignored.</li>
+<li>On Python 3.4, Control-C works if you hit it twice, but then a lot of strange stack traces are dumped.</li>
+</ul>
+<p>Most documentation I've found online talks about how to cleanly kill threads with the old <code>threading</code> module. None of it seems to apply here.</p>
+<p>And all the methods provided within the <code>concurrent.futures</code> module to stop stuff (like <code>Executor.shutdown()</code> and <code>Future.cancel()</code>) only work when the Futures haven't started yet or are complete, which is pointless in this case. I want to interrupt the Future immediately.</p>
+<p>My use case is simple: When the user hits Control-C, the script should exit immediately like any well-behaved script does. That's all I want.</p>
+<p>So what's the proper way to get this behavior when using <code>concurrent.futures</code>?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It's kind of painful. Essentially, your worker threads have to be finished before your main thread can exit. You cannot exit unless they do. The typical workaround is to have some global state, that each thread can check to determine if they should do more work or not.</p>
+<p>Here's the <a href="https://hg.python.org/cpython/file/2805b0dca798/Lib/concurrent/futures/thread.py#l15" rel="noreferrer">quote</a> explaining why. In essence, if threads exited when the interpreter does, bad things could happen.</p>
+<p>Here's a working example. Note that C-c takes at most 1 sec to propagate because the sleep duration of the child thread.</p>
+<pre><code>#!/usr/bin/env python
+from __future__ import print_function
+
+import concurrent.futures
+import time
+import sys
+
+quit = False
+def wait_a_bit(name):
+    while not quit:
+        print("{n} is doing work...".format(n=name))
+        time.sleep(1)
+
+def setup():
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+    future1 = executor.submit(wait_a_bit, "Jack")
+    future2 = executor.submit(wait_a_bit, "Jill")
+
+    # main thread must be doing "work" to be able to catch a Ctrl+C 
+    # http://www.luke.maurits.id.au/blog/post/threads-and-signals-in-python.html
+    while (not (future1.done() and future2.done())):
+        time.sleep(1)
+
+if __name__ == "__main__":
+    try:
+        setup()
+    except KeyboardInterrupt:
+        quit = True
+</code></pre>
+</div>
+<span class="comment-copy">Reading a <a href="http://stackoverflow.com/q/671049/877069">related question about Java</a>, I see that killing a thread is not something you normally do because it can make your program state inconsistent. In my case I don't <i>think</i> this is a concern since I just want the whole program to exit. There was also mention of <a href="http://stackoverflow.com/a/11387729/877069">setting some shared variable</a> that the threads can read to know when to self-terminate. Not sure if that approach carries over to Python.</span>
+<span class="comment-copy">Just a heads up, Ctrl+Break will work, even when Ctrl+C doesn't.</span>
+<span class="comment-copy">@jedwards - With Python 2 I'm trying Command + . (which is Control + Break on OS X apparently) and it doesn't seem to work. Seems to be equivalent to Control + C, actually.</span>
+<span class="comment-copy">I'll take for now that this is the best solution. It sucks that you have to have your threads burn CPU time with the sleep loop. What's more, the more responsive you want the kill to be, the shorter the sleep loop needs to be and thus, the more CPU time is burnt on it.</span>
+<span class="comment-copy">You don't have to sleep. You just need them to check back whether or not they should exit.</span>
+<span class="comment-copy">This trick worked for me when using <code>ThreadPoolExecutor</code> but not with <code>ProcessPoolExecutor</code>. Is there some gotcha when attempting to share global variables across processes? Would I have to store the <code>quit</code> flag on disk or something?</span>
+<span class="comment-copy">Processes do not share variables, you would have to use a queue or semaphore to communicate.</span>
+<span class="comment-copy">@NickChammas AFAIK sleeping doesn't usually burn CPU time in any relevant amount. Try creating 10k Threads that immediately go to sleep for one day; you won't see any CPU usage after the setup time. So in most applications this should be fine.</span>

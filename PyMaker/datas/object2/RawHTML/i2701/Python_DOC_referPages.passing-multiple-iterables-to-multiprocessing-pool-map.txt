@@ -1,0 +1,72 @@
+<div class="post-text" itemprop="text">
+<p>Consider the following function:</p>
+<pre><code>def f(x, dummy=list(range(10000000))):
+    return x
+</code></pre>
+<p>If I use <code>multiprocessing.Pool.imap</code>, I get the following timings:</p>
+<pre><code>import time
+import os
+from multiprocessing import Pool
+
+def f(x, dummy=list(range(10000000))):
+    return x
+
+start = time.time()
+pool = Pool(2)
+for x in pool.imap(f, range(10)):
+    print("parent process, x=%s, elapsed=%s" % (x, int(time.time() - start)))
+
+parent process, x=0, elapsed=0
+parent process, x=1, elapsed=0
+parent process, x=2, elapsed=0
+parent process, x=3, elapsed=0
+parent process, x=4, elapsed=0
+parent process, x=5, elapsed=0
+parent process, x=6, elapsed=0
+parent process, x=7, elapsed=0
+parent process, x=8, elapsed=0
+parent process, x=9, elapsed=0
+</code></pre>
+<p>Now if I use <code>functools.partial</code> instead of using a default value:</p>
+<pre><code>import time
+import os
+from multiprocessing import Pool
+from functools import partial
+
+def f(x, dummy):
+    return x
+
+start = time.time()
+g = partial(f, dummy=list(range(10000000)))
+pool = Pool(2)
+for x in pool.imap(g, range(10)):
+    print("parent process, x=%s, elapsed=%s" % (x, int(time.time() - start)))
+
+parent process, x=0, elapsed=1
+parent process, x=1, elapsed=2
+parent process, x=2, elapsed=5
+parent process, x=3, elapsed=7
+parent process, x=4, elapsed=8
+parent process, x=5, elapsed=9
+parent process, x=6, elapsed=10
+parent process, x=7, elapsed=10
+parent process, x=8, elapsed=11
+parent process, x=9, elapsed=11
+</code></pre>
+<p>Why is the version using <code>functools.partial</code> so much slower?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Using <code>multiprocessing</code> requires sending the worker processes information about the function to run, not just the arguments to pass.  That information is transferred by <a href="https://docs.python.org/3/library/pickle.html" rel="noreferrer">pickling</a> that information in the main process, sending it to the worker process, and unpickling it there.</p>
+<p>This leads to the primary issue:</p>
+<p><strong>Pickling a function with default arguments is cheap</strong>; it only pickles the name of the function (plus the info to let Python know it's a function); the worker processes just look up the local copy of the name. They already have a named function <code>f</code> to find, so it costs almost nothing to pass it.</p>
+<p>But <strong>pickling a <code>partial</code> function involves pickling the underlying function (cheap) and <em>all</em> the default arguments (<em>expensive</em> when the default argument is a 10M long <code>list</code>)</strong>. So every time a task is dispatched in the <code>partial</code> case, it's pickling the bound argument, sending it to the worker process, the worker process unpickles, then finally does the "real" work. On my machine, that pickle is roughly 50 MB in size, which is a huge amount of overhead; in quick timing tests on my machine, pickling and unpickling a 10 million long <code>list</code> of <code>0</code> takes about 620 ms (and that's ignoring the overhead of actually transferring the 50 MB of data).</p>
+<p><code>partial</code>s have to pickle this way, because they don't know their own names; when pickling a function like <code>f</code>, <code>f</code> (being <code>def</code>-ed) knows its qualified name (in an interactive interpreter or from the main module of a program, it's <code>__main__.f</code>), so the remote side can just recreate it locally by doing the equivalent of <code>from __main__ import f</code>. But the <code>partial</code> doesn't know its name; sure, you assigned it to <code>g</code>, but neither <code>pickle</code> nor the <code>partial</code> itself know it available with the qualified name <code>__main__.g</code>; it could be named <code>foo.fred</code> or a million other things. So it has to <code>pickle</code> the info necessary to recreate it entirely from scratch. It's also <code>pickle</code>-ing for each call (not just once per worker) because it doesn't know that the callable isn't changing in the parent between work items, and it's always trying to ensure it sends up to date state.</p>
+<p>You have other issues (timing creation of the <code>list</code> only in the <code>partial</code> case and the minor overhead of calling a <code>partial</code> wrapped function vs. calling the function directly), but those are chump change relative to the per-call overhead pickling and unpickling the <code>partial</code> is adding (the initial creation of the <code>list</code> is adding one-time overhead of a little under half what <em>each</em> pickle/unpickle cycle costs; the overhead to call through the <code>partial</code> is less than a microsecond).</p>
+</div>
+<span class="comment-copy">Why are you using <code>list(range(...))</code>? AFAIK your code would do exactly the same thing without the call to <code>list</code>, except that the problem explained by ShadowRanger wouldn't occur and the overhead of pickling would be <i>much much</i> smaller.</span>
+<span class="comment-copy">Side-note: Using <code>list</code>s (or any other mutable type) as default (or <code>partial</code> bound) arguments is dangerous, since the <i>same</i> <code>list</code> is shared between all default invocations of the function, not a fresh copy for each call; usually, you want the fresh copy.</span>
+<span class="comment-copy">as aside note, is usually bad idea using mutable object as default values because if you modify it in the function every subsequent invocation to the function is going to see the changes</span>
+<span class="comment-copy">@Bakuriu: I think this is just a minimal example to demonstrate the discrepancy, not real code. Which is appreciated; getting a giant dump of someone's project and no indication that they've attempted to suss out the problem is a royal PITA.</span>
+<span class="comment-copy">1) If the default argument <code>dummy</code> is not pickled, then how is it sent to the worker? It is not a global variable, is it? 2) With the <code>partial</code>, each function call is expensive. Does it mean that <code>g</code> gets (re)pickled for each function call?</span>
+<span class="comment-copy">@usualme: #1: On Linux, the workers are forked from the parent, so they already have their own copy of the function in their own memory space (it's copy-on-write, so they may actually be sharing pages with the parent for a while). And their copy already has the same default argument initialized, so when they look up the same function by qualified name, it comes already set up. On Windows, Python simulates fork by running <code>__main__</code> w/o running it as if it were being run as the main module; if the function is imported in <code>__main__</code>, the cost to make the list is paid once per worker, not task.</span>
+<span class="comment-copy">@usualme: #2: Yup, the <code>Pool</code> is generic, and there is no guarantee that worker processes won't die and be replaced, that the process of launching and receiving results from the workers won't mutate the callable passed to <code>imap</code>, that any given worker has even received work yet, or that other tasks using different callables might not be interspersed, etc. So both callable and arguments are serialized for dispatch on every individual task, not just once per worker. Usually, callables are fairly cheap to serialize, this is one of those pathological cases that's the exception to the general rule.</span>

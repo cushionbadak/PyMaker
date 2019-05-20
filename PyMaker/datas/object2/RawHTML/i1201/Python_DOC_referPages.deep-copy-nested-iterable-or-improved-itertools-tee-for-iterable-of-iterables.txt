@@ -1,0 +1,329 @@
+<div class="post-text" itemprop="text">
+<h1>Preface</h1>
+<p>I have a test where I'm working with nested iterables (by <em>nested iterable</em> I mean iterable with only iterables as elements). </p>
+<p>As a test cascade consider</p>
+<pre><code>from itertools import tee
+from typing import (Any,
+                    Iterable)
+
+
+def foo(nested_iterable: Iterable[Iterable[Any]]) -&gt; Any:
+    ...
+
+
+def test_foo(nested_iterable: Iterable[Iterable[Any]]) -&gt; None:
+    original, target = tee(nested_iterable)  # this doesn't copy iterators elements
+
+    result = foo(target)
+
+    assert is_contract_satisfied(result, original)
+
+
+def is_contract_satisfied(result: Any,
+                          original: Iterable[Iterable[Any]]) -&gt; bool:
+    ...
+</code></pre>
+<p>E.g. <code>foo</code> may be simple identity function</p>
+<pre><code>def foo(nested_iterable: Iterable[Iterable[Any]]) -&gt; Iterable[Iterable[Any]]:
+    return nested_iterable
+</code></pre>
+<p>and contract is simply checks that flattened iterables have same elements</p>
+<pre><code>from itertools import (chain,
+                       starmap,
+                       zip_longest)
+from operator import eq
+...
+flatten = chain.from_iterable
+
+
+def is_contract_satisfied(result: Iterable[Iterable[Any]],
+                          original: Iterable[Iterable[Any]]) -&gt; bool:
+    return all(starmap(eq,
+                       zip_longest(flatten(result), flatten(original),
+                                   # we're assuming that ``object()``
+                                   # will create some unique object
+                                   # not presented in any of arguments
+                                   fillvalue=object())))
+</code></pre>
+<p>But if some of <code>nested_iterable</code> elements is an iterator, it may be exhausted since <code>tee</code> is making shallow copies, not deep ones, i.e. for given <code>foo</code> and <code>is_contract_satisfied</code> next statement</p>
+<pre><code>&gt;&gt;&gt; test_foo([iter(range(10))])
+</code></pre>
+<p>leads to predictable</p>
+<pre><code>Traceback (most recent call last):
+  ...
+    test_foo([iter(range(10))])
+  File "...", line 19, in test_foo
+    assert is_contract_satisfied(result, original)
+AssertionError
+</code></pre>
+<h1>Problem</h1>
+<p>How to deep copy an arbitrary nested iterable?</p>
+<h1>Note</h1>
+<p>I'm aware of <a href="https://docs.python.org/3/library/copy.html#copy.deepcopy" rel="nofollow noreferrer"><code>copy.deepcopy</code> function</a>, but it won't work for file objects.</p>
+</div>
+<div class="post-text" itemprop="text">
+<h1>Naive solution</h1>
+<p>Straightforward algorithm would be </p>
+<ol>
+<li>Perform elementwise copying of original nested iterable.</li>
+<li>Make <code>n</code> copies of elementwise copy.</li>
+<li>Obtain coordinates related to each independent copy.</li>
+</ol>
+<p>which may be implemented like</p>
+<pre><code>from itertools import tee
+from operator import itemgetter
+from typing import (Any,
+                    Iterable,
+                    Tuple,
+                    TypeVar)
+
+Domain = TypeVar('Domain')
+
+
+def copy_nested_iterable(nested_iterable: Iterable[Iterable[Domain]],
+                         *,
+                         count: int = 2
+                         ) -&gt; Tuple[Iterable[Iterable[Domain]], ...]:
+    def shallow_copy(iterable: Iterable[Domain]) -&gt; Tuple[Iterable[Domain], ...]:
+        return tee(iterable, count)
+
+    copies = shallow_copy(map(shallow_copy, nested_iterable))
+    return tuple(map(itemgetter(index), iterables)
+                 for index, iterables in enumerate(copies))
+</code></pre>
+<p>Pros:</p>
+<ul>
+<li>quite easy to read &amp; explain.</li>
+</ul>
+<p>Cons:</p>
+<ul>
+<li>if we wanted to extend our approach for iterables with greater nesting level (like iterable of nested iterables and so on) this approach doesn't look helpful.</li>
+</ul>
+<p>We can do better.</p>
+<h1>Improved solution</h1>
+<p>If we look at <a href="https://docs.python.org/3/library/itertools.html#itertools.tee" rel="nofollow noreferrer"><code>itertools.tee</code> function documentation</a>, it contains Python recipe, which with help of <a href="https://docs.python.org/3/library/functools.html#functools.singledispatch" rel="nofollow noreferrer"><code>functools.singledispatch</code> decorator</a> can be rewritten like</p>
+<pre><code>from collections import (abc,
+                         deque)
+from functools import singledispatch
+from itertools import repeat
+from typing import (Iterable,
+                    Tuple,
+                    TypeVar)
+
+Domain = TypeVar('Domain')
+
+
+@functools.singledispatch
+def copy(object_: Domain,
+         *,
+         count: int) -&gt; Iterable[Domain]:
+    raise TypeError('Unsupported object type: {type}.'
+                    .format(type=type(object_)))
+
+# handle general case
+@copy.register(object)
+# immutable strings represent a special kind of iterables
+# that can be copied by simply repeating
+@copy.register(bytes)
+@copy.register(str)
+# mappings cannot be copied as other iterables
+# since they are iterable only by key
+@copy.register(abc.Mapping)
+def copy_object(object_: Domain,
+                *,
+                count: int) -&gt; Iterable[Domain]:
+    return itertools.repeat(object_, count)
+
+
+@copy.register(abc.Iterable)
+def copy_iterable(object_: Iterable[Domain],
+                  *,
+                  count: int = 2) -&gt; Tuple[Iterable[Domain], ...]:
+    iterator = iter(object_)
+    # we are using `itertools.repeat` instead of `range` here
+    # due to efficiency of the former
+    # more info at
+    # https://stackoverflow.com/questions/9059173/what-is-the-purpose-in-pythons-itertools-repeat/9098860#9098860
+    queues = [deque() for _ in repeat(None, count)]
+
+    def replica(queue: deque) -&gt; Iterable[Domain]:
+        while True:
+            if not queue:
+                try:
+                    element = next(iterator)
+                except StopIteration:
+                    return
+                element_copies = copy(element,
+                                           count=count)
+                for sub_queue, element_copy in zip(queues, element_copies):
+                    sub_queue.append(element_copy)
+            yield queue.popleft()
+
+    return tuple(replica(queue) for queue in queues)
+</code></pre>
+<p>Pros:</p>
+<ul>
+<li>handles nesting on deeper levels or even mixed elements like both iterables and non-iterables on the same level,</li>
+<li>may be extended for user-defined structures (e.g. for making independent deep copies of them).</li>
+</ul>
+<p>Cons:</p>
+<ul>
+<li>less readable (but as we know <a href="https://www.python.org/dev/peps/pep-0020/#the-zen-of-python" rel="nofollow noreferrer">"practicality beats purity"</a>),</li>
+<li>provides some overhead related to dispatching (but it's ok since it is based on dictionary lookup which has <code>O(1)</code> complexity).</li>
+</ul>
+<hr/>
+<h1>Test</h1>
+<h2>Preparation</h2>
+<p>Let's define our nested iterable as follows</p>
+<pre><code>nested_iterable = [range(10 ** index) for index in range(1, 7)]
+</code></pre>
+<p>Since iterators creation says nothing about underlying copies performance, let's define function for iterators exhausting (described <a href="https://mail.python.org/pipermail/python-ideas/2013-September/023488.html" rel="nofollow noreferrer">here</a>)</p>
+<pre><code>exhaust_iterable = deque(maxlen=0).extend
+</code></pre>
+<h2>Time</h2>
+<p>Using <code>timeit</code> package</p>
+<pre><code>import timeit
+
+def naive(): exhaust_iterable(copy_nested_iterable(nested_iterable))
+
+def improved(): exhaust_iterable(copy_iterable(nested_iterable))
+
+print('naive approach:', min(timeit.repeat(naive)))
+print('improved approach:', min(timeit.repeat(improved)))
+</code></pre>
+<p>I have on my laptop with Windows 10 x64 in Python 3.5.4</p>
+<pre><code>naive approach: 5.1863865
+improved approach: 3.5602296000000013
+</code></pre>
+<h2>Memory</h2>
+<p>Using <a href="https://pypi.org/project/memory-profiler/" rel="nofollow noreferrer"><code>memory_profiler</code> package</a></p>
+<pre><code>Line #    Mem usage    Increment   Line Contents
+================================================
+    78     17.2 MiB     17.2 MiB   @profile
+    79                             def profile_memory(nested_iterable: Iterable[Iterable[Any]]) -&gt; None:
+    80     68.6 MiB     51.4 MiB       result = list(flatten(flatten(copy_nested_iterable(nested_iterable))))
+</code></pre>
+<p>for "naive" approach and</p>
+<pre><code>Line #    Mem usage    Increment   Line Contents
+================================================
+    78     17.2 MiB     17.2 MiB   @profile
+    79                             def profile_memory(nested_iterable: Iterable[Iterable[Any]]) -&gt; None:
+    80     68.7 MiB     51.4 MiB       result = list(flatten(flatten(copy_iterable(nested_iterable))))
+</code></pre>
+<p>for "improved" one.</p>
+<p><strong>Note</strong>: I've made different runs of script because making them at once won't be representative since second statement will reuse previously created under-the-hood <code>int</code> objects.</p>
+<hr/>
+<h1>Conclusion</h1>
+<p>As we can see both functions have similar performance, but the last one supports deeper levels of nesting and looks pretty extensible.</p>
+<h2>Advertisement</h2>
+<p>I've added "improved" solution to <a href="https://pypi.org/project/lz" rel="nofollow noreferrer"><code>lz</code> package</a> from <code>0.4.0</code> version which can be used like</p>
+<pre><code>&gt;&gt;&gt; from lz.replication import replicate
+&gt;&gt;&gt; iterable = iter(range(5))
+&gt;&gt;&gt; list(map(list, replicate(iterable,
+                             count=3)))
+[[0, 1, 2, 3, 4], [0, 1, 2, 3, 4], [0, 1, 2, 3, 4]]
+</code></pre>
+<p>It is property-based tested using <a href="https://hypothesis.works/" rel="nofollow noreferrer"><code>hypothesis</code> framework</a>, so we may be sure that it works as expected.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Addressing your question: <em>How to deep copy a nested iterable?</em></p>
+<p>You can use <code>deepcopy</code> from the standard library:</p>
+<pre><code>&gt;&gt;&gt; from copy import deepcopy
+&gt;&gt;&gt; 
+&gt;&gt;&gt; ni = [1, [2,3,4]]
+&gt;&gt;&gt; ci = deepcopy(ni)
+&gt;&gt;&gt; ci[1][0] = "Modified"
+&gt;&gt;&gt; ci
+[1, ['Modified', 3, 4]]
+&gt;&gt;&gt; ni
+[1, [2,3,4]]
+</code></pre>
+<h1>Update</h1>
+<p>@Azat Ibrakov said: <em>you are working with sequences, try to deepcopy a file object for example (hint: it will fail)</em></p>
+<p>No, deepcopy on a file object, won't fail, you can deep copy a file object, demonstration:</p>
+<pre><code>import copy
+
+with open('example.txt', 'w') as f:
+     f.writelines(["{}\n".format(i) for i in range(100)])
+
+with open('example.txt', 'r') as f:
+    l = [1, [f]]
+    c = copy.deepcopy(l)
+    print(isinstance(c[1][0], file))  # Prints  True.
+    print("\n".join(dir(c[1][0])))
+</code></pre>
+<p>Prints:</p>
+<pre><code>True
+__class__
+__delattr__
+__doc__
+__enter__
+__exit__
+__format__
+__getattribute__
+...
+write
+writelines
+xreadlines
+</code></pre>
+<h1>The problem is in the concept.</h1>
+<p>According to Python Iterator protocol, the items contained by some container are obtained executing the <code>next</code> function see the <a href="http://docs.python.org/2/library/stdtypes.html#iterator-types" rel="nofollow noreferrer">docs here</a>.</p>
+<p>You won't have all items of an object that implements the iterator protocol (as file objects) until you traverse the whole iterator (execute <code>next()</code> until StopIteration exception is raised).</p>
+<p>That's because there is no way you can tell for sure the result of executing the <code>next</code> (<code>__next__</code> for Python 2.x) method of an iterator</p>
+<p>See the following example:</p>
+<pre><code>import random
+
+class RandomNumberIterator:
+
+    def __init__(self):
+        self.count = 0
+        self.internal_it = range(10)  # For later demostration on deepcopy
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        self.count += 1
+        if self.count == 10:
+            raise StopIteration
+        return random.randint(0, 1000)
+
+ri = RandomNumberIterator()
+
+for i in ri:
+    print(i)  # This will print randor numbers each time.
+              # Can you come out with some sort of mechanism to be able
+              # to copy **THE CONTENT** of the `ri` iterator? 
+</code></pre>
+<p>Again you could:</p>
+<pre><code>from copy import deepcopy
+
+cri = deepcopy(ri)
+
+for i in cri.internal_it:
+    print(i)   # Will print numbers 0..9
+               # Deepcopy on ri successful!
+</code></pre>
+<blockquote>
+<p>A file object is an especial case here, there are file handlers involved, before, you see you can deepcopy a file object, but it will have <code>closed</code> state.</p>
+</blockquote>
+<h1>Alternative.</h1>
+<p>You could call <code>list</code> on your iterables, that will automatically evaluate iterables an then you will be able to test again <strong>THE ITERABLE'S CONTENT</strong>. </p>
+<p>Returning to files:</p>
+<pre><code>with open('example.txt', 'w') as f:
+         f.writelines(["{}\n".format(i) for i in range(5)])
+
+with open('example.txt', 'r') as f:
+    print(list(f))  # Prints ['0\n', '1\n', '2\n', '3\n', '4\n']
+</code></pre>
+<h1>So, resuming</h1>
+<p>You can deepcopy nested iterables but, you can't evaluate iterables while they are being copied, it just has no sense (remember <code>RandomNumberIterator</code>). </p>
+<p>If you need to test on the iterables <strong>CONTENT</strong> you need to evaluate them.</p>
+</div>
+<span class="comment-copy">Is there any reason you are averse to simply materializing the nested iterator into a nested list, let's say?</span>
+<span class="comment-copy">@juanpa.arrivillaga: yes, I'm writing a library which works with arbitrary iterables (both finite &amp; infinite, user-defined or from standard library), and writing property-based tests</span>
+<span class="comment-copy">you are working with sequences, try to deepcopy a file object for example (hint: it will fail)</span>
+<span class="comment-copy">which Python version are you using? for Python 3 <code>deepcopy</code>ing file object will end up with <code>TypeError: cannot serialize '_io.TextIOWrapper' object</code></span>
+<span class="comment-copy">what do you mean by "you can't evaluate iterables while they are being copied", I can succesfully make copies of plain iterables with <code>itertools.tee</code> and then evaluate each one of them independently, even potentially infinite ones</span>
+<span class="comment-copy">in Python 2.7 if I do <code>copy.deepcopy(file)</code> I get <code>&lt;closed file '&lt;uninitialized file&gt;', mode '&lt;uninitialized file&gt;' at 0x7f4a99ac3930&gt;</code> and after trying to iterate over it like <code>list(file_copy)</code> it raises <code>ValueError: I/O operation on closed file</code>, while original one works as expected, so no, you can't make functioning copy of  file object with <code>copy.deepcopy</code> function</span>
+<span class="comment-copy">@Azat Ibrakov , in your code samples you're using type annotations, so, I assume you're using Python 3.x , so, I've used Python 3x as well for my answer. On the other hand, the file object, Is not the same as the file content.</span>

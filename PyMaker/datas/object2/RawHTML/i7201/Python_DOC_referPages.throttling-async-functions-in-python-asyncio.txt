@@ -1,0 +1,471 @@
+<div class="post-text" itemprop="text">
+<p>I have a <code>list</code> of <code>awaitables</code> that I want to pass to the <a href="https://docs.python.org/3/library/asyncio-sync.html#asyncio.Semaphore" rel="noreferrer"><code>asyncio.AbstractEventLoop</code></a> but I need to throttle the requests to a third party API.</p>
+<p>I would like to avoid something that waits to pass the <code>future</code> to the loop because in the meantime I block my loop waiting. What options do I have? <a href="https://docs.python.org/3/library/asyncio-sync.html#asyncio.Semaphore" rel="noreferrer"><code>Semaphores</code></a> and <code>ThreadPools</code> will limit how many are running concurrently, but that's not my problem. I need to throttle my requests to 100/sec, but it doesn't matter how long it takes to complete the request.</p>
+<p>This is a very concise (non)working example using the standard library, that demonstrates the problem. This is supposed to throttle at 100/sec but throttles at 116.651/sec. <strong>What's the best way to throttle the scheduling of an asynchronous request in asyncio</strong>?</p>
+<p>Working code:</p>
+<pre><code>import asyncio
+from threading import Lock
+
+class PTBNL:
+
+    def __init__(self):
+        self._req_id_seq = 0
+        self._futures = {}
+        self._results = {}
+        self.token_bucket = TokenBucket()
+        self.token_bucket.set_rate(100)
+
+    def run(self, *awaitables):
+
+        loop = asyncio.get_event_loop()
+
+        if not awaitables:
+            loop.run_forever()
+        elif len(awaitables) == 1:
+            return loop.run_until_complete(*awaitables)
+        else:
+            future = asyncio.gather(*awaitables)
+            return loop.run_until_complete(future)
+
+    def sleep(self, secs) -&gt; True:
+
+        self.run(asyncio.sleep(secs))
+        return True
+
+    def get_req_id(self) -&gt; int:
+
+        new_id = self._req_id_seq
+        self._req_id_seq += 1
+        return new_id
+
+    def start_req(self, key):
+
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        self._futures[key] = future
+        return future
+
+    def end_req(self, key, result=None):
+
+        future = self._futures.pop(key, None)
+        if future:
+            if result is None:
+                result = self._results.pop(key, [])
+            if not future.done():
+                future.set_result(result)
+
+    def req_data(self, req_id, obj):
+        # Do Some Work Here
+        self.req_data_end(req_id)
+        pass
+
+    def req_data_end(self, req_id):
+        print(req_id, " has ended")
+        self.end_req(req_id)
+
+    async def req_data_async(self, obj):
+
+        req_id = self.get_req_id()
+        future = self.start_req(req_id)
+
+        self.req_data(req_id, obj)
+
+        await future
+        return future.result()
+
+    async def req_data_batch_async(self, contracts):
+
+        futures = []
+        FLAG = False
+
+        for contract in contracts:
+            req_id = self.get_req_id()
+            future = self.start_req(req_id)
+            futures.append(future)
+
+            nap = self.token_bucket.consume(1)
+
+            if FLAG is False:
+                FLAG = True
+                start = asyncio.get_event_loop().time()
+
+            asyncio.get_event_loop().call_later(nap, self.req_data, req_id, contract)
+
+        await asyncio.gather(*futures)
+        elapsed = asyncio.get_event_loop().time() - start
+
+        return futures, len(contracts)/elapsed
+
+class TokenBucket:
+
+    def __init__(self):
+        self.tokens = 0
+        self.rate = 0
+        self.last = asyncio.get_event_loop().time()
+        self.lock = Lock()
+
+    def set_rate(self, rate):
+        with self.lock:
+            self.rate = rate
+            self.tokens = self.rate
+
+    def consume(self, tokens):
+        with self.lock:
+            if not self.rate:
+                return 0
+
+            now = asyncio.get_event_loop().time()
+            lapse = now - self.last
+            self.last = now
+            self.tokens += lapse * self.rate
+
+            if self.tokens &gt; self.rate:
+                self.tokens = self.rate
+
+            self.tokens -= tokens
+
+            if self.tokens &gt;= 0:
+                return 0
+            else:
+                return -self.tokens / self.rate
+
+
+if __name__ == '__main__':
+
+    asyncio.get_event_loop().set_debug(True)
+    app = PTBNL()
+
+    objs = [obj for obj in range(500)]
+
+    l,t = app.run(app.req_data_batch_async(objs))
+
+    print(l)
+    print(t)
+</code></pre>
+<p>Edit: I've added a simple example of <code>TrottleTestApp</code> here using semaphores, but still can't throttle the execution:</p>
+<pre><code>import asyncio
+import time
+
+
+class ThrottleTestApp:
+
+    def __init__(self):
+        self._req_id_seq = 0
+        self._futures = {}
+        self._results = {}
+        self.sem = asyncio.Semaphore()
+
+    async def allow_requests(self, sem):
+        """Permit 100 requests per second; call 
+           loop.create_task(allow_requests())
+        at the beginning of the program to start this routine.  That call returns
+        a task handle that can be canceled to end this routine.
+
+        asyncio.Semaphore doesn't give us a great way to get at the value other
+        than accessing sem._value.  We do that here, but creating a wrapper that
+        adds a current_value method would make this cleaner"""
+
+        while True:
+            while sem._value &lt; 100: sem.release()
+            await asyncio.sleep(1)  # Or spread more evenly 
+                                    # with a shorter sleep and 
+                                    # increasing the value less
+
+    async def do_request(self, req_id, obj):
+        await self.sem.acquire()
+
+        # this is the work for the request
+        self.req_data(req_id, obj)
+
+    def run(self, *awaitables):
+
+        loop = asyncio.get_event_loop()
+
+        if not awaitables:
+            loop.run_forever()
+        elif len(awaitables) == 1:
+            return loop.run_until_complete(*awaitables)
+        else:
+            future = asyncio.gather(*awaitables)
+            return loop.run_until_complete(future)
+
+    def sleep(self, secs: [float]=0.02) -&gt; True:
+
+        self.run(asyncio.sleep(secs))
+        return True
+
+    def get_req_id(self) -&gt; int:
+
+        new_id = self._req_id_seq
+        self._req_id_seq += 1
+        return new_id
+
+    def start_req(self, key):
+
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        self._futures[key] = future
+        return future
+
+    def end_req(self, key, result=None):
+
+        future = self._futures.pop(key, None)
+        if future:
+            if result is None:
+                result = self._results.pop(key, [])
+            if not future.done():
+                future.set_result(result)
+
+    def req_data(self, req_id, obj):
+        # This is the method that "does" something
+        self.req_data_end(req_id)
+        pass
+
+    def req_data_end(self, req_id):
+
+        print(req_id, " has ended")
+        self.end_req(req_id)
+
+    async def req_data_batch_async(self, objs):
+
+        futures = []
+        FLAG = False
+
+        for obj in objs:
+            req_id = self.get_req_id()
+            future = self.start_req(req_id)
+            futures.append(future)
+
+            if FLAG is False:
+                FLAG = True
+                start = time.time()
+
+            self.do_request(req_id, obj)
+
+        await asyncio.gather(*futures)
+        elapsed = time.time() - start
+        print("Roughly %s per second" % (len(objs)/elapsed))
+
+        return futures
+
+
+if __name__ == '__main__':
+
+    asyncio.get_event_loop().set_debug(True)
+    app = ThrottleTestApp()
+
+    objs = [obj for obj in range(10000)]
+
+    app.run(app.req_data_batch_async(objs))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can do this by implementing the <a href="https://en.wikipedia.org/wiki/Leaky_bucket" rel="nofollow noreferrer">leaky bucket algorithm</a>:</p>
+<pre><code>import asyncio
+import contextlib
+import collections
+import time
+
+from types import TracebackType
+from typing import Dict, Optional, Type
+
+try:  # Python 3.7
+    base = contextlib.AbstractAsyncContextManager
+    _current_task = asyncio.current_task
+except AttributeError:
+    base = object  # type: ignore
+    _current_task = asyncio.Task.current_task  # type: ignore
+
+class AsyncLeakyBucket(base):
+    """A leaky bucket rate limiter.
+
+    Allows up to max_rate / time_period acquisitions before blocking.
+
+    time_period is measured in seconds; the default is 60.
+
+    """
+    def __init__(
+        self,
+        max_rate: float,
+        time_period: float = 60,
+        loop: Optional[asyncio.AbstractEventLoop] = None
+    ) -&gt; None:
+        self._loop = loop
+        self._max_level = max_rate
+        self._rate_per_sec = max_rate / time_period
+        self._level = 0.0
+        self._last_check = 0.0
+        # queue of waiting futures to signal capacity to
+        self._waiters: Dict[asyncio.Task, asyncio.Future] = collections.OrderedDict()
+
+    def _leak(self) -&gt; None:
+        """Drip out capacity from the bucket."""
+        if self._level:
+            # drip out enough level for the elapsed time since
+            # we last checked
+            elapsed = time.time() - self._last_check
+            decrement = elapsed * self._rate_per_sec
+            self._level = max(self._level - decrement, 0)
+        self._last_check = time.time()
+
+    def has_capacity(self, amount: float = 1) -&gt; bool:
+        """Check if there is enough space remaining in the bucket"""
+        self._leak()
+        requested = self._level + amount
+        # if there are tasks waiting for capacity, signal to the first
+        # there there may be some now (they won't wake up until this task
+        # yields with an await)
+        if requested &lt; self._max_level:
+            for fut in self._waiters.values():
+                if not fut.done():
+                    fut.set_result(True)
+                    break
+        return self._level + amount &lt;= self._max_level
+
+    async def acquire(self, amount: float = 1) -&gt; None:
+        """Acquire space in the bucket.
+
+        If the bucket is full, block until there is space.
+
+        """
+        if amount &gt; self._max_level:
+            raise ValueError("Can't acquire more than the bucket capacity")
+
+        loop = self._loop or asyncio.get_event_loop()
+        task = _current_task(loop)
+        assert task is not None
+        while not self.has_capacity(amount):
+            # wait for the next drip to have left the bucket
+            # add a future to the _waiters map to be notified
+            # 'early' if capacity has come up
+            fut = loop.create_future()
+            self._waiters[task] = fut
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(fut),
+                    1 / self._rate_per_sec * amount,
+                    loop=loop
+                )
+            except asyncio.TimeoutError:
+                pass
+            fut.cancel()
+        self._waiters.pop(task, None)
+
+        self._level += amount
+
+        return None
+
+    async def __aenter__(self) -&gt; None:
+        await self.acquire()
+        return None
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType]
+    ) -&gt; None:
+        return None
+</code></pre>
+<p>Note that we leak capacity from the bucket opportunistically, there is no need to run a separate async task just to lower the level; instead, capacity are leaked out when testing for sufficient remaining capacity.</p>
+<p>Note that tasks that wait for capacity are kept in an ordered dictionary, and when there might be capacity to spare again, the first still-waiting task is woken up early.</p>
+<p>You can use this as a context manager; trying to acquire the bucket when it is full blocks until enough capacity has been freed again:</p>
+<pre><code>bucket = AsyncLeakyBucket(100)
+
+# ...
+
+async with bucket:
+    # only reached once the bucket is no longer full
+</code></pre>
+<p>or you can call <code>acquire()</code> directly:</p>
+<pre><code>await bucket.acquire()  # blocks until there is space in the bucket
+</code></pre>
+<p>or you can simply test if there is space first:</p>
+<pre><code>if bucket.has_capacity():
+    # reject a request due to rate limiting
+</code></pre>
+<p>Note that you can count some requests as 'heavier' or 'lighter' by increasing or decreasing the amount you 'drip' into the bucket:</p>
+<pre><code>await bucket.acquire(10)
+if bucket.has_capacity(0.5):
+</code></pre>
+<p>Do be careful with this though; when mixing large and small drips, small drips tend to get run before large drips when at or close to the maximum rate, because there is a greater likelyhood that there is enough free capacity for a smaller drip before there is space for a larger one.</p>
+<p>Demo:</p>
+<pre><code>&gt;&gt;&gt; import asyncio, time
+&gt;&gt;&gt; bucket = AsyncLeakyBucket(5, 10)
+&gt;&gt;&gt; async def task(id):
+...     await asyncio.sleep(id * 0.01)
+...     async with bucket:
+...         print(f'{id:&gt;2d}: Drip! {time.time() - ref:&gt;5.2f}')
+...
+&gt;&gt;&gt; ref = time.time()
+&gt;&gt;&gt; tasks = [task(i) for i in range(15)]
+&gt;&gt;&gt; result = asyncio.run(asyncio.wait(tasks))
+ 0: Drip!  0.00
+ 1: Drip!  0.02
+ 2: Drip!  0.02
+ 3: Drip!  0.03
+ 4: Drip!  0.04
+ 5: Drip!  2.05
+ 6: Drip!  4.06
+ 7: Drip!  6.06
+ 8: Drip!  8.06
+ 9: Drip! 10.07
+10: Drip! 12.07
+11: Drip! 14.08
+12: Drip! 16.08
+13: Drip! 18.08
+14: Drip! 20.09
+</code></pre>
+<p>The bucket is filled up quickly at the start in a burst, causing the rest of the tasks to be spread out more evenly; every 2 seconds enough capacity is freed for another task to be handled.</p>
+<p>The maximum burst size is equal to the maximum rate value, in the above demo that was set to 5. If you do not want to permit bursts, set the maximum rate to 1, and the time period to the minimum time between drips:</p>
+<pre><code>&gt;&gt;&gt; bucket = AsyncLeakyBucket(1, 1.5)  # no bursts, drip every 1.5 seconds
+&gt;&gt;&gt; async def task():
+...     async with bucket:
+...         print(f'Drip! {time.time() - ref:&gt;5.2f}')
+...
+&gt;&gt;&gt; ref = time.time()
+&gt;&gt;&gt; tasks = [task() for _ in range(5)]
+&gt;&gt;&gt; result = asyncio.run(asyncio.wait(tasks))
+Drip!  0.00
+Drip!  1.50
+Drip!  3.01
+Drip!  4.51
+Drip!  6.02
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Another solution - using bounded semaphores - by a coworker, mentor, and friend, is the following:</p>
+<pre><code>import asyncio
+
+
+class AsyncLeakyBucket(object):
+
+    def __init__(self, max_tasks: float, time_period: float = 60, loop: asyncio.events=None):
+        self._delay_time = time_period / max_tasks
+        self._sem = asyncio.BoundedSemaphore(max_tasks)
+        self._loop = loop or asyncio.get_event_loop()
+        self._loop.create_task(self._leak_sem())
+
+    async def _leak_sem(self):
+        """
+        Background task that leaks semaphore releases based on the desired rate of tasks per time_period
+        """
+        while True:
+            await asyncio.sleep(self._delay_time)
+            try:
+                self._sem.release()
+            except ValueError:
+                pass
+
+    async def __aenter__(self) -&gt; None:
+        await self._sem.acquire()
+
+    async def __aexit__(self, exc_type, exc, tb) -&gt; None:
+        pass
+</code></pre>
+<p>Can still be used with the same <code>async with bucket</code> code as in @Martijn's answer</p>
+</div>
+<span class="comment-copy">Are you trying to limit the number of requests which were in progress per second, or requests started in a particular second. For example, if you start 100 requests that take 3 seconds each, can you start 200 more requests in the following 2 seconds?</span>
+<span class="comment-copy">@AaronSchif It does not matter when they initiate, just that over any 1-sec rolling window no more than 100 have been initiated.</span>
+<span class="comment-copy">Bookmarked in my folder "Greatest algorithms" ;)</span>
+<span class="comment-copy">Note that this’ll still allow bursts, at up to <code>max_tasks</code> at a time. That’s because when below the set rate, the semaphore freely let’s tasks acquire it. You can then end up with series of bursts if the time that tasks hold the semaphore is uniform (all tasks hold the semaphore lock for an equal amount of time).</span>

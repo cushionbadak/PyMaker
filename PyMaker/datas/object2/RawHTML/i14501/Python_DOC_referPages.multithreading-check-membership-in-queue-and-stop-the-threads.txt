@@ -1,0 +1,151 @@
+<div class="post-text" itemprop="text">
+<p>I want to iterate over a list using 2 thread. One from leading and other from trailing, and put the elements in a <code>Queue</code> on each iteration. But before putting the value in <code>Queue</code> I need to check for existence of the value within <code>Queue</code> (its when that one of the threads has putted that value in <code>Queue</code>), So when this happens I need to stop the thread and return list of traversed values for each thread.</p>
+<p>This is what I have tried so far :</p>
+<pre><code>from Queue import Queue
+from threading import Thread, Event
+
+class ThreadWithReturnValue(Thread):
+    def __init__(self, group=None, target=None, name=None,
+                 args=(), kwargs={}, Verbose=None):
+        Thread.__init__(self, group, target, name, args, kwargs, Verbose)
+        self._return = None
+    def run(self):
+        if self._Thread__target is not None:
+            self._return = self._Thread__target(*self._Thread__args,
+                                                **self._Thread__kwargs)
+    def join(self):
+        Thread.join(self)
+        return self._return
+
+main_path = Queue()
+
+def is_in_queue(x, q):
+   with q.mutex:
+      return x in q.queue
+
+def a(main_path,g,l=[]):
+  for i in g:
+    l.append(i)
+    print 'a'
+    if is_in_queue(i,main_path):
+      return l
+    main_path.put(i)
+
+def b(main_path,g,l=[]):
+  for i in g:
+    l.append(i)
+    print 'b'
+    if is_in_queue(i,main_path):
+      return l
+    main_path.put(i)
+
+g=['a','b','c','d','e','f','g','h','i','j','k','l']
+
+t1 = ThreadWithReturnValue(target=a, args=(main_path,g))
+t2 = ThreadWithReturnValue(target=b, args=(main_path,g[::-1]))
+t2.start()
+t1.start()
+# Wait for all produced items to be consumed
+print main_path.join()
+</code></pre>
+<p>I used <code>ThreadWithReturnValue</code> that will create a custom thread that returns the value. </p>
+<p>And for membership checking I used the following function :</p>
+<pre><code>def is_in_queue(x, q):
+   with q.mutex:
+      return x in q.queue
+</code></pre>
+<p>Now if I first start the <code>t1</code> and then the <code>t2</code> I will get 12 <code>a</code> then one <code>b</code> then it doesn't do any thing and I need to terminate the python manually! </p>
+<p>But if I first run the <code>t2</code> then <code>t1</code> I will get the following result:</p>
+<pre><code>b
+b
+b
+b
+ ab
+
+ab
+b
+
+b
+b
+ b
+a
+a
+</code></pre>
+<p>So my questions is that why python treads different in this cases? and how can I terminate the threads and make them communicate with each other?  </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Before we get into bigger problems, you're not using <a href="https://docs.python.org/3/library/queue.html#queue.Queue.join" rel="nofollow"><code>Queue.join</code></a> right.</p>
+<p>The whole point of this function is that a producer who adds a bunch of items to a queue can wait until the consumer or consumers have finished working on all of those items. This works by having the consumer call <code>task_done</code> after they finish working on each item that they pulled off with <code>get</code>. Once there have been as many <code>task_done</code> calls as <code>put</code> calls, the queue is done. You're not doing a <code>get</code> anywhere, much less a <code>task_done</code>, so there's no way the queue can ever be finished. So, that's why you block forever after the two threads finish.</p>
+<hr/>
+<p>The first problem here is that your threads are doing almost no work outside of the actual synchronization. If the only thing they do is fight over a queue, only one of them is going to be able to run at a time. </p>
+<p>Of course that's common in toy problems, but you have to think through your real problem:</p>
+<ul>
+<li>If you're doing a lot of I/O work (listening on sockets, waiting for user input, etc.), threads work great.</li>
+<li>If you're doing a lot of CPU work (calculating primes), threads don't work in Python because of the GIL, but processes do.</li>
+<li>If you're actually primarily dealing with synchronizing separate tasks, neither one is going to work well (and processes will be worse). It may still be <em>simpler</em> to think in terms of threads, but it'll be the slowest way to do things. You may want to look into coroutines; Greg Ewing has a <a href="http://www.cosc.canterbury.ac.nz/greg.ewing/python/yield-from/yield_from.html" rel="nofollow">great demonstration</a> of how to use <code>yield from</code> to use coroutines to build things like schedulers or many-actor simulations.</li>
+</ul>
+<hr/>
+<p>Next, as I alluded to in your previous question, making threads (or processes) work efficiently with shared state requires holding locks for as short a time as possible.</p>
+<p>So, if you have to search a whole queue under a lock, that had better be a constant-time search, not a linear-time search. That's why I suggested using something like an <code>OrderedSet</code> recipe rather than a <code>list</code>, like the one inside the stdlib's <code>Queue.Queue</code>. Then this function:</p>
+<pre><code>def is_in_queue(x, q):
+   with q.mutex:
+      return x in q.queue
+</code></pre>
+<p>… is only blocking the queue for a tiny fraction of a second—just long enough to look up a hash value in a table, instead of long enough to compare every element in the queue against <code>x</code>.</p>
+<hr/>
+<p>Finally, I tried to explain about race conditions on your other question, but let me try again.</p>
+<p>You need a lock around every complete "transaction" in your code, not just around the individual operations.</p>
+<p>For example, if you do this:</p>
+<pre><code>with queue locked:
+    see if x is in the queue
+if x was not in the queue:
+    with queue locked:
+        add x to the queue
+</code></pre>
+<p>… then it's always possible that x was not in the queue when you checked, but in the time between when you unlocked it and relocked it, someone added it. This is exactly why it's possible for both threads to stop early.</p>
+<p>To fix this, you need to put a lock around the whole thing:</p>
+<pre><code>with queue locked:
+    if x is not in the queue:
+        add x to the queue
+</code></pre>
+<hr/>
+<p>Of course this goes directly against what I said before about locking the queue for as short a time as possible. Really, that's what makes multithreading hard in a nutshell. It's easy to write safe code that just locks everything for as long as might conceivably be necessary, but then your code ends up only using a single core, while all the other threads are blocked waiting for the lock. And it's easy to write fast code that just locks everything as briefly as possible, but then it's unsafe and you get garbage values or even crashes all over the place. Figuring out what needs to be a transaction, and how to minimize the work inside those transactions, and how to deal with the multiple locks you'll probably need to make that work without deadlocking them… that's not so easy.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>A couple of things that I think can be improved:</p>
+<ol>
+<li>Due to the <a href="http://en.wikipedia.org/wiki/Global_Interpreter_Lock" rel="nofollow">GIL</a>, you might want to use the <a href="https://docs.python.org/2/library/multiprocessing.html" rel="nofollow"><code>multiprocessing</code></a> (rather than <code>threading</code>) module. In general, CPython threading will not cause CPU intensive work to speed up. (Depending on what exactly is the context of your question, it's also possible that <code>multiprocessing</code> won't, but <code>threading</code> almost certainly won't.)</li>
+<li>A function like your <code>is_inqueue</code> would likely lead to high contention.</li>
+</ol>
+<p>The locked time seems linear in the number of items that need to be traversed:</p>
+<pre><code>def is_in_queue(x, q):
+    with q.mutex:
+        return x in q.queue
+</code></pre>
+<p>So, instead, you could possibly do the following.</p>
+<p>Use <code>multiprocessing</code> with a shared <code>dict</code>:</p>
+<pre><code> from multiprocessing import Process, Manager
+
+ manager = Manager()
+ d = manager.dict()
+
+ # Fn definitions and such
+
+ p1 = Process(target=p1, args=(d,))
+ p2 = Process(target=p2, args=(d,))
+</code></pre>
+<p>within each function, check for the item like this:</p>
+<pre><code>def p1(d):
+
+    # Stuff
+
+    if 'foo' in d:
+        return 
+</code></pre>
+</div>
+<span class="comment-copy">Take a look here <a href="http://pymotw.com/2/multiprocessing/communication.html" rel="nofollow noreferrer">pymotw.com/2/multiprocessing/communication.html</a> ... you're interested more in Managing Shared State</span>
+<span class="comment-copy">@OWADVL Sound useful i'll see that! thanks!</span>
+<span class="comment-copy">Do you have an actual requirements to iterate from both ends of the list or are you just doing that as a way to divide the tasks?</span>
+<span class="comment-copy">Thank you so much @abarnert for taking time and complete explanation!you clarify some of my miss understanding, actually i'm terrible in multiprocessing, i think i need more study!! :)</span>
+<span class="comment-copy">@Kasra: There's a reason "shared-memory multithreading is hard" is a cliche. Everyone's terrible at at, because our intuitions are just wrong (at least on systems that were designed from the language level down to the CPU microcode level to optimize single-processing and can't be changed).  Use higher-level abstractions (message passing instead of shared memory, STM, etc.) whenever possible, and when it's not… well, you'll gradually get a feel for when to ignore your intuitions and rigorously work through (and/or test) what can happen, but you'll still make hard-to-debug mistakes…</span>
+<span class="comment-copy">Yeah there is a lot of scenarios in my problem! i'm working slowly on it and i want to learn it deeply! As you said  "shared-memory multithreading is hard" is a cliche and its True for me too but i like hard things and i'll work through!</span>

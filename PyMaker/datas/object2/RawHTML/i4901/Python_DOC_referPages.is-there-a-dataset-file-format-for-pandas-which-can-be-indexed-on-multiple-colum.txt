@@ -1,0 +1,102 @@
+<div class="post-text" itemprop="text">
+<p>I'm building an interactive browser and editor for larger-than-memory datasets which will be later processed with Pandas. Thus, I'll need to have indexes on several columns that the dataset will be interactively sorted or filtered on (database indexes, not Pandas indexing), and I'd like the dataset file format to support cheap edits without rewriting most of the file. Like a database, only I want to be able to just send the files away afterwards in a Pandas-compatible format, without exporting.</p>
+<p>So, I wonder if any of the formats that Pandas supports:</p>
+<ul>
+<li>Have an option of building database-indexes on several columns (for sorting and filtering)</li>
+<li>Can be updated 'in-place' or otherwise cheaply without shifting the rest of the records around</li>
+<li>Preferably both of the above</li>
+</ul>
+<p>What are my options?</p>
+<p>I'm a complete noob in Pandas, and so far it seems that most of the formats are simply serialized sequential records, just like CSV, and at most can be sorted or indexed on one column. If nothing better comes up, I'll have to either build the indexes myself externally and juggle the edited rows manually before exporting the dataset, or dump the whole dataset in and out of a database—but I'd prefer avoiding both of those.</p>
+<hr/>
+<p>Edit: more specifically, <a href="/questions/26909543/index-in-parquet">it appears that Parquet has upper/lower bounds recorded for each column in each data page</a>, and I wonder if these can be used as sort-of-indexes to speed up sorting on arbitrary columns, or whether other formats have similar features.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I would argue that parquet is indeed a good format for this situation. It maps well to the tabular nature of pandas dataframes, stores most common data in efficient binary representations (with optional compression), and is a standard, portable format. Furthermore, it allows you to load only those columns or "row groups" (chunks) you require. This latter gets to the crux of your problem.</p>
+<p>Pandas' <code>.to_parquet()</code> will automatically store metadata relating to the indexing of your dataframe, and create the column max/min metadata as you suggest. If you use the <code>fastparquet</code> backend, you can use the <code>filters=</code> keyword when loading to select only some of the row-groups (this does not filter <em>within</em> row-groups)</p>
+<pre><code>pd.read_parquet('split', filters=[('cat', '==', '1')], 
+    engine='fastparquet')
+</code></pre>
+<p>(selects only row-groups where <em>some</em> values of field <code>'cat'</code> are equal to <code>'1'</code>)
+This can be particularly efficient, if you have used directory-based partitioning on writing, e.g., </p>
+<pre><code>out.to_parquet('another_dataset.parq', partition_on=['cat'], 
+    engine='fastparquet', file_scheme='hive')
+</code></pre>
+<p>Some of these options are only documented in the <a href="https://github.com/dask/fastparquet/" rel="nofollow noreferrer">fastparquet docs</a>, and maybe the API of that library implements slightly more than is available via the pandas methods; and I am not sure how well such options are implemented with the arrow backend.</p>
+<p>Note further, that you may wish to read/save your dataframes using dask's to/<a href="http://dask.pydata.org/en/latest/dataframe-api.html#dask.dataframe.read_parquet" rel="nofollow noreferrer">read_parquet</a> methods. Dask will understand the index if it is 1D and perform the equivalent of the <code>filters=</code> operation automatically load only relevant parts of the data on disc when you do filtering operations on the index. Dask is built to deal with data that does not easily fit into memory, and do computations in parallel.</p>
+<p>(in answer to some of the comments above: Pandas-SQL interaction is generally <em>not</em> efficient, unless you can push the harder parts of the computation into a fast DB backend - in which case you don't really have a problem)</p>
+<p>EDITs some specific notes:</p>
+<ul>
+<li>parquet is not in general made for atomic record updating; but you could write to chunks of the whole (not via the pandas API - I think this is true for ALL of the writing format methods)</li>
+<li>the "index" you speak on is not the same thing as a pandas index, but I am thinking that the information above may show that the sort of indexing in parquet is still useful for you.</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you decide to go the database route, SQLite is perfect since it's shipped with Python already, the driver api is in Python's <a href="https://docs.python.org/3/library/sqlite3.html" rel="nofollow noreferrer">standard library</a>, and the fie format is platform independent. I use it for all my personal projects.</p>
+<p>Example is modified from this <a href="http://www.datacarpentry.org/python-ecology-lesson/08-working-with-sql/" rel="nofollow noreferrer">tutorial on Pandas + sqlite3</a> and the <a href="https://pandas.pydata.org/pandas-docs/stable/io.html#sql-queries" rel="nofollow noreferrer">pandas.io documentation</a>:</p>
+<pre><code># Code to create the db
+import sqlite3
+import pandas as pd
+
+# Create a data frame
+df = pd.DataFrame(dict(col1=[1,2,3], col2=['foo', 'bar', 'baz']))
+df.index = ('row{}'.format(i) for i in range(df.shape[0]))
+
+# Connect to your database
+conn = sqlite3.connect("data/your_database.sqlite")
+
+# Write the data to your table (overwrite old data)
+df.to_sql('your_table', conn, if_exists='replace')
+
+# Add more data
+new_rows = pd.DataFrame(
+    dict(col1=[3, 4], col2=['notbaz', 'grunt']),
+    index=('row2', 'row3')
+)
+new_rows.to_sql('your_table', conn, if_exists='append')  # `append`
+</code></pre>
+<p>This part is an aside in case you need more complex stuff:</p>
+<pre><code># (oops - duplicate row 2)
+# also ... need to quote "index" column name because it's a keyword.
+query = 'SELECT * FROM your_table WHERE "index" = ?'
+pd.read_sql(query, conn, params=('row2',))
+#   index  col1    col2
+# 0  row2     3     baz
+# 1  row2     3  notbaz
+
+# For more complex queries use pandas.io.sql
+from pandas.io import sql
+query = 'DELETE FROM your_table WHERE "col1" = ? AND "col2" = ?'
+sql.execute(query, conn, params=(3, 'notbaz'))
+conn.commit()
+
+# close
+conn.close()
+</code></pre>
+<p>When you or collaborators want to read from the database, just send them the
+file <em><code>data/your_database.sqlite</code></em> and this code:</p>
+<pre><code># Code to access the db
+import sqlite3
+import pandas as pd
+
+# Connect to your database
+conn = sqlite3.connect("data/your_database.sqlite")
+
+# Load the data into a DataFrame
+query = 'SELECT * FROM your_table WHERE col1 BETWEEN ? and ?'
+df = pd.read_sql_query(query, conn, params=(1,3))
+#    index  col1 col2
+#  0  row0     1  foo
+#  1  row1     2  bar
+#  2  row2     3  baz
+</code></pre>
+</div>
+<span class="comment-copy">Just use a database. You can build a pandas dataframe with the result of a database query.</span>
+<span class="comment-copy">@hoyland that's why I mentioned 'sending the files away.' People who receive the files likely won't want to be setting up a database to get at the data.</span>
+<span class="comment-copy">You can use hdf5 with pandas for larger than memory datasets.</span>
+<span class="comment-copy">@BabuArunachalam the question is whether HDF5 or any of the other non-sql formats supported by Pandas have the functionality outlined in the post. As far as I can tell, no, but maybe I'm missing something.</span>
+<span class="comment-copy">It really depends on why you would need indices on multiple columns.  With hdf5, you can store the pandas data frame along with it's index as hdf5, reading and writing parts of it efficiently.  Once you load a portion of that data frame in memory for processing, you really don't need indices on columns.  If you are going to run queries similar to SQL on all the data on disk, then it is better to store it in a database and create indices.  With pandas, you can also push to sql efficiently.</span>
+<span class="comment-copy">Thanks for the info, the fastparquet filters approach is new to me. A couple follow-up questions: • Just to be sure—this filtering can be done, using the min/max info, on any column, not only the primary sorted one? • It won't help with sorting the selection result, right? (To clarify, for the interactive browser I'll need pagination of larger-than-memory datasets, with sorting "on the fly," and it seems juuust barely possible without a full-blown db index, depending on the api.)</span>
+<span class="comment-copy">Correct, filters= is for any column. To sort and work with the data out-of-core, you most likely need dask, although the fastparquet API does support iteration over <a href="https://github.com/dask/fastparquet/blob/master/fastparquet/api.py#L278" rel="nofollow noreferrer">row-groups</a>.</span>
+<span class="comment-copy">Strange. From my brief perusal of Dask documentation, I gathered that it's not too good at sorting data: the docs say it needs two passes over the data, to distribute it and then to sort it, even if an index is used—though this description doesn't take Parquet's features into account. Is there something I missed about Dask's sorting capabilities? Or do you mention it due to it being targeted at the larger-than-memory workflow? (I envisioned some sort of low-level access instead, specific to the format, without the high-level pandas/dask interface).</span>
+<span class="comment-copy">You are right that dask is not designed for sorting, but it will take advantage of sorting as described. It <i>is</i> designed for handing large data, though - there is some give-and-take here.</span>

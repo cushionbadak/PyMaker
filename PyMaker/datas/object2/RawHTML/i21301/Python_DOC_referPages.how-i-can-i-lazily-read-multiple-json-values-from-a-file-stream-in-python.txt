@@ -1,0 +1,1136 @@
+<div class="post-text" itemprop="text">
+<p>I'd like to read multiple JSON objects from a file/stream in Python, one at a time. Unfortunately <code>json.load()</code> just <code>.read()</code>s until end-of-file; there doesn't seem to be any way to use it to read a single object or to lazily iterate over the objects.</p>
+<p>Is there any way to do this? Using the standard library would be ideal, but if there's a third-party library I'd use that instead.</p>
+<p>At the moment I'm putting each object on a separate line and using <code>json.loads(f.readline())</code>, but I would really prefer not to need to do this.</p>
+<h2>Example Use</h2>
+<h3>example.py</h3>
+<pre class="lang-python prettyprint-override"><code>import my_json as json
+import sys
+
+for o in json.iterload(sys.stdin):
+    print("Working on a", type(o))
+</code></pre>
+<h3>in.txt</h3>
+<pre class="lang-js prettyprint-override"><code>{"foo": ["bar", "baz"]} 1 2 [] 4 5 6
+</code></pre>
+<h3>example session</h3>
+<pre class="lang-none prettyprint-override"><code>$ python3.2 example.py &lt; in.txt
+Working on a dict
+Working on a int
+Working on a int
+Working on a list
+Working on a int
+Working on a int
+Working on a int
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Sure you can do this. You just have to take to <code>raw_decode</code> directly. This implementation loads the whole file into memory and operates on that string (much as <code>json.load</code> does); if you have large files you can modify it to only read from the file as necessary without much difficulty.</p>
+<pre><code>import json
+from json.decoder import WHITESPACE
+
+def iterload(string_or_fp, cls=json.JSONDecoder, **kwargs):
+    if isinstance(string_or_fp, file):
+        string = string_or_fp.read()
+    else:
+        string = str(string_or_fp)
+
+    decoder = cls(**kwargs)
+    idx = WHITESPACE.match(string, 0).end()
+    while idx &lt; len(string):
+        obj, end = decoder.raw_decode(string, idx)
+        yield obj
+        idx = WHITESPACE.match(string, end).end()
+</code></pre>
+<p>Usage: just as you requested, it's a generator.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>JSON generally isn't very good for this sort of incremental use; there's no standard way to serialise multiple objects so that they can easily be loaded one at a time, without parsing the whole lot.</p>
+<p>The object per line solution that you're using is seen elsewhere too. Scrapy calls it 'JSON lines':</p>
+<ul>
+<li><a href="http://doc.scrapy.org/topics/exporters.html#jsonlinesitemexporter" rel="noreferrer">http://doc.scrapy.org/topics/exporters.html#jsonlinesitemexporter</a></li>
+<li><a href="http://www.enricozini.org/2011/tips/python-stream-json/" rel="noreferrer">http://www.enricozini.org/2011/tips/python-stream-json/</a></li>
+</ul>
+<p>You can do it slightly more Pythonically:</p>
+<pre><code>for jsonline in f:
+    yield json.loads(jsonline)   # or do the processing in this loop
+</code></pre>
+<p>I think this is about the best way - it doesn't rely on any third party libraries, and it's easy to understand what's going on. I've used it in some of my own code as well.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is a pretty nasty problem actually because you have to stream in lines, but pattern match across multiple lines against braces, but also pattern match json. It's a sort of json-preparse followed by a json parse. Json is, in comparison to other formats, easy to parse so it's not always necessary to go for a parsing library, nevertheless, how to should we solve these conflicting issues?</p>
+<p><em>Generators to the rescue!</em></p>
+<p>The beauty of generators for a problem like this is you can stack them on top of each other gradually abstracting away the difficulty of the problem whilst maintaining laziness. I also considered using the mechanism for passing back values into a generator (send()) but fortunately found I didn't need to use that.</p>
+<p>To solve the first of the problems you need some sort of streamingfinditer, as a streaming version of re.finditer. My attempt at this below pulls in lines as needed (uncomment the debug statement to see) whilst still returning matches. I actually then modified it slightly to yield non-matched lines as well as matches (marked as 0 or 1 in the first part of the yielded tuple).</p>
+<pre><code>import re
+
+def streamingfinditer(pat,stream):
+  for s in stream:
+#    print "Read next line: " + s
+    while 1:
+      m = re.search(pat,s)
+      if not m:
+        yield (0,s)
+        break
+      yield (1,m.group())
+      s = re.split(pat,s,1)[1]
+</code></pre>
+<p>With that, it's then possible to match up until braces, account each time for whether the braces are balanced, and then return either simple or compound objects as appropriate.</p>
+<pre><code>braces='{}[]'
+whitespaceesc=' \t'
+bracesesc='\\'+'\\'.join(braces)
+balancemap=dict(zip(braces,[1,-1,1,-1]))
+bracespat='['+bracesesc+']'
+nobracespat='[^'+bracesesc+']*'
+untilbracespat=nobracespat+bracespat
+
+def simpleorcompoundobjects(stream):
+  obj = ""
+  unbalanced = 0
+  for (c,m) in streamingfinditer(re.compile(untilbracespat),stream):
+    if (c == 0): # remainder of line returned, nothing interesting
+      if (unbalanced == 0):
+        yield (0,m)
+      else:
+        obj += m
+    if (c == 1): # match returned
+      if (unbalanced == 0):
+        yield (0,m[:-1])
+        obj += m[-1]
+      else:
+        obj += m
+      unbalanced += balancemap[m[-1]]
+      if (unbalanced == 0):
+        yield (1,obj)
+        obj="" 
+</code></pre>
+<p>This returns tuples as follows:</p>
+<pre><code>(0,"String of simple non-braced objects easy to parse")
+(1,"{ 'Compound' : 'objects' }")
+</code></pre>
+<p>Basically that's the nasty part done. We now just have to do the final level of parsing as we see fit. For example we can use Jeremy Roman's iterload function (Thanks!) to do parsing for a single line:</p>
+<pre><code>def streamingiterload(stream):
+  for c,o in simpleorcompoundobjects(stream):
+    for x in iterload(o):
+      yield x 
+</code></pre>
+<p>Test it:</p>
+<pre><code>of = open("test.json","w") 
+of.write("""[ "hello" ] { "goodbye" : 1 } 1 2 {
+} 2
+9 78
+ 4 5 { "animals" : [ "dog" , "lots of mice" ,
+ "cat" ] }
+""")
+of.close()
+// open &amp; stream the json
+f = open("test.json","r")
+for o in streamingiterload(f.readlines()):
+  print o
+f.close()
+</code></pre>
+<p>I get these results (and if you turn on that debug line, you'll see it pulls in the lines as needed):</p>
+<pre><code>[u'hello']
+{u'goodbye': 1}
+1
+2
+{}
+2
+9
+78
+4
+5
+{u'animals': [u'dog', u'lots of mice', u'cat']}
+</code></pre>
+<p>This won't work for all situations. Due to the implementation of the <code>json</code> library, it is <em>impossible</em> to work entirely correctly without reimplementing the parser yourself.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>A little late maybe, but I had this exact problem (well, more or less). My standard solution for these problems is usually to just do a regex split on some well-known root object, but in my case it was impossible. The only feasible way to do this generically is <em>to implement a proper tokenizer</em>.</p>
+<p>After not finding a generic-enough and reasonably well-performing solution, I ended doing this myself, writing the <a href="https://github.com/evolvIQ/splitstream"><code>splitstream</code></a> module. It is a pre-tokenizer that understands JSON and XML and splits a continuous stream into multiple chunks for parsing (it leaves the actual parsing up to you though). To get some kind of performance out of it, it is written as a C module.</p>
+<p>Example:</p>
+<pre><code>from splitstream import splitfile
+
+for jsonstr in splitfile(sys.stdin, format="json")):
+    yield json.loads(jsonstr)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's a much, much simpler solution.  The secret is to try, fail, and use the information in the exception to parse correctly.  The only limitation is the file must be seekable.</p>
+<pre><code>def stream_read_json(fn):
+    import json
+    start_pos = 0
+    with open(fn, 'r') as f:
+        while True:
+            try:
+                obj = json.load(f)
+                yield obj
+                return
+            except json.JSONDecodeError as e:
+                f.seek(start_pos)
+                json_str = f.read(e.pos)
+                obj = json.loads(json_str)
+                start_pos += e.pos
+                yield obj
+</code></pre>
+<p>Edit:  just noticed that this will only work for Python &gt;=3.5.  For earlier, failures return a ValueError, and you have to parse out the position from the string, e.g.</p>
+<pre><code>def stream_read_json(fn):
+    import json
+    import re
+    start_pos = 0
+    with open(fn, 'r') as f:
+        while True:
+            try:
+                obj = json.load(f)
+                yield obj
+                return
+            except ValueError as e:
+                f.seek(start_pos)
+                end_pos = int(re.match('Extra data: line \d+ column \d+ .*\(char (\d+).*\)',
+                                    e.args[0]).groups()[0])
+                json_str = f.read(end_pos)
+                obj = json.loads(json_str)
+                start_pos += end_pos
+                yield obj
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'd like to provide a solution. The key thought is to "try" to decode: if it fails, give it more feed, otherwise use the offset information to prepare next decoding.</p>
+<p>However the current json module can't tolerate SPACE in head of string to be decoded, so I have to strip them off.</p>
+<pre><code>import sys
+import json
+
+def iterload(file):
+    buffer = ""
+    dec = json.JSONDecoder()
+    for line in file:         
+        buffer = buffer.strip(" \n\r\t") + line.strip(" \n\r\t")
+        while(True):
+            try:
+                r = dec.raw_decode(buffer)
+            except:
+                break
+            yield r[0]
+            buffer = buffer[r[1]:].strip(" \n\r\t")
+
+
+for o in iterload(sys.stdin):
+    print("Working on a", type(o),  o)
+</code></pre>
+<p>=========================
+I have tested for several txt files, and it works fine.
+(in1.txt)</p>
+<pre><code>{"foo": ["bar", "baz"]
+}
+ 1 2 [
+  ]  4
+{"foo1": ["bar1", {"foo2":{"A":1, "B":3}, "DDD":4}]
+}
+ 5   6
+</code></pre>
+<p>(in2.txt)</p>
+<pre><code>{"foo"
+: ["bar",
+  "baz"]
+  } 
+1 2 [
+] 4 5 6
+</code></pre>
+<p>(in.txt, your initial)</p>
+<pre><code>{"foo": ["bar", "baz"]} 1 2 [] 4 5 6
+</code></pre>
+<p>(output for Benedict's testcase)</p>
+<pre><code>python test.py &lt; in.txt
+('Working on a', &lt;type 'list'&gt;, [u'hello'])
+('Working on a', &lt;type 'dict'&gt;, {u'goodbye': 1})
+('Working on a', &lt;type 'int'&gt;, 1)
+('Working on a', &lt;type 'int'&gt;, 2)
+('Working on a', &lt;type 'dict'&gt;, {})
+('Working on a', &lt;type 'int'&gt;, 2)
+('Working on a', &lt;type 'int'&gt;, 9)
+('Working on a', &lt;type 'int'&gt;, 78)
+('Working on a', &lt;type 'int'&gt;, 4)
+('Working on a', &lt;type 'int'&gt;, 5)
+('Working on a', &lt;type 'dict'&gt;, {u'animals': [u'dog', u'lots of mice', u'cat']})
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I believe a better way of doing it would be to use a state machine. Below is a sample code that I worked out by converting a NodeJS code on below link to Python <s>3 (used nonlocal keyword only available in Python 3, code won't work on Python 2)</s></p>
+<p><strong>Edit-1: Updated and made code compatible with Python 2</strong></p>
+<p><strong>Edit-2: Updated and added a Python3 only version as well</strong></p>
+<p><a href="https://gist.github.com/creationix/5992451" rel="nofollow noreferrer">https://gist.github.com/creationix/5992451</a></p>
+<h2>Python 3 only version</h2>
+<pre><code># A streaming byte oriented JSON parser.  Feed it a single byte at a time and
+# it will emit complete objects as it comes across them.  Whitespace within and
+# between objects is ignored.  This means it can parse newline delimited JSON.
+import math
+
+
+def json_machine(emit, next_func=None):
+    def _value(byte_data):
+        if not byte_data:
+            return
+
+        if byte_data == 0x09 or byte_data == 0x0a or byte_data == 0x0d or byte_data == 0x20:
+            return _value  # Ignore whitespace
+
+        if byte_data == 0x22:  # "
+            return string_machine(on_value)
+
+        if byte_data == 0x2d or (0x30 &lt;= byte_data &lt; 0x40):  # - or 0-9
+            return number_machine(byte_data, on_number)
+
+        if byte_data == 0x7b:  #:
+            return object_machine(on_value)
+
+        if byte_data == 0x5b:  # [
+            return array_machine(on_value)
+
+        if byte_data == 0x74:  # t
+            return constant_machine(TRUE, True, on_value)
+
+        if byte_data == 0x66:  # f
+            return constant_machine(FALSE, False, on_value)
+
+        if byte_data == 0x6e:  # n
+            return constant_machine(NULL, None, on_value)
+
+        if next_func == _value:
+            raise Exception("Unexpected 0x" + str(byte_data))
+
+        return next_func(byte_data)
+
+    def on_value(value):
+        emit(value)
+        return next_func
+
+    def on_number(number, byte):
+        emit(number)
+        return _value(byte)
+
+    next_func = next_func or _value
+    return _value
+
+
+TRUE = [0x72, 0x75, 0x65]
+FALSE = [0x61, 0x6c, 0x73, 0x65]
+NULL = [0x75, 0x6c, 0x6c]
+
+
+def constant_machine(bytes_data, value, emit):
+    i = 0
+    length = len(bytes_data)
+
+    def _constant(byte_data):
+        nonlocal i
+        if byte_data != bytes_data[i]:
+            i += 1
+            raise Exception("Unexpected 0x" + str(byte_data))
+
+        i += 1
+        if i &lt; length:
+            return _constant
+        return emit(value)
+
+    return _constant
+
+
+def string_machine(emit):
+    string = ""
+
+    def _string(byte_data):
+        nonlocal string
+
+        if byte_data == 0x22:  # "
+            return emit(string)
+
+        if byte_data == 0x5c:  # \
+            return _escaped_string
+
+        if byte_data &amp; 0x80:  # UTF-8 handling
+            return utf8_machine(byte_data, on_char_code)
+
+        if byte_data &lt; 0x20:  # ASCII control character
+            raise Exception("Unexpected control character: 0x" + str(byte_data))
+
+        string += chr(byte_data)
+        return _string
+
+    def _escaped_string(byte_data):
+        nonlocal string
+
+        if byte_data == 0x22 or byte_data == 0x5c or byte_data == 0x2f:  # " \ /
+            string += chr(byte_data)
+            return _string
+
+        if byte_data == 0x62:  # b
+            string += "\b"
+            return _string
+
+        if byte_data == 0x66:  # f
+            string += "\f"
+            return _string
+
+        if byte_data == 0x6e:  # n
+            string += "\n"
+            return _string
+
+        if byte_data == 0x72:  # r
+            string += "\r"
+            return _string
+
+        if byte_data == 0x74:  # t
+            string += "\t"
+            return _string
+
+        if byte_data == 0x75:  # u
+            return hex_machine(on_char_code)
+
+    def on_char_code(char_code):
+        nonlocal string
+        string += chr(char_code)
+        return _string
+
+    return _string
+
+
+# Nestable state machine for UTF-8 Decoding.
+def utf8_machine(byte_data, emit):
+    left = 0
+    num = 0
+
+    def _utf8(byte_data):
+        nonlocal num, left
+        if (byte_data &amp; 0xc0) != 0x80:
+            raise Exception("Invalid byte in UTF-8 character: 0x" + byte_data.toString(16))
+
+        left = left - 1
+
+        num |= (byte_data &amp; 0x3f) &lt;&lt; (left * 6)
+        if left:
+            return _utf8
+        return emit(num)
+
+    if 0xc0 &lt;= byte_data &lt; 0xe0:  # 2-byte UTF-8 Character
+        left = 1
+        num = (byte_data &amp; 0x1f) &lt;&lt; 6
+        return _utf8
+
+    if 0xe0 &lt;= byte_data &lt; 0xf0:  # 3-byte UTF-8 Character
+        left = 2
+        num = (byte_data &amp; 0xf) &lt;&lt; 12
+        return _utf8
+
+    if 0xf0 &lt;= byte_data &lt; 0xf8:  # 4-byte UTF-8 Character
+        left = 3
+        num = (byte_data &amp; 0x07) &lt;&lt; 18
+        return _utf8
+
+    raise Exception("Invalid byte in UTF-8 string: 0x" + str(byte_data))
+
+
+# Nestable state machine for hex escaped characters
+def hex_machine(emit):
+    left = 4
+    num = 0
+
+    def _hex(byte_data):
+        nonlocal num, left
+
+        if 0x30 &lt;= byte_data &lt; 0x40:
+            i = byte_data - 0x30
+        elif 0x61 &lt;= byte_data &lt;= 0x66:
+            i = byte_data - 0x57
+        elif 0x41 &lt;= byte_data &lt;= 0x46:
+            i = byte_data - 0x37
+        else:
+            raise Exception("Expected hex char in string hex escape")
+
+        left -= 1
+        num |= i &lt;&lt; (left * 4)
+
+        if left:
+            return _hex
+        return emit(num)
+
+    return _hex
+
+
+def number_machine(byte_data, emit):
+    sign = 1
+    number = 0
+    decimal = 0
+    esign = 1
+    exponent = 0
+
+    def _mid(byte_data):
+        if byte_data == 0x2e:  # .
+            return _decimal
+
+        return _later(byte_data)
+
+    def _number(byte_data):
+        nonlocal number
+        if 0x30 &lt;= byte_data &lt; 0x40:
+            number = number * 10 + (byte_data - 0x30)
+            return _number
+
+        return _mid(byte_data)
+
+    def _start(byte_data):
+        if byte_data == 0x30:
+            return _mid
+
+        if 0x30 &lt; byte_data &lt; 0x40:
+            return _number(byte_data)
+
+        raise Exception("Invalid number: 0x" + str(byte_data))
+
+    if byte_data == 0x2d:  # -
+        sign = -1
+        return _start
+
+    def _decimal(byte_data):
+        nonlocal decimal
+        if 0x30 &lt;= byte_data &lt; 0x40:
+            decimal = (decimal + byte_data - 0x30) / 10
+            return _decimal
+
+        return _later(byte_data)
+
+    def _later(byte_data):
+        if byte_data == 0x45 or byte_data == 0x65:  # E e
+            return _esign
+
+        return _done(byte_data)
+
+    def _esign(byte_data):
+        nonlocal esign
+        if byte_data == 0x2b:  # +
+            return _exponent
+
+        if byte_data == 0x2d:  # -
+            esign = -1
+            return _exponent
+
+        return _exponent(byte_data)
+
+    def _exponent(byte_data):
+        nonlocal exponent
+        if 0x30 &lt;= byte_data &lt; 0x40:
+            exponent = exponent * 10 + (byte_data - 0x30)
+            return _exponent
+
+        return _done(byte_data)
+
+    def _done(byte_data):
+        value = sign * (number + decimal)
+        if exponent:
+            value *= math.pow(10, esign * exponent)
+
+        return emit(value, byte_data)
+
+    return _start(byte_data)
+
+
+def array_machine(emit):
+    array_data = []
+
+    def _array(byte_data):
+        if byte_data == 0x5d:  # ]
+            return emit(array_data)
+
+        return json_machine(on_value, _comma)(byte_data)
+
+    def on_value(value):
+        array_data.append(value)
+
+    def _comma(byte_data):
+        if byte_data == 0x09 or byte_data == 0x0a or byte_data == 0x0d or byte_data == 0x20:
+            return _comma  # Ignore whitespace
+
+        if byte_data == 0x2c:  # ,
+            return json_machine(on_value, _comma)
+
+        if byte_data == 0x5d:  # ]
+            return emit(array_data)
+
+        raise Exception("Unexpected byte: 0x" + str(byte_data) + " in array body")
+
+    return _array
+
+
+def object_machine(emit):
+    object_data = {}
+    key = None
+
+    def _object(byte_data):
+        if byte_data == 0x7d:  #
+            return emit(object_data)
+
+        return _key(byte_data)
+
+    def _key(byte_data):
+        if byte_data == 0x09 or byte_data == 0x0a or byte_data == 0x0d or byte_data == 0x20:
+            return _object  # Ignore whitespace
+
+        if byte_data == 0x22:
+            return string_machine(on_key)
+
+        raise Exception("Unexpected byte: 0x" + str(byte_data))
+
+    def on_key(result):
+        nonlocal key
+        key = result
+        return _colon
+
+    def _colon(byte_data):
+        if byte_data == 0x09 or byte_data == 0x0a or byte_data == 0x0d or byte_data == 0x20:
+            return _colon  # Ignore whitespace
+
+        if byte_data == 0x3a:  # :
+            return json_machine(on_value, _comma)
+
+        raise Exception("Unexpected byte: 0x" + str(byte_data))
+
+    def on_value(value):
+        object_data[key] = value
+
+    def _comma(byte_data):
+        if byte_data == 0x09 or byte_data == 0x0a or byte_data == 0x0d or byte_data == 0x20:
+            return _comma  # Ignore whitespace
+
+        if byte_data == 0x2c:  # ,
+            return _key
+
+        if byte_data == 0x7d:  #
+            return emit(object_data)
+
+        raise Exception("Unexpected byte: 0x" + str(byte_data))
+
+    return _object
+</code></pre>
+<h2>Python 2 compatible version</h2>
+<pre><code># A streaming byte oriented JSON parser.  Feed it a single byte at a time and
+# it will emit complete objects as it comes across them.  Whitespace within and
+# between objects is ignored.  This means it can parse newline delimited JSON.
+import math
+
+
+def json_machine(emit, next_func=None):
+    def _value(byte_data):
+        if not byte_data:
+            return
+
+        if byte_data == 0x09 or byte_data == 0x0a or byte_data == 0x0d or byte_data == 0x20:
+            return _value  # Ignore whitespace
+
+        if byte_data == 0x22:  # "
+            return string_machine(on_value)
+
+        if byte_data == 0x2d or (0x30 &lt;= byte_data &lt; 0x40):  # - or 0-9
+            return number_machine(byte_data, on_number)
+
+        if byte_data == 0x7b:  #:
+            return object_machine(on_value)
+
+        if byte_data == 0x5b:  # [
+            return array_machine(on_value)
+
+        if byte_data == 0x74:  # t
+            return constant_machine(TRUE, True, on_value)
+
+        if byte_data == 0x66:  # f
+            return constant_machine(FALSE, False, on_value)
+
+        if byte_data == 0x6e:  # n
+            return constant_machine(NULL, None, on_value)
+
+        if next_func == _value:
+            raise Exception("Unexpected 0x" + str(byte_data))
+
+        return next_func(byte_data)
+
+    def on_value(value):
+        emit(value)
+        return next_func
+
+    def on_number(number, byte):
+        emit(number)
+        return _value(byte)
+
+    next_func = next_func or _value
+    return _value
+
+
+TRUE = [0x72, 0x75, 0x65]
+FALSE = [0x61, 0x6c, 0x73, 0x65]
+NULL = [0x75, 0x6c, 0x6c]
+
+
+def constant_machine(bytes_data, value, emit):
+    local_data = {"i": 0, "length": len(bytes_data)}
+
+    def _constant(byte_data):
+        # nonlocal i, length
+        if byte_data != bytes_data[local_data["i"]]:
+            local_data["i"] += 1
+            raise Exception("Unexpected 0x" + byte_data.toString(16))
+
+        local_data["i"] += 1
+
+        if local_data["i"] &lt; local_data["length"]:
+            return _constant
+        return emit(value)
+
+    return _constant
+
+
+def string_machine(emit):
+    local_data = {"string": ""}
+
+    def _string(byte_data):
+        # nonlocal string
+
+        if byte_data == 0x22:  # "
+            return emit(local_data["string"])
+
+        if byte_data == 0x5c:  # \
+            return _escaped_string
+
+        if byte_data &amp; 0x80:  # UTF-8 handling
+            return utf8_machine(byte_data, on_char_code)
+
+        if byte_data &lt; 0x20:  # ASCII control character
+            raise Exception("Unexpected control character: 0x" + byte_data.toString(16))
+
+        local_data["string"] += chr(byte_data)
+        return _string
+
+    def _escaped_string(byte_data):
+        # nonlocal string
+
+        if byte_data == 0x22 or byte_data == 0x5c or byte_data == 0x2f:  # " \ /
+            local_data["string"] += chr(byte_data)
+            return _string
+
+        if byte_data == 0x62:  # b
+            local_data["string"] += "\b"
+            return _string
+
+        if byte_data == 0x66:  # f
+            local_data["string"] += "\f"
+            return _string
+
+        if byte_data == 0x6e:  # n
+            local_data["string"] += "\n"
+            return _string
+
+        if byte_data == 0x72:  # r
+            local_data["string"] += "\r"
+            return _string
+
+        if byte_data == 0x74:  # t
+            local_data["string"] += "\t"
+            return _string
+
+        if byte_data == 0x75:  # u
+            return hex_machine(on_char_code)
+
+    def on_char_code(char_code):
+        # nonlocal string
+        local_data["string"] += chr(char_code)
+        return _string
+
+    return _string
+
+
+# Nestable state machine for UTF-8 Decoding.
+def utf8_machine(byte_data, emit):
+    local_data = {"left": 0, "num": 0}
+
+    def _utf8(byte_data):
+        # nonlocal num, left
+        if (byte_data &amp; 0xc0) != 0x80:
+            raise Exception("Invalid byte in UTF-8 character: 0x" + byte_data.toString(16))
+
+        local_data["left"] -= 1
+
+        local_data["num"] |= (byte_data &amp; 0x3f) &lt;&lt; (local_data["left"] * 6)
+        if local_data["left"]:
+            return _utf8
+        return emit(local_data["num"])
+
+    if 0xc0 &lt;= byte_data &lt; 0xe0:  # 2-byte UTF-8 Character
+        local_data["left"] = 1
+        local_data["num"] = (byte_data &amp; 0x1f) &lt;&lt; 6
+        return _utf8
+
+    if 0xe0 &lt;= byte_data &lt; 0xf0:  # 3-byte UTF-8 Character
+        local_data["left"] = 2
+        local_data["num"] = (byte_data &amp; 0xf) &lt;&lt; 12
+        return _utf8
+
+    if 0xf0 &lt;= byte_data &lt; 0xf8:  # 4-byte UTF-8 Character
+        local_data["left"] = 3
+        local_data["num"] = (byte_data &amp; 0x07) &lt;&lt; 18
+        return _utf8
+
+    raise Exception("Invalid byte in UTF-8 string: 0x" + str(byte_data))
+
+
+# Nestable state machine for hex escaped characters
+def hex_machine(emit):
+    local_data = {"left": 4, "num": 0}
+
+    def _hex(byte_data):
+        # nonlocal num, left
+        i = 0  # Parse the hex byte
+        if 0x30 &lt;= byte_data &lt; 0x40:
+            i = byte_data - 0x30
+        elif 0x61 &lt;= byte_data &lt;= 0x66:
+            i = byte_data - 0x57
+        elif 0x41 &lt;= byte_data &lt;= 0x46:
+            i = byte_data - 0x37
+        else:
+            raise Exception("Expected hex char in string hex escape")
+
+        local_data["left"] -= 1
+        local_data["num"] |= i &lt;&lt; (local_data["left"] * 4)
+
+        if local_data["left"]:
+            return _hex
+        return emit(local_data["num"])
+
+    return _hex
+
+
+def number_machine(byte_data, emit):
+    local_data = {"sign": 1, "number": 0, "decimal": 0, "esign": 1, "exponent": 0}
+
+    def _mid(byte_data):
+        if byte_data == 0x2e:  # .
+            return _decimal
+
+        return _later(byte_data)
+
+    def _number(byte_data):
+        # nonlocal number
+        if 0x30 &lt;= byte_data &lt; 0x40:
+            local_data["number"] = local_data["number"] * 10 + (byte_data - 0x30)
+            return _number
+
+        return _mid(byte_data)
+
+    def _start(byte_data):
+        if byte_data == 0x30:
+            return _mid
+
+        if 0x30 &lt; byte_data &lt; 0x40:
+            return _number(byte_data)
+
+        raise Exception("Invalid number: 0x" + byte_data.toString(16))
+
+    if byte_data == 0x2d:  # -
+        local_data["sign"] = -1
+        return _start
+
+    def _decimal(byte_data):
+        # nonlocal decimal
+        if 0x30 &lt;= byte_data &lt; 0x40:
+            local_data["decimal"] = (local_data["decimal"] + byte_data - 0x30) / 10
+            return _decimal
+
+        return _later(byte_data)
+
+    def _later(byte_data):
+        if byte_data == 0x45 or byte_data == 0x65:  # E e
+            return _esign
+
+        return _done(byte_data)
+
+    def _esign(byte_data):
+        # nonlocal esign
+        if byte_data == 0x2b:  # +
+            return _exponent
+
+        if byte_data == 0x2d:  # -
+            local_data["esign"] = -1
+            return _exponent
+
+        return _exponent(byte_data)
+
+    def _exponent(byte_data):
+        # nonlocal exponent
+        if 0x30 &lt;= byte_data &lt; 0x40:
+            local_data["exponent"] = local_data["exponent"] * 10 + (byte_data - 0x30)
+            return _exponent
+
+        return _done(byte_data)
+
+    def _done(byte_data):
+        value = local_data["sign"] * (local_data["number"] + local_data["decimal"])
+        if local_data["exponent"]:
+            value *= math.pow(10, local_data["esign"] * local_data["exponent"])
+
+        return emit(value, byte_data)
+
+    return _start(byte_data)
+
+
+def array_machine(emit):
+    local_data = {"array_data": []}
+
+    def _array(byte_data):
+        if byte_data == 0x5d:  # ]
+            return emit(local_data["array_data"])
+
+        return json_machine(on_value, _comma)(byte_data)
+
+    def on_value(value):
+        # nonlocal array_data
+        local_data["array_data"].append(value)
+
+    def _comma(byte_data):
+        if byte_data == 0x09 or byte_data == 0x0a or byte_data == 0x0d or byte_data == 0x20:
+            return _comma  # Ignore whitespace
+
+        if byte_data == 0x2c:  # ,
+            return json_machine(on_value, _comma)
+
+        if byte_data == 0x5d:  # ]
+            return emit(local_data["array_data"])
+
+        raise Exception("Unexpected byte: 0x" + str(byte_data) + " in array body")
+
+    return _array
+
+
+def object_machine(emit):
+    local_data = {"object_data": {}, "key": ""}
+
+    def _object(byte_data):
+        # nonlocal object_data, key
+        if byte_data == 0x7d:  #
+            return emit(local_data["object_data"])
+
+        return _key(byte_data)
+
+    def _key(byte_data):
+        if byte_data == 0x09 or byte_data == 0x0a or byte_data == 0x0d or byte_data == 0x20:
+            return _object  # Ignore whitespace
+
+        if byte_data == 0x22:
+            return string_machine(on_key)
+
+        raise Exception("Unexpected byte: 0x" + byte_data.toString(16))
+
+    def on_key(result):
+        # nonlocal object_data, key
+        local_data["key"] = result
+        return _colon
+
+    def _colon(byte_data):
+        # nonlocal object_data, key
+        if byte_data == 0x09 or byte_data == 0x0a or byte_data == 0x0d or byte_data == 0x20:
+            return _colon  # Ignore whitespace
+
+        if byte_data == 0x3a:  # :
+            return json_machine(on_value, _comma)
+
+        raise Exception("Unexpected byte: 0x" + str(byte_data))
+
+    def on_value(value):
+        # nonlocal object_data, key
+        local_data["object_data"][local_data["key"]] = value
+
+    def _comma(byte_data):
+        # nonlocal object_data
+        if byte_data == 0x09 or byte_data == 0x0a or byte_data == 0x0d or byte_data == 0x20:
+            return _comma  # Ignore whitespace
+
+        if byte_data == 0x2c:  # ,
+            return _key
+
+        if byte_data == 0x7d:  #
+            return emit(local_data["object_data"])
+
+        raise Exception("Unexpected byte: 0x" + str(byte_data))
+
+    return _object
+</code></pre>
+<h3>Testing it</h3>
+<pre><code>if __name__ == "__main__":
+    test_json = """[1,2,"3"] {"name": 
+    "tarun"} 1 2 
+    3 [{"name":"a", 
+    "data": [1,
+    null,2]}]
+"""
+    def found_json(data):
+        print(data)
+
+    state = json_machine(found_json)
+
+    for char in test_json:
+        state = state(ord(char))
+</code></pre>
+<p>The output of the same is</p>
+<pre><code>[1, 2, '3']
+{'name': 'tarun'}
+1
+2
+3
+[{'name': 'a', 'data': [1, None, 2]}]
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I used @wuilang's elegant solution. The simple approach -- read a byte, try to decode, read a byte, try to decode, ... -- worked, but unfortunately it was very slow.</p>
+<p>In my case, I was trying to read "pretty-printed" JSON objects of the same object type from a file. This allowed me to optimize the approach; I could read the file line-by-line, only decoding when I found a line that contained exactly "}":</p>
+<pre><code>def iterload(stream):
+    buf = ""
+    dec = json.JSONDecoder()
+    for line in stream:
+        line = line.rstrip()
+        buf = buf + line
+        if line == "}":
+            yield dec.raw_decode(buf)
+            buf = ""
+</code></pre>
+<p>If you happen to be working with one-per-line compact JSON that escapes newlines in string literals, then you can safely simplify this approach even more:</p>
+<pre><code>def iterload(stream):
+    dec = json.JSONDecoder()
+    for line in stream:
+        yield dec.raw_decode(line)
+</code></pre>
+<p>Obviously, these simple approaches only work for very specific kinds of JSON. However, if these assumptions hold, these solutions work correctly and quickly.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's mine:</p>
+<pre><code>import simplejson as json
+from simplejson import JSONDecodeError
+class StreamJsonListLoader():
+    """
+    When you have a big JSON file containint a list, such as
+
+    [{
+        ...
+    },
+    {
+        ...
+    },
+    {
+        ...
+    },
+    ...
+    ]
+
+    And it's too big to be practically loaded into memory and parsed by json.load,
+    This class comes to the rescue. It lets you lazy-load the large json list.
+    """
+
+    def __init__(self, filename_or_stream):
+        if type(filename_or_stream) == str:
+            self.stream = open(filename_or_stream)
+        else:
+            self.stream = filename_or_stream
+
+        if not self.stream.read(1) == '[':
+            raise NotImplementedError('Only JSON-streams of lists (that start with a [) are supported.')
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        read_buffer = self.stream.read(1)
+        while True:
+            try:
+                json_obj = json.loads(read_buffer)
+
+                if not self.stream.read(1) in [',',']']:
+                    raise Exception('JSON seems to be malformed: object is not followed by comma (,) or end of list (]).')
+                return json_obj
+            except JSONDecodeError:
+                next_char = self.stream.read(1)
+                read_buffer += next_char
+                while next_char != '}':
+                    next_char = self.stream.read(1)
+                    if next_char == '':
+                        raise StopIteration
+                    read_buffer += next_char
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you use a json.JSONDecoder instance you can use <code>raw_decode</code> member function. It returns a tuple of python representation of the JSON value and an index to where the parsing stopped. This makes it easy to slice (or seek in a stream object) the remaining JSON values. I'm not so happy about the extra while loop to skip over the white space between the different JSON values in the input but it gets the job done in my opinion.</p>
+<pre><code>import json
+
+def yield_multiple_value(f):
+    '''
+    parses multiple JSON values from a file.
+    '''
+    vals_str = f.read()
+    decoder = json.JSONDecoder()
+    try:
+        nread = 0
+        while nread &lt; len(vals_str):
+            val, n = decoder.raw_decode(vals_str[nread:])
+            nread += n
+            # Skip over whitespace because of bug, below.
+            while nread &lt; len(vals_str) and vals_str[nread].isspace():
+                nread += 1
+            yield val
+    except json.JSONDecodeError as e:
+        pass
+    return
+</code></pre>
+<p>The next version is much shorter and eats the part of the string that is already parsed. It seems that for some reason a second call json.JSONDecoder.raw_decode() seems to fail when the first character in the string is a whitespace, that is also the reason why I skip over the whitespace in the whileloop above ...</p>
+<pre><code>def yield_multiple_value(f):
+    '''
+    parses multiple JSON values from a file.
+    '''
+    vals_str = f.read()
+    decoder = json.JSONDecoder()
+    while vals_str:
+        val, n = decoder.raw_decode(vals_str)
+        #remove the read characters from the start.
+        vals_str = vals_str[n:]
+        # remove leading white space because a second call to decoder.raw_decode()
+        # fails when the string starts with whitespace, and
+        # I don't understand why...
+        vals_str = vals_str.lstrip()
+        yield val
+    return
+</code></pre>
+<p>In the documentation about the json.JSONDecoder class the method raw_decode <a href="https://docs.python.org/3/library/json.html#encoders-and-decoders" rel="nofollow noreferrer">https://docs.python.org/3/library/json.html#encoders-and-decoders</a> contains the following:</p>
+<blockquote>
+<p>This can be used to decode a JSON document from a string that may have
+  extraneous data at the end.</p>
+</blockquote>
+<p>And this extraneous data can easily be another JSON value. In other words the method might be written with this purpose in mind.</p>
+<p>With the input.txt using the upper function I obtain the example output as presented in the original question.</p>
+</div>
+<span class="comment-copy">Could you add an example of the behaviour you would like from nested objects please?</span>
+<span class="comment-copy">@TimMcNamara: The behaviour of nested object should not change. However, once we've reached the end of the first top-level object (<code>{"foo": ["bar", "baz"]}</code> in my example), it should <code>yield</code> it and then continue to the next one (<code>1</code>).</span>
+<span class="comment-copy">why avoid the "json lines"? It is always possible to serialize an object into json such that it has no <code>'\n'</code> (a single newline, not two characters) in its json representation because <i><code>'\n'</code> must be escaped</i> inside a json string and therefore <code>'\n'</code> may be used for formatting only e.g., I believe <code>json.dumps()</code> doesn't introduce <code>'\n'</code> by default. Beware that Unicode newlines such as U+0085 might be unescaped inside json strings.</span>
+<span class="comment-copy">The <b>ijson</b> library could be useful in this case. <a href="https://pypi.python.org/pypi/ijson/" rel="nofollow noreferrer">pypi.python.org/pypi/ijson</a> <a href="https://github.com/isagalaev/ijson" rel="nofollow noreferrer">github.com/isagalaev/ijson</a></span>
+<span class="comment-copy">Shouldn't the title be "How I can I lazily read multiple JSON <b>values</b> from a file/stream in Python?" Since an object is a value too as is a json int, string etc. whereas the reverse isn't necessary true?</span>
+<span class="comment-copy">&lt;edit&gt; yes with streaming reads this would work.</span>
+<span class="comment-copy">It seems that the tricky part would be ensuring that the streaming reads bring in enough of the file that you have an entire object to decode.  So this is a simple approach that works if you e.g. assume objects never have newlines in them.  But unless you impose that kind of additional structure on the file, which the OP is trying to avoid, it seems you'd need a solution like that from @Benedict</span>
+<span class="comment-copy">re: "no standard way": I don't see the problem, the syntax seems to make multiple consecutive objects unambiguous as long as you have a one-character buffer. Thanks for pointing out that other people use "JSON lines", I feel less bad about using it for now.</span>
+<span class="comment-copy">If you want to do this correctly, you also need to watch out for braces and brackets within strings. And then also watch out for escaped quotes. Before you know it, the “preparser” will get almost as complicated as a full JSON parser.</span>
+<span class="comment-copy">Thanks Jeremy. It was nice challenge of a question! Yes Petr - you are absolutely right of course :)</span>
+<span class="comment-copy">Nicely done. Will this behave correctly if characters like <code>"}"</code> and <code>"]"</code> occur inside JSON strings? I think this is a general limitation of parsing with regex.</span>
+<span class="comment-copy">When poking around I found that the main parsing function is built in such a way that it's <b>impossible</b> to properly use it lazily, so you're not going to get a perfect result without implementing a complete parser by yourself. This answer demonstrates several useful relevant things, and handles simple cases nicely.</span>
+<span class="comment-copy">This answer is horrid and I have no idea why it is upvoted.  The author admits that it doesn't actually work for all inputs so by definition it isn't even a right answer, and it uses a complex regular expression that is <i>computed</i>, so we can't even read what it is.  What good is a function that sometimes give the right result?</span>
+<span class="comment-copy">That's awesome. Thanks for sharing it.</span>
+<span class="comment-copy">This is the definitive solution. I hope you keep updating it.</span>
+<span class="comment-copy">It simply works. Thanks for providing such a useful module.</span>
+<span class="comment-copy">Could you upload a compiled .py version? I've tried to build and install the module but... it produces a bunch of errors regarding redefining constants and such.</span>
+<span class="comment-copy">The module is written in C. Porting it to pure Python is left as an exercise to whoever is up for the task :). It will likely be too slow for the purpose for which it was written though. If you have trouble compiling you probably need to install the python-dev packge.</span>
+<span class="comment-copy">Welcome to Stack Overflow and thanks for the answer! That's much closer to what I was hoping to find. I should be able to adapt this for the types of cases I was thinking about, even if they don't directly provide seeking.</span>
+<span class="comment-copy">That <code>re</code> won't work - the backslashes need escaping.  Consider a raw string <code>r'...'</code>.</span>
+<span class="comment-copy">I needed this for my own work, so I I created a little python library to do this,  using more or less your technique with some details, and it's here: <a href="https://pypi.python.org/pypi/Streamy" rel="nofollow noreferrer">pypi.python.org/pypi/Streamy</a></span>
+<span class="comment-copy">If you use <code>ujson</code> instead of <code>json</code> you are going to get a huge speedup</span>
+<span class="comment-copy">Nice solution! I'll take a closer look later but this is very promising. But for what it's worth, I preferred the Python 3-only version. Using dicts for all your local variables is kind-of awkward, and I for one am happy to leave Python 2 in the past. ;)</span>
+<span class="comment-copy">@JeremyBanks, sure I didn't know which version you targeted. Now I have added a Python3 only version and Py2 compatible one also in the answer for someone else who may still be on Python 2</span>
+<span class="comment-copy">@JeremyBanks, only 1 day left with the bounty, hope you can review and provide feedback on the answer</span>
+<span class="comment-copy">Hi, this is super useful but could you show how I can use the class to load the json file?</span>

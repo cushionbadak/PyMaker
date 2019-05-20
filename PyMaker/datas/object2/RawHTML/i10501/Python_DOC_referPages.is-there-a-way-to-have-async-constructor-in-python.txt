@@ -1,0 +1,224 @@
+<div class="post-text" itemprop="text">
+<p>How can I define a class with <code>await</code> in the constructor or class body?</p>
+<p>For example what I want:</p>
+<pre class="lang-py prettyprint-override"><code>import asyncio
+
+# some code
+
+
+class Foo(object):
+
+    async def __init__(self, settings):
+        self.settings = settings
+        self.pool = await create_pool(dsn)
+
+foo = Foo(settings)
+# it raises:
+# TypeError: __init__() should return None, not 'coroutine'
+</code></pre>
+<p>or example with class body attribute:</p>
+<pre class="lang-py prettyprint-override"><code>class Foo(object):
+
+    self.pool = await create_pool(dsn)  # Sure it raises syntax Error
+
+    def __init__(self, settings):
+        self.settings = settings
+
+foo = Foo(settings)
+</code></pre>
+<p>My solution (But I would like to see a more elegant way)</p>
+<pre class="lang-py prettyprint-override"><code>class Foo(object):
+
+    def __init__(self, settings):
+        self.settings = settings
+
+    async def init(self):
+        self.pool = await create_pool(dsn)
+
+foo = Foo(settings)
+await foo.init()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Most magic methods aren't designed to work with <code>async def</code>/<code>await</code> - in general, you should only be using <code>await</code> inside the dedicated asynchronous magic methods - <code>__aiter__</code>, <code>__anext__</code>, <code>__aenter__</code>, and <code>__aexit__</code>. Using it inside other magic methods either won't work at all (as is the case with <code>__init__</code>), or will force you to always use whatever triggers the magic method call in an asynchronous context.</p>
+<p>Existing <code>asyncio</code> libraries tend to deal with this in one of two ways: First, I've seen the factory pattern used (<a href="https://github.com/jonathanslenders/asyncio-redis/blob/master/asyncio_redis/pool.py#L27"><code>asyncio-redis</code></a>, for example):</p>
+<pre><code>import asyncio
+
+dsn = "..."
+
+class Foo(object):
+    @classmethod
+    async def create(cls, settings):
+        self = Foo()
+        self.settings = settings
+        self.pool = await create_pool(dsn)
+        return self
+
+async def main(settings):
+    settings = "..."
+    foo = await Foo.create(settings)
+</code></pre>
+<p>Other libraries use a top-level coroutine function that creates the object, rather than a factory method:</p>
+<pre><code>import asyncio
+
+dsn = "..."
+
+async def create_foo(settings):
+    foo = Foo(settings)
+    await foo._init()
+    return foo
+
+class Foo(object):
+    def __init__(self, settings):
+        self.settings = settings
+
+    async def _init(self):
+        self.pool = await create_pool(dsn)
+
+async def main():
+    settings = "..."
+    foo = await create_foo(settings)
+</code></pre>
+<p>The <code>create_pool</code> function from <code>aiopg</code> that you want to call in <code>__init__</code> is actually using this exact pattern.</p>
+<p>This at least addresses the <code>__init__</code> issue. I haven't seen class variables that make asynchronous calls in the wild that I can recall, so I don't know that any well-established patterns have emerged.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I would recommend a separate factory method. It's safe and straightforward. However, if you insist on a <code>async</code> version of <code>__init__()</code>, here's an example:</p>
+<pre><code>def asyncinit(cls):
+    __new__ = cls.__new__
+
+    async def init(obj, *arg, **kwarg):
+        await obj.__init__(*arg, **kwarg)
+        return obj
+
+    def new(cls, *arg, **kwarg):
+        obj = __new__(cls, *arg, **kwarg)
+        coro = init(obj, *arg, **kwarg)
+        #coro.__init__ = lambda *_1, **_2: None
+        return coro
+
+    cls.__new__ = new
+    return cls
+</code></pre>
+<p><strong>Usage:</strong></p>
+<pre><code>@asyncinit
+class Foo(object):
+    def __new__(cls):
+        '''Do nothing. Just for test purpose.'''
+        print(cls)
+        return super().__new__(cls)
+
+    async def __init__(self):
+        self.initialized = True
+</code></pre>
+<p><p></p>
+<pre><code>async def f():
+    print((await Foo()).initialized)
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(f())
+</code></pre>
+<p><strong>Output:</strong></p>
+<pre><code>&lt;class '__main__.Foo'&gt;
+True
+</code></pre>
+<p><strong>Explanation:</strong></p>
+<p>Your class construction must return a <code>coroutine</code> object instead of its own instance. </p>
+</p></div>
+<div class="post-text" itemprop="text">
+<p>Another way to do this, for funsies:</p>
+<pre><code>class aobject(object):
+    """Inheriting this class allows you to define an async __init__.
+
+    So you can create objects by doing something like `await MyClass(params)`
+    """
+    async def __new__(cls, *a, **kw):
+        instance = super().__new__(cls)
+        await instance.__init__(*a, **kw)
+        return instance
+
+    async def __init__(self):
+        pass
+
+#With non async super classes
+
+class A:
+    def __init__(self):
+        self.a = 1
+
+class B(A):
+    def __init__(self):
+        self.b = 2
+        super().__init__()
+
+class C(B, aobject):
+    async def __init__(self):
+        super().__init__()
+        self.c=3
+
+#With async super classes
+
+class D(aobject):
+    async def __init__(self, a):
+        self.a = a
+
+class E(D):
+    async def __init__(self):
+        self.b = 2
+        await super().__init__(1)
+
+# Overriding __new__
+
+class F(aobject):
+    async def __new__(cls):
+        print(cls)
+        return await super().__new__(cls)
+
+    async def __init__(self):
+        await asyncio.sleep(1)
+        self.f = 6
+
+loop = asyncio.get_event_loop()
+e = loop.run_until_complete(E())
+e.b # 2
+e.a # 1
+
+c = loop.run_until_complete(C())
+c.a # 1
+c.b # 2
+c.c # 3
+
+f = loop.run_until_complete(F()) # Prints F class
+f.f # 6
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you're using Python3.7 or newer then you can use <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.run" rel="nofollow noreferrer">asyncio.run</a>:</p>
+<pre class="lang-python prettyprint-override"><code>import asyncio
+
+
+# some code
+
+
+class Foo(object):
+
+    async def __init(self):
+        self.pool = await create_pool(dsn)
+
+    def __init__(self, settings):
+        self.settings = settings
+        asyncio.run(self.__init)
+
+
+foo = Foo(settings)
+</code></pre>
+<p>Note, this won't work if you're instantiating <code>Foo</code> in an asynchronous function that's already running. See <a href="https://www.aeracode.org/2018/02/19/python-async-simplified/" rel="nofollow noreferrer">this blog post</a> for a discussion on how to handle this scenario and a nice discussion of asynchronous programming in Python.</p>
+</div>
+<span class="comment-copy">You might have some luck with <code>__new__</code>, although it might not be elegant</span>
+<span class="comment-copy">I don't have experience with 3.5, and in other languages this wouldn't work because of the viral nature of async/await, but have you tried defining an async function like <code>_pool_init(dsn)</code> and then calling it from <code>__init__</code>? It would preserve the init-in-constructor appearance.</span>
+<span class="comment-copy">If you use curio: <a href="https://curio.readthedocs.io/en/latest/reference.html#curio.meta.AsyncObject" rel="nofollow noreferrer">curio.readthedocs.io/en/latest/…</a></span>
+<span class="comment-copy">Hmm, interesting trick. Not sure I want to use it though.</span>
+<span class="comment-copy">Couldn't you name your <code>new</code> <code>__new__</code> and use <code>super</code> (likewise for <code>__init__</code>, i.e. just let the client override that) instead?</span>
+<span class="comment-copy">This is currently the most clear and understandable implementation in my opinion. I really like how intuitively extensible it is. I was worried it would be necessary to delve into metaclasses.</span>
+<span class="comment-copy">This doesn't have correct <code>__init__</code> semantics if <code>super().__new__(cls)</code> returns a pre-existing instance - normally, this would skip <code>__init__</code>, but your code not.</span>
+<span class="comment-copy">Hmm, per <code>object.__new__</code> documentation, <code>__init__</code> should only be invoked if <code>isinstance(instance, cls)</code> ? This seems somewhat unclear to me... But I don't see the semantics you claim anywhere...</span>

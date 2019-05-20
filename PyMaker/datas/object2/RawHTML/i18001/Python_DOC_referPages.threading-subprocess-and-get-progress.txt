@@ -1,0 +1,162 @@
+<div class="post-text" itemprop="text">
+<p>I'd like to automate handbrake a little bit and wrote a little program in python.
+Now I have a problem with the subprocess and threading module. I want to dynamically change the number of handbrake processes which I run. And I implement the queue module, for getting and putting the movies.</p>
+<p><code>CompressThread</code> calls the encode method in the handbrake class, and encode calls <code>_execute</code>. Now I want to store the progress, which I read in the handbrake class, in the compressor class centralized. So I can publish the progress to a <code>socketserver</code> and a <code>webgui</code>. No I write to a <code>sqlite3</code> db, but this should be removed(because of threading issues), and only on exit of the program saved.</p>
+<p>The only way I can think of save the data centralized is to create another thread, and poll data in the <code>CompressThread</code> class. My problem with this is that there are 4 threads for my program. </p>
+<p>Is there a better solution? Maybe the db is not wrong, and I shouldn't remove it?</p>
+<p>Compressor class:</p>
+<pre><code>class CompressThread(threading.Thread):
+    """ Manage the queue of movies to be compressed
+    """
+
+    def __init__(self):
+        threading.Thread.__init__(self)
+        self._config = ConfigParser()
+        self._config.process_config()
+        self._handbrake = self._config.get_handbrake()
+        self._lock = threading.Lock()
+
+    def run(self):
+        while True:
+            movie_id = QUEUE.get()
+            return_code = self._handbrake.encode(movie_id)
+            print(return_code)
+            QUEUE.task_done()
+
+
+class Compressor(object):
+    """ Compresses given mkv file
+
+    Attributes:
+
+
+    """
+
+    __MAX_THREADS = 1
+
+    def __init__(self):
+        self._dest_audio_tracks = None
+        self._log = None
+        self.settings = None
+        self.config = ConfigParser()
+        self._database = db.DB()
+        self._database.connect()
+        self._running = True
+        self._threads = []
+        try:
+            self.handbrake, self._log = self.config.process_config()
+            self._log = logging.getLogger("Compressor")
+        except ConfigError as error:
+            raise Error("Config error: {0}".format(error))
+
+    def process_file(self, input_file, output_file, title):
+        if not os.path.exists(input_file):
+            self._log.warning("Input file not exists: {0}".format(input_file))
+            print("Input file not found: {0}".format(input_file))
+        else:
+            media_info = mediainfo.Mediainfo.parse(input_file)
+            movie_settings = settings.Settings(input_file, title, output_file)
+            movie_settings.parse(media_info)
+            self._log.info("Added file {0} to list".format(movie_settings.input_file))
+            QUEUE.put(self._database.insert_movie(movie_settings))
+
+            print("File added.")
+
+    def start(self):
+        self._threads = [CompressThread() for i in range(self.__MAX_THREADS)]
+        for thread in self._threads:
+            thread.setDaemon(True)
+            thread.start()
+        while self._running:
+            cmd = input("mCompress&gt; ")
+            if cmd == "quit":
+                self._running = False
+            elif cmd == "status":
+                print("{0}".format(self._threads))
+            elif cmd == "newfile":
+                input_file = input("mCompress&gt; newFile&gt; Input filename&gt; ")
+                output_file = input("mCompress&gt; newFile&gt; Output filename&gt; ")
+                title = input("mCompress&gt; newFile&gt; Title&gt; ")
+                self.process_file(input_file, output_file, title)
+
+    def _initialize_logging(self, log_file):
+        try:
+            self._log_file = open(log_file, "a+")
+        except IOError as error:
+            log_error = "Could not open log file {0}".format(error)
+            self._log.error(log_error)
+            raise IOError(log_error)
+        self._log_file.seek(0)
+
+if __name__ == "__main__":
+    options_parser = OptionsParser()
+    args = options_parser.parser.parse_args()
+    if args.start:
+        Compressor().start()
+</code></pre>
+<p>A piece of the handbrake class:</p>
+<pre><code>def _execute(self, options):
+    command = ["{0}".format(self._location)]
+    if self._validate_options(options):
+        for option in options:
+            command.extend(option.generate_command())
+        print(" ".join(command))
+        state = 1
+        returncode = None
+        process = None
+        temp_file = tempfile.TemporaryFile()
+        try:
+            process = subprocess.Popen(command, stdout=temp_file, stderr=temp_file, shell=False)
+            temp_file.seek(0)
+            while True:
+                returncode = process.poll()
+                if not returncode:
+                    for line in temp_file.readlines():
+                        p = re.search("Encoding:.*([0-9]{1,2}\.[0-9]{1,2}) % \(([0-9]{1,2}\.[0-9]{1,2}) fps, avg "
+                                      "([0-9]{1,2}\.[0-9]{1,2}) fps, ETA ([0-9]{1,2}h[0-9]{1,2}m[0-9]{1,2})",
+                                      line.decode("utf-8"))
+                        if p is not None:
+                            self._database.update_progress(p.group(1), p.group(2), p.group(3), p.group(4))
+                else:
+                    break
+            temp_file.seek(0)
+            print(temp_file.readline())
+            self._write_log(temp_file.readlines())
+            if returncode == 0:
+                state = 5
+            else:
+                state = 100
+                raise ExecuteError("HandBrakeCLI stopped with an exit code not null: {0}".format(returncode))
+        except OSError as error:
+            state = 105
+            raise ExecuteError("CLI command failed: {0}".format(error))
+        except KeyboardInterrupt:
+            state = 101
+        finally:
+            try:
+                process.kill()
+            except:
+                pass
+            temp_file.close()
+            return state
+    else:
+        raise ExecuteError("No option given")
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Just do exactly what you were planning to do.</p>
+<p>If this means you have 5 threads instead of 4, so what?</p>
+<p>None of your threads are CPU-bound. That is, they're not crunching numbers or parsing strings or doing other computational work, they're just waiting on I/O, or an external process, or another thread. So there's no harm in creating more non-CPU-bound threads, unless you go hog-wild to the point where your OS can't handle them smoothly anymore. Which is in the hundreds.</p>
+<p>If any of your threads <em>were</em> CPU-bound, then even 2 would be too many. In CPython,* threads have to acquire the Global Interpreter Lock to do any work,** so they end up not running in parallel, and spending more time fighting over the GIL than working. But even then, adding another non-CPU-bound thread that spends all its time waiting on a queue that the CPU-bound threads were filling wouldn't make things significantly worse than they already are.***</p>
+<hr/>
+<p>As for the db…</p>
+<p>SQLite3 itself, as long as you have a new enough version, is fine with multithreading. But the Python <code>sqlite3</code> module is not, for backward compatibility with very old versions of the SQLite3 engine. See <a href="http://docs.python.org/3/library/sqlite3.html#multithreading" rel="nofollow">Multithreading</a> in the docs for details. If I remember correctly (the site seems to be temporarily down, so I can't check), you can build the third-party module <a href="https://pypi.python.org/pypi/pysqlite" rel="nofollow"><code>pysqlite</code></a> (which the stdlib module is based on) with threading support if you need to. </p>
+<p>However, if you're not using the database very heavily, running a single thread to talk to the database, with a queue to listen to other threads, is a perfectly reasonable design.</p>
+<hr/>
+<p>* And PyPy, but not necessarily in other implementations.</p>
+<p>** Extension modules can release the GIL to do work in C, as long as they don't touch any values visible from Python. Some well-known modules like NumPy take advantage of this.</p>
+<p>*** The waiting thread itself might be hampered by the CPU-bound threads, especially in Python 3.1 and earlier, but it won't interfere with them.</p>
+</div>
+<span class="comment-copy">"My problem with this is that there are 4 threads for my program." How is that a problem? If your threads are all spending most of their time waiting on I/O, external programs, or other threads, you can have dozens of them. On the other hand, if they're doing actual CPU work, you should only have one. There is no realistic situation in Python in which 4 threads is better or worse than 3 or 5.</span>
+<span class="comment-copy">I thought it's not optimal to have many threads, but yeah, they're all doing nothing but waiting. Only one is CPU bound. And for the database, I will make a class  with a queue, and have only one thread. Thank you very much!</span>
+<span class="comment-copy">@Dominik2000: It's true that it's not optimal to have many threads, but "many" here is in the high dozens or beyond, not 5. You may be confusing the fact that the optimal number of CPU-bound threads (including in child processes) is the number of cores on the machine. On a 4-core machine, 4 CPU-bound threads can use up all the CPU power there is; adding a 5th just adds overhead for no benefit.</span>

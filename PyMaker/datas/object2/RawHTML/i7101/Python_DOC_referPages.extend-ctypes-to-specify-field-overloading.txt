@@ -1,0 +1,252 @@
+<div class="post-text" itemprop="text">
+<p>I would like to extend ctypes Structure, BigEndianStructure, LittleEndianStructure.</p>
+<p>The ability to specify each field to have a description, and overload how the variable is returned to possibly enum, polyco, etc attributes.</p>
+<p>Something like the following is what I would like to do, but am not sure how to make the ModifedCTypesStructure parent class.</p>
+<p>My goal is to use this for commanding / telemetry of binary data.</p>
+<pre><code>class Color(Enum): 
+     RED = 1
+     GREEN = 2
+     BLUE = 3
+
+class Packet(ModifedCTypesStructure):
+   __fields__ = [("fieldA",ctypes.c_int32,
+                    {"brief":"""Description of fieldA""",
+                     "enum":Color}
+                 ),
+                 ("fieldB",ctypes.c_uint32, 
+                     {"repr":lambda x: hex(x)}
+                 )
+                ]
+
+ a = Packet()
+ help(a.fieldA)
+ &gt; Description of fieldA
+ a.fieldA = Color.RED
+print a._fieldA # Return the binary field
+&gt; 1
+a.fieldB = 0xbb
+print a.fieldB
+&gt; 0xbb #Note repr is called to return '0xbb'
+print a._fieldB
+&gt; 187
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>It is possible - 
+most of the magic provided by <code>ctypes.Structure</code> is due to its fields being "descriptors" - i.e. objects that follow <a href="https://docs.python.org/3/reference/datamodel.html#implementing-descriptors" rel="nofollow noreferrer">Python's descriptor protocol</a> - analog to what we get when we use the <code>@property</code> decorator in a class body.</p>
+<p><code>ctypes.Structure</code> has a metaclass that is responsible to convert each field listed in the special cased  variable name <code>_fields_</code> into a <code>_ctypes.CField</code> object (you can check that by verifying the result of <code>type(mystryct.field)</code> in an interactive Python prompt. </p>
+<p>Therefore, in order to extend the behavior for the fields themselves, we'd need to extend this <code>CField</code> class - and modify the metaclass that creates your Strutcture to use our fields.  The CField class seems to be a normal Python class itself - so it is easy to modify, if we respect the call to the super-methods.</p>
+<p><em>however</em> there are some catches in your "wishlist": </p>
+<ol>
+<li><p>using "help" requires the Python object to have the help string embedded in its class <code>__doc__</code> attribute (not the instance). So we can do that each time the field itself is retrieved from the structure class, we ceae dynamically a new class with the required help.</p></li>
+<li><p>When retrieving a value from an object, Python can't "know" in advance if the value will be used just for being "viewed" by <code>repr</code> or will actually be used. Therefore we either customize the value that is returned by <code>a.fieldB</code> for one that have a custom representation or we don't do it at all. The code bellow <em>does</em> create a dynamic class on field retrieval that will have a custom representation, and try to preserve all other numeric properties of the underlying value. But that is set to be both slow and may present some incompatibilities - you may choose to turn that off when not debugging values, or simply get the raw value.</p></li>
+<li><p>Ctype's "Fields" will of course have some internal structure of their own, like the offset for each memory position and so on - thus, I'd suggest the following approach:(1) create a new "Field" class that does not inherit from ctypes.Field at all - and that implement the enhancements you want; (2) Upon ModifiedStructure creation create all the "_" prefixed names, and pass these for the original Ctypes.Structure metaclass to create its fields as it always does; (3) make our "Field" class read and write to the original ctypes.Fields, and have their custom transforms and representations.</p></li>
+</ol>
+<p>As you can see, I also took care of actually transforming Enum values upon writting.</p>
+<p>To try everything, just inherit from "ModifiedStructure" bellow, instead of <code>ctypes.Structure</code>: </p>
+<pre><code>from ctypes import Structure
+import ctypes
+
+
+class A(Structure):
+    _fields_ = [("a", ctypes.c_uint8)]
+
+FieldType = type(A.a)
+StructureType = type(A)
+
+del A
+
+
+def repr_wrapper(value, transform):
+    class ReprWrapper(type(value)):
+        def __new__(cls, value):
+            return super().__new__(cls, value)
+        def __repr__(self):
+            return transform(self)
+
+    return ReprWrapper(value)
+
+
+def help_wrapper(field):
+    class Field2(field.__class__):
+        __doc__ = field.help
+
+        def __repr__(self):
+            return self.__doc__
+
+    return Field2(field.name, field.type_, help=field.help, repr=field.repr, enum=field.enum)
+
+
+class Field:
+    def __init__(self, name, type_, **kwargs):
+        self.name = name
+        self.type_ = type_
+        self.real_name = "_" + name
+        self.help = kwargs.pop("brief", f"Proxy structure field {name}")
+        self.repr = kwargs.pop("repr", None)
+        self.enum = kwargs.pop("enum", None)
+        if self.enum:
+            self.rev_enum =  {constant.value:constant for constant in self.enum.__members__.values() }
+
+    def __get__(self, instance, owner):
+        if not instance:
+            return help_wrapper(self)
+
+        value = getattr(instance, self.real_name)
+        if self.enum:
+            return self.rev_enum[value]
+        if self.repr:
+            return repr_wrapper(value, self.repr)
+
+        return value
+
+    def __set__(self, instance, value):
+        if self.enum:
+            value = getattr(self.enum, value.name).value
+        setattr(instance, self.real_name, value)
+
+
+class ModifiedStructureMeta(StructureType):
+    def __new__(metacls, name, bases, namespace):
+        _fields = namespace.get("_fields_", "")
+        classic_fields = []
+        for field in _fields:
+            # Create the set of descriptors for the new-style fields:
+            name = field[0]
+            namespace[name] = Field(name, field[1], **(field[2] if len(field) &gt; 2 else {}))
+            classic_fields.append(("_" + name, field[1]))
+
+        namespace["_fields_"] = classic_fields
+        return super().__new__(metacls, name, bases, namespace)
+
+
+class ModifiedStructure(ctypes.Structure, metaclass=ModifiedStructureMeta):
+    __slots__ = ()
+</code></pre>
+<p>And testing it on the interactive prompt:</p>
+<pre><code>In [165]: class A(ModifiedStructure):
+     ...:     _fields_ = [("b", ctypes.c_uint8, {"enum": Color, 'brief': "a color", }), ("c", ctypes.c_uint8, {"repr": hex})]
+     ...:     
+     ...:     
+
+In [166]: a = A()
+
+In [167]: a.c = 20
+
+In [169]: a.c
+Out[169]: 0x14
+
+In [170]: a.c = 256
+
+In [171]: a.c
+Out[171]: 0x0
+
+In [172]: a.c = 255
+
+In [173]: a.c
+Out[173]: 0xff
+
+In [177]: a.b = Color.RED
+
+In [178]: a._b
+Out[178]: 1
+
+In [180]: help(A.b)
+(shows full Field class help starting with the given description)
+
+In [181]: A.b
+Out[181]: a color
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is what I came up with after playing around with metaclasses for a while. I haven't ever used them so I wasnt sure if this was the correct approach.</p>
+<p>I couldnt figure out the repr thing.  Im going to play around with your solution @jsbueno.  </p>
+<p>I ended up building and appending properties to the classes on creation.
+Everything i read was saying not to use metaclasses 99% of the time so kind of wondering if I was going down the wrong path.</p>
+<p>Also I wanted to use the same metaclass for BigEndian / LittleEndian structures forgot to add that to the wish list.</p>
+<pre><code>import ctypes
+
+
+
+def make_fget(key,enum=None):
+    def fget(self):
+        res = getattr(self,  key)
+        if enum != None:
+            res = enum(res)
+        return res
+    return fget
+def make_fset(key):
+    def fset(self, value):
+        if isinstance(value,Enum):
+            value = value.value        
+        setattr(self, key, value)
+    return fset
+
+class PyGndTlmMeta(type):
+    def __new__(cls,name,bases, dct):
+        endian = ctypes.Structure
+        if '_endian_' in dct:
+            endian = dct['_endian_']
+        if not endian in [ctypes.Structure, ctypes.LittleEndianStructure, ctypes.BigEndianStructure]:
+            pass #TODO throw error
+
+        fields = []
+        attributes = dct.copy()
+
+        for f in dct['_fields_']:
+            fname = '_' + f[0]
+            ftype = f[1]
+            res = (fname,ftype)
+            specs = {}
+            #If 3rd argument is an integer than we are dealing with bitfields
+            if len(f)   &gt;= 3 and type(f[2]) == int:
+                res = (fname,ftype,f[2])
+            elif len(f) &gt;= 3 and type(f[2]) == dict:
+                specs = f[2]
+            elif len(f) &gt;= 4 and type(f[3]) == dict:
+                specs = f[3]
+            fields.append(res)
+
+            enum = None
+            if "enum" in specs:
+                enum = specs['enum']            
+            fget = make_fget(fname,enum=enum)
+            fset = make_fset(fname)
+
+            doc = "Not Set"
+            if "brief" in specs:
+                doc = specs["brief"]
+
+            if "enum" in specs:
+                #TODO use different getter/setter
+                pass
+            attributes[f[0]] = property(fget, fset,doc=doc)
+
+        attributes['_fields_'] = fields
+
+        bases = (endian,)
+
+        x = type(name, bases, attributes)
+        return x
+
+from enum import Enum
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+    BLUE = 3
+
+class Packet( ):
+    __metaclass__ = PyGndTlmMeta
+    _endian_ = ctypes.BigEndianStructure
+    _fields_ = [
+                ("a",ctypes.c_byte,{"brief":"testing"}),
+                ("b",ctypes.c_int, {"enum":Color})
+                ]
+
+
+x = Packet()
+</code></pre>
+</div>
+<span class="comment-copy">If you were going to inherit from both the BigEndianStructure, and the LittleEndianStructure would you just make a ModifiedStructureMetaLE, and a ModifiedStructureMetaBE?  I was trying to read through the ctypes code, and its all in C.</span>
+<span class="comment-copy">You will need to create one more metaclass  - just check the return of  <code>type (ctypes.LittleEndianStructure)</code>  and the same for BigEndian - you will see that there are two separate metaclasses . No code change i necessary, jsut changing from whic metaclass the custom metaclass inherits is enough. The "Field" class I created should work for all three, though.</span>
+<span class="comment-copy">How would you handle bitfields ?</span>

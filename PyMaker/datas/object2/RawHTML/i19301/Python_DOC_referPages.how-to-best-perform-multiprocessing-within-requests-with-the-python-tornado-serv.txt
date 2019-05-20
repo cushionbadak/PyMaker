@@ -1,0 +1,613 @@
+<div class="post-text" itemprop="text">
+<p>I am using the I/O non-blocking python server Tornado.  I have a class of <code>GET</code> requests which may take a significant amount of time to complete (think in the range of 5-10 seconds).  The problem is that Tornado blocks on these requests so that subsequent fast requests are held up until the slow request completes.</p>
+<p>I looked at: <a href="https://github.com/facebook/tornado/wiki/Threading-and-concurrency">https://github.com/facebook/tornado/wiki/Threading-and-concurrency</a> and came to the conclusion that I wanted some combination of #3 (other processes) and #4 (other threads).  #4 on its own had issues and I was unable to get reliable control back to the ioloop when there was another thread doing the "heavy_lifting". (I assume that this was due to the GIL and the fact that the heavy_lifting task has high CPU load and keeps pulling control away from the main ioloop, but thats a guess).</p>
+<p>So I have been prototyping how to solve this by doing "heavy lifting" tasks within these slow <code>GET</code> requests in a separate process and then place a callback back into the Tornado ioloop when the process is done to finish the request. This frees up the ioloop to handle other requests.</p>
+<p>I have created a simple example demonstrating a possible solution, but am curious to get feedback from the community on it.</p>
+<p><strong>My question is two-fold: How can this current approach be simplified?  What pitfalls potentially exist with it?</strong></p>
+<h2>The Approach</h2>
+<ol>
+<li><p>Utilize Tornado's builtin <code>asynchronous</code> decorator which allows a request to stay open and for the ioloop to continue.</p></li>
+<li><p>Spawn a separate process for "heavy lifting" tasks using python's <code>multiprocessing</code> module.  I first attempted to use the <code>threading</code> module but was unable to get any reliable relinquishing of control back to the ioloop. It also appears that <code>mutliprocessing</code> would also take advantage of multicores.</p></li>
+<li><p>Start a 'watcher' thread in the main ioloop process using the <code>threading</code> module who's job it is to watch a <code>multiprocessing.Queue</code> for the results of the "heavy lifting" task when it completes.  This was needed because I needed a way to know that the heavy_lifting task had completed while being able to still notify the ioloop that this request was now finished.</p></li>
+<li><p>Be sure that the 'watcher' thread relinquishes control to the main ioloop loop often with <code>time.sleep(0)</code> calls so that other requests continue to get readily processed.</p></li>
+<li><p>When there is a result in the queue then add a callback from the "watcher" thread using <code>tornado.ioloop.IOLoop.instance().add_callback()</code> which is documented to be the only safe way to call ioloop instances from other threads.</p></li>
+<li><p>Be sure to then call <code>finish()</code> in the callback to complete the request and hand over a reply.</p></li>
+</ol>
+<p>Below is some sample code showing this approach.  <code>multi_tornado.py</code> is the server implementing the above outline and <code>call_multi.py</code> is a sample script that calls the server in two different ways to test the server.  Both tests call the server with 3 slow <code>GET</code> requests followed by 20 fast <code>GET</code> requests.  The results are shown for both running with and without the threading turned on.</p>
+<p>In the case of running it with "no threading" the 3 slow requests block (each taking a little over a second to complete).  A few of the 20 fast requests squeeze through in between some of the slow requests within the ioloop (not totally sure how that occurs - but could be an artifact that I am running both the server and client test script on the same machine).  The point here being that all of the fast requests are held up to varying degrees.</p>
+<p>In the case of running it with threading enabled the 20 fast requests all complete first immediately and the three slow requests complete at about the same time afterwards as they have each been running in parallel.  This is the desired behavior. The three slow requests take 2.5 seconds to complete in parallel - whereas in the non threaded case the three slow requests take about 3.5 seconds in total.  So there is about 35% speed up overall (I assume due to multicore sharing).  But more importantly - the fast requests were immediately handled in leu of the slow ones.</p>
+<p>I do not have a lot experience with multithreaded programming - so while this seemingly works here I am curious to learn:</p>
+<p><strong>Is there a simpler way to accomplish this?  What monster's may lurk within this approach?</strong> </p>
+<p>(Note:  A future tradeoff may be to just run more instances of Tornado with a reverse proxy like nginx doing load balancing.  No matter what I will be running multiple instances with a load balancer - but I am concerned about just throwing hardware at this problem since it seems that the hardware is so directly coupled to the problem in terms of the blocking.)</p>
+<h2>Sample Code</h2>
+<p><strong><code>multi_tornado.py</code></strong> (sample server):</p>
+<pre><code>import time
+import threading
+import multiprocessing
+import math
+
+from tornado.web import RequestHandler, Application, asynchronous
+from tornado.ioloop import IOLoop
+
+
+# run in some other process - put result in q
+def heavy_lifting(q):
+    t0 = time.time()
+    for k in range(2000):
+        math.factorial(k)
+
+    t = time.time()
+    q.put(t - t0)  # report time to compute in queue
+
+
+class FastHandler(RequestHandler):
+    def get(self):
+        res = 'fast result ' + self.get_argument('id')
+        print res
+        self.write(res)
+        self.flush()
+
+
+class MultiThreadedHandler(RequestHandler):
+    # Note:  This handler can be called with threaded = True or False
+    def initialize(self, threaded=True):
+        self._threaded = threaded
+        self._q = multiprocessing.Queue()
+
+    def start_process(self, worker, callback):
+        # method to start process and watcher thread
+        self._callback = callback
+
+        if self._threaded:
+            # launch process
+            multiprocessing.Process(target=worker, args=(self._q,)).start()
+
+            # start watching for process to finish
+            threading.Thread(target=self._watcher).start()
+
+        else:
+            # threaded = False just call directly and block
+            worker(self._q)
+            self._watcher()
+
+    def _watcher(self):
+        # watches the queue for process result
+        while self._q.empty():
+            time.sleep(0)  # relinquish control if not ready
+
+        # put callback back into the ioloop so we can finish request
+        response = self._q.get(False)
+        IOLoop.instance().add_callback(lambda: self._callback(response))
+
+
+class SlowHandler(MultiThreadedHandler):
+    @asynchronous
+    def get(self):
+        # start a thread to watch for
+        self.start_process(heavy_lifting, self._on_response)
+
+    def _on_response(self, delta):
+        _id = self.get_argument('id')
+        res = 'slow result {} &lt;--- {:0.3f} s'.format(_id, delta)
+        print res
+        self.write(res)
+        self.flush()
+        self.finish()   # be sure to finish request
+
+
+application = Application([
+    (r"/fast", FastHandler),
+    (r"/slow", SlowHandler, dict(threaded=False)),
+    (r"/slow_threaded", SlowHandler, dict(threaded=True)),
+])
+
+
+if __name__ == "__main__":
+    application.listen(8888)
+    IOLoop.instance().start()
+</code></pre>
+<p><strong><code>call_multi.py</code></strong> (client tester):</p>
+<pre><code>import sys
+from tornado.ioloop import IOLoop
+from tornado import httpclient
+
+
+def run(slow):
+    def show_response(res):
+        print res.body
+
+    # make 3 "slow" requests on server
+    requests = []
+    for k in xrange(3):
+        uri = 'http://localhost:8888/{}?id={}'
+        requests.append(uri.format(slow, str(k + 1)))
+
+    # followed by 20 "fast" requests
+    for k in xrange(20):
+        uri = 'http://localhost:8888/fast?id={}'
+        requests.append(uri.format(k + 1))
+
+    # show results as they return
+    http_client = httpclient.AsyncHTTPClient()
+
+    print 'Scheduling Get Requests:'
+    print '------------------------'
+    for req in requests:
+        print req
+        http_client.fetch(req, show_response)
+
+    # execute requests on server
+    print '\nStart sending requests....'
+    IOLoop.instance().start()
+
+if __name__ == '__main__':
+    scenario = sys.argv[1]
+
+    if scenario == 'slow' or scenario == 'slow_threaded':
+        run(scenario)
+</code></pre>
+<h2>Test Results</h2>
+<p>By running <code>python call_multi.py slow</code>  (the blocking behavior):</p>
+<pre><code>Scheduling Get Requests:
+------------------------
+http://localhost:8888/slow?id=1
+http://localhost:8888/slow?id=2
+http://localhost:8888/slow?id=3
+http://localhost:8888/fast?id=1
+http://localhost:8888/fast?id=2
+http://localhost:8888/fast?id=3
+http://localhost:8888/fast?id=4
+http://localhost:8888/fast?id=5
+http://localhost:8888/fast?id=6
+http://localhost:8888/fast?id=7
+http://localhost:8888/fast?id=8
+http://localhost:8888/fast?id=9
+http://localhost:8888/fast?id=10
+http://localhost:8888/fast?id=11
+http://localhost:8888/fast?id=12
+http://localhost:8888/fast?id=13
+http://localhost:8888/fast?id=14
+http://localhost:8888/fast?id=15
+http://localhost:8888/fast?id=16
+http://localhost:8888/fast?id=17
+http://localhost:8888/fast?id=18
+http://localhost:8888/fast?id=19
+http://localhost:8888/fast?id=20
+
+Start sending requests....
+slow result 1 &lt;--- 1.338 s
+fast result 1
+fast result 2
+fast result 3
+fast result 4
+fast result 5
+fast result 6
+fast result 7
+slow result 2 &lt;--- 1.169 s
+slow result 3 &lt;--- 1.130 s
+fast result 8
+fast result 9
+fast result 10
+fast result 11
+fast result 13
+fast result 12
+fast result 14
+fast result 15
+fast result 16
+fast result 18
+fast result 17
+fast result 19
+fast result 20
+</code></pre>
+<p>By running <code>python call_multi.py slow_threaded</code>  (the desired behavior):</p>
+<pre><code>Scheduling Get Requests:
+------------------------
+http://localhost:8888/slow_threaded?id=1
+http://localhost:8888/slow_threaded?id=2
+http://localhost:8888/slow_threaded?id=3
+http://localhost:8888/fast?id=1
+http://localhost:8888/fast?id=2
+http://localhost:8888/fast?id=3
+http://localhost:8888/fast?id=4
+http://localhost:8888/fast?id=5
+http://localhost:8888/fast?id=6
+http://localhost:8888/fast?id=7
+http://localhost:8888/fast?id=8
+http://localhost:8888/fast?id=9
+http://localhost:8888/fast?id=10
+http://localhost:8888/fast?id=11
+http://localhost:8888/fast?id=12
+http://localhost:8888/fast?id=13
+http://localhost:8888/fast?id=14
+http://localhost:8888/fast?id=15
+http://localhost:8888/fast?id=16
+http://localhost:8888/fast?id=17
+http://localhost:8888/fast?id=18
+http://localhost:8888/fast?id=19
+http://localhost:8888/fast?id=20
+
+Start sending requests....
+fast result 1
+fast result 2
+fast result 3
+fast result 4
+fast result 5
+fast result 6
+fast result 7
+fast result 8
+fast result 9
+fast result 10
+fast result 11
+fast result 12
+fast result 13
+fast result 14
+fast result 15
+fast result 19
+fast result 20
+fast result 17
+fast result 16
+fast result 18
+slow result 2 &lt;--- 2.485 s
+slow result 3 &lt;--- 2.491 s
+slow result 1 &lt;--- 2.517 s
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you're willing to use <a href="https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor" rel="noreferrer"><code>concurrent.futures.ProcessPoolExecutor</code></a> instead of <code>multiprocessing</code>, this is actually very simple. Tornado's ioloop already supports  <code>concurrent.futures.Future</code>, so they'll play nicely together out of the box. <code>concurrent.futures</code> is included in Python 3.2+, and <a href="https://pypi.python.org/pypi/futures" rel="noreferrer">has been backported to Python 2.x</a>.</p>
+<p>Here's an example:</p>
+<pre><code>import time
+from concurrent.futures import ProcessPoolExecutor
+from tornado.ioloop import IOLoop
+from tornado import gen
+
+def f(a, b, c, blah=None):
+    print "got %s %s %s and %s" % (a, b, c, blah)
+    time.sleep(5)
+    return "hey there"
+
+@gen.coroutine
+def test_it():
+    pool = ProcessPoolExecutor(max_workers=1)
+    fut = pool.submit(f, 1, 2, 3, blah="ok")  # This returns a concurrent.futures.Future
+    print("running it asynchronously")
+    ret = yield fut
+    print("it returned %s" % ret)
+    pool.shutdown()
+
+IOLoop.instance().run_sync(test_it)
+</code></pre>
+<p>Output:</p>
+<pre><code>running it asynchronously
+got 1 2 3 and ok
+it returned hey there
+</code></pre>
+<p><code>ProcessPoolExecutor</code> has a more limited API than <code>multiprocessing.Pool</code>, but if you don't need the more advanced features of <code>multiprocessing.Pool</code>, it's worth using because the integration is so much simpler.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>multiprocessing.Pool</code> can be integrated into the <code>tornado</code> I/O loop, but it's a bit messy. A much cleaner integration can be done using <code>concurrent.futures</code> (see <a href="https://stackoverflow.com/a/25208213/2073595">my other answer</a> for details), but if you're stuck on Python 2.x and can't install the <code>concurrent.futures</code> backport, here is how you can do it strictly using <code>multiprocessing</code>:</p>
+<p>The <code>multiprocessing.Pool.apply_async</code> and <code>multiprocessing.Pool.map_async</code> methods both have an optional <code>callback</code> parameter, which means that both can potentially be plugged into a <code>tornado.gen.Task</code>. So in most cases, running code asynchronously in a sub-process is as simple as this:</p>
+<pre><code>import multiprocessing
+import contextlib
+
+from tornado import gen
+from tornado.gen import Return
+from tornado.ioloop import IOLoop
+from functools import partial
+
+def worker():
+    print "async work here"
+
+@gen.coroutine
+def async_run(func, *args, **kwargs):
+    result = yield gen.Task(pool.apply_async, func, args, kwargs)
+    raise Return(result)
+
+if __name__ == "__main__":
+    pool = multiprocessing.Pool(multiprocessing.cpu_count())
+    func = partial(async_run, worker)
+    IOLoop().run_sync(func)
+</code></pre>
+<p>As I mentioned, this works well in <em>most</em> cases. But if <code>worker()</code> throws an exception, <code>callback</code> is never called, which means the <code>gen.Task</code> never finishes, and you hang forever. Now, if you know that your work will <em>never</em> throw an exception (because you wrapped the whole thing in a <code>try</code>/<code>except</code>, for example), you can happily use this approach. However, if you want to let exceptions escape from your worker, the only solution I found was to subclass some multiprocessing components, and make them call <code>callback</code> even if the worker sub-process raised an exception:</p>
+<pre><code>from multiprocessing.pool import ApplyResult, Pool, RUN
+import multiprocessing
+class TornadoApplyResult(ApplyResult):
+    def _set(self, i, obj):
+        self._success, self._value = obj 
+        if self._callback:
+            self._callback(self._value)
+        self._cond.acquire()
+        try:
+            self._ready = True
+            self._cond.notify()
+        finally:
+            self._cond.release()
+        del self._cache[self._job]
+
+class TornadoPool(Pool):
+    def apply_async(self, func, args=(), kwds={}, callback=None):
+        ''' Asynchronous equivalent of `apply()` builtin
+
+        This version will call `callback` even if an exception is
+        raised by `func`.
+
+        '''
+        assert self._state == RUN
+        result = TornadoApplyResult(self._cache, callback)
+        self._taskqueue.put(([(result._job, None, func, args, kwds)], None))
+        return result
+ ...
+
+ if __name__ == "__main__":
+     pool = TornadoPool(multiprocessing.cpu_count())
+     ...
+</code></pre>
+<p>With these changes, the exception object will be returned by the <code>gen.Task</code>, rather than the <code>gen.Task</code> hanging indefinitely. I also updated my <code>async_run</code> method to re-raise the exception when its returned, and made some other changes to provide better tracebacks for exceptions thrown in the worker sub-processes. Here's the full code:</p>
+<pre><code>import multiprocessing
+from multiprocessing.pool import Pool, ApplyResult, RUN
+from functools import wraps
+
+import tornado.web
+from tornado.ioloop import IOLoop
+from tornado.gen import Return
+from tornado import gen
+
+class WrapException(Exception):
+    def __init__(self):
+        exc_type, exc_value, exc_tb = sys.exc_info()
+        self.exception = exc_value
+        self.formatted = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+
+    def __str__(self):
+        return '\n%s\nOriginal traceback:\n%s' % (Exception.__str__(self), self.formatted)
+
+class TornadoApplyResult(ApplyResult):
+    def _set(self, i, obj):
+        self._success, self._value = obj 
+        if self._callback:
+            self._callback(self._value)
+        self._cond.acquire()
+        try:
+            self._ready = True
+            self._cond.notify()
+        finally:
+            self._cond.release()
+        del self._cache[self._job]   
+
+class TornadoPool(Pool):
+    def apply_async(self, func, args=(), kwds={}, callback=None):
+        ''' Asynchronous equivalent of `apply()` builtin
+
+        This version will call `callback` even if an exception is
+        raised by `func`.
+
+        '''
+        assert self._state == RUN
+        result = TornadoApplyResult(self._cache, callback)
+        self._taskqueue.put(([(result._job, None, func, args, kwds)], None))
+        return result
+
+@gen.coroutine
+def async_run(func, *args, **kwargs):
+    """ Runs the given function in a subprocess.
+
+    This wraps the given function in a gen.Task and runs it
+    in a multiprocessing.Pool. It is meant to be used as a
+    Tornado co-routine. Note that if func returns an Exception 
+    (or an Exception sub-class), this function will raise the 
+    Exception, rather than return it.
+
+    """
+    result = yield gen.Task(pool.apply_async, func, args, kwargs)
+    if isinstance(result, Exception):
+        raise result
+    raise Return(result)
+
+def handle_exceptions(func):
+    """ Raise a WrapException so we get a more meaningful traceback"""
+    @wraps(func)
+    def inner(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            raise WrapException()
+    return inner
+
+# Test worker functions
+@handle_exceptions
+def test2(x):
+    raise Exception("eeee")
+
+@handle_exceptions
+def test(x):
+    print x
+    time.sleep(2)
+    return "done"
+
+class TestHandler(tornado.web.RequestHandler):
+    @gen.coroutine
+    def get(self):
+        try:
+            result = yield async_run(test, "inside get")
+            self.write("%s\n" % result)
+            result = yield async_run(test2, "hi2")
+        except Exception as e:
+            print("caught exception in get")
+            self.write("Caught an exception: %s" % e)
+        finally:
+            self.finish()
+
+app = tornado.web.Application([
+    (r"/test", TestHandler),
+])
+
+if __name__ == "__main__":
+    pool = TornadoPool(4)
+    app.listen(8888)
+    IOLoop.instance().start()
+</code></pre>
+<p>Here's how it behaves for the client:</p>
+<pre><code>dan@dan:~$ curl localhost:8888/test
+done
+Caught an exception: 
+
+Original traceback:
+Traceback (most recent call last):
+  File "./mutli.py", line 123, in inner
+    return func(*args, **kwargs)
+  File "./mutli.py", line 131, in test2
+    raise Exception("eeee")
+Exception: eeee
+</code></pre>
+<p>And if I send two simultaneous curl requests, we can see they're handled asynchronously on the server-side:</p>
+<pre><code>dan@dan:~$ ./mutli.py 
+inside get
+inside get
+caught exception inside get
+caught exception inside get
+</code></pre>
+<p><strong>Edit:</strong></p>
+<p>Note that this code becomes simpler with Python 3, because it introduces an <code>error_callback</code> keyword argument to all asynchronous <code>multiprocessing.Pool</code> methods. This makes it much easier to integrate with Tornado:</p>
+<pre><code>class TornadoPool(Pool):
+    def apply_async(self, func, args=(), kwds={}, callback=None):
+        ''' Asynchronous equivalent of `apply()` builtin
+
+        This version will call `callback` even if an exception is
+        raised by `func`.
+
+        '''
+        super().apply_async(func, args, kwds, callback=callback,
+                            error_callback=callback)
+
+@gen.coroutine
+def async_run(func, *args, **kwargs):
+    """ Runs the given function in a subprocess.
+
+    This wraps the given function in a gen.Task and runs it
+    in a multiprocessing.Pool. It is meant to be used as a
+    Tornado co-routine. Note that if func returns an Exception
+    (or an Exception sub-class), this function will raise the
+    Exception, rather than return it.
+
+    """
+    result = yield gen.Task(pool.apply_async, func, args, kwargs)
+    raise Return(result)
+</code></pre>
+<p>All we need to do in our overridden <code>apply_async</code> is call the parent with the <code>error_callback</code> keyword argument, in addition to the <code>callback</code> kwarg. No need to override <code>ApplyResult</code>.</p>
+<p>We can get even fancier by using a MetaClass in our <code>TornadoPool</code>, to allow its <code>*_async</code> methods to be called directly as if they were coroutines:</p>
+<pre><code>import time
+from functools import wraps
+from multiprocessing.pool import Pool
+
+import tornado.web
+from tornado import gen
+from tornado.gen import Return
+from tornado import stack_context
+from tornado.ioloop import IOLoop
+from tornado.concurrent import Future
+
+def _argument_adapter(callback):
+    def wrapper(*args, **kwargs):
+        if kwargs or len(args) &gt; 1:
+            callback(Arguments(args, kwargs))
+        elif args:
+            callback(args[0])
+        else:
+            callback(None)
+    return wrapper
+
+def PoolTask(func, *args, **kwargs):
+    """ Task function for use with multiprocessing.Pool methods.
+
+    This is very similar to tornado.gen.Task, except it sets the
+    error_callback kwarg in addition to the callback kwarg. This
+    way exceptions raised in pool worker methods get raised in the
+    parent when the Task is yielded from.
+
+    """
+    future = Future()
+    def handle_exception(typ, value, tb):
+        if future.done():
+            return False
+        future.set_exc_info((typ, value, tb))
+        return True
+    def set_result(result):
+        if future.done():
+            return
+        if isinstance(result, Exception):
+            future.set_exception(result)
+        else:
+            future.set_result(result)
+    with stack_context.ExceptionStackContext(handle_exception):
+        cb = _argument_adapter(set_result)
+        func(*args, callback=cb, error_callback=cb)
+    return future
+
+def coro_runner(func):
+    """ Wraps the given func in a PoolTask and returns it. """
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        return PoolTask(func, *args, **kwargs)
+    return wrapper
+
+class MetaPool(type):
+    """ Wrap all *_async methods in Pool with coro_runner. """
+    def __new__(cls, clsname, bases, dct):
+        pdct = bases[0].__dict__
+        for attr in pdct:
+            if attr.endswith("async") and not attr.startswith('_'):
+                setattr(bases[0], attr, coro_runner(pdct[attr]))
+        return super().__new__(cls, clsname, bases, dct)
+
+class TornadoPool(Pool, metaclass=MetaPool):
+    pass
+
+# Test worker functions
+def test2(x):
+    print("hi2")
+    raise Exception("eeee")
+
+def test(x):
+    print(x)
+    time.sleep(2)
+    return "done"
+
+class TestHandler(tornado.web.RequestHandler):
+    @gen.coroutine
+    def get(self):
+        try:
+            result = yield pool.apply_async(test, ("inside get",))
+            self.write("%s\n" % result)
+            result = yield pool.apply_async(test2, ("hi2",))
+            self.write("%s\n" % result)
+        except Exception as e:
+            print("caught exception in get")
+            self.write("Caught an exception: %s" % e)
+            raise
+        finally:
+            self.finish()
+
+app = tornado.web.Application([
+    (r"/test", TestHandler),
+])
+
+if __name__ == "__main__":
+    pool = TornadoPool()
+    app.listen(8888)
+    IOLoop.instance().start()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If your get requests are taking that long then tornado is the wrong framework. </p>
+<p>I suggest you use nginx to route the fast gets to tornado and the slower ones to a different server.</p>
+<p>PeterBe has an interesting article where he runs multiple Tornado servers and sets one of them to be 'the slow one' for handling the long running requests see: <a href="http://www.peterbe.com/plog/worrying-about-io-blocking" rel="nofollow">worrying-about-io-blocking</a> I would try this method.</p>
+</div>
+<span class="comment-copy">Recommendation - watch out for the wall of text.</span>
+<span class="comment-copy">OK. Suggestions? Isn't clear to me to convey all of the detail of what is going on much more concisely.</span>
+<span class="comment-copy">Usually its best to ask long questions such as this one in multiple smaller ones. But, I could be wrong. So... is your only question how to simplify this? I would put that at the top - more interesting.</span>
+<span class="comment-copy">I'm looking for simplification or alternative approach.  I edited the question slightly to put a little bit more of what I am looking for up front.</span>
+<span class="comment-copy">It strikes me that you could simplify this using a request queue that feeds a process pool such as the one found in the multiprocessing module. See <a href="http://docs.python.org/2/library/multiprocessing.html#module-multiprocessing.pool" rel="nofollow noreferrer">docs.python.org/2/library/…</a> for info.</span>
+<span class="comment-copy">Would this work for asynchronous access to Mongodb as well for example? I don't seem to be able to get Motor working with ssl so this might be an alternative solution (I have queries which can take several seconds). Related question: should I go with ThreadPoolExecutor instead? Might be more lightweight?</span>
+<span class="comment-copy">@ThomasBrowne Yes, you could use a <code>ThreadPoolExecutor</code> and follow the same pattern. You don't need <code>ProcessPoolExecutor</code> because accessing a DB is blocking I/O, which should release the GIL.</span>
+<span class="comment-copy">Easiest way to send python code in Tornado context to another process. Thanks!</span>
+<span class="comment-copy">I can easily imagine he's using Tornado to make an API to initiate the long running requests and return the result. Also, what if slow and fast work is related?</span>
+<span class="comment-copy">@andy-boot no ,Get requests are slower because they are busy calculating factorials of large numbers .</span>

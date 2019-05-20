@@ -1,0 +1,116 @@
+<div class="post-text" itemprop="text">
+<p>I noticed the following odd behaviour when timing <a href="https://docs.python.org/3/library/functions.html#enumerate" rel="nofollow"><code>enumerate</code></a> with the default <code>start</code> parameter specified:</p>
+<pre><code>In [23]: %timeit enumerate([1, 2, 3, 4])
+The slowest run took 7.18 times longer than the fastest. This could mean that an intermediate result is being cached 
+1000000 loops, best of 3: 511 ns per loop
+
+In [24]: %timeit enumerate([1, 2, 3, 4], start=0)
+The slowest run took 12.45 times longer than the fastest. This could mean that an intermediate result is being cached 
+1000000 loops, best of 3: 1.22 µs per loop
+</code></pre>
+<p>So, approximately a 2x slowdown for the case where <code>start</code> is specified.</p>
+<p>The byte code issued for each case doesn't really indicate anything that would contribute to the significant difference in speed. Case in point, after examining the different calls with <a href="https://docs.python.org/3/library/dis.html#dis.dis" rel="nofollow"><code>dis.dis</code></a> the additional commands issued are:</p>
+<pre><code>18 LOAD_CONST               5 ('start')
+21 LOAD_CONST               6 (0)
+</code></pre>
+<p>These, along with the <code>CALL_FUNCTION</code> having 1 keyword, are the only differences. </p>
+<p>I tried tracing through the calls made in <code>CPython</code>s <a href="https://hg.python.org/cpython/file/tip/Python/ceval.c#l4309" rel="nofollow"><code>ceval</code></a> with <code>gdb</code> and both seem to use <a href="https://hg.python.org/cpython/file/tip/Python/ceval.c#l4532" rel="nofollow"><code>do_call</code></a> in <code>call_function</code> and not some other optimization I could detect.</p>
+<p>Now, I understand <code>enumerate</code> just creates an enumerate iterator, so we're dealing with object creation here (right?). I looked in <strong><a href="https://hg.python.org/cpython/file/tip/Objects/enumobject.c" rel="nofollow"><code>Objects/enumobject.c</code></a></strong> trying to spot any differences if <code>start</code> was specified. The only thing that (I believe) differs is when <code>start != NULL</code> in which the following happens:  </p>
+<pre><code>if (start != NULL) {
+    start = PyNumber_Index(start);
+    if (start == NULL) {
+        Py_DECREF(en);
+        return NULL;
+    }
+    assert(PyInt_Check(start) || PyLong_Check(start));
+    en-&gt;en_index = PyInt_AsSsize_t(start);
+    if (en-&gt;en_index == -1 &amp;&amp; PyErr_Occurred()) {
+        PyErr_Clear();
+        en-&gt;en_index = PY_SSIZE_T_MAX;
+        en-&gt;en_longindex = start;
+    } else {
+        en-&gt;en_longindex = NULL;
+        Py_DECREF(start);
+    }
+</code></pre>
+<p>Which doesn't look like something which would introduce a 2x slowdown. (I think, not sure.)</p>
+<p>The previous code segments have been executed on Python <code>3.5</code>, similar results are present in <code>2.x</code> too, though.</p>
+<hr/>
+<p><em>This is where I'm stuck and can't figure out where to look</em>. This might just be a case of overhead from additional calls in the second case accumulating, but again, I'm not really sure. <em>Does anybody know what might be the reason behind this?</em> </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>One reason might be because of calling the <a href="https://hg.python.org/cpython/file/tip/Objects/abstract.c#l1490" rel="nofollow"><code>PyNumber_Index</code></a> while you specify a start in following part :</p>
+<pre class="lang-c prettyprint-override"><code>if (start != NULL) {
+    start = PyNumber_Index(start);
+</code></pre>
+<p>And If you take a look at <code>PyNumber_Index</code> function in <a href="https://hg.python.org/cpython/file/tip/Objects/abstract.c" rel="nofollow"><code>abstract.c</code></a> module you'll see the following comment at the top level of function:</p>
+<pre class="lang-c prettyprint-override"><code>/* Return a Python int from the object item.
+   Raise TypeError if the result is not an int
+   or if the object cannot be interpreted as an index.
+*/
+</code></pre>
+<p>So this function has to check if the object cannot be interpreted as an index and will returns the relative errors. And if you look at the source carefully you'll see the all of this checking and referencing, specially in following part which has to do a nested structure dereference in order to checking the index type:</p>
+<pre class="lang-c prettyprint-override"><code>result = item-&gt;ob_type-&gt;tp_as_number-&gt;nb_index(item);
+if (result &amp;&amp;
+     !PyInt_Check(result) &amp;&amp; !PyLong_Check(result)) {
+                         ...
+</code></pre>
+<p>Would takes much time to check and return a desire result.</p>
+<hr/>
+<p>But as @ user2357112 mentioned, another and most important reason is because of the python keyword argument matching.</p>
+<p>If you time-it the function without keyword argument you'll see the difference time will decrease approximately ~2X time: </p>
+<pre><code>~$ python -m timeit "enumerate([1, 2, 3, 4])"
+1000000 loops, best of 3: 0.251 usec per loop
+~$ python -m timeit "enumerate([1, 2, 3, 4],start=0)"
+1000000 loops, best of 3: 0.431 usec per loop
+~$ python -m timeit "enumerate([1, 2, 3, 4],0)"
+1000000 loops, best of 3: 0.275 usec per loop
+</code></pre>
+<p>The difference with positional argument is:</p>
+<pre><code>&gt;&gt;&gt; 0.251 - 0.275
+-0.024
+</code></pre>
+<p>Which seems that is because of <code>PyNumber_Index</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><em>It probably is just is a combination of factors contributing to the overall slowdown.</em> </p>
+<h3>Keyword args:</h3>
+<p>When Python sees the <code>CALL_FUNCTION</code> argument it will call <a href="https://hg.python.org/cpython/file/tip/Python/ceval.c#l4309" rel="nofollow"><code>call_function</code></a> as you already pointed out. After going through some <code>if</code> clauses the call issued is <a href="https://hg.python.org/cpython/file/tip/Python/ceval.c#l4372" rel="nofollow"><code>x = do_call(func, pp_stack, na, nk);</code></a>. Notice <code>nk</code> here which holds the total <strong>count</strong> of keyword arguments (so in the case of <code>enumerate -&gt; kw=1</code>). </p>
+<p>In <a href="https://hg.python.org/cpython/file/tip/Python/ceval.c#l4532" rel="nofollow"><code>do_call</code></a> you'll see the following <a href="https://hg.python.org/cpython/file/tip/Python/ceval.c#l4538" rel="nofollow"><code>if</code></a> clause:</p>
+<pre><code>if (nk &gt; 0) {
+    kwdict = update_keyword_args(NULL, nk, pp_stack, func);
+    if (kwdict == NULL)
+        goto call_fail;
+}
+</code></pre>
+<p>If the number of keyword args is not zero (<code>nk &gt; 0</code>), call <a href="https://hg.python.org/cpython/file/tip/Python/ceval.c#l4452" rel="nofollow"><code>update_keyword_args</code></a>.
+Now, <code>update_keyword_args</code> does what you would expect, <code>if orig_kwdict</code> is <code>NULL</code> (which it is, look at the call to <code>update_keyword_args</code>) create a new dictionary:</p>
+<pre><code>if (orig_kwdict == NULL)
+    kwdict = PyDict_New();
+</code></pre>
+<p>and then populate the dictionary with all values present in the value stack:</p>
+<pre><code>while (--nk &gt;= 0) {
+// copy from stack
+</code></pre>
+<p>These probably contribute significant to the overall delay.</p>
+<h3>Creating the <code>enum</code> object:</h3>
+<p>You're right about <a href="https://hg.python.org/cpython/file/tip/Objects/enumobject.c#l14" rel="nofollow"><code>enum_new</code></a>, if called with <code>enumerate([1, 2, 3, 4], start=0)</code> the variable <code>start</code> inside <code>enum_new</code> will have a value and therefore be <code>!= NULL</code>. As a result the <a href="https://hg.python.org/cpython/file/tip/Objects/enumobject.c#l28" rel="nofollow"><code>if</code></a> clause will evaluate to <code>True</code> and the code inside it will execute, adding time to the call.</p>
+<p>What is performed inside the <code>if</code> clause is not really heavy work, but <em>it does contribute to the overall time required</em>.</p>
+<hr/>
+<p><strong>Additionally:</strong> </p>
+<ol>
+<li><p>you also have the two additional byte code commands to consider, they might just be two but they add to the overall time taken due to the fact that we're timing really quick things (in the range of <code>ns</code>). </p></li>
+<li><p>Again, insignificant from an overall standpoint, but, parsing a call with <code>kws</code> requires as before, a wee bit more time.</p></li>
+</ol>
+<p><strong>Finally:</strong></p>
+<p>I might be missing some stuff but overall these are some of the factors that, in conjunction, create overhead when creating a new enumerate object with <code>start</code> specified. </p>
+</div>
+<span class="comment-copy">Have you measured differences for bigger input sizes? It's much more likely that it's a const factor difference, rather than 2x speed regression.</span>
+<span class="comment-copy">@Rogalski: We're only creating the iterator, not iterating over it. The speed doesn't depend on input size at all.</span>
+<span class="comment-copy">Apologies for the title, it is a bit misleading.  As for the input size, what @user2357112 said.</span>
+<span class="comment-copy">@user2357112 I was sure enumerate is not lazy in Python2 (like map and so on), my bad. Obviously my comment is redundant - constant time operation will indeed be observed as <code>n</code> times worse.</span>
+<span class="comment-copy">Nah, try specifying <code>start</code> as a positional argument, and the speed difference disappears. I'd say the keyword argument dict is the culprit.</span>
+<span class="comment-copy">@user2357112 Let me give it a try.</span>
+<span class="comment-copy">Not really sure about this. Specifying a simple function with <code>def foo(par=0): pass</code> and timing it's different calls yields: <code>foo() -&gt; 164ns</code> and <code>foo(par=0) -&gt; 183ns</code>. Any thoughts?</span>
+<span class="comment-copy">@Ariadni I think its because of built in functions are implemented in C and when you give it a keyword argument it first of all python tries to pars the args at interpreter level then pass it to C level</span>
+<span class="comment-copy">@Ariadni: For reference, <a href="https://hg.python.org/cpython/file/2.7/Python/ceval.c#l4309" rel="nofollow noreferrer">the code that <code>CALL_FUNCTION</code> is delegating to</a>. You'll notice the first <code>if</code> check is checking for <code>PyCFunction</code>s (that is, CPython functions implemented in C) where <code>nk == 0</code> (<code>nk</code> is number of keywords). If no keywords are passed to multiarg function, it uses the fast path through <code>PyCFunction_Call</code>, and that path doesn't even construct an empty <code>dict</code> for the <code>kwds</code> (passes <code>NULL</code>); by not passing kwds, you save <code>dict</code> construction, C-style string to <code>str</code> construction/destruction, <code>dict</code> lookup, etc.</span>

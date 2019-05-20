@@ -1,5 +1,4 @@
-from numpy import save
-from numpy import load
+import numpy as np
 from scipy import dot, linalg
 
 from lt2_global import *
@@ -16,7 +15,7 @@ def save_all_obj4_docvec():
     for i in range(0, 10655):
         _, c = obj4_str(obj4_filename(i, includepath=True))
         ofilename = obj4_vecrep_filename(i)
-        save(ofilename, unigram_sentence_wordvecsum(c))
+        np.save(ofilename, unigram_sentence_wordvecsum(c), allow_pickle=False)
 
 
 def get_all_obj4_docvec():
@@ -25,7 +24,7 @@ def get_all_obj4_docvec():
     # dict (index, (vector-rep, vector-size))
     d = dict()
     for i in range(0, 10655):
-        na = load(obj4_vecrep_filename(i, includepath=True) + '.npy')
+        na = np.load(obj4_vecrep_filename(i, includepath=True) + '.npy', allow_pickle=False)
         d[i] = (na, linalg.norm(na))
     return d
 
@@ -43,7 +42,7 @@ def get_top_n_similar_pydoc(ws, d, n=N_FOR_TOP_N_VALUES):
     for i in range(0, len(uli)):
         pydocvr, pydocvrs = d[obj4_link_list.index(uli[i])]
         l.append((dot(vr, pydocvr.T)/vrs/pydocvrs).item())
-    
+
     # https://stackoverflow.com/a/7851166
     return [k for k in sorted(range(len(l)), reverse=True, key=lambda k: l[k])[:n]]
 
@@ -59,7 +58,7 @@ def correct_answers_count(candidate, answer):
 
 def test_obj3(d, n=N_FOR_TOP_N_VALUES, testnum=N_FOR_TESTCASE_NUM, removeDuplicateAnswer=True):
     # d : return value of get_all_obj4_docvec()
-    # output : No return value. test log will go to stdout. 
+    # output : No return value. test log will go to stdout.
 
     fnl = obj3_allfilelist()
     test_iter = 0
@@ -69,7 +68,7 @@ def test_obj3(d, n=N_FOR_TOP_N_VALUES, testnum=N_FOR_TESTCASE_NUM, removeDuplica
         test_iter += 1
         if testnum > 0 and test_iter > testnum:
             break
-        
+
         c, a = obj3_readfile(fn, isupperpydocused=True)
         a = [obj4_link_list.index(num2upperpydoc[aa]) for aa in a]
         a = list(set(a)) if removeDuplicateAnswer else a
@@ -81,7 +80,7 @@ def test_obj3(d, n=N_FOR_TOP_N_VALUES, testnum=N_FOR_TESTCASE_NUM, removeDuplica
         fntail = obj3_getdistinctfilename(fn)
         print('ITEATION ' + str(test_iter) + ' =>\tCORRECT: ' + str(
             co) + ' / ' + str(len(a)) + '\t\tFILE: ' + fntail)
-        
+
         print('CANDIDATES:')
         for can in gtnsp:
             print('\t' + uli[can])
@@ -92,7 +91,7 @@ def test_obj3(d, n=N_FOR_TOP_N_VALUES, testnum=N_FOR_TESTCASE_NUM, removeDuplica
     print('')
 
     return
-        
+
 if OBJ4_VECREP_CALC_TEST:
     d = get_all_obj4_docvec()
     test_obj3(d)

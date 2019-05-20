@@ -1,0 +1,95 @@
+<div class="post-text" itemprop="text">
+<p>I know this sounds like something that has been asked before, but wait, I'll explain why the other options don't work.</p>
+<p>I'm currently using <code>multiprocessing.Pool</code> to implement parallelism in an application, and would like to extend this to be able to exploit nested parallelism. The naive approach of just passing the <code>Pool</code> object as an argument to <code>apply_async</code> doesn't work <a href="https://stackoverflow.com/a/17140574">as noted in other answers</a>, because <code>Pool</code> cannot be pickled.</p>
+<p>Here are my requirements:</p>
+<ol>
+<li><p>I need some sort of a pool to limit the number of concurrent executing tasks. E.g. <code>multiprocess.Pool</code> serves this purposes, except it can't be passed to other processes.</p></li>
+<li><p>I need nested parallelism. In my application, I need to perform I/O in order to identify what the nested work is, so I absolutely don't want to do this from a single thread. I think that rules out all the answers to <a href="https://stackoverflow.com/q/17038288">this question</a>.</p></li>
+<li><p>It needs to be in the standard library; I can't add dependencies. That rules out <a href="https://stackoverflow.com/a/31617653">this answer</a>.</p></li>
+<li><p>I'd really like it to work with both Python 2 and 3. However, if it could be shown that moving to Python 3 would solve my problem, I would consider it.</p></li>
+</ol>
+<p>I don't need this to use multiple processes specifically, it would be ok to use threads because most of the work is I/O or waiting on subprocesses to complete.</p>
+<p>I have tried using <code>multiprocessing.dummy</code>, which is the same interface but implemented on top of <code>threading</code>. However, when I try to call <code>get()</code> to retrieve the results of my tests, I get the following error, so I think this is out.</p>
+<pre><code>  File "/usr/lib/python2.7/multiprocessing/pool.py", line 567, in get
+    raise self._value
+ValueError: signal only works in main thread
+</code></pre>
+<p>I am aware of the <code>concurrent.futures</code> library in Python 3, but this appears to have some severe limitations. For example, the second example in this section would seem to be a show stopper in my case:</p>
+<p><a href="https://docs.python.org/3/library/concurrent.futures.html#threadpoolexecutor" rel="nofollow noreferrer">https://docs.python.org/3/library/concurrent.futures.html#threadpoolexecutor</a></p>
+<p>I don't see how you could avoid hitting that with basically any straightforwardly-written nested parallel algorithm. So even if I was willing to use Python 3, I think this is a non-starter.</p>
+<p>I'm not aware of any other options available in the standard library, without writing my own implementation.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You seem to have ruled it out, but I suspect
+<a href="https://docs.python.org/3/library/concurrent.futures.html#threadpoolexecutor" rel="nofollow noreferrer">https://docs.python.org/3/library/concurrent.futures.html#threadpoolexecutor</a>, or <a href="https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor" rel="nofollow noreferrer">https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor</a> would work, if you are able to move to Python 3, or add a dependency for Python 2.</p>
+<p>If the extra work from each file doesn't have to be triggered until that file is processed, you can have a single coordinating thread that triggers all the others, and so deadlock can be prevented, as in below example.</p>
+<pre><code>from concurrent.futures import ThreadPoolExecutor
+import time
+
+pool = ThreadPoolExecutor(max_workers=3)
+
+def find_work_inputs(dummy_file):
+    print("{}: Finding work...".format(dummy_file))
+    time.sleep(1)
+    work = range(0, dummy_file)
+    print("{}: Work is {}".format(dummy_file, work))
+    return work
+
+def do_work(dummy_file, work_input):
+    print("{}: {}".format(dummy_file, work_input))
+    print("{}: Doing work {}...".format(dummy_file, work_input))
+    time.sleep(1)
+    return work_input * work_input
+
+dummy_files = [1,2,3,4,5]
+
+futures = []
+for dummy_file in dummy_files:
+    work_inputs = pool.submit(find_work_inputs, dummy_file)
+    for work_input in work_inputs.result():
+        result = work_input
+        futures.append((dummy_file, result, pool.submit(do_work, dummy_file, result)))
+
+for dummy_file, work_input, future in futures:
+    print("Result from file:{} input:{} is {}".format(dummy_file, work_input, future.result()))
+</code></pre>
+<p>Alternatively, if each thread on the first level needs to trigger the work themselves, the extra work may need to be in another pool to prevent deadlock (depending on when <code>result()</code> is called on each future) as below.</p>
+<pre><code>from concurrent.futures import ThreadPoolExecutor
+import time
+
+find_work_pool = ThreadPoolExecutor(max_workers=3)
+do_work_pool = ThreadPoolExecutor(max_workers=3)
+
+def find_work_inputs(dummy_file):
+    print("{}: Finding work...".format(dummy_file))
+    time.sleep(1)
+    work = range(0, dummy_file)
+    print("{}: Work is {}".format(dummy_file, work))
+
+    futures = []
+    for work_input in work:
+        futures.append((dummy_file, work_input, do_work_pool.submit(do_work, dummy_file, work_input)))
+    return futures
+
+def do_work(dummy_file, work_input):
+    print("{}: {}".format(dummy_file, work_input))
+    print("{}: Doing work {}...".format(dummy_file, work_input))
+    time.sleep(1)
+    return work_input * work_input
+
+dummy_files = [1,2,3,4,5]
+
+futures = []
+for dummy_file in dummy_files:
+    futures.extend(find_work_pool.submit(find_work_inputs, dummy_file).result())
+
+for dummy_file, work_input, future in futures:
+    print("Result from file:{} input:{} is {}".format(dummy_file, work_input, future.result()))
+</code></pre>
+</div>
+<span class="comment-copy">"I need to perform I/O in order to identify what the nested work is". Is this network I/O? If so, I wonder if eventlet for the IO + threading might work? <a href="http://eventlet.net/doc/threading.html" rel="nofollow noreferrer">eventlet.net/doc/threading.html</a></span>
+<span class="comment-copy">In my case it's file I/O; basically at the top level I've got a file per unit of work, and based on what that file contains there might be further nested parallelism I could exploit. However, I'd really rather avoid dependencies if there are any other reasonable options. It seems like a pretty major limitation if the standard library doesn't provide a way of exploiting nested parallelism that I'm just surprised if it's not possible.</span>
+<span class="comment-copy">Ah ok... another question: how many levels of nesting will there be? The file I/O on one level, and then work based from that on another level, and that's it?</span>
+<span class="comment-copy">At the moment, yes, two levels of nesting.</span>
+<span class="comment-copy">One more... for each file the might trigger further work. Can the work be triggered once that file has been processed, or should any more work be triggered along the way?</span>
+<span class="comment-copy">It's too bad Python doesn't have a cleaner way to do true nested parallelism, but given the realities, I think this answer does a good job of showing what you have to do. To be fair though, option (1) would also work just as well with <code>multiprocess.Pool</code>.</span>

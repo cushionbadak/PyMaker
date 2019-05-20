@@ -1,0 +1,159 @@
+<div class="post-text" itemprop="text">
+<p>What is the most efficient way to achieve the following goal: main process is collecting and distributing events (event loop run_forever) to subprocessess. These subprocesses stay alive and collect signals from outer world or consume signals and perform cpu-bound operations. So far, I came up with something like this:</p>
+<pre><code>import os
+import time
+import signal
+import asyncio
+from asyncio import PriorityQueue
+from multiprocessing import Process, Pipe
+
+class Event(object):
+    __slots__ = ['type','priority','payload','timestamp']   
+    def __init__(self, _type = None, _priority = None, _payload = None):
+        self.type, self.priority, self.payload, self.timestamp = _type, _priority, _payload, time.time()
+    def __str__(self):
+        return "%s(%s,%s,%s)" % (self.__class__.__name__, self.type, self.priority, self.payload)
+    def __lt__(self, other):
+        return (self.priority, self.timestamp) &gt; (other.priority, other.timestamp)
+
+class EventQueue(PriorityQueue):
+    def _put(self, event):
+        super()._put( (event.priority, event) ) 
+
+@asyncio.coroutine
+def consumeAnyEvent(eq, acon_write_p = None): ## more args with write_conn pipes 
+    while True:
+        priority, event = yield from eq.get()
+        print("consumed",event)
+        if event.type == 'sig_a':
+            acon_write_p.send(event)
+        if event.type == 'sig_b':
+            pass
+        if event.type == 'sig_c':
+            pass
+        ## and so on - broadcast events to relevant sub-processes
+        yield from asyncio.sleep(0)
+
+@asyncio.coroutine
+def produceSignalA(eq,read_p):
+    while True:
+        yield from asyncio.sleep(0)
+        row = read_p.recv()
+        if row:
+            yield from eq.put( Event( 'sig_a', payload = row ) )
+
+class someSource(object):
+    """db, http, file watch or other io"""
+    def fetch(self):
+        pass
+
+def someSlowMethod(a=None):
+    """cpu-bound operations"""
+    pass
+
+def signalAPublisher(pipe):
+    read_p, write_p = pipe
+    read_p.close() 
+    s = someSource()
+    while True:
+        result = s.fetch()
+        if result:
+            write_p.send(result)
+
+def signalAConsumer(pipe):
+    read_p, write_p = pipe
+    while True:
+        inp = read_p.recv()        
+        if inp:
+            result = someSlowMethod(inp)
+            write_p.send(result)
+
+def main():
+    ## main process is responsible for handling events: 
+    ## colllecting from all signal publisher subprocessses 
+    ## and broadcasting to all interested consumer subprocesses
+    eventQueue = EventQueue()    
+    apub_read_p, apub_write_p = Pipe()
+    acon_read_p, acon_write_p = Pipe()
+    ## more pipes for Signal B, ... Signal Z
+    signalAPublisher_p = Process(target=signalAPublisher, args=((apub_read_p, apub_write_p),))    
+    signalAConsumer_p = Process(target=signalAPublisher, args=((acon_read_p, acon_write_p),))
+    signalAPublisher_p.start()
+    signalAConsumer_p.start()
+    ## and so on for Signal B, Signal C, ... Signal Z
+    loop = asyncio.get_event_loop()
+    try:
+        tasks = asyncio.gather(
+            loop.create_task(produceSignalA(eventQueue,apub_read_p)),
+            loop.create_task(consumeAnyEvent(eventQueue,acon_write_p))    
+        )
+        loop.run_forever()
+    except KeyboardInterrupt:
+        print("Caught keyboard interrupt. Canceling tasks...")
+        tasks.cancel()
+    finally:
+        loop.close()
+        os.kill(signalAPublisher_p.pid, signal.SIGTERM) 
+        os.kill(signalAConsumer_p.pid, signal.SIGTERM)
+        ## kill for Signal B, ... Signal Z
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>However I have a feeling that the above is not efficient / elegant enough and i'm missing something. Any ideas, suggestions?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As a start, try using a <a href="https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor" rel="nofollow noreferrer"><code>ProcessPoolExecutor</code></a> and <a href="https://docs.python.org/3/library/asyncio-eventloop.html#executor" rel="nofollow noreferrer"><code>run_in_executor()</code></a> to distribute any CPU bound procedure, otherwise just use regular <code>async def</code>/<code>async for</code>/<code>await</code> from <code>asyncio</code> without any queue.</p>
+<pre><code>import asyncio
+import time
+from concurrent.futures.process import ProcessPoolExecutor
+
+import random
+
+
+async def coro_a(n):
+    print("&gt; a", n)
+    await asyncio.sleep(random.uniform(0.1, 1))
+    result = await asyncio.gather(coro_b(n),
+                                  loop.run_in_executor(None, slow_method_c, n))
+    print("&lt; a", n, result)
+
+
+async def coro_b(n):
+    print("&gt; b", n)
+    await asyncio.sleep(random.uniform(0.1, 1))
+    result = await loop.run_in_executor(None, slow_method_d, n)
+    print("&lt; b", n, result)
+    return ("B", result)
+
+
+def slow_method_c(n):
+    print("&gt; c", n)
+    time.sleep(random.uniform(0.5, 5))
+    print("&lt; c", n)
+    return ("C", n)
+
+
+def slow_method_d(n):
+    print("&gt; d", n)
+    time.sleep(random.uniform(0.5, 5))
+    print("&lt; d", n)
+    return ("D", n)
+
+
+async def main_producer():
+    tasks = []
+    for i in range(10):
+        tasks.append(asyncio.ensure_future(coro_a(i + 1)))
+        await asyncio.sleep(1)
+    await asyncio.wait(tasks)
+
+
+loop = asyncio.get_event_loop()
+loop.set_default_executor(ProcessPoolExecutor())
+loop.run_until_complete(main_producer())
+loop.close()
+</code></pre>
+</div>
+<span class="comment-copy"><a href="http://zeromq.org/" rel="nofollow noreferrer">zeromq.org</a></span>
+<span class="comment-copy">@PadraicCunningham thanks for the insight - went to study! how painful it would be to integrate into python? ideally i would like not to go beyond standard python libraries.</span>

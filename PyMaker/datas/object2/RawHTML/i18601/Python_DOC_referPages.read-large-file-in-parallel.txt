@@ -1,0 +1,128 @@
+<div class="post-text" itemprop="text">
+<p>I have a large file which I need to read in and make a dictionary from.  I would like this to be as fast as possible. However my code in python is too slow.  Here is a minimal example that shows the problem.</p>
+<p>First make some fake data</p>
+<pre><code>paste &lt;(seq 20000000) &lt;(seq 2 20000001)  &gt; largefile.txt
+</code></pre>
+<p>Now here is a minimal piece of python code to read it in and make a dictionary.</p>
+<pre><code>import sys
+from collections import defaultdict
+fin = open(sys.argv[1])
+
+dict = defaultdict(list)
+
+for line in fin:
+    parts = line.split()
+    dict[parts[0]].append(parts[1])
+</code></pre>
+<p>Timings:</p>
+<pre><code>time ./read.py largefile.txt
+real    0m55.746s
+</code></pre>
+<p>However it is possible to read the whole file much faster as:</p>
+<pre><code>time cut -f1 largefile.txt &gt; /dev/null    
+real    0m1.702s
+</code></pre>
+<blockquote>
+<p>My CPU has 8 cores, is it possible to parallelize this program in
+  python to speed it up?</p>
+</blockquote>
+<p>One possibility might be to read in large chunks of the input and then run 8 processes in parallel on different non-overlapping subchunks making dictionaries in parallel from the data in memory then read in another large chunk.  Is this possible in python using multiprocessing somehow?</p>
+<p><strong>Update</strong>.  The fake data was not very good as it had only one value per key. Better is</p>
+<pre><code>perl -E 'say int rand 1e7, $", int rand 1e4 for 1 .. 1e7' &gt; largefile.txt
+</code></pre>
+<p>(Related to <a href="https://stackoverflow.com/questions/18086424/read-in-large-file-and-make-dictionary">Read in large file and make dictionary</a> .)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There was a blog post series "Wide Finder Project" several years ago about this at Tim Bray's site [1]. You can find there a solution [2] by Fredrik Lundh of ElementTree [3] and PIL [4] fame. I know posting links is generally discouraged at this site but I think these links give you better answer than copy-pasting his code.</p>
+<p>[1] <a href="http://www.tbray.org/ongoing/When/200x/2007/10/30/WF-Results" rel="nofollow">http://www.tbray.org/ongoing/When/200x/2007/10/30/WF-Results</a><br/>
+[2] <a href="http://effbot.org/zone/wide-finder.htm" rel="nofollow">http://effbot.org/zone/wide-finder.htm</a><br/>
+[3] <a href="http://docs.python.org/3/library/xml.etree.elementtree.html" rel="nofollow">http://docs.python.org/3/library/xml.etree.elementtree.html</a><br/>
+[4] <a href="http://www.pythonware.com/products/pil/" rel="nofollow">http://www.pythonware.com/products/pil/</a> </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It may be possible to parallelize this to speed it up, but doing multiple reads in parallel is unlikely to help.</p>
+<p>Your OS is unlikely to usefully do multiple reads in parallel (the exception is with something like a striped raid array, in which case you still need to know the stride to make optimal use of it).</p>
+<p>What you can do, is run the relatively expensive string/dictionary/list operations in parallel to the read.</p>
+<p>So, one thread reads and pushes (large) chunks to a synchronized queue, one or more consumer threads pulls chunks from the queue, split them into lines, and populate the dictionary.</p>
+<p>(If you go for multiple consumer threads, as Pappnese says, build one dictionary per thread and then join them).</p>
+<hr/>
+<p>Hints:</p>
+<ul>
+<li>... push chunks to a <a href="http://docs.python.org/2/library/queue.html" rel="nofollow">synchronized queue</a> ...</li>
+<li>... one or more consumer <a href="http://docs.python.org/2/library/threading.html#thread-objects" rel="nofollow">threads</a> ...</li>
+</ul>
+<hr/>
+<p>Re. bounty:</p>
+<p>C obviously doesn't have the GIL to contend with, so multiple consumers are likely to scale better. The read behaviour doesn't change though. The down side is that C lacks built-in support for hash maps (assuming you still want a Python-style dictionary) and synchronized queues, so you have to either find suitable components or write your own.
+The basic strategy of multiple consumers each building their own dictionary and then merging them at the end is still likely the best.</p>
+<p>Using <code>strtok_r</code> instead of <code>str.split</code> may be faster, but remember you'll need to manage the memory for all your strings manually too. Oh, and you need logic to manage line fragments too. Honestly C gives you so many options I think you'll just need to profile it and see.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It does seem tempting to think that using a processing pool will solve problems like this, but it's going to end up being a good bit more complicated than that, at least in pure Python.</p>
+<p>Because the OP mentioned that the lists on each input line would be longer in practice than two elements, I made a slightly-more-realistic input file using :</p>
+<pre><code>paste &lt;(seq 20000000) &lt;(seq 2 20000001) &lt;(seq 3 20000002) |
+  head -1000000 &gt; largefile.txt
+</code></pre>
+<p>After profiling the original code, I found the slowest portion of the process to be the line-splitting routine. (<code>.split()</code> took approximately 2x longer than <code>.append()</code> on my machine.)</p>
+<pre><code>1000000    0.333    0.000    0.333    0.000 {method 'split' of 'str' objects}
+1000000    0.154    0.000    0.154    0.000 {method 'append' of 'list' objects}
+</code></pre>
+<p>So I factored the split into another function and use a pool to distribute the work of splitting the fields :</p>
+<pre><code>import sys
+import collections
+import multiprocessing as mp
+
+d = collections.defaultdict(list)
+
+def split(l):
+    return l.split()
+
+pool = mp.Pool(processes=4)
+for keys in pool.map(split, open(sys.argv[1])):
+    d[keys[0]].append(keys[1:])
+</code></pre>
+<p>Unfortunately, adding the pool slowed things down by more than 2x. The original version looked like this :</p>
+<pre><code>$ time python process.py smallfile.txt 
+real    0m7.170s
+user    0m6.884s
+sys     0m0.260s
+</code></pre>
+<p>versus the parallel version :</p>
+<pre><code>$ time python process-mp.py smallfile.txt 
+real    0m16.655s
+user    0m24.688s
+sys     0m1.380s
+</code></pre>
+<p>Because the <code>.map()</code> call basically has to serialize (pickle) each input, send it to the remote process, and then deserialize (unpickle) the return value from the remote process, using a pool in this way is much slower. You do get some improvement by adding more cores to the pool, but I'd argue that this is fundamentally the wrong way to distribute this work.</p>
+<p>To really speed this up across cores, my guess is that you'd need to read in large chunks of the input using some sort of fixed block size. Then you could send the entire block to a worker process and get serialized lists back (though it's still unknown how much the deserialization here will cost you). Reading the input in fixed-size blocks sounds like it might be tricky with the anticipated input, however, since my guess is that each line isn't necessarily the same length.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>One thing you could try is to get the line count from the file, then spawn 8 threads that makes a dictionary from 1/8th of the file each, then join the dictionaries when all threads are finished. This will probably speed it up if it is the appending that takes time and not the reading of the lines. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>More cardinal solution for slow dictionary appending: replace the dictionary with array of pairs of strings. Fill it and then sort.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If your data on file, is not changing so often, you can choose to serialize it. 
+Python interpreter will deserialize it much more quickly.
+You can use cPickle module.</p>
+<p>Or creating 8 separate processes is an other option.
+Because, having an only dict make it much more possible.
+You can interact between those processes via Pipe in "multiprocessing" module or, "socket" module.</p>
+<p>Best regards</p>
+<p>Barış ÇUHADAR.</p>
+</div>
+<span class="comment-copy">the list is probably slowing you down.</span>
+<span class="comment-copy">@sihrc Most of the time is spent in dict[parts[0]].append(parts[1]) according to the profiling but append does take around 10% of the time. Note that in this fake case lists only have length 1 but in general I expect them to be longer.</span>
+<span class="comment-copy">That's what I mean. That .append part is slowing you down. Have you thought of alternatives to appending large lists? What kind of data are you appending?</span>
+<span class="comment-copy">You cannot parallelize I/O with only one disk. If you have much RAM you can read the whole file into memory with <code>readlines()</code> and process them directly in RAM.</span>
+<span class="comment-copy">Yes, but reading the file isn't the slow part. it's the appending lists in the dictionary, which can be parallelized</span>
+<span class="comment-copy">Thank you. Would you mind showing me how to do that?</span>
+<span class="comment-copy">I've given a couple of hints to get you started. Write some code, and ask if you have trouble with it.</span>
+<span class="comment-copy">Are multiple threads going to work? I am worried about the GIL.</span>
+<span class="comment-copy">The producer thread is I/O bound, so if the GIL is released while it thread blocks on the read system call, <i>one</i> consumer thread can make progress computing hashes and updating its dictionary. Multiple consumer threads are very likely to contend for the GIL though.</span>
+<span class="comment-copy">I am surprised the dictionary creation wasn't the slowest part for you as it is in my profiling. About the line length I think I wasn't clear.   Each line will not be exactly the same length but will split into the same number of parts. My new fake data example is more realistic that I just added.</span>
+<span class="comment-copy">pool.map(split,open(sys.argv[1]),10000) will group lines by 10000-length chunks, but execution time not differs then non-chunked version.</span>
+<span class="comment-copy">Since this is a CPU-bound problem, <a href="http://www.linuxforu.com/2011/01/python-threading-and-its-caveats/" rel="nofollow noreferrer">threading isn't going to help much</a> on CPython. The normal solution is to use multiprocessing instead, but that does not allow sharing a python dict amongst processes. Therefore there must be a single process with a dict that has the task of adding to it, and other processes for reading and parsing that send along their results using a queue or pipe. I don't think you'll be able to achieve a speedup of more than 3x using this method, because of the overhead.</span>
+<span class="comment-copy">@LauritzV.Thaulow What about loading the whole thing into memory then building 8 dicts and then merging them? Does that sound sensible?</span>
+<span class="comment-copy">@Anush Well, the dicts have to be serialized and rebuilt when moved from one process to another, and since the rebuilding will require almost as much work as the building, it defeats much of the purpose. Then the rebuilt dicts must be merged, and here my python knowledge is lacking, because I don't know if <code>d1.update(d2)</code> can do some shortcut that makes it much faster than looping over <code>d2</code> and adding key-value pairs one by one. In any case I doubt it will help much. I understand IronPython does not have the CPU-bound threading problem, so if you can use that then Useless' answer should work.</span>

@@ -1,0 +1,81 @@
+<div class="post-text" itemprop="text">
+<p>My setup is python tornado server, which asynchronously processes tasks with a <code>ThreadPoolExecutor</code>. In some conditions, the task might turn into infinite loop. With the <code>with_timeout</code> decorator, I have managed to catch the timeout exception and return an error result to the client. The problem is that the task is still running in the background. How it is possible to stop the task from running in the <code>ThreadPoolExecutor</code>? Or is it possible to cancel the <code>Future</code>?
+Here is the code that reproduces the problem. Run the code with tornado 4 and concurrent.futures libraries and go to <a href="http://localhost:8888/test" rel="nofollow">http://localhost:8888/test</a></p>
+<pre><code>from tornado.concurrent import run_on_executor
+from tornado.gen import with_timeout
+from tornado.ioloop import IOLoop
+import tornado.web
+from tornado import gen
+from concurrent.futures import ThreadPoolExecutor
+import datetime
+MAX_WAIT_SECONDS = 10
+
+class MainHandler(tornado.web.RequestHandler):
+    executor = ThreadPoolExecutor(2)
+
+    @run_on_executor
+    def test_func(self):
+        ...
+        #infinite loop might be here
+        ...
+
+    @tornado.gen.coroutine
+    def get(self):
+        future = self.test_func()
+        try:
+            result_search_struct = yield with_timeout(datetime.timedelta(seconds=MAX_WAIT_SECONDS), future )
+            self.write({'status' : 0})
+            self.finish()
+        except Exception, e:
+            #how to cancel the task here if it was timeout
+            future.cancel() # &lt;-- Does not work
+            self.write({'status' : 100})
+            self.finish()
+
+application = tornado.web.Application([
+    (r"/test", MainHandler),
+])
+application.listen(8888)
+IOLoop.instance().start()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>Future</code> instances themselves can't be cancelled once they're actually executing, they can only be cancelled if they're in a pending state. This is noted <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Future.cancel" rel="nofollow">in the docs</a>:</p>
+<blockquote>
+<p><strong>cancel()</strong></p>
+<p>Attempt to cancel the call. If the call is currently being executed and cannot be cancelled then the method will return <code>False</code>,
+  otherwise the call will be cancelled and the method will return <code>True</code>.</p>
+</blockquote>
+<p>So, the only way to abort the method you're running in the background is to actually insert logic into your potentially infinite loop so that it can be aborted when you tell it to. With your example, you could use a <a href="https://docs.python.org/2/library/threading.html#event-objects" rel="nofollow"><code>threading.Event</code></a>:</p>
+<pre><code>class MainHandler(tornado.web.RequestHandler):
+    executor = ThreadPoolExecutor(2)
+
+    @run_on_executor
+    def test_func(self, event):
+        i = 0
+        while not event.is_set():
+            print i
+            i = i + 1
+
+    @tornado.gen.coroutine
+    def get(self):
+        event = threading.Event()
+        future = self.test_func(event)
+        try:
+            result_search_struct = yield with_timeout(datetime.timedelta(seconds=MAX_WAIT_SECONDS), future )
+            self.write({'status' : 0})
+            self.finish()
+        except Exception, e:
+            future.cancel() # Might not work, depending on how busy the Executor is
+            event.set()
+            self.write({'status' : 100})
+            self.finish()
+
+application = tornado.web.Application([
+    (r"/test", MainHandler),
+])
+</code></pre>
+</div>
+<span class="comment-copy">dano, thanks for reply, the problem is that there is no real "loop". There is a subtle bug that is still under investigation, which causes infinite loop inside the task. As a temporary solution I thougth of cancelling the hung thread atm.  I am not sure how to do it in the current code structure.</span>
+<span class="comment-copy">I have modified my code so it won't confuse that there is real loop</span>
+<span class="comment-copy">@EgorLakomkin See <a href="http://stackoverflow.com/questions/323972/is-there-any-way-to-kill-a-thread-in-python">this question</a> about killing a thread in Python. There are some things you can do that will work in some circumstances, but there isn't really a single approach that will work for all use-cases. Most of the approaches there are particularly problematic because you're using a <code>ThreadPoolExecutor</code>, not a <code>Thread</code> object directly.</span>

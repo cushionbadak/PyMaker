@@ -1,0 +1,187 @@
+<div class="post-text" itemprop="text">
+<p>I need a <code>sleep()</code> method which can be aborted (as described <a href="https://stackoverflow.com/questions/5114292/break-interrupt-a-time-sleep-in-python">here</a> or <a href="https://stackoverflow.com/questions/8430929/is-there-a-way-to-stop-time-sleep-in-windows">here</a>). </p>
+<p>My approach is to let a <code>threading.Event.wait()</code> timeout at the specified duration:</p>
+<pre><code>def abortable_sleep(secs, abort_event):
+    abort_event.wait(timeout=secs)
+    abort_event.clear()
+</code></pre>
+<p>After calling <code>abortable_sleep(10, _abort)</code> I can now (from another thread) call <code>_event.set(_abort)</code> to let <code>abortable_sleep()</code> terminate before the 10 seconds.</p>
+<p>Example:</p>
+<pre><code>def sleeping_thread():
+    _start = time.perf_counter()
+    print("%f thread started" % (time.perf_counter() - _start))
+    abortable_sleep(5, _abort)
+    print("%f thread stopped" % (time.perf_counter() - _start))
+
+if __name__ == '__main__':
+
+    _abort = threading.Event()
+    while True:
+        threading.Thread(target=sleeping_thread).start()
+        time.sleep(3)
+        _abort.set()
+        time.sleep(1)
+</code></pre>
+<p>Output:    </p>
+<pre><code>0.000001 thread started
+3.002668 thread stopped
+0.000002 thread started
+3.003014 thread stopped
+0.000001 thread started
+3.002928 thread stopped
+0.000001 thread started
+</code></pre>
+<p>This code is working as expected but I still have some questions:</p>
+<ul>
+<li>isn't there an <strong>easier</strong> way to have s.th. likea <code>sleep()</code> which can be aborted?</li>
+<li>can this be done <strong>more elegant</strong>? E.g. this way I have to be careful with the <code>Event</code> instance which is not bound to an instance of <code>abortable_sleep()</code></li>
+<li>do I have to expect <strong>performance issues</strong> with high frequency loops like <code>while True: abortable_sleep(0.0001)</code>? How is the wait()-timeout implemented?</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>I have a wrapper class which basically slaps some sleep semantics on top of an <code>Event</code>. The nice thing is that you only have to pass around a <code>Sleep</code> object, which you can call <code>sleep()</code> on several times if you like (<code>sleep()</code> is not thread safe though) and that you can <code>wake()</code> from another thread.</p>
+<pre><code>from threading import Event
+
+class Sleep(object):
+    def __init__(self, seconds, immediate=True):
+        self.seconds = seconds
+        self.event = Event()
+        if immediate:
+            self.sleep()
+
+    def sleep(self, seconds=None):
+        if seconds is None:
+            seconds = self.seconds
+        self.event.clear()
+        self.event.wait(timeout=seconds)
+
+    def wake(self):
+        self.event.set()
+</code></pre>
+<p>Usage example:</p>
+<pre><code>if __name__ == '__main__':
+    from threading import Thread
+    import time
+    import logging
+
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(created)d - %(message)s')
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    logger.info("sleep")
+    s = Sleep(3)
+    logger.info("awake")
+
+    def wake_it(sleeper):
+        time.sleep(1)
+        logger.info("wakeup!")
+        sleeper.wake()
+
+    logger.info("sleeping again")
+    s = Sleep(60, immediate=False)
+    Thread(target=wake_it, args=[s]).start()
+    s.sleep()
+    logger.info("awake again")
+</code></pre>
+<p>The above might output something like this:</p>
+<pre><code>1423750549 - sleep
+1423750552 - awake
+1423750552 - sleeping again
+1423750553 - wakeup!
+1423750553 - awake again
+</code></pre>
+<p>Exactly what you did, but encapsulated in a class.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'd wrap the sleep/abort function up in a new class:</p>
+<pre><code>class AbortableSleep():
+    def __init__(self):
+        self._condition = threading.Condition()
+
+    def __call__(self, secs):
+        with self._condition:
+            self._aborted = False
+            self._condition.wait(timeout=secs)
+            return not self._aborted
+
+    def abort(self):
+        with self._condition:
+            self._condition.notify()
+            self._aborted = True
+</code></pre>
+<p>I'd then also supply a <code>Thread</code> subclass to manage the sharing of the wakeup routine on a per-thread basis:</p>
+<pre><code>class ThreadWithWakeup(threading.Thread):
+    def __init__(self, *args, **kwargs):
+        self.abortable_sleep = AbortableSleep()
+        super(ThreadWithWakeup, self).__init__(*args, **kwargs)
+
+    def wakeup(self):
+        self.abortable_sleep.abort()
+</code></pre>
+<p>Any other thread with access to this thread can call <code>wakeup()</code> to abort the current <code>abortable_sleep()</code> (if one is in progress).</p>
+<hr/>
+<h3>Using ThreadWithWakeup</h3>
+<p>You can create threads using the <code>ThreadWithWakeup</code> class, and use it like this:</p>
+<pre><code>class MyThread(ThreadWithWakeup):
+    def run(self):
+        print "Sleeper: sleeping for 10"
+        if self.abortable_sleep(10):
+            print "Sleeper: awoke naturally"
+        else:
+            print "Sleeper: rudely awoken"
+
+t = MyThread()
+t.start()
+print "Main: sleeping for 5"
+for i in range(5):
+    time.sleep(1)
+    print i + 1 
+print "Main: waking thread"
+t.wakeup()
+</code></pre>
+<p>The output of which looks like:</p>
+<pre><code>Sleeper: sleeping for 10
+Main: sleeping for 5
+1
+2
+3
+4
+5
+Main: waking thread
+Sleeper: rudely awoken
+</code></pre>
+<hr/>
+<h3>Using AbortableSleep on its own</h3>
+<p>You can also use the <code>AbortableSleep</code> class on its own, which is handy if you can't use the <code>ThreadWithWakeup</code> class for some reason (maybe you're in the main thread, maybe something else creates the threads for you, etc.):</p>
+<pre><code>abortable_sleep = AbortableSleep()
+def run():
+    print "Sleeper: sleeping for 10"
+    if abortable_sleep(10):
+        print "Sleeper: awoke naturally"
+    else:
+        print "Sleeper: rudely awoken"
+threading.Thread(target=run).start()
+
+print "Main: sleeping for 5"
+for i in range(5):
+    time.sleep(1)
+    print i + 1
+print "Main: aborting"
+abortable_sleep.abort()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Due to race conditions, your solution is not always perfectly correct.  You should use a <a href="https://docs.python.org/3/library/threading.html#threading.Semaphore" rel="nofollow"><code>threading.BoundedSemaphore()</code></a> instead.  Call <code>aquire()</code> immediately after creating it.  When you want to sleep, call <code>acquire()</code> with a timeout, then call <code>release()</code> if the <code>acquire()</code> returned true.  To abort the sleep early, call <code>release()</code> from a different thread; this will raise <code>ValueError</code> if there is no sleep in progress.</p>
+<p>Using an event instead is problematic if the other thread calls <code>set()</code> at the wrong time (i.e. at any time other than when you are actually waiting on the event).</p>
+</div>
+<span class="comment-copy">It seems to me this is more or less the right approach. It depends on what you want to happen when calling the _abort. Do you want all threads sleeping to wake up? Do you want one of the threads to wake up? Do you want to abort particular thread? Depending on the answer you might want to use a different model (Condition?) or you might want to use thread-local storage to save the _abort event or subclass the Thread class to save the _abort object.</span>
+<span class="comment-copy">re: point 1 - probably not.  As for point 2 - you should subclass <code>Thread</code> and encapsulate this behavior.</span>
+<span class="comment-copy"><code>abortable_sleep(0.0001)</code>: This will always have issues, abortable or not.  You're asking to sleep for 100 us, but the thread scheduler might not get around to waking you up until long after that.</span>
+<span class="comment-copy">There are also race conditions.  If the other thread sets the event after you've finished sleeping and cleared it, you'll have problems.  You could call <code>event.clear()</code> right before sleeping, but that just shortens the danger window.</span>
+<span class="comment-copy">I'm not sure I see the race condition. Can you give an example?</span>
+<span class="comment-copy">@AndréLaszlo: Thread 1 calls <code>abortable_sleep()</code>.  The sleep completes.  Thread 2 attempts to abort the sleep by setting the event.  Thread 1 calls <code>abortable_sleep()</code> again, and it <b>returns immediately</b> because the event was already set.  This is a bug.</span>
+<span class="comment-copy">Aha, thanks. I must have thought about it since I put a <code>clear()</code> before the <code>wait()</code> in my code. It should work in <code>abortable_sleep</code> as well, right? Assuming that it's the same thread that's doing the clearing/waiting at least.</span>
+<span class="comment-copy">That would probably work for this specific use case, but if you want the other thread to know whether it succeeded, you have to use something more sophisticated than an Event.</span>

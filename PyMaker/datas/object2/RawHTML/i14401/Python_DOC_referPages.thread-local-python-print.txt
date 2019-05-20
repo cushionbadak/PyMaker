@@ -1,0 +1,161 @@
+<div class="post-text" itemprop="text">
+<p>Are there any built-in ways to have different threads have different destinations for <code>print()</code> and similar?</p>
+<p>I'm exploring the creation of an interactive Python environment, so I can't just use <code>print()</code> from module spamegg. It has to be the globally available one with no arguments.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can replace <code>sys.stdout</code> with an object that checks the current thread and writes to the appropriate file:</p>
+<pre><code>import sys, threading
+
+class CustomOutput(object):
+    def __init__(self):
+        # the "softspace" slot is used internally by Python's print
+        # to keep track of whether to prepend space to the
+        # printed expression
+        self.softspace = 0
+        self._old_stdout = None
+
+    def activate(self):
+        self._old_stdout = sys.stdout
+        sys.stdout = self
+
+    def deactivate(self):
+        sys.stdout = self._old_stdout
+        self._old_stdout = None
+
+    def write(self, s):
+        # actually write to an open file obtained from an attribute
+        # on the current thread
+        threading.current_thread().open_file.write(s)
+
+    def writelines(self, seq):
+        for s in seq:
+            self.write(s)
+
+    def close(self):
+        pass
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>It <em>is</em> possible to do what you're asking, although it's complicated and clunky and possibly not portable, and I don't think it's what you want to do.</p>
+<p>Your objection to just using <code>spamegg.print</code> is:</p>
+<blockquote>
+<p>I'm exploring the creation of an interactive Python environment, so I can't just use <code>print()</code> from module <code>spamegg</code>. It has to be the globally available one with no arguments.</p>
+</blockquote>
+<p>But the solution to that is easy: Just use <code>print</code> from module <code>spamegg</code> in your code, and <code>from spamegg import print</code> in the interactive interpreter. That's all there is to it.</p>
+<p>For that matter, there's no good reason this even needs to be called <code>print</code> in the first place. If all of your code used some other output function with a different name, you could do the same thing in the interactive interpreter.</p>
+<hr/>
+<p>But how does that let each thread have a different destination?</p>
+<p>The easy way to do that is to just look up the destination in a <a href="https://docs.python.org/3/library/threading.html#thread-local-data" rel="nofollow"><code>threading.local()</code></a>.</p>
+<hr/>
+<p>But if you really want to do both parts of this the hard way, you can.</p>
+<p>To do the global <code>print</code> the hard way, you can either have <code>spamegg</code> replace the builtin <code>print</code> instead of just giving you a way to shadow it, or have it replace <code>sys.stdout</code>, so the builtin <code>print</code> with default arguments will print somewhere else.</p>
+<pre><code>import builtins
+_real_print = builtins.print
+def _print(*args, **kwargs):
+    kwargs.setdefault('file', my_output_destination)
+    _real_print(*args, **kwargs)
+builtins.print = _print
+
+import io
+import sys
+class MyStdOut(io.TextIOBase):
+    # ... __init__, write, etc.
+sys.stdout = MyStdOut()
+</code></pre>
+<p>That still requires having <code>MyStdOut</code> use a thread-local target.</p>
+<p>Alternatively, you can compile or wrap each thread function in its own custom <code>globals</code> environment that replaces <code>__builtins__</code> and/or <code>sys</code> from the default, allowing you to give a different one to each thread from the start. For example:</p>
+<pre><code>from functools import partial
+from threading import Thread
+from types import FunctionType
+
+class MyThread(Thread):
+    def __init__(self, group=None, target=None, *args, **kwargs):
+        if target:
+            g = target.__globals__.copy()
+            g['__builtins__'] = g['__builtins__'].copy()
+            output = make_output_for_new_thread()
+            g['__builtins__']['print'] = partial(print, file=output)
+            target = FunctionType(thread_func.__code__, g, thread_func.__name__, 
+                                  thread_func.__defaults__, thread_func.__closure__)
+        super().__init__(self, group, target, *args, **kwargs) 
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I might have solution for you, but it's quite more complicated than just print. </p>
+<pre><code>class ClusteredLogging(object):
+    '''
+    Class gathers all logs performed inside with statement and flush
+    it to mainHandler on exit at once.
+    Good for multithreaded applications that has to log several
+    lines at once.
+    '''
+
+
+    def __init__(self, mainHandler, formatter):
+        self.mainHandler = mainHandler
+        self.formatter = formatter
+
+        self.buffer = StringIO()
+        self.handler = logging.StreamHandler(self.buffer)
+        self.handler.setFormatter(formatter)
+
+
+    def __enter__(self):
+        rootLogger = logging.getLogger()
+        rootLogger.addHandler(self.handler)
+
+
+    def __exit__(self, t, value, tb):
+        rootLogger = logging.getLogger()
+        rootLogger.removeHandler(self.handler)
+        self.handler.flush()
+        self.buffer.flush()
+
+        rootLogger.addHandler(self.mainHandler)
+        logging.info(self.buffer.getvalue().strip())
+        rootLogger.removeHandler(self.mainHandler)
+</code></pre>
+<p>Using this, you can create log handler for each thread and configure them to store logs to different locations.</p>
+<p>Keep in mind that this is developed with slightly different goal in mind (see comments) but you can adapt it by taking handler juggling feature of ClusteredLogging as a start.</p>
+<p>And some test code:</p>
+<pre><code>import concurrent.futures
+try:
+    from StringIO import StringIO
+except ImportError:
+    from io import StringIO
+import logging
+import sys
+
+# put ClusteredLogging here
+
+if __name__ == "__main__":
+    formatter = logging.Formatter('%(asctime)s %(levelname)8s\t%(message)s')
+    onlyMessageFormatter = logging.Formatter("%(message)s")
+    mainHandler = logging.StreamHandler(sys.stdout)
+    mainHandler.setFormatter(onlyMessageFormatter)
+    mainHandler.setLevel(logging.DEBUG)
+    rootLogger = logging.getLogger()
+    rootLogger.setLevel(logging.DEBUG)
+
+    def logSomethingLong(label):
+        with ClusteredLogging(mainHandler, formatter):
+            for i in range(15):
+                logging.info(label + " " + str(i))        
+
+    labels = ("TEST", "EXPERIMENT", "TRIAL")
+
+    executor = concurrent.futures.ProcessPoolExecutor()
+    futures = [executor.submit(logSomethingLong, label) for label in labels]
+    concurrent.futures.wait(futures)
+</code></pre>
+</div>
+<span class="comment-copy">What do you mean "the globally available one with no arguments"? The globally available <code>print</code> function takes 0 or more arguments. You can just as easily define another <code>print</code> function that does the same. (Unless you're using Python 2.x and not using <code>from __future__ import print_function</code>, in which case <code>print</code> isn't a function in the first place, it's a special kind of statement, and you can't replace it at all.)</span>
+<span class="comment-copy">Meanwhile, if you want different destinations, you can do that by replacing <code>sys.stdout</code>, but that's a global on <code>sys</code>, so that doesn't help. You're pretty much going to have to create some namespace (presumably a module, but it could be a fake builtins or an <code>exec</code> context or who knows what without knowing more about your design…) that has a <code>print</code> function in it.</span>
+<span class="comment-copy">@abarnert Without using <code>print(..., file=spamegg)</code></span>
+<span class="comment-copy">I'd appreciate any comment why it's not useful.</span>

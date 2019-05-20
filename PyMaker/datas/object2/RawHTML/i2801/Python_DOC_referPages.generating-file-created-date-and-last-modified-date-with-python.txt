@@ -1,0 +1,301 @@
+<div class="post-text" itemprop="text">
+<p>I am building a script that walks through a directory (and its subdirectories) the user specifies and uploads the files to a postgres DB.  </p>
+<p>It all works -- after a lot of trial and error! -- and now I'm trying to implement a check before uploading that the same filename + modified date do not exist in the DB prior to uploading.  (If the same file version does exist, I want to skip it.)</p>
+<p>Can anyone advise me on how to go about this?</p>
+<pre><code>"""A tool for saving files to and from a postgresql db.
+
+            *** THIS IS WRITTEN FOR PYTHON 2.7 ***
+"""
+import os
+import sys
+import argparse
+import psycopg2
+import time
+import datetime
+import msvcrt as m
+
+db_conn_str = "xxx"
+
+# Define your table schema
+create_table_stm = """
+CREATE TABLE IF NOT EXISTS test_table (
+    id serial PPRIMARY KEY,
+    orig_filename TEXT NOT NULL,
+    file_extension TEXT NOT NULL,
+    created_date DATE NOT NULL,
+    last_modified_date DATE NOT NULL,
+    upload_timestamp_UTC TIMESTAMP NOT NULL,
+    uploaded_by TEXT NOT NULL,
+    file_size_in_bytes INTEGER NOT NULL,
+    original_containing_folder TEXT NOT NULL,
+    file_data BYTEA NOT NULL
+)
+"""
+
+uploaded_by = raw_input("Please, enter your [Firstname] [Lastname]: ")
+
+if not uploaded_by:
+    print "You did not enter your name.  Press ENTER to exit this script, then attempt to run the script again."
+    m.getch()
+    exit()
+else:
+    print "Thank you, " + uploaded_by + "! Please, press ENTER to upload the files."
+    m.getch()
+
+# Walk through the directory
+def main():
+    parser = argparse.ArgumentParser()
+    parser_action = parser.add_mutually_exclusive_group(required=True)
+    parser_action.add_argument("--store", action='store_const', const=True, help="Load an image from the named file and save it in the DB")
+    parser_action.add_argument("--fetch", type=int, help="Fetch an image from the DB and store it in the named file, overwriting it if it exists. Takes the database file identifier as an argument.", metavar='42')
+    parser.add_argument("parentdir", help="Name of folder to write to / fetch from")
+    args = parser.parse_args()
+
+    conn = psycopg2.connect(db_conn_str)
+    curs = conn.cursor()
+
+    # Run the create_table_stm code at the top of this file to generate the table if it does not already exist
+    curs.execute(create_table_stm)
+
+    for root, dirs, files in os.walk(args.parentdir):
+        for name in files:
+            # Store the original file path from the computer the file was uploaded from.
+            joined_var = os.path.join(root)
+            original_path = os.path.abspath(joined_var)
+
+            # Set the file the script is looking at to a variable for later use to pull filesize
+            filestat = os.stat(os.path.join(root, name))
+
+            # Split the file extension from the filename
+            file_extension_holder = os.path.splitext(name)[1]
+
+            # Time module: https://docs.python.org/3.7/library/time.html#module-time
+            # The return value is a number giving the number of seconds since the epoch (see the time module).
+            # The epoch is the point where the time starts, and is platform dependent. For Windows and Unix, the epoch is January 1, 1970, 00:00:00 (UTC). 
+            # To find out what the epoch is on a given platform, look at time.gmtime(0).  The code below is written for Windows.
+
+            # Datetime module: https://docs.python.org/3/library/datetime.html
+
+            # More info: https://stackoverflow.com/questions/237079/how-to-get-file-creation-modification-date-times-in-python            
+
+            # Generate the created_date -- I suspect there is a more straightforward way to do this with the time or datetime module.  But this works.
+            c_time_in_seconds = os.path.getctime(os.path.join(root, name))
+            c_time_array = str(time.gmtime(c_time_in_seconds)[:3])
+            c_date_str = ''.join(c_time_array)
+            c_format_str = '(%Y, %m, %d)' 
+            c_datetime_obj = datetime.datetime.strptime(c_date_str, c_format_str)
+            created_date = c_datetime_obj.date()
+
+            # Generate the last_modified_date
+            m_time_in_seconds = os.path.getmtime(os.path.join(root, name))
+            m_time_array = str(time.gmtime(m_time_in_seconds)[:3])
+            m_date_str = ''.join(m_time_array)
+            m_format_str = '(%Y, %m, %d)' 
+            m_datetime_obj = datetime.datetime.strptime(m_date_str, m_format_str)
+            last_modified_date = m_datetime_obj.date()
+
+            # Generate the timestamp of the upload (in UTC timezone)
+            py_uploaded_timestamp = datetime.datetime.now()
+
+
+
+            if args.store:
+                with open(os.path.join(root, name),'rb') as f:
+
+                    # read the binary 
+                    filedata = psycopg2.Binary(f.read())
+
+                    # Call the st_size command from os.stat to read the filesize in bytes
+                    filesize = filestat.st_size
+
+                    # This has to agree with the table schema you set at the top of this file
+                    curs.execute(
+                       """
+                           INSERT INTO test_table
+                               (id, orig_filename, file_extension, created_date, last_modified_date, upload_timestamp_UTC, uploaded_by, file_size_in_bytes, original_containing_folder, file_data)
+                           VALUES
+                               (DEFAULT, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                           RETURNING id
+                       """,
+                       (name, file_extension_holder, created_date, last_modified_date, py_uploaded_timestamp, uploaded_by, filesize, original_path, filedata)
+                    )
+                    print curs
+                    returned_id = curs.fetchone()[0]
+                print("Stored {0} into DB record {1}".format(args.parentdir, returned_id))
+                conn.commit()
+
+            elif args.fetch is not None:
+                with open(args.parentdir,'wb') as f:
+                    curs.execute(
+                       "SELECT file_data, orig_filename FROM files WHERE id = %s",
+                       (int(args.fetch),)
+                    )
+                    (file_data, orig_parentdir) = curs.fetchone()
+                    f.write(file_data)
+                print("Fetched {0} into file {1}; original parentdir was {2}".format(args.fetch, args.parentdir, orig_filename))
+
+
+        for name in dirs:
+            print(os.path.join(root, name))
+
+    conn.close()        
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can add a unique constraint on <code>orig_filename</code> and <code>last_modified</code>.</p>
+<p>And then when performing the insert, use <code>ON CONFLICT (columns) DO NOTHING</code> in the insert statement.</p>
+<p>Your code may then look like this.</p>
+<pre><code>"""A tool for saving files to and from a postgresql db.
+
+            *** THIS IS WRITTEN FOR PYTHON 2.7 ***
+"""
+import os
+import sys
+import argparse
+import psycopg2
+import time
+import datetime
+import msvcrt as m
+
+db_conn_str = "xxx"
+
+# Define your table schema
+create_table_stm = """
+CREATE TABLE IF NOT EXISTS test_table (
+    id SERIAL PRIMARY KEY,
+    orig_filename TEXT NOT NULL,
+    file_extension TEXT NOT NULL,
+    created_date DATE NOT NULL,
+    last_modified_date DATE NOT NULL,
+    upload_timestamp_UTC TIMESTAMP NOT NULL,
+    uploaded_by TEXT NOT NULL,
+    file_size_in_bytes INTEGER NOT NULL,
+    original_containing_folder TEXT NOT NULL,
+    file_data BYTEA NOT NULL
+
+    UNIQUE (orig_filename, last_modified_date) -- Notice this unique constraint
+)
+"""
+
+uploaded_by = raw_input("Please, enter your [Firstname] [Lastname]: ")
+
+if not uploaded_by:
+    print "You did not enter your name.  Press ENTER to exit this script, then attempt to run the script again."
+    m.getch()
+    exit()
+else:
+    print "Thank you, " + uploaded_by + "! Please, press ENTER to upload the files."
+    m.getch()
+
+# Walk through the directory
+def main():
+    parser = argparse.ArgumentParser()
+    parser_action = parser.add_mutually_exclusive_group(required=True)
+    parser_action.add_argument("--store", action='store_const', const=True, help="Load an image from the named file and save it in the DB")
+    parser_action.add_argument("--fetch", type=int, help="Fetch an image from the DB and store it in the named file, overwriting it if it exists. Takes the database file identifier as an argument.", metavar='42')
+    parser.add_argument("parentdir", help="Name of folder to write to / fetch from")
+    args = parser.parse_args()
+
+    conn = psycopg2.connect(db_conn_str)
+    curs = conn.cursor()
+
+    # Run the create_table_stm code at the top of this file to generate the table if it does not already exist
+    curs.execute(create_table_stm)
+
+    for root, dirs, files in os.walk(args.parentdir):
+        for name in files:
+            # Store the original file path from the computer the file was uploaded from.
+            joined_var = os.path.join(root)
+            original_path = os.path.abspath(joined_var)
+
+            # Set the file the script is looking at to a variable for later use to pull filesize
+            filestat = os.stat(os.path.join(root, name))
+
+            # Split the file extension from the filename
+            file_extension_holder = os.path.splitext(name)[1]
+
+            # Time module: https://docs.python.org/3.7/library/time.html#module-time
+            # The return value is a number giving the number of seconds since the epoch (see the time module).
+            # The epoch is the point where the time starts, and is platform dependent. For Windows and Unix, the epoch is January 1, 1970, 00:00:00 (UTC). 
+            # To find out what the epoch is on a given platform, look at time.gmtime(0).  The code below is written for Windows.
+
+            # Datetime module: https://docs.python.org/3/library/datetime.html
+
+            # More info: https://stackoverflow.com/questions/237079/how-to-get-file-creation-modification-date-times-in-python            
+
+            # Generate the created_date -- I suspect there is a more straightforward way to do this with the time or datetime module.  But this works.
+            c_time_in_seconds = os.path.getctime(os.path.join(root, name))
+            c_time_array = str(time.gmtime(c_time_in_seconds)[:3])
+            c_date_str = ''.join(c_time_array)
+            c_format_str = '(%Y, %m, %d)' 
+            c_datetime_obj = datetime.datetime.strptime(c_date_str, c_format_str)
+            created_date = c_datetime_obj.date()
+
+            # Generate the last_modified_date
+            m_time_in_seconds = os.path.getmtime(os.path.join(root, name))
+            m_time_array = str(time.gmtime(m_time_in_seconds)[:3])
+            m_date_str = ''.join(m_time_array)
+            m_format_str = '(%Y, %m, %d)' 
+            m_datetime_obj = datetime.datetime.strptime(m_date_str, m_format_str)
+            last_modified_date = m_datetime_obj.date()
+
+            # Generate the timestamp of the upload (in UTC timezone)
+            py_uploaded_timestamp = datetime.datetime.now()
+
+
+
+            if args.store:
+                with open(os.path.join(root, name),'rb') as f:
+
+                    # read the binary 
+                    filedata = psycopg2.Binary(f.read())
+
+                    # Call the st_size command from os.stat to read the filesize in bytes
+                    filesize = filestat.st_size
+
+                    # This has to agree with the table schema you set at the top of this file
+                    curs.execute(
+                        """
+                           INSERT INTO test_table
+                              (id, orig_filename, created_date, last_modified_date, uploaded_by, file_size_in_bytes, file_data)
+                           VALUES
+                              (DEFAULT,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT(orig_filename, last_modified) DO NOTHING
+                           RETURNING id
+                        """,
+                        (
+                          name, file_extension_holder, created_date, last_modified_date, py_uploaded_timestamp, uploaded_by, filesize, original_path, filedata
+                        )
+                    )
+
+                    print curs
+                    returned_id = curs.fetchone()[0]
+                print("Stored {0} into DB record {1}".format(args.parentdir, returned_id))
+                conn.commit()
+
+            elif args.fetch is not None:
+                with open(args.parentdir,'wb') as f:
+                    curs.execute("SELECT file_data, orig_filename FROM files WHERE id = %s", (int(args.fetch),))
+                    (file_data, orig_parentdir) = curs.fetchone()
+                    f.write(file_data)
+                print("Fetched {0} into file {1}; original parentdir was {2}".format(args.fetch, args.parentdir, orig_filename))
+
+
+
+
+        for name in dirs:
+            print(os.path.join(root, name))
+
+    conn.close()        
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+</div>
+<span class="comment-copy">One option is to do a <code>SELECT COUNT(*) FROM test_table WHERE orig_filename=%s AND last_modified_date=%s</code>, or whatever it is you want to test for. If the result is 0, do all the work; otherwise, print an appropriate message and skip all the work.</span>
+<span class="comment-copy">Alternatively, you could put a uniqueness constraint on the database, e.g., something like <code>CONSTRAINT duplicate_file UNIQUE(orig_filename, last_modified_date) ON CONFLICT FAIL</code> in your <code>CREATE TABLE</code> statement. (The exact details are different in every database, so you probably need to read the Postgres docs to figure out exactly how to write it.) Then, you can just try the <code>INSERT</code>, and it will fail for a duplicate file, and you can handle that with <code>try</code>/<code>except</code>.</span>
+<span class="comment-copy">As a side note: If your code is really written for Python 2, and you aren't using <code>from __future__ import print_function</code>, you really shouldn't use Python 3-stye <code>print(…)</code> calls. Everything will seem to work, until the first time you accidentally do <code>print(one_thing, another_thing)</code> and wonder why it's printing out <code>('spam', 'eggs')</code> instead of <code>spam eggs</code>.</span>
+<span class="comment-copy">@CD9999 Accept the answer if it was helpful to you; will help others find it easier</span>

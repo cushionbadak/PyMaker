@@ -1,0 +1,137 @@
+<div class="post-text" itemprop="text">
+<p>I created two lists <code>l1</code> and <code>l2</code>, but each one with a different creation method:</p>
+<pre><code>import sys
+
+l1 = [None] * 10
+l2 = [None for _ in range(10)]
+
+print('Size of l1 =', sys.getsizeof(l1))
+print('Size of l2 =', sys.getsizeof(l2))
+</code></pre>
+<p>But the output surprised me:</p>
+<pre><code>Size of l1 = 144
+Size of l2 = 192
+</code></pre>
+<p>The list created with a list comprehension is a bigger size in memory, but the two lists are identical in Python otherwise.</p>
+<p>Why is that? Is this some CPython internal thing, or some other explanation?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>When you write <code>[None] * 10</code>, Python knows that it will need a list of exactly 10 objects, so it allocates exactly that.</p>
+<p>When you use a list comprehension, Python doesn't know how much it will need. So it gradually grows the list as elements are added. For each reallocation it allocates more room than is immediately needed, so that it doesn't have to reallocate for each element. The resulting list is likely to be somewhat bigger than needed.</p>
+<p>You can see this behavior when comparing lists created with similar sizes:</p>
+<pre><code>&gt;&gt;&gt; sys.getsizeof([None]*15)
+184
+&gt;&gt;&gt; sys.getsizeof([None]*16)
+192
+&gt;&gt;&gt; sys.getsizeof([None for _ in range(15)])
+192
+&gt;&gt;&gt; sys.getsizeof([None for _ in range(16)])
+192
+&gt;&gt;&gt; sys.getsizeof([None for _ in range(17)])
+264
+</code></pre>
+<p>You can see that the first method allocates just what is needed, while the second one grows periodically. In this example, it allocates enough for 16 elements, and had to reallocate when reaching the 17th.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As noted in <a href="https://stackoverflow.com/questions/40018398/list-uses-more-memory-than-list-comprehension">this question</a> the list-comprehension uses <code>list.append</code> under the hood, so it will call the list-resize method, which overallocates. </p>
+<p>To demonstrate this to yourself, you can actually use the <code>dis</code> dissasembler:</p>
+<pre><code>&gt;&gt;&gt; code = compile('[x for x in iterable]', '', 'eval')
+&gt;&gt;&gt; import dis
+&gt;&gt;&gt; dis.dis(code)
+  1           0 LOAD_CONST               0 (&lt;code object &lt;listcomp&gt; at 0x10560b810, file "", line 1&gt;)
+              2 LOAD_CONST               1 ('&lt;listcomp&gt;')
+              4 MAKE_FUNCTION            0
+              6 LOAD_NAME                0 (iterable)
+              8 GET_ITER
+             10 CALL_FUNCTION            1
+             12 RETURN_VALUE
+
+Disassembly of &lt;code object &lt;listcomp&gt; at 0x10560b810, file "", line 1&gt;:
+  1           0 BUILD_LIST               0
+              2 LOAD_FAST                0 (.0)
+        &gt;&gt;    4 FOR_ITER                 8 (to 14)
+              6 STORE_FAST               1 (x)
+              8 LOAD_FAST                1 (x)
+             10 LIST_APPEND              2
+             12 JUMP_ABSOLUTE            4
+        &gt;&gt;   14 RETURN_VALUE
+&gt;&gt;&gt;
+</code></pre>
+<p>Notice the <code>LIST_APPEND</code> opcode in the disassembly of the <code>&lt;listcomp&gt;</code> code object. From the <a href="https://docs.python.org/3/library/dis.html#opcode-LIST_APPEND" rel="noreferrer">docs</a>:</p>
+<blockquote>
+<p><strong>LIST_APPEND(i)</strong> </p>
+<p>Calls <code>list.append(TOS[-i], TOS)</code>. Used to implement list comprehensions.</p>
+</blockquote>
+<p>Now, for the list-repetition operation, we have a hint about what is going on if we consider:</p>
+<pre><code>&gt;&gt;&gt; import sys
+&gt;&gt;&gt; sys.getsizeof([])
+64
+&gt;&gt;&gt; 8*10
+80
+&gt;&gt;&gt; 64 + 80
+144
+&gt;&gt;&gt; sys.getsizeof([None]*10)
+144
+</code></pre>
+<p>So, it seems to be able to <em>exactly</em> allocate the size. Looking at the <a href="https://github.com/python/cpython/blob/48ed88a93bb0bbeaae9a4cfaa533e4edf13bcb51/Objects/listobject.c#L504" rel="noreferrer">source code</a>, we see this is exactly what happens:</p>
+<pre><code>static PyObject *
+list_repeat(PyListObject *a, Py_ssize_t n)
+{
+    Py_ssize_t i, j;
+    Py_ssize_t size;
+    PyListObject *np;
+    PyObject **p, **items;
+    PyObject *elem;
+    if (n &lt; 0)
+        n = 0;
+    if (n &gt; 0 &amp;&amp; Py_SIZE(a) &gt; PY_SSIZE_T_MAX / n)
+        return PyErr_NoMemory();
+    size = Py_SIZE(a) * n;
+    if (size == 0)
+        return PyList_New(0);
+    np = (PyListObject *) PyList_New(size);
+</code></pre>
+<p>Namely, here: <code>size = Py_SIZE(a) * n;</code>. The rest of the functions simply fills the array.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>None is a block of memory, but it is not a pre-specified size. In addition to that, there is some extra spacing in an array between array elements. You can see this yourself by running:</p>
+<pre><code>for ele in l2:
+    print(sys.getsizeof(ele))
+
+&gt;&gt;&gt;&gt;16
+16
+16
+16
+16
+16
+16
+16
+16
+16
+</code></pre>
+<p>Which does not total the size of l2, but rather is less.</p>
+<pre><code>print(sys.getsizeof([None]))
+72
+</code></pre>
+<p>And this is much greater than one tenth of the size of <code>l1</code>.</p>
+<p>Your numbers should vary depending on both the details of your operating system and the details of current memory usage in your operating system. The size of [None] can never be bigger than the available adjacent memory where the variable is set to be stored, and the variable may have to be moved if it is later dynamically allocated to be larger. </p>
+</div>
+<span class="comment-copy">@juanpa.arrivillaga I see, some internal CPython thing. I was just wondering...</span>
+<span class="comment-copy">Probably, the repetition operator will invoke some function that exactly sizes the underlying array. Note, that <code>144 == sys.getsizeof([]) + 8*10)</code> where 8 is the size of a pointer.</span>
+<span class="comment-copy">@juanpa.arrivillaga I don't think it's a duplicate. That question is comparing two methods of generating a list of unknown size, while this one is for a known size vs. an unknown size.</span>
+<span class="comment-copy">@interjay I should probably keep that in mind, when creating some huge lists</span>
+<span class="comment-copy">Note that if you change <code>10</code> to <code>11</code>, the <code>[None] * 11</code> list has size <code>152</code>, but the list comprehension still has size <code>192</code>.  The previously linked question isn't an exact duplicate, but it is relevant in understanding why this happens.</span>
+<span class="comment-copy">Yes, that makes sense. It's probably better create lists with <code>*</code> when I know the size in front.</span>
+<span class="comment-copy">@AndrejKesely Only use <code>[x] * n</code> with immutable <code>x</code> in your list. The resulting list will hold references to the identical object.</span>
+<span class="comment-copy">@schwobaseggl well, that <i>may</i> be what you want, but it is good to understand that.</span>
+<span class="comment-copy">@juanpa.arrivillaga True, it might be. But usually it isn't and particularly SO is full of posters wondering why all their data changed simultaneously :D</span>
+<span class="comment-copy">"As noted in this question the list-comprehension uses list.append under the hood" I think that it's more accurate to say that it uses <code>.extend()</code>.</span>
+<span class="comment-copy">@Acccumulation why do you believe so?</span>
+<span class="comment-copy">Because it's not appending elements one-by-one. When you append elements to a list, you're really creating a new list, with a new memory allocation, and putting the list into that new memory allocation. List comprehensions, on the other hand, put most of the new elements into memory that has already been allocated, and when they run out of allocated memory, they allocate another chuck of memory, not just enough for the new element.</span>
+<span class="comment-copy">@Acccumulation That is incorrect. <code>list.append</code> is an amortized constant time operation because when a list resizes, it overallocates. Not every append operation, therefore, results in a newly allocated array. In any event the question that I linked to shows you in the source code that in fact, list comprehensions <i>do</i> use <code>list.append</code>,. I'll be back at my laptop in a moment and I can show you the disassembled bytecode for a list comprehension and the corresponding <code>LIST_APPEND</code> opcode</span>
+<span class="comment-copy">@Acccumulation I've updated my answer.</span>
+<span class="comment-copy"><code>None</code> isn't actually stored in the underlying array, the only thing that is stored is a <code>PyObject</code> pointer (8 bytes). All Python objects are allocated on the heap. <code>None</code> is a singleton, so having a list with many nones is simply will create an array of PyObject pointers to the same <code>None</code> object on the heap (and not use additional memory in the process per additional <code>None</code>). I'm not sure what you meanby "None doesn't have a pre-specified size", but that doesn't sound correct. Finally, your loop with <code>getsizeof</code> each element isn't demonstrating what you appear to think it is demonstrating.</span>
+<span class="comment-copy">If as you say is true, the size of [None]*10 should be the same as the size of [None]. But clearly this is not so-- some extra storage has been added. In fact, the size of [None] repeated ten times (160) is also less than the size of [None] multiplied by ten. As you point out, clearly the size of the pointer to [None] is smaller than the size of [None] itself (16 bytes rather than 72 bytes). However, 160+32 is 192. I don't think the preceding answer solves the problem entirely either. It's clear that some extra small amount of memory (perhaps machine state dependent) is allocated.</span>
+<span class="comment-copy">"If as you say is true, the size of [None]*10 should be the same as the size of [None]" what am I saying that could possibly imply that? Again, you seem to be concentrating on the fact that the underlying buffer is over-allocated, or that the size of the list includes more than the size of the underlying buffer (it of course does), but that isn't the point of this question.  Again, your use of <code>gestsizeof</code> on each <code>ele</code> of <code>l2</code> is misleading because <code>getsizeof(l2)</code> <i>does not take into account the size of the elements inside the container</i>.</span>
+<span class="comment-copy">To prove to yourself that last claim, do <code>l1 = [None]; l2 = [None]*100; l3 = [l2]</code> then <code>print(sys.getsizeof(l1), sys.getsizeof(l2), sys.getsizeof(l3))</code>. you'll get a result like: <code>72 864 72</code>. That is, respectively, <code>64 + 1*8</code>, <code>64 + 100*8</code>, and <code>64 + 1*8</code>, again, assuming a 64bit system with 8 byte pointer size.</span>
+<span class="comment-copy">As I've stated, <code>sys.getsizeof</code> *does not account for the size of the items in the container. From the <a href="https://docs.python.org/3/library/sys.html#sys.getsizeof" rel="nofollow noreferrer">docs</a>: "Only the memory consumption directly attributed to the object is accounted for, not the memory consumption of objects it refers to...See <a href="https://code.activestate.com/recipes/577504" rel="nofollow noreferrer">recursive sizeof</a> recipe for an example of using getsizeof() recursively to find the size of containers and all their contents."</span>

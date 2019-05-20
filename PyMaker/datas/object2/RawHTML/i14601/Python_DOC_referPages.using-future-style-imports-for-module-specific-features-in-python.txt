@@ -1,0 +1,117 @@
+<div class="post-text" itemprop="text">
+<p>The Python future statement <code>from __future__ import feature</code> provides a nice way to ease the transition to new language features. Is it is possible to implement a similar feature for Python libraries: <code>from myproject.__future__ import feature</code>?</p>
+<p>It's straightforward to set a module wide constants on an import statement. What isn't obvious to me is how you could ensure these constants don't propagate to code executed in imported modules -- they should also require a future import to enable the new feature.</p>
+<p>This came up recently in a <a href="http://mail.scipy.org/pipermail/numpy-discussion/2015-April/072699.html">discussion of possible indexing changes</a> in NumPy. I don't expect it will actually be used in NumPy, but I can see it being useful for other projects.</p>
+<p>As a concrete example, suppose that we do want to change how indexing works in some future version of NumPy. This would be a backwards incompatible change, so we decide we to use a future statement to ease the transition. A script using this new feature looks something like this:</p>
+<pre><code>import numpy as np
+from numpy.__future__ import orthogonal_indexing
+
+x = np.random.randn(5, 5)
+print(x[[0, 1], [0, 1]])  # should use the "orthogonal indexing" feature
+# prints a 2x2 array of random numbers
+
+# we also want to use a legacy project that uses indexing, but
+# hasn't been updated to the use the "orthogonal indexing" feature
+from legacy_project import do_something
+
+do_something(x)  # should *not* use "orthogonal indexing"
+</code></pre>
+<p>If this isn't possible, what's the closest we can get for enabling local options? For example, is to possible to write something like:</p>
+<pre><code>from numpy import future
+future.enable_orthogonal_indexing()
+</code></pre>
+<p>Using something like a context manager would be fine, but the problem is that we don't want to propagate options to nested scopes:</p>
+<pre><code>with numpy.future.enable_orthogonal_indexing():
+    print(x[[0, 1], [0, 1]])  # should use the "orthogonal indexing" feature
+    do_something(x)  # should *not* use "orthogonal indexing" inside do_something
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <code>__future__</code> in Python is both a module and also not. The Python <code>__future__</code> is actually not imported from anywhere - it is a construct used by the Python bytecode compiler, deliberately chosen so that no new syntax needs to be created. There is also a <code>__future__.py</code> in the library directory; it can be imported as such: <code>import __future__</code>; and then you can for example access the <code>__future__.print_function</code> to find out which Python version makes the feature optionally available and in which version the feature is on by default.</p>
+<hr/>
+<p>It is possible to make a <code>__future__</code> module that knows what is being imported. Here is an example of <code>myproject/__future__.py</code> that can intercept feature imports on per module basis:</p>
+<pre><code>import sys
+import inspect
+
+class FutureMagic(object):
+    inspect = inspect
+
+    @property
+    def more_magic(self):
+        importing_frame = self.inspect.getouterframes(
+                  self.inspect.currentframe())[1][0]
+        module = importing_frame.f_globals['__name__']
+        print("more magic imported in %s" % module)
+
+sys.modules[__name__] = FutureMagic()
+</code></pre>
+<p>On load time the module is replaced with a <code>FutureMagic()</code> instance. Whenever <code>more_magic</code> is imported from <code>myproject.FutureMagic</code>, the <code>more_magic</code> property method will be called, and it will print out the name of the module that imported the feature:</p>
+<pre><code>&gt;&gt;&gt; from myproject.__future__ import more_magic
+more magic imported in __main__
+</code></pre>
+<p>Now, you could have a bookkeeping of the modules that have imported this feature. Doing <code>import myproject.__future__</code>; <code>myproject.__future__.more_magic</code> would trigger the same machinery, but you could also ensure that the <code>more_magic</code> import be at the beginning of the file - its global variables at that point shouldn't contain anything else except values returned from this fake module; otherwise the value is being accessed for inspection only.</p>
+<p>However the real question is: how could you use this - to find out from which module the function is being called is quite expensive, and would limit the usefulness of this feature.</p>
+<hr/>
+<p>Thus a possibly more fruitful approach could be to use <a href="https://docs.python.org/3/reference/import.html#import-hooks" rel="nofollow">import hooks</a> to do source translation on abstract syntax trees on modules that do <code>from mypackage.__future__ import more_magic</code>, possibly changing all <code>object[index]</code> into <code>__newgetitem__(operand, index)</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The way Python itself does this is pretty simple:</p>
+<p>In the <a href="https://docs.python.org/3/reference/import.html" rel="nofollow">importer</a>, when you try to import from a <code>.py</code> file, the code first scans the module for <a href="https://docs.python.org/3/reference/simple_stmts.html#future-statements" rel="nofollow">future statements</a>. </p>
+<p>Note that the only things allowed before a future statement are strings, comments, blank lines, and other future statements, which means it doesn't need to fully parse the code to do this. That's important, because future statements can change the way the code is parsed (in fact, that's the whole point of having them…); strings, comments, and blank lines can be handled by the <a href="https://docs.python.org/3/reference/lexical_analysis.html" rel="nofollow">lexer</a> step, and future statements can be parsed with a very simple special-purpose parser.</p>
+<p>Then, if any future statements are found, Python sets a corresponding flag bit, then re-seeks to the top of the file and calls <a href="https://docs.python.org/3/library/functions.html#compile" rel="nofollow"><code>compile</code></a> with those flags. For example, for <code>from __future__ import unicode_literals</code>, it does <code>flags |= __future__.unicode_literals.compiler_flag</code>, which changes <code>flags</code> from <code>0</code> to <code>0x20000</code>.</p>
+<p>In this "real compile" step, the future statements are treated as normal imports, and you will end up with a <code>__future__._Feature</code> value in the variable <code>unicode_literals</code> in the module's globals.</p>
+<hr/>
+<p>Now, you can't quite do the same thing, because you're not going to reimplement or wrap the compiler. But what you <em>can</em> do is use your future-like statements to signal an AST transform step. Something like this:</p>
+<pre><code>flags = []
+for line in f:
+    flag = parse_future(line)
+    if flag is None:
+        break
+    flags.append(flag)
+f.seek(0)
+contents = f.read()
+tree = ast.parse(contents, f.name)
+for flag in flags:
+    tree = transformers[flag](tree)
+code = compile(tree, f.name)
+</code></pre>
+<p>Of course you have to write that <code>parse_future</code> function to return 0 for a blank line, comment, or string, a flag for a recognized future import (which you can look up dynamically if you want), or <code>None</code> for anything else. And you have to write the <a href="https://docs.python.org/3/library/ast.html#ast.NodeTransformer" rel="nofollow">AST transformers</a> for each flag. But they can be pretty simple—e.g., you can transform <code>Subscript</code> nodes into different <code>Subscript</code> nodes, or even into <code>Call</code> nodes that call different functions based on the form of the index.</p>
+<p>To hook this into the import system, see <a href="https://www.python.org/dev/peps/pep-0302/" rel="nofollow">PEP 302</a>. Note that this gets simpler in Python 3.3, and simpler again in Python 3.4, so if you can require one of those versions, instead read the <a href="https://docs.python.org/3/reference/import.html" rel="nofollow">import system</a> docs for your minimum version.</p>
+<hr/>
+<p>For a great example of import hooks and AST transformers being used in real life, see <a href="https://github.com/lihaoyi/macropy" rel="nofollow">MacroPy</a>. (Note that it's using the old 2.3-style import hook mechanism; again, your own code can be simpler if you can use 3.3+ or 3.4+. And of course your code isn't generating the transforms dynamically, which is the most complicated part of MacroPy…)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, you can't.  The real <code>__future__</code> import is special in that its effects are local to the individual file where it occurs.  But ordinary imports are global: once one module does <code>import blah</code>, <code>blah</code> is executed and is available globally; other modules that later do <code>import blah</code> just retrieve the already-imported module.  This means that if <code>from numpy.__future__</code> changes something in numpy, everything that does <code>import numpy</code> will see the change.</p>
+<p>As an aside, I don't think this is what that mailing list message is suggesting.  I read it as suggesting an effect that <em>is</em> global, equivalent to setting a flag like <code>numpy.useNewIndexing = True</code>.  This would mean that you should only set that flag at the top level of your application if you know that all parts of your application will work with that.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, there is no reasonable way to do this.  Let's go through the requirements.</p>
+<p>First, you need to figure out which modules have your custom future statement enabled.  Standard imports aren't up to this, but you could require them to e.g. call some enabling function and pass <code>__name__</code> as a parameter.  This is somewhat ugly:</p>
+<pre><code>from numpy.future import new_indexing
+new_indexing(__name__)
+</code></pre>
+<p>This falls apart in the face of <a href="https://docs.python.org/3/library/importlib.html#importlib.reload" rel="nofollow"><code>importlib.reload()</code></a>, but meh.</p>
+<p>Next, you need to figure out whether your caller is running in one of these modules.  You'd start by pulling out the stack via <a href="https://docs.python.org/3/library/inspect.html#inspect.stack" rel="nofollow"><code>inspect.stack()</code></a> (which won't work under all Python implementations, misses C extension modules, etc.) and then goof around with <a href="https://docs.python.org/3/library/inspect.html#inspect.getmodule" rel="nofollow"><code>inspect.getmodule()</code></a> and the like.</p>
+<p>Frankly, this is just a Bad Idea.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If the "feature" that you want to control can be boiled down to changing a name, then this is easy to do, like</p>
+<pre><code>from module.new_way import something
+</code></pre>
+<p>vs</p>
+<pre><code>from module.old_way import something
+</code></pre>
+<p>The feature you suggested is not, of course, but I would argue that this is the only Pythonic way of having different behavior in different scopes (and I do think you mean scope, not module, e.g., what if someone does an import inside a function definition), since scoping names is controlled and well supported by the interpreter itself. </p>
+</div>
+<span class="comment-copy">Can you give an example of the type of thing you want the "feature" to be, and what you mean about the effects not propagating to imported modules?</span>
+<span class="comment-copy">No, you can't; <code>__future__</code> isn't <i>really</i> a standard <code>import</code>, it just adopts that syntax for convenience. See e.g. <a href="https://docs.python.org/2/reference/simple_stmts.html#future" rel="nofollow noreferrer">docs.python.org/2/reference/simple_stmts.html#future</a></span>
+<span class="comment-copy">@BrenBarn just added an example to the question</span>
+<span class="comment-copy">You <i>can</i> do this by writing an <a href="https://www.python.org/dev/peps/pep-0302/" rel="nofollow noreferrer">import hook</a> (or, more simply, in 3.4+, by just <a href="https://docs.python.org/3/reference/import.html" rel="nofollow noreferrer">implementing the piece of the import machinery you want to replace</a>.</span>
+<span class="comment-copy">It's worth noting that Python only uses future statements when absolutely necessary (i.e., when it affects the parser), and even then there's a lot of resistance, and more each year. Look at all the work that's gone into making <code>await</code> and <code>async</code> into effectively contextual keywords just to avoid having to create a new future feature. (Although many of the core devs seem to think contextual keywords are even worse, so they may end up using a future statement anyway...) So extending the same idea to a wider realm may not fit the modern definition of "pythonic".</span>
+<span class="comment-copy">Technically, anything which relies on the <code>sys.modules[__name__]</code> hack is <a href="https://docs.python.org/3/reference/import.html#fnlo" rel="nofollow noreferrer">only guaranteed to work under CPython</a>, but it's sufficiently well-known that I imagine it's likely to work under most reasonable implementations.  As a fallback, you can always put your module in a package and do the fixup in the package's <code>__init__.py</code> file instead.</span>
+<span class="comment-copy">You can do this, but it won't really achieve what the OP seems to want.  The problem is that if your magic <i>does</i> anything that affects the behavior of <i>other</i> modules (or its enclosing package), it will do so globally.  That is, if <code>from myproject.__future__ import more_magic</code> changes the behavior of some functions in <code>myproject</code>, those functions, when called, will not know whether they are being called from a module that has imported this custom <code>__future__</code>.  So for this to work, you would have to add similar caller-checking to every function whose behavior you want to futurize.</span>
+<span class="comment-copy">I should note that you arguably aren't writing "pure" Python any more if you use AST transforms, but this does look more workable than the other answers.</span>
+<span class="comment-copy">@Kevin: Well, it's still "pure Python syntax", and your code is still executable on any Python interpreter as long as the import hooking code is present (which is the same for any other module you just normally import), so it's arguable the other way too… But yeah, obviously I would only do this if you different semantics from normal Python semantics; otherwise, what's the point? So, you'll at least need to make it very clear to your readers what you're doing, and what they need to learn. But anyway, "not pure Python X.Y" is exactly what future statements do, right? And that's what's asked for</span>
+<span class="comment-copy">I'd also like to note, as a practical matter, that AST transforms are going to have a hell of a time figuring out whether a given subscript is or is not a NumPy subscript (to use OP's example), since that basically entails deducing the type of a variable.  This can be done in some cases, but not every case.</span>
+<span class="comment-copy">Numpy on CPython contains native code already, so you can call a native function <code>__newgetitem__</code> instead for all indexing operators; it could do some pretty fast dispatch for example by first seeing the <code>tp_type</code> flags for list, tuple, string, bytes or dictionary, then if that fails, looking up by <code>tp_type</code> from a hash table...</span>
+<span class="comment-copy">@anttihaapala: I think it would be easier to check for NumPy types, do the new method if found, and just call the normal <code>__getitem__</code> if not. Of course that would mean you can't write a "NumPy-like type" in pure Python, but most projects don't need that. (If yours does, I don't see any alternative but a <code>getattr</code> for the new method, which would be slower.)</span>

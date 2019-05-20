@@ -1,0 +1,85 @@
+<div class="post-text" itemprop="text">
+<p>Normally I process files in Python using a with statement, as in this chunk for downloading a resource via HTTP:</p>
+<pre><code>with (open(filename), "wb"):
+    for chunk in request.iter_content(chunk_size=1024):
+        if chunk:
+            file.write(chunk)
+            file.flush()
+</code></pre>
+<p>But this assumes I know the filename.  Suppose I want to use <code>tempfile.mkstemp()</code>.  This function returns a handle to an open file and a pathname, so using <code>open</code> in a <code>with</code> statement would be wrong.</p>
+<p>I've searched around a bit and found lots of warnings about being careful to use <code>mkstemp</code> properly.  Several blog articles nearly shout when they say do NOT throw away the integer returned by <code>mkstemp</code>.  There are discussions about the os-level filehandle being different from a Python-level file object.  That's fine, but I haven't been able to find the simplest coding pattern that would ensure that</p>
+<ul>
+<li><code>mkstemp</code> is called to get a file to be written to</li>
+<li>after writing, the Python file and its underlying os filehandle are both closed cleanly even in the event of an exception.  This is precisely the kind of behavior we can get with an <code>with(open...</code> pattern.</li>
+</ul>
+<p>So my question is, is there a nice way in Python to create and write to a <code>mkstemp</code> generated file, perhaps using a different kind of with statemement, or do I have to manually do things like <code>fdopen</code> or <code>close</code>, etc.  It seems there should be a clear pattern for this.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <em>simplest</em> coding pattern for this is <code>try:</code>/<code>finally:</code>:</p>
+<pre><code>fd, pathname = tempfile.mkstemp()
+try:
+    dostuff(fd)
+finally:
+    os.close(fd)
+</code></pre>
+<p>However, if you're doing this more than once, it's trivial to wrap it up in a context manager:</p>
+<pre><code>@contextlib.contextmanager
+def mkstemping(*args):
+    fd, pathname = tempfile.mkstemp(*args)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+</code></pre>
+<p>And then you can just do:</p>
+<pre><code>with mkstemping() as fd:
+    dostuff(fd)
+</code></pre>
+<hr/>
+<p>If you really want to, of course, you can always wrap the fd up in a file object (by passing it to <a href="http://docs.python.org/3/library/functions.html#open" rel="noreferrer"><code>open</code></a>, or <a href="http://docs.python.org/3/library/os.html#os.fdopen" rel="noreferrer"><code>os.fdopen</code></a> in older versions). But… why go to the extra trouble? If you want an fd, use it as an fd.</p>
+<p>And if you <em>don't</em> want an fd, unless you have a good reason that you need <code>mkstemp</code> instead of the simpler and higher-level <a href="http://docs.python.org/3/library/tempfile.html#tempfile.NamedTemporaryFile" rel="noreferrer"><code>NamedTemporaryFile</code></a>, 
+you <em>shouldn't</em> be using the low-level API. Just do this:</p>
+<pre><code>with tempfile.NamedTemporaryFile(delete=False) as f:
+    dostuff(f)
+</code></pre>
+<p>Besides being simpler to <code>with</code>, this also has the advantage that it's already a Python file object instead of just an OS file descriptor (and, in Python 3.x, it can be a Unicode text file).</p>
+<hr/>
+<p>An even simpler solution is to avoid the tempfile completely.</p>
+<p>Almost all XML parsers have a way to parse a string instead of a file. With <code>cElementTree</code>, it's just a matter of calling <a href="http://docs.python.org/2/library/xml.etree.elementtree.html#xml.etree.ElementTree.fromstring" rel="noreferrer"><code>fromstring</code></a> instead of <code>parse</code>. So, instead of this:</p>
+<pre><code>req = requests.get(url)
+with tempfile.NamedTemporaryFile() as f:
+    f.write(req.content)
+    f.seek(0)
+    tree = ET.parse(f)
+</code></pre>
+<p>… just do this:</p>
+<pre><code>req = requests.get(url)
+tree = ET.fromstring(req.content)
+</code></pre>
+<p>Of course the first version only needs to hold the XML document and the parsed tree in memory one after the other, while the second needs to hold them both at once, so this may increase your peak memory usage by about 30%. But this is rarely a problem.</p>
+<p>If it <em>is</em> a problem, many XML libraries have a way to feed in data as it arrives, and many downloading libraries have a way to stream data bit by bit—and, as you might imagine, this is again true for cElementTree's <a href="http://docs.python.org/2/library/xml.etree.elementtree.html#xmlparser-objects" rel="noreferrer"><code>XMLParser</code></a> and for <code>requests</code> in <a href="http://www.python-requests.org/en/latest/user/advanced/#body-content-workflow" rel="noreferrer">a few different ways</a>. For example:</p>
+<pre><code>req = requests.get(url, stream=True)
+parser = ET.XMLParser()
+for chunk in iter(lambda: req.raw.read(8192), ''):
+    parser.feed(chunk)
+tree = parser.close()
+</code></pre>
+<p>Not quite as simple as just using <code>fromstring</code>… but it's still simpler than using a temporary file, and probably more efficient to boot.</p>
+<p>If that use of the two-argument form of <a href="http://docs.python.org/2/library/functions.html#iter" rel="noreferrer"><code>iter</code></a> confuses you (a lot of people seem to have trouble grasping it at first), you can rewrite it as:</p>
+<pre><code>req = requests.get(url, stream=True)
+parser = ET.XMLParser()
+while True:
+    chunk = req.raw.read(8192)
+    if not chunk:
+        break
+    parser.feed(chunk)
+tree = parser.close()
+</code></pre>
+</div>
+<span class="comment-copy">First, is there a reason you need to use <code>mkstemp</code> instead of the simpler and higher-level <code>NamedTemporaryFile</code>?</span>
+<span class="comment-copy"><code>NamedTemporaryFile</code> is correct.  The warnings about it not behaving exactly the same on different platforms was a little disconcerting at first, and led me to the underlying <code>mkstemp</code>, but I'm okay with it now.</span>
+<span class="comment-copy">I like the simplicity of <code>NamedTemporaryFile</code>.  I'm just going to fetch an XML (sorry! not my choice) resource into the tempfile, then parse and validate it, then the tempfile can go away.</span>
+<span class="comment-copy">@RayToal: Do you actually even need a temp file? Most XML parsers can parse a string and/or let you feed data in as it arrives…</span>
+<span class="comment-copy">Good question.  I'm downloading an xml file with the <a href="http://docs.python-requests.org/en/latest/" rel="nofollow noreferrer">requests</a> module and parsing it with <a href="http://effbot.org/zone/celementtree.htm" rel="nofollow noreferrer">cElementTree</a>.  Yes I would love to be able to have the downloaded HTTP response be treated as a stream which is then read by the cElementTree parser.  I tried to figure that out first before giving up and switching to a temp file.</span>
+<span class="comment-copy">@RayToal: If you really do need to stream, see <a href="http://www.python-requests.org/en/latest/user/advanced/#body-content-workflow" rel="nofollow noreferrer">Body Content Workflow</a> for how to stream data iteratively from requests, and <a href="http://docs.python.org/2/library/xml.etree.elementtree.html#xmlparser-objects" rel="nofollow noreferrer"><code>XMLParser</code> Objects</a> for how to feed data iteratively to etree.</span>
+<span class="comment-copy">@RayToal: See my edited answer for how to do this without using a file at all.</span>

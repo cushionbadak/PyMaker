@@ -1,0 +1,852 @@
+<div class="post-text" itemprop="text">
+<p>How to get the value <code>'foo'</code> which is returned from the thread's target?  </p>
+<pre><code>from threading import Thread
+
+def foo(bar):
+    print('hello {}'.format(bar))
+    return 'foo'
+
+thread = Thread(target=foo, args=('world!',))
+thread.start()
+return_value = thread.join()
+</code></pre>
+<p>The "one obvious way to do it", shown above, doesn't work: <code>thread.join()</code> returned <code>None</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>FWIW, the <code>multiprocessing</code> module has a nice interface for this using the <code>Pool</code> class.  And if you want to stick with threads rather than processes, you can just use the <code>multiprocessing.pool.ThreadPool</code> class as a drop-in replacement.</p>
+<pre><code>def foo(bar, baz):
+  print 'hello {0}'.format(bar)
+  return 'foo' + baz
+
+from multiprocessing.pool import ThreadPool
+pool = ThreadPool(processes=1)
+
+async_result = pool.apply_async(foo, ('world', 'foo')) # tuple of args for foo
+
+# do some other stuff in the main process
+
+return_val = async_result.get()  # get the return value from your function.
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>One way I've seen is to pass a mutable object, such as a list or a dictionary, to the thread's constructor, along with a an index or other identifier of some sort. The thread can then store its results in its dedicated slot in that object.  For example:</p>
+<pre><code>def foo(bar, result, index):
+    print 'hello {0}'.format(bar)
+    result[index] = "foo"
+
+from threading import Thread
+
+threads = [None] * 10
+results = [None] * 10
+
+for i in range(len(threads)):
+    threads[i] = Thread(target=foo, args=('world!', results, i))
+    threads[i].start()
+
+# do some other stuff
+
+for i in range(len(threads)):
+    threads[i].join()
+
+print " ".join(results)  # what sound does a metasyntactic locomotive make?
+</code></pre>
+<p>If you really want <code>join()</code> to return the return value of the called function, you can do this with a <code>Thread</code> subclass like the following:</p>
+<pre><code>from threading import Thread
+
+def foo(bar):
+    print 'hello {0}'.format(bar)
+    return "foo"
+
+class ThreadWithReturnValue(Thread):
+    def __init__(self, group=None, target=None, name=None,
+                 args=(), kwargs={}, Verbose=None):
+        Thread.__init__(self, group, target, name, args, kwargs, Verbose)
+        self._return = None
+    def run(self):
+        if self._Thread__target is not None:
+            self._return = self._Thread__target(*self._Thread__args,
+                                                **self._Thread__kwargs)
+    def join(self):
+        Thread.join(self)
+        return self._return
+
+twrv = ThreadWithReturnValue(target=foo, args=('world!',))
+
+twrv.start()
+print twrv.join()   # prints foo
+</code></pre>
+<p>That gets a little hairy because of some name mangling, and it accesses "private" data structures that are specific to <code>Thread</code> implementation... but it works.</p>
+<p>For python3</p>
+<pre><code>class ThreadWithReturnValue(Thread):
+    def __init__(self, group=None, target=None, name=None,
+                 args=(), kwargs={}, Verbose=None):
+        Thread.__init__(self, group, target, name, args, kwargs)
+        self._return = None
+    def run(self):
+        print(type(self._target))
+        if self._target is not None:
+            self._return = self._target(*self._args,
+                                                **self._kwargs)
+    def join(self, *args):
+        Thread.join(self, *args)
+        return self._return
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Jake's answer is good, but if you don't want to use a threadpool (you don't know how many threads you'll need, but create them as needed) then a good way to transmit information between threads is the built-in <a href="http://docs.python.org/2/library/queue.html" rel="noreferrer">Queue.Queue</a> class, as it offers thread safety.</p>
+<p>I created the following decorator to make it act in a similar fashion to the threadpool:</p>
+<pre><code>def threaded(f, daemon=False):
+    import Queue
+
+    def wrapped_f(q, *args, **kwargs):
+        '''this function calls the decorated function and puts the 
+        result in a queue'''
+        ret = f(*args, **kwargs)
+        q.put(ret)
+
+    def wrap(*args, **kwargs):
+        '''this is the function returned from the decorator. It fires off
+        wrapped_f in a new thread and returns the thread object with
+        the result queue attached'''
+
+        q = Queue.Queue()
+
+        t = threading.Thread(target=wrapped_f, args=(q,)+args, kwargs=kwargs)
+        t.daemon = daemon
+        t.start()
+        t.result_queue = q        
+        return t
+
+    return wrap
+</code></pre>
+<p>Then you just use it as:</p>
+<pre><code>@threaded
+def long_task(x):
+    import time
+    x = x + 5
+    time.sleep(5)
+    return x
+
+# does not block, returns Thread object
+y = long_task(10)
+print y
+
+# this blocks, waiting for the result
+result = y.result_queue.get()
+print result
+</code></pre>
+<p>The decorated function creates a new thread each time it's called and returns a Thread object that contains the queue that will receive the result.</p>
+<p><strong>UPDATE</strong></p>
+<p>It's been quite a while since I posted this answer, but it still gets views so I thought I would update it to reflect the way I do this in newer versions of Python:</p>
+<p>Python 3.2 added in the <a href="https://docs.python.org/3/library/concurrent.futures.html" rel="noreferrer"><code>concurrent.futures</code></a> module which provides a high-level interface for parallel tasks.  It provides <code>ThreadPoolExecutor</code> and <code>ProcessPoolExecutor</code>, so you can use a thread or process pool with the same api.</p>
+<p>One benefit of this api is that submitting a task to an <code>Executor</code> returns a <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Future" rel="noreferrer"><code>Future</code></a> object, which will complete with the return value of the callable you submit.</p>
+<p>This makes attaching a <code>queue</code> object unnecessary, which simplifies the decorator quite a bit:</p>
+<pre><code>_DEFAULT_POOL = ThreadPoolExecutor()
+
+def threadpool(f, executor=None):
+    @wraps(f)
+    def wrap(*args, **kwargs):
+        return (executor or _DEFAULT_POOL).submit(f, *args, **kwargs)
+
+    return wrap
+</code></pre>
+<p>This will use a default <em>module</em> threadpool executor if one is not passed in.</p>
+<p>The usage is very similar to before:</p>
+<pre><code>@threadpool
+def long_task(x):
+    import time
+    x = x + 5
+    time.sleep(5)
+    return x
+
+# does not block, returns Future object
+y = long_task(10)
+print y
+
+# this blocks, waiting for the result
+result = y.result()
+print result
+</code></pre>
+<p>If you're using Python 3.4+, one really nice feature of using this method (and Future objects in general) is that the returned future can be wrapped to turn it into an <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.Future" rel="noreferrer"><code>asyncio.Future</code></a> with <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.wrap_future" rel="noreferrer"><code>asyncio.wrap_future</code></a>.  This makes it work easily with coroutines:</p>
+<pre><code>result = await asyncio.wrap_future(long_task(10))
+</code></pre>
+<p>If you don't need access to the underlying <code>concurrent.Future</code> object, you can include the wrap in the decorator:</p>
+<pre><code>_DEFAULT_POOL = ThreadPoolExecutor()
+
+def threadpool(f, executor=None):
+    @wraps(f)
+    def wrap(*args, **kwargs):
+        return asyncio.wrap_future((executor or _DEFAULT_POOL).submit(f, *args, **kwargs))
+
+    return wrap
+</code></pre>
+<p>Then, whenever you need to push cpu intensive or blocking code off the event loop thread, you can put it in a decorated function:</p>
+<pre><code>@threadpool
+def some_long_calculation():
+    ...
+
+# this will suspend while the function is executed on a threadpool
+result = await some_long_calculation()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Another solution that doesn't require changing your existing code:</p>
+<pre><code>import Queue
+from threading import Thread
+
+def foo(bar):
+    print 'hello {0}'.format(bar)
+    return 'foo'
+
+que = Queue.Queue()
+
+t = Thread(target=lambda q, arg1: q.put(foo(arg1)), args=(que, 'world!'))
+t.start()
+t.join()
+result = que.get()
+print result
+</code></pre>
+<p>It can be also easily adjusted to a multi-threaded environment:</p>
+<pre><code>import Queue
+from threading import Thread
+
+def foo(bar):
+    print 'hello {0}'.format(bar)
+    return 'foo'
+
+que = Queue.Queue()
+threads_list = list()
+
+t = Thread(target=lambda q, arg1: q.put(foo(arg1)), args=(que, 'world!'))
+t.start()
+threads_list.append(t)
+
+# Add more threads here
+...
+threads_list.append(t2)
+...
+threads_list.append(t3)
+...
+
+# Join all the threads
+for t in threads_list:
+    t.join()
+
+# Check thread's return value
+while not que.empty():
+    result = que.get()
+    print result
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Parris / kindall's <a href="https://stackoverflow.com/a/6894023/4952130">answer</a> <code>join</code>/<code>return</code> answer ported to Python 3:</p>
+<pre class="lang-python prettyprint-override"><code>from threading import Thread
+
+def foo(bar):
+    print('hello {0}'.format(bar))
+    return "foo"
+
+class ThreadWithReturnValue(Thread):
+    def __init__(self, group=None, target=None, name=None, args=(), kwargs=None, *, daemon=None):
+        Thread.__init__(self, group, target, name, args, kwargs, daemon=daemon)
+
+        self._return = None
+
+    def run(self):
+        if self._target is not None:
+            self._return = self._target(*self._args, **self._kwargs)
+
+    def join(self):
+        Thread.join(self)
+        return self._return
+
+
+twrv = ThreadWithReturnValue(target=foo, args=('world!',))
+
+twrv.start()
+print(twrv.join())   # prints foo
+</code></pre>
+<p>Note, the <code>Thread</code> class is implemented differently in Python 3.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I stole kindall's answer and cleaned it up just a little bit.</p>
+<p>The key part is adding *args and **kwargs to join() in order to handle the timeout</p>
+<pre><code>class threadWithReturn(Thread):
+    def __init__(self, *args, **kwargs):
+        super(threadWithReturn, self).__init__(*args, **kwargs)
+
+        self._return = None
+
+    def run(self):
+        if self._Thread__target is not None:
+            self._return = self._Thread__target(*self._Thread__args, **self._Thread__kwargs)
+
+    def join(self, *args, **kwargs):
+        super(threadWithReturn, self).join(*args, **kwargs)
+
+        return self._return
+</code></pre>
+<p><strong>UPDATED ANSWER BELOW</strong></p>
+<p>This is my most popularly upvoted answer, so I decided to update with code that will run on both py2 and py3.</p>
+<p>Additionally, I see many answers to this question that show a lack of comprehension regarding Thread.join(). Some completely fail to handle the <code>timeout</code> arg. But there is also a corner-case that you should be aware of regarding instances when you have (1) a target function that can return <code>None</code> and (2) you also pass the <code>timeout</code> arg to join().  Please see "TEST 4" to understand this corner case.</p>
+<p>ThreadWithReturn class that works with py2 and py3:</p>
+<pre><code>import sys
+from threading import Thread
+from builtins import super    # https://stackoverflow.com/a/30159479
+
+if sys.version_info &gt;= (3, 0):
+    _thread_target_key = '_target'
+    _thread_args_key = '_args'
+    _thread_kwargs_key = '_kwargs'
+else:
+    _thread_target_key = '_Thread__target'
+    _thread_args_key = '_Thread__args'
+    _thread_kwargs_key = '_Thread__kwargs'
+
+class ThreadWithReturn(Thread):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._return = None
+
+    def run(self):
+        target = getattr(self, _thread_target_key)
+        if not target is None:
+            self._return = target(*getattr(self, _thread_args_key), **getattr(self, _thread_kwargs_key))
+
+    def join(self, *args, **kwargs):
+        super().join(*args, **kwargs)
+        return self._return
+</code></pre>
+<p>Some sample tests are shown below:</p>
+<pre><code>import time, random
+
+# TEST TARGET FUNCTION
+def giveMe(arg, seconds=None):
+    if not seconds is None:
+        time.sleep(seconds)
+    return arg
+
+# TEST 1
+my_thread = ThreadWithReturn(target=giveMe, args=('stringy',))
+my_thread.start()
+returned = my_thread.join()
+# (returned == 'stringy')
+
+# TEST 2
+my_thread = ThreadWithReturn(target=giveMe, args=(None,))
+my_thread.start()
+returned = my_thread.join()
+# (returned is None)
+
+# TEST 3
+my_thread = ThreadWithReturn(target=giveMe, args=('stringy',), kwargs={'seconds': 5})
+my_thread.start()
+returned = my_thread.join(timeout=2)
+# (returned is None) # because join() timed out before giveMe() finished
+
+# TEST 4
+my_thread = ThreadWithReturn(target=giveMe, args=(None,), kwargs={'seconds': 5})
+my_thread.start()
+returned = my_thread.join(timeout=random.randint(1, 10))
+</code></pre>
+<p>Can you identify the corner-case that we may possibly encounter with TEST 4?</p>
+<p>The problem is that we expect giveMe() to return None (see TEST 2), but we also expect join() to return None if it times out.</p>
+<p><code>returned is None</code> means either:</p>
+<p>(1) that's what giveMe() returned, or</p>
+<p>(2) join() timed out</p>
+<p>This example is trivial since we know that giveMe() will always return None. But in real-world instance (where the target may legitimately return None or something else) we'd want to explicitly check for what happened.</p>
+<p>Below is how to address this corner-case:</p>
+<pre><code># TEST 4
+my_thread = ThreadWithReturn(target=giveMe, args=(None,), kwargs={'seconds': 5})
+my_thread.start()
+returned = my_thread.join(timeout=random.randint(1, 10))
+
+if my_thread.isAlive():
+    # returned is None because join() timed out
+    # this also means that giveMe() is still running in the background
+    pass
+    # handle this based on your app's logic
+else:
+    # join() is finished, and so is giveMe()
+    # BUT we could also be in a race condition, so we need to update returned, just in case
+    returned = my_thread.join()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Using Queue :</p>
+<pre><code>import threading, queue
+
+def calc_square(num, out_queue1):
+  l = []
+  for x in num:
+    l.append(x*x)
+  out_queue1.put(l)
+
+
+arr = [1,2,3,4,5,6,7,8,9,10]
+out_queue1=queue.Queue()
+t1=threading.Thread(target=calc_square, args=(arr,out_queue1))
+t1.start()
+t1.join()
+print (out_queue1.get())
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>My solution to the problem is to wrap the function and thread in a class. Does not require using pools,queues, or c type variable passing. It is also non blocking. You check status instead. See example of how to use it at end of code.</p>
+<pre><code>import threading
+
+class ThreadWorker():
+    '''
+    The basic idea is given a function create an object.
+    The object can then run the function in a thread.
+    It provides a wrapper to start it,check its status,and get data out the function.
+    '''
+    def __init__(self,func):
+        self.thread = None
+        self.data = None
+        self.func = self.save_data(func)
+
+    def save_data(self,func):
+        '''modify function to save its returned data'''
+        def new_func(*args, **kwargs):
+            self.data=func(*args, **kwargs)
+
+        return new_func
+
+    def start(self,params):
+        self.data = None
+        if self.thread is not None:
+            if self.thread.isAlive():
+                return 'running' #could raise exception here
+
+        #unless thread exists and is alive start or restart it
+        self.thread = threading.Thread(target=self.func,args=params)
+        self.thread.start()
+        return 'started'
+
+    def status(self):
+        if self.thread is None:
+            return 'not_started'
+        else:
+            if self.thread.isAlive():
+                return 'running'
+            else:
+                return 'finished'
+
+    def get_results(self):
+        if self.thread is None:
+            return 'not_started' #could return exception
+        else:
+            if self.thread.isAlive():
+                return 'running'
+            else:
+                return self.data
+
+def add(x,y):
+    return x +y
+
+add_worker = ThreadWorker(add)
+print add_worker.start((1,2,))
+print add_worker.status()
+print add_worker.get_results()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can define a mutable above the scope of the threaded function, and add the result to that. (I also modified the code to be python3 compatible)</p>
+<pre><code>returns = {}
+def foo(bar):
+    print('hello {0}'.format(bar))
+    returns[bar] = 'foo'
+
+from threading import Thread
+t = Thread(target=foo, args=('world!',))
+t.start()
+t.join()
+print(returns)
+</code></pre>
+<p>This returns <code>{'world!': 'foo'}</code></p>
+<p>If you use the function input as the key to your results dict, every unique input is guaranteed to give an entry in the results </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can use Pool as a pool of worker processes as below:</p>
+<pre><code>from multiprocessing import Pool
+
+
+def f1(x, y):
+    return x*y
+
+
+if __name__ == '__main__':
+    with Pool(processes=10) as pool:
+        result = pool.apply(f1, (2, 3))
+        print(result)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Taking into consideration <strong><em>@iman</em></strong> comment on <strong><em>@JakeBiesinger</em></strong> answer I have recomposed it to have various number of threads:</p>
+<pre><code>from multiprocessing.pool import ThreadPool
+
+def foo(bar, baz):
+    print 'hello {0}'.format(bar)
+    return 'foo' + baz
+
+numOfThreads = 3 
+results = []
+
+pool = ThreadPool(numOfThreads)
+
+for i in range(0, numOfThreads):
+    results.append(pool.apply_async(foo, ('world', 'foo'))) # tuple of args for foo)
+
+# do some other stuff in the main process
+# ...
+# ...
+
+results = [r.get() for r in results]
+print results
+
+pool.close()
+pool.join()
+</code></pre>
+<p>Cheers,</p>
+<p>Guy.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>join</code> always return <code>None</code>, i think you should subclass <code>Thread</code> to handle return codes and so.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'm using this wrapper, which comfortably turns any function for running in a <code>Thread</code> - taking care of its return value or exception. It doesn't add <code>Queue</code> overhead. </p>
+<pre><code>def threading_func(f):
+    """Decorator for running a function in a thread and handling its return
+    value or exception"""
+    def start(*args, **kw):
+        def run():
+            try:
+                th.ret = f(*args, **kw)
+            except:
+                th.exc = sys.exc_info()
+        def get(timeout=None):
+            th.join(timeout)
+            if th.exc:
+                raise th.exc[0], th.exc[1], th.exc[2] # py2
+                ##raise th.exc[1] #py3                
+            return th.ret
+        th = threading.Thread(None, run)
+        th.exc = None
+        th.get = get
+        th.start()
+        return th
+    return start
+</code></pre>
+<h2>Usage Examples</h2>
+<pre><code>def f(x):
+    return 2.5 * x
+th = threading_func(f)(4)
+print("still running?:", th.is_alive())
+print("result:", th.get(timeout=1.0))
+
+@threading_func
+def th_mul(a, b):
+    return a * b
+th = th_mul("text", 2.5)
+
+try:
+    print(th.get())
+except TypeError:
+    print("exception thrown ok.")
+</code></pre>
+<h2>Notes on <code>threading</code> module</h2>
+<p>Comfortable return value &amp; exception handling of a threaded function is a frequent "Pythonic" need and should indeed already be offered by the <code>threading</code> module - possibly directly in the standard <code>Thread</code> class. <code>ThreadPool</code> has way too much overhead for simple tasks - 3 managing threads, lots of bureaucracy. Unfortunately <code>Thread</code>'s layout was copied from Java originally - which you see e.g. from the still useless 1st (!) constructor parameter <code>group</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As mentioned multiprocessing pool is much slower than basic threading. Using queues as proposeded in some answers here is a very effective alternative. I have use it with dictionaries in order to be able run a lot of small threads and recuperate multiple answers by combining them with dictionaries:</p>
+<pre><code>#!/usr/bin/env python3
+
+import threading
+# use Queue for python2
+import queue
+import random
+
+LETTERS = 'abcdefghijklmnopqrstuvwxyz'
+LETTERS = [ x for x in LETTERS ]
+
+NUMBERS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+def randoms(k, q):
+    result = dict()
+    result['letter'] = random.choice(LETTERS)
+    result['number'] = random.choice(NUMBERS)
+    q.put({k: result})
+
+threads = list()
+q = queue.Queue()
+results = dict()
+
+for name in ('alpha', 'oscar', 'yankee',):
+    threads.append( threading.Thread(target=randoms, args=(name, q)) )
+    threads[-1].start()
+_ = [ t.join() for t in threads ]
+while not q.empty():
+    results.update(q.get())
+
+print(results)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Define your target to<br/>
+1) take an argument <code>q</code><br/>
+2) replace any statements <code>return foo</code> with <code>q.put(foo); return</code></p>
+<p>so a function</p>
+<pre><code>def func(a):
+    ans = a * a
+    return ans
+</code></pre>
+<p>would become</p>
+<pre><code>def func(a, q):
+    ans = a * a
+    q.put(ans)
+    return
+</code></pre>
+<p>and then you would proceed as such</p>
+<pre><code>from Queue import Queue
+from threading import Thread
+
+ans_q = Queue()
+arg_tups = [(i, ans_q) for i in xrange(10)]
+
+threads = [Thread(target=func, args=arg_tup) for arg_tup in arg_tups]
+_ = [t.start() for t in threads]
+_ = [t.join() for t in threads]
+results = [q.get() for _ in xrange(len(threads))]
+</code></pre>
+<p>And you can use function decorators/wrappers to make it so you can use your existing functions as <code>target</code> without modifying them, but follow this basic scheme.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>One usual solution is to wrap your function <code>foo</code> with a decorator like</p>
+<pre><code>result = queue.Queue()
+
+def task_wrapper(*args):
+    result.put(target(*args))
+</code></pre>
+<p>Then the whole code may looks like that</p>
+<pre><code>result = queue.Queue()
+
+def task_wrapper(*args):
+    result.put(target(*args))
+
+threads = [threading.Thread(target=task_wrapper, args=args) for args in args_list]
+
+for t in threads:
+    t.start()
+    while(True):
+        if(len(threading.enumerate()) &lt; max_num):
+            break
+for t in threads:
+    t.join()
+return result
+</code></pre>
+<h1>Note</h1>
+<p>One important issue is that the return values may be <strong>unorderred</strong>.
+(In fact, the <code>return value</code> is not necessarily saved to the <code>queue</code>, since you can choose arbitrary <strong>thread-safe</strong> data structure )</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Why don't just use global variable?</p>
+<pre><code>import threading
+
+
+class myThread(threading.Thread):
+    def __init__(self, ind, lock):
+        threading.Thread.__init__(self)
+        self.ind = ind
+        self.lock = lock
+
+    def run(self):
+        global results
+        with self.lock:
+            results.append(self.ind)
+
+
+
+results = []
+lock = threading.Lock()
+threads = [myThread(x, lock) for x in range(1, 4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print(results)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Very simple way to get this done for such dummies like me:</p>
+<pre><code>import queue
+import threading
+
+# creating queue instance
+q = queue.Queue()
+
+# creating threading class
+class AnyThread():
+    def __init__ (self):
+        threading.Thread.__init__(self)
+
+    def run(self):
+        # in this class and function we will put our test target function
+        test()
+
+t = AnyThread()
+
+# having our test target function
+def test():
+    # do something in this function:
+    result = 3 + 2
+    # and put result to a queue instance
+    q.put(result)
+
+for i in range(3): #calling our threading fucntion 3 times (just for example)
+    t.run()
+    output = q.get() # here we get output from queue instance
+    print(output)
+
+&gt;&gt;&gt; 5
+&gt;&gt;&gt; 5
+&gt;&gt;&gt; 5
+</code></pre>
+<p>main thing here - is <code>queue</code> module. We create <code>queue.Queue()</code> instance and include it in our function. We feed it with our result which later we get beyond the thread.</p>
+<p>Please see one more example with arguments passed to our test function:</p>
+<pre><code>import queue
+import threading
+
+# creating queue instance
+q = queue.Queue()
+
+# creating threading class
+class AnyThread():
+    def __init__ (self):
+        threading.Thread.__init__(self)
+
+    def run(self, a, b):
+        # in this class and function we will put our execution test function
+        test(a, b)
+
+t = AnyThread()
+
+# having our test target function
+def test(a, b):
+    # do something in this function:
+    result = a + b
+    # and put result to a queue instance
+    q.put(result)
+
+for i in range(3): #calling our threading fucntion 3 times (just for example)
+    t.run(3+i, 2+i)
+    output = q.get() # here we get output from queue instance
+    print(output)
+
+&gt;&gt;&gt; 5
+&gt;&gt;&gt; 7
+&gt;&gt;&gt; 9
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>GuySoft's idea is great, but I think the object does not necessarily have to inherit from Thread and start() could be removed from interface:</p>
+<pre><code>from threading import Thread
+import queue
+class ThreadWithReturnValue(object):
+    def __init__(self, target=None, args=(), **kwargs):
+        self._que = queue.Queue()
+        self._t = Thread(target=lambda q,arg1,kwargs1: q.put(target(*arg1, **kwargs1)) ,
+                args=(self._que, args, kwargs), )
+        self._t.start()
+
+    def join(self):
+        self._t.join()
+        return self._que.get()
+
+
+def foo(bar):
+    print('hello {0}'.format(bar))
+    return "foo"
+
+twrv = ThreadWithReturnValue(target=foo, args=('world!',))
+
+print(twrv.join())   # prints foo
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://stackoverflow.com/a/6894023/5033247">Kindall's answer</a> in Python3</p>
+<pre><code>class ThreadWithReturnValue(Thread):
+    def __init__(self, group=None, target=None, name=None,
+                 args=(), kwargs={}, *, daemon=None):
+        Thread.__init__(self, group, target, name, args, kwargs, daemon)
+        self._return = None 
+
+    def run(self):
+        try:
+            if self._target:
+                self._return = self._target(*self._args, **self._kwargs)
+        finally:
+            del self._target, self._args, self._kwargs 
+
+    def join(self,timeout=None):
+        Thread.join(self,timeout)
+        return self._return
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If only True or False is to be validated from a function's call, a simpler solution I find is updating a global list. </p>
+<pre><code>import threading
+
+lists = {"A":"True", "B":"True"}
+
+def myfunc(name: str, mylist):
+    for i in mylist:
+        if i == 31:
+            lists[name] = "False"
+            return False
+        else:
+            print("name {} : {}".format(name, i))
+
+t1 = threading.Thread(target=myfunc, args=("A", [1, 2, 3, 4, 5, 6], ))
+t2 = threading.Thread(target=myfunc, args=("B", [11, 21, 31, 41, 51, 61], ))
+t1.start()
+t2.start()
+t1.join()
+t2.join()
+
+for value in lists.values():
+    if value == False:
+        # Something is suspicious 
+        # Take necessary action 
+</code></pre>
+<p>This is more helpful where you want to find if any one of the threads had returned a false status to take the necessary action. </p>
+</div>
+<span class="comment-copy">@JakeBiesinger My point is, that I was looking for answer, how to get response from Thread, came here, and accepted answer doesn't answer question stated. I differantiate threads and processes. I know about Global Interpreter Lock however I'm working on I/O bound problem so Threads are ok, I don't need processes. Other answers here better answer question stated.</span>
+<span class="comment-copy">@omikron But threads in python don't return a response unless you use a subclass that enables this functionality. Of possible subclasses, ThreadPools are a great choice (choose # of threads, use map/apply w/sync/async).  Despite being imported from <code>multiprocess</code>, they have nothing to do with Processes.</span>
+<span class="comment-copy">@JakeBiesinger Oh, I'm blind. Sorry for my unnecessary comments. You are right. I just assumed that multiprocessing = processes.</span>
+<span class="comment-copy">Don't forget to set <code>processes=1</code> to more than one if you have more threads!</span>
+<span class="comment-copy">The problem with multiprocessing and the thread pool is that it much slower to setup and start threads compared to the basic threading library. It's great for starting long running threads but defeat the purpose when needing to start a lot of short running threads.  The solution of using "threading" and "Queue" documented in other answers here is a better alternative for that latter use case in my opinion.</span>
+<span class="comment-copy">thanks, i can see that that would be fine as a workaround, but it changes the function definition so that it doesn't really <code>return</code> anything.  i wanted to know in my original case, where <i>does</i> that 'foo' actually go...?</span>
+<span class="comment-copy">cool, thanks for the example!  i wonder why Thread was not implemented with handling a return value in the first place, it seems like an obvious enough thing to support.</span>
+<span class="comment-copy">I think this should be the accepted answer - the OP asked for <code>threading</code>, not a different library to try, plus the pool size limitation introduces an additional potential problem, which happened in my case.</span>
+<span class="comment-copy">Great train joke.</span>
+<span class="comment-copy">On python3 this returns <code>TypeError: __init__() takes from 1 to 6 positional arguments but 7 were given</code> . Any way to fix that?</span>
+<span class="comment-copy">I can't seem to get this to work; I get an error stating <code>AttributeError: 'module' object has no attribute 'Lock'</code> this appears to be emanating from the line <code>y = long_task(10)</code>... thoughts?</span>
+<span class="comment-copy">The code doesn't explicitly use Lock, so the problem could be somewhere else in your code.  You may want to post a new SO question about it</span>
+<span class="comment-copy">Why is result_queue an instance attribute? Would it be better if it was a class attribute so that users won't have to know to call result_queue when using @threaded which is not explicit and ambiguous?</span>
+<span class="comment-copy">@t88, not sure what you mean, you need some way of accessing the result, which means you need to know what to call.  If you want it to be something else you can subclass Thread and do what you want (this was a simple solution).  The reason the queue needs to be attached to the thread is so that multiple calls/functions have their own queues</span>
+<span class="comment-copy">This is brilliant! Thank you very much.</span>
+<span class="comment-copy">t = Thread(target=lambda q, arg1: q.put(foo(arg1)), args=(que, 'world!')) whats q.put doing here, what does the Queue.Queue() does</span>
+<span class="comment-copy">que = Queue.Queue() - creates a queue q.put(foo) - inserts foo() into the queue</span>
+<span class="comment-copy">right !! i am delighted</span>
+<span class="comment-copy">There should be a statue of you in your hometown, thank you!</span>
+<span class="comment-copy">@Onilol - Thank you very much. Your comment is exactly the reason I do this :)</span>
+<span class="comment-copy">join takes a timeout parameter that should be passed along</span>
+<span class="comment-copy">Do you know the _Thread_target equivalent for Python3? That attribute doesn't exist in Python3.</span>
+<span class="comment-copy">I looked in the threading.py file, it turns out it is _target (other attributes are similarly named).</span>
+<span class="comment-copy">You could avoid accessing the private variables of the thread class, if you save the <code>target</code>, <code>args</code>, and <code>kwargs</code> arguments to <b>init</b> as member variables in your class.</span>
+<span class="comment-copy">@GreySage See my answer, <a href="http://stackoverflow.com/a/40344234/311268">I ported this block to python3</a> below</span>
+<span class="comment-copy">@GreySage answer now supports py2 and py3</span>
+<span class="comment-copy">Really like this sollution, short and sweet. If your function reads an input queue, and you add to the <code>out_queue1</code> you will need to loop over <code>out_queue1.get()</code> and catch the Queue.Empty exception: <code>ret = [] ; try: ; while True; ret.append(out_queue1.get(block=False)) ; except Queue.Empty: ; pass</code>. Semi-colons to simulate line breaks.</span>
+<span class="comment-copy">how would you handle an exception? let's say the add function was given and int and a str. would all the threads fail or would only one fail?</span>
+<span class="comment-copy">the first constructor is not useless, its reserved there for future implementation.. from python parallel programming cookbook</span>

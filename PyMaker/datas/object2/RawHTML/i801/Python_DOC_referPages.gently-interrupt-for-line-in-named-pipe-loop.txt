@@ -1,0 +1,191 @@
+<div class="post-text" itemprop="text">
+<p>I'm reading from a named pipe in a blocking manner.
+I want my python script to react to SIGTERM signals.</p>
+<p>This is what i've got so far:</p>
+<pre><code>#!/usr/bin/python3
+
+import signal
+
+def handler_stop_signals(signum, frame):
+    global fifo
+    fifo.close()
+    exit
+
+signal.signal(signal.SIGTERM, handler_stop_signals)
+
+fifo = open("someNamedPipe", "r")
+while True:
+    for line in fifo:
+        doSomething
+fifo.close()
+exit
+</code></pre>
+<p>When the script receives a SIGTERM signal, it closes the pipe as expected but raises a RuntimeError.</p>
+<p><code>RuntimeError: reentrant call inside &lt;_io.BufferedReader name='someNamedPipe'&gt;</code></p>
+<p>Is there another way to get out of the foor loop and close the fifo gently?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>TL;DR You need a <em>non-blocking</em> read in order to be able to control termination; <a href="https://docs.python.org/3/library/asyncio.html" rel="nofollow noreferrer">asyncio</a> using <a href="https://github.com/Tinche/aiofiles" rel="nofollow noreferrer">aiofiles</a> is probably the most elegant solution, but they all have their quirks.</p>
+<h2>Sample Producer</h2>
+<p>I'm going to start with how one would go about writing a well-behaved <em>producer</em> of data to a named pipe, because it's an easier vehicle to introduce some APIs.</p>
+<pre><code>import os
+from threading import Event
+
+class Producer:
+    def __init__(self, path):
+        self.path = path
+        self.event = Event()
+
+    def start(self):
+        os.mkfifo(self.path)
+        try:
+            print('Waiting for a listener...')
+            with open(self.path, 'w') as fifo:
+                fifo.write('Starting the convoluted clock...\n')
+                fifo.flush()
+
+                while not self.event.wait(timeout=1):
+                    print('Writing a line...')
+                    fifo.write(str(datetime.now()) + '\n')
+                    fifo.flush()
+
+                fifo.write('The convoluted clock has finished.\n')
+                fifo.flush()
+                print('Finished.')
+        finally:
+            os.unlink(self.path)
+
+    def stop(self, *args, **kwargs):
+        self.event.set()
+
+producer = Producer('/tmp/someNamedPipe')
+signal.signal(signal.SIGINT, producer.stop)
+signal.signal(signal.SIGTERM, producer.stop)
+producer.start()
+</code></pre>
+<p>This writes the current date out to the named pipe as a string once a second. <code>SIGINT</code> and <code>SIGTERM</code> will both shut the pipe down gracefully, writing <code>The convoluted clock has finished.</code> as the last line to the pipe before closing down. It uses a <code>threading.Event</code> to communicate between the <code>stop</code> method (which will be run on a background thread) and <code>start</code> (which waits for at most one second before advancing to the next iteration of the loop). <code>self.event.wait(timeout=1)</code> immediately returns <code>True</code> if the signal is set, or <code>False</code> after waiting at most one second <em>without</em> the signal being set.</p>
+<h2>Sample (Buggy) Consumer</h2>
+<p>It would be tempting to use a similar technique to write the consumer:</p>
+<pre><code>import signal, os
+from threading import Event
+
+class BuggyConsumer:
+    def __init__(self, path):
+        self.path = path
+        self.event = Event()
+
+    def start(self):
+        with open(self.path, 'r') as fifo:
+            # we'll be a bit more aggressive on checking for termination
+            # because we could have new data for us at any moment!
+            while not self.event.wait(0.1):
+                print('Got from the producer:', fifo.readline())
+
+            print('The consumer was nicely stopped.')
+            # technically the pipe gets closed AFTER this print statement
+            # because we're using a with block
+        finally:
+            fifo.close()
+
+    def stop(self, *args, **kwargs):
+        self.event.set()
+
+consumer = BuggyConsumer('/tmp/someNamedPipe')
+signal.signal(signal.SIGINT, consumer.stop)
+signal.signal(signal.SIGTERM, consumer.stop)
+consumer.start()
+</code></pre>
+<p>Unfortunately this won't work great in practice because <code>open()</code> opens files in <em>blocking mode</em>. This means <code>read()</code> calls block the calling thread, which essentially prevent "nice" aborts unless you check in-between <code>read</code> calls. Concretely, if the producer stops producing but kept the pipe open, the consumer would sit forever at <code>fifo.readline()</code> and would never get around to checking the signal for "nice" termination.</p>
+<h2>Sample (Less Buggy) Consumer</h2>
+<p>This example avoids the problem of a misbehaving producer trapping the consumer in a blocking read call, but it's considerably more complicated and forces you to use lower-level APIs that are not nearly as friendly:</p>
+<pre><code>import signal, os
+from threading import Event
+
+class ComplicatedConsumer:
+    def __init__(self, path):
+        self.path = path
+        self.event = Event()
+
+    def start(self):
+        # Open a file descriptor in a non-blocking way.
+        fifo = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            while not self.event.wait(0.1):
+                try:
+                    # This is FAR from a comprehensive implementation.
+                    # We're making some pretty yucky assumptions.
+                    line = os.read(fifo, 1000).decode('utf8')
+                    if line:
+                        print('Got from the producer:', line)
+                    else:
+                        print('EOF from the producer.')
+                        break
+                except BlockingIOError:
+                    # the call to os.read would have blocked (meaning we're
+                    # caught up)
+                    pass
+
+            print('The consumer was nicely stopped.')
+
+        finally:
+            os.close(fifo)
+
+    def stop(self, *args, **kwargs):
+        self.event.set()
+</code></pre>
+<p>A <em>proper</em> implementation would be FAR more complicated, because this code naively assumes that:</p>
+<ul>
+<li>each <code>read()</code> call from the pipe is a single, complete "message"; this is the worst assumption. You could speed up the producer and see that this less buggy consumer starts reading multiple "lines" as a single line.</li>
+<li>a line never spans more than 1000 bytes; a more advanced implementation would need to buffer "partial" messages, look for newlines, and split accordingly</li>
+</ul>
+<p>In all but the most simplistic and slow-moving use cases (like, say, a once-a-second ticking clock), this implementation would need a TON of work in order to be practically useful.</p>
+<h2>Sample Consumer (<code>asyncio</code>)</h2>
+<p>The challenge in writing this properly is that there are multiple unpredictable sources of events (signals, incoming data from a pipe). <code>asyncio</code> allows you to express your code as coroutines, and they can be suspended and resumed when Python feels like it, but with you specifying the rules.</p>
+<pre><code>import asyncio
+import aiofiles
+
+class AsyncConsumer:
+    def __init__(self, path):
+        loop = asyncio.get_event_loop()
+        self.path = path
+        self.fifo_closed = loop.create_future()
+        self.fifo = None
+
+    async def start(self):
+        import aiofiles
+        self.fifo = await aiofiles.open(self.path, 'r')
+        done, pending = await asyncio.wait(
+            [self._read_lines(), self.fifo_closed],
+            return_when=asyncio.FIRST_COMPLETED)
+        print('The consumer is going to be nicely stopped...')
+        await self.fifo.close()
+        print('The consumer was nicely stopped.')
+
+    async def _read_lines(self):
+        try:
+            async for line in self.fifo:
+                print('Got from the producer:', line)
+            print('EOF from the producer.')
+        except ValueError:
+            # aiofiles raises a `ValueError` when the underlying file is closed
+            # from underneath it
+            pass
+
+    def stop(self, *args, **kwargs):
+        if self.fifo is not None:
+            print('we got the message')
+            self.fifo_closed.set_result(None)
+
+loop = asyncio.get_event_loop()
+consumer = AsyncConsumer('/tmp/someNamedPipe')
+loop.add_signal_handler(signal.SIGINT, consumer.stop)
+loop.add_signal_handler(signal.SIGTERM, consumer.stop)
+loop.run_until_complete(consumer.start())
+</code></pre>
+<p>The <code>async start()</code> method kicks off two <s>threads</s> <s>streams</s> things of work: one which reads lines one-by-one as they come in, and the other which essentially hangs until a signal is received. It proceeds when EITHER of these two things finishes.</p>
+<p>Unfortunately I noticed that ultimately <code>aiofiles</code> relies on a blocking implementation under the hood, because the <code>await self.fifo.close()</code> method still hangs if a <code>read()</code> is in progress. But at least there is a spot to place your code.</p>
+<h2>Wrapping it up</h2>
+<p>Ultimately there isn't a super great out-of-the-box solution to solving your problem, but hopefully one of these variations can help you solve your problem.</p>
+</div>
+<span class="comment-copy">If your process terminates, its open file handles (including named pipes) will get closed automatically. What's the actual problem you're trying to solve?</span>
+<span class="comment-copy">I got somewhat different failure, but I suspect in your handler you may want to say: <code>if not fifo.closed: fifo.close()</code>. That could be race prone, so perhaps rather <code>try/except</code>. Also <code>fifo</code> may still not exist when the handler kicks in... and after all as @NPE said, kernel will take care of that for you once the process terminates anyways. You'd really need to worry about termination handling if you were writing stuff and had to make sure your buffers are properly flushed.</span>

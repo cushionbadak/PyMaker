@@ -1,0 +1,80 @@
+<div class="post-text" itemprop="text">
+<p>I have a header file like:</p>
+<pre><code>#include &lt;vector&gt;
+
+inline std::vector&lt;uint8_t&gt;&amp; vec() {
+  static std::vector&lt;uint8_t&gt; v { 'a', 'b', 'c', 'd' };
+  return v;
+}
+
+inline const std::vector&lt;uint8_t&gt;&amp; cvec() {
+  return vec();
+}
+</code></pre>
+<p>I can <a href="https://stackoverflow.com/questions/8896828/make-c-array-of-objects-iterable-in-python/8898129#8898129">wrap it in SWIG using std_vector.i and pyabc.i</a> but that is quite inefficient (there's a jump between C++ and Python code for every access) and given that these are literally just a bunch of bytes I ought to be able to wrap them with <a href="http://docs.python.org/2/library/stdtypes.html#memoryview" rel="nofollow noreferrer">Python's <code>memoryview</code> interface</a>.</p>
+<p>How can I expose my <code>std::vector&lt;uint8_t&gt;</code> as a Python <code>memoryview</code>?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Exposing it as a <code>memoryview</code> requires creating a <code>Py_buffer</code> first. In Python 3.3+ there is a convenient helper function, <a href="http://docs.python.org/3/c-api/memoryview.html#PyMemoryView_FromMemory"><code>PyMemoryView_FromMemory</code></a> that does a lot of the work for us. In earlier versions though we'll need to take a few extra steps, so our basic out typemap looks like:</p>
+<pre class="lang-c prettyprint-override"><code>%typemap(out) std::vector&lt;uint8_t&gt;&amp;, const std::vector&lt;uint8_t&gt;&amp; {
+  Py_buffer *buf=(Py_buffer*)malloc(sizeof *buf);
+  const bool ro = info&lt;$1_type&gt;::is_readonly();
+  if (PyBuffer_FillInfo(buf, NULL,  &amp;((*$1)[0]), (*$1).size(), ro, PyBUF_ND)) {
+    // error, handle
+  }
+  $result = PyMemoryView_FromBuffer(buf);
+}
+</code></pre>
+<p>Here we're basically allocating some memory for the <code>Py_buffer</code>. This just contains the details of the buffer internally for Python. The memory we allocate will be owned by the <code>memoryview</code> object once it's created. Unfortunately since it's going to be released with a call to <code>free()</code> we need to allocate it with <code>malloc()</code>, even though it's C++ code.</p>
+<p>Besides the <code>Py_buffer</code> and an optional <code>Py_Object</code> <a href="http://docs.python.org/2/c-api/buffer.html#PyBuffer_FillInfo"><code>PyBuffer_FillInfo</code></a> takes a <code>void*</code> (the buffer itself), the size of the buffer, a boolean indicating if it's writeable and a flag. In this case our flag simply indicates that we have provided C-style contiguous memory for the buffer.</p>
+<p>For deciding if it is readonly or not we used SWIG's built in <a href="http://www.swig.org/Doc2.0/Typemaps.html#Typemaps_special_variables"><code>$n_type</code></a> variable and a helper (which could be a C++11 type trait if we wanted).</p>
+<p>To complete our SWIG interface we need to provide that helper and include the header file, so the whole thing becomes:</p>
+<pre><code>%module test
+
+%{
+#include "test.hh" 
+
+namespace {
+  template &lt;typename T&gt;
+  struct info {
+    static bool is_readonly() {
+      return false;
+    }
+  };
+
+  template &lt;typename T&gt;
+  struct info&lt;const T&amp;&gt; {
+    static bool is_readonly() {
+      return true;
+    }
+  };
+}
+%}
+
+%typemap(out) std::vector&lt;uint8_t&gt;&amp;, const std::vector&lt;uint8_t&gt;&amp; {
+  Py_buffer *buf=(Py_buffer*)malloc(sizeof *buf);
+  const bool ro = info&lt;$1_type&gt;::is_readonly();
+  if (PyBuffer_FillInfo(buf, NULL,  &amp;((*$1)[0]), (*$1).size(), ro, PyBUF_ND)) {
+    // error, handle
+  }
+  $result = PyMemoryView_FromBuffer(buf);
+}
+
+%include "test.hh"
+</code></pre>
+<p>We can then test it with:</p>
+<pre><code>import test
+
+print test.vec()
+print len(test.vec())
+print test.vec()[0]
+print test.vec().readonly
+test.vec()[0]='z'
+print test.vec()[0]
+
+print "This should fail:"
+test.cvec()[0] = 0
+</code></pre>
+<p>Which worked as expected, tested using Python 2.7.</p>
+<p>Compared to just wrapping it using std_vector.i this approach does have some drawbacks. The biggest being that we can't resize the vector, or convert it back to a vector later trivially. We could work around that, at least partially by creating a SWIG proxy for the vector like normal and using the second parameter of <code>PyBuffer_FillInfo</code> to store it internally. (This would also be needed if we had to manage the ownership of the vector for instance).</p>
+</div>

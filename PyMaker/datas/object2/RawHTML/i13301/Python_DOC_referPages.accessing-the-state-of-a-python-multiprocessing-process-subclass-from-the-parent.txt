@@ -1,0 +1,154 @@
+<div class="post-text" itemprop="text">
+<p>I am creating a simple TCP server as a stub so I can test a script that operates a piece of test equipment, without having to have the equipment there. The server should sit there waiting for a connection and then maintain and update a state variable (just a list of 6 integers) in response to commands that it receives. The parent process (a unit test class for example) should then be able to interrogate the state at any time.</p>
+<p>The interface of the server should be as simple as:</p>
+<pre><code>server = StubServer()
+server.start()
+'''
+the client script connects with the server and
+some stuff happens to change the state
+'''
+newState = server.getState() # newState = [93,93,93,3,3,45] for example
+server.terminate()
+</code></pre>
+<p>I have subclassed Multiprocessing.Process to do this and I can start the server off no problem. When I first tested this, in the getState() method I just returned the instance variable _state but I found this was always just the initial state. After some digging I couldn't find any similar examples out there. Lots about subclassing Process, but not this specific problem. Eventually I put together the below which uses an internal Queue() to store the state on but this looks messy and clunky to me. Is there a better way to do this?</p>
+<pre><code>import socket
+from multiprocessing import Process, Queue
+
+class StubServer(Process):
+
+    _port = 4001
+    _addr = '' # all addresses 0.0.0.0
+    _sock = None
+    _state = []
+    _queue = None
+
+    def __init__(self, initState=[93,93,93,93,93,93]):
+        super(StubServer, self).__init__()
+        self._queue = Queue()
+        self._state = initState
+
+    def run(self):
+        # Put the state into the queue
+        self._queue.put(self._state)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.bind((self._addr, self._port))
+        self._sock.listen(1)
+
+        waitingForConnection = True
+        '''
+        Main loop will continue until the connection is terminated. if a connection is closed, the loop returns
+        to the start and waits for a new connection. This means multiple tests can be run with the same server
+        '''
+        while 1:
+            # Wait for a connection, or go back and wait for a new message (if a connection already exists)
+            if waitingForConnection:
+                waitingForConnection = False
+                conn, addr = self._sock.accept()
+            chunk = ''
+            chunks = []
+            while '\x03' not in chunk: # '\x03' is terminating character for a message
+                chunk = conn.recv(8192)
+                if not chunk: # Connection terminated, start the loop again and wait for a new connection
+                    waitingForConnection = True
+                    break
+                chunks.append(chunk)
+            message = ''.join(chunks)
+            # Now do some stuff to parse the message, and update the state if we received a command
+            if isACommand(message):
+                _updateState(message)
+        conn.close()
+        return
+
+    def getState(self):
+        # This is called from the parent process, so return the object on the queue
+        state = self._queue.get()
+        # But put the state back in the queue again so it's there if this method is called again before a state update
+        self._queue.put(state)
+        return state
+
+    def _updateState(self, message):
+        # Do some stuff to figure out what to update then update the state
+        self._state[updatedElementIndex] = updatedValue
+        # Now empty the queue and put the new state in the queue
+        while not self._queue.empty():
+            self._queue.get()
+        self._queue.put(self._state)
+        return
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>As its name implies, <code>multiprocessing</code> uses different processes. At some point, <a href="https://en.wikipedia.org/wiki/Fork_%28system_call%29" rel="nofollow"><code>fork()</code></a> is called and the child processes copy the memory of the parent process, and the child is left with its own memory, not being shared with the parent process.</p>
+<p>Unfortunately, you <em>have</em> to use <a href="https://docs.python.org/3/library/multiprocessing.html#exchanging-objects-between-processes" rel="nofollow">tools available</a> to share memory between processes, leading to the code overhead you mention.</p>
+<p>You can look up for other ways to do parallel processing with shared memory, but do mind that sharing memory between threads/processes/nodes/etc is never easy.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can dump state of your stub server to file and read it from unittests in any moment. It's pretty simple solution for test needs. </p>
+<p>All that you need to do:</p>
+<ul>
+<li>Pass <code>filename</code> as parameter to constructor</li>
+<li>Call <code>_updateState</code> with init values</li>
+<li>Rewrite <code>_updateState</code> to write state to <code>filename</code>. It's better to create a new file near <code>filename</code> and replace it. If you are worrying about atomicity.</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>Thanks Felipe, my question was mainly 'is there a better way than using queues' as I did in the question. After a bit more research (prompted by your mention of shared memory) I have found a shared array is much better for this case:</p>
+<pre><code>import socket
+from multiprocessing import Process, Array
+
+class StubServer(Process):
+
+    _port = 4001
+    _addr = '' # all addresses 0.0.0.0
+    _sock = None
+    _state = None
+    _queue = None
+
+    def __init__(self, initState=[93,93,93,93,93,93]):
+        super(StubServer, self).__init__()
+        self._state = Array('i', initState) # Is always a 6 element array
+
+    def run(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.bind((self._addr, self._port))
+        self._sock.listen(1)
+
+        waitingForConnection = True
+        '''
+        Main loop will continue until process is terminated. if a connection is closed, the loop returns
+        to the start and waits for a new connection. This means multiple tests can be run with the same server
+        '''
+        while 1:
+            # Wait for a connection, or go back and wait for a new message (if a connection already exists)
+            if waitingForConnection:
+                waitingForConnection = False
+                conn, addr = self._sock.accept()
+            chunk = ''
+            chunks = []
+            while '\x03' not in chunk: # '\x03' is terminating character for a message
+                chunk = conn.recv(8192)
+                if not chunk: # Connection terminated, start the loop again and wait for a new connection
+                    waitingForConnection = True
+                    break
+                chunks.append(chunk)
+            message = ''.join(chunks)
+            # Now do some stuff to parse the message, and update the state if we received a command
+            if isACommand(message):
+                _updateState(message)
+        conn.close()
+        return
+
+    def getState(self):
+        # Aquire the lock return the contents of the shared array
+        with self._state.get_lock():
+            return self._state[:6] # This is OK because we know it is always a 6 element array
+        return state
+
+    def _updateState(self, message):
+        # Do some stuff to figure out what to update then..
+        # Aquire the lock and update the appropriate element in the shared array
+        with self._state.get_lock():
+            self._state[updatedElementIndex] = updatedValue
+        return
+</code></pre>
+<p>This works a treat and is a bit more elegant. Thanks for your help</p>
+</div>

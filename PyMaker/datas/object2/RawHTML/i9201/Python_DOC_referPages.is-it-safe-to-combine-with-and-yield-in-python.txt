@@ -1,0 +1,195 @@
+<div class="post-text" itemprop="text">
+<p>It's a common idiom in python to use context manager to automatically close files:</p>
+<pre><code>with open('filename') as my_file:
+    # do something with my_file
+
+# my_file gets automatically closed after exiting 'with' block
+</code></pre>
+<p>Now I want to read contents of several files. Consumer of the data does not know or care if data comes from files or not-files. It does not want to check if the objects it received can be open or not. It just wants to get something to read lines from. So I create an iterator like this:</p>
+<pre><code>def select_files():
+    """Yields carefully selected and ready-to-read-from files"""
+    file_names = [.......]
+    for fname in file_names:
+        with open(fname) as my_open_file:
+            yield my_open_file
+</code></pre>
+<p>This iterator may be used like this:</p>
+<pre><code>for file_obj in select_files():
+    for line in file_obj:
+        # do something useful
+</code></pre>
+<p>(Note, that the same code could be used to consume not the open files, but lists of strings - that's cool!)</p>
+<p><strong>The question is: is it safe to yield open files?</strong></p>
+<p>Looks like "why not?". Consumer calls iterator, iterator opens file, yields it to consumer. Consumer processes the file and comes back to iterator for next one. Iterator code resumes, we exit 'with' block, the <code>my_open_file</code> object gets closed, go to next file, etc.</p>
+<p>But what if consumer never comes back to iterator for the next file? F.e. an exception occurred inside the consumer. Or consumer found something very exciting in one of the files and happily returned the results to whoever called it?</p>
+<p>Iterator code would never resume in this case, we would never come to the end of 'with' block, and the <code>my_open_file</code> object would never get closed!</p>
+<p>Or would it?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You bring up a criticism that has been raised before<sup>1</sup>.  The cleanup in this case is non-deterministic, but it <em>will</em> happen with <strong>CPython</strong> when the generator gets garbage collected.  <strong>Your mileage may vary for other python implementations...</strong></p>
+<p>Here's a quick example:</p>
+<pre><code>from __future__ import print_function
+import contextlib
+
+@contextlib.contextmanager
+def manager():
+    """Easiest way to get a custom context manager..."""
+    try:
+        print('Entered')
+        yield
+    finally:
+        print('Closed')
+
+
+def gen():
+    """Just a generator with a context manager inside.
+
+    When the context is entered, we'll see "Entered" on the console
+    and when exited, we'll see "Closed" on the console.
+    """
+    man = manager()
+    with man:
+        for i in range(10):
+            yield i
+
+
+# Test what happens when we consume a generator.
+list(gen())
+
+def fn():
+    g = gen()
+    next(g)
+    # g.close()
+
+# Test what happens when the generator gets garbage collected inside
+# a function
+print('Start of Function')
+fn()
+print('End of Function')
+
+# Test what happens when a generator gets garbage collected outside
+# a function.  IIRC, this isn't _guaranteed_ to happen in all cases.
+g = gen()
+next(g)
+# g.close()
+print('EOF')
+</code></pre>
+<p>Running this script in CPython, I get:</p>
+<pre><code>$ python ~/sandbox/cm.py
+Entered
+Closed
+Start of Function
+Entered
+Closed
+End of Function
+Entered
+EOF
+Closed
+</code></pre>
+<p>Basically, what we see is that for generators that are exhausted, the context manager cleans up when you expect.  For generators that <em>aren't</em> exhausted, the cleanup function runs when the generator is collected by the garbage collector.  This happens when the generator goes out of scope (or, IIRC at the next <code>gc.collect</code> cycle at the latest).</p>
+<p>However, doing some quick experiments (e.g. running the above code in <code>pypy</code>), I don't get all of my context managers cleaned up:</p>
+<pre><code>$ pypy --version
+Python 2.7.10 (f3ad1e1e1d62, Aug 28 2015, 09:36:42)
+[PyPy 2.6.1 with GCC 4.2.1 Compatible Apple LLVM 5.1 (clang-503.0.40)]
+$ pypy ~/sandbox/cm.py
+Entered
+Closed
+Start of Function
+Entered
+End of Function
+Entered
+EOF
+</code></pre>
+<p>So, the assertion that the context manager's <code>__exit__</code> <em>will</em> get called for all python implementations is untrue.  Likely the misses here are attributable to <a href="http://doc.pypy.org/en/latest/cpython_differences.html#differences-related-to-garbage-collection-strategies" rel="noreferrer">pypy's garbage collection strategy</a> (which <em>isn't</em> reference counting) and by the time <code>pypy</code> decides to reap the generators, the process is already shutting down and therefore, it doesn't bother with it...  In most real-world applications, the generators would <em>probably</em> get reaped and finalized quickly enough that it doesn't actually matter...</p>
+<hr/>
+<h3>Providing strict guarantees</h3>
+<p>If you want to guarantee that your context manager is finalized properly, you should take care to <a href="https://docs.python.org/3/reference/expressions.html#generator.close" rel="noreferrer">close</a> the generator when you are done with it<sup>2</sup>.  Uncommenting the <code>g.close()</code> lines above gives me deterministic cleanup because a <code>GeneratorExit</code> is raised at the <code>yield</code> statement (which is inside the context manager) and then it's caught/suppressed by the generator...</p>
+<pre><code>$ pypy ~/sandbox/cm.py
+Entered
+Closed
+Start of Function
+Entered
+Closed
+End of Function
+Entered
+Closed
+EOF
+
+$ python3 ~/sandbox/cm.py
+Entered
+Closed
+Start of Function
+Entered
+Closed
+End of Function
+Entered
+Closed
+EOF
+
+$ python ~/sandbox/cm.py
+Entered
+Closed
+Start of Function
+Entered
+Closed
+End of Function
+Entered
+Closed
+EOF
+</code></pre>
+<hr/>
+<p>FWIW, this means that you can clean up your generators using <code>contextlib.closing</code>:</p>
+<pre><code>from contextlib import closing
+with closing(gen_function()) as items:
+    for item in items:
+        pass # Do something useful!
+</code></pre>
+<p><sup><sup>1</sup>Most recently, some discussion has revolved around <a href="https://www.python.org/dev/peps/pep-0533/" rel="noreferrer">PEP 533</a> which aims to make iterator cleanup more deterministic.</sup><br/>
+<sup><sup>2</sup>It is perfectly OK to close an already closed and/or consumed generator so you can call it without worrying about the state of the generator.</sup></p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<h1>Is it safe to combine 'with' and 'yield' in python?</h1>
+</blockquote>
+<p>I don't think you should do this.</p>
+<p>Let me demonstrate making some files:</p>
+<pre><code>&gt;&gt;&gt; for f in 'abc':
+...     with open(f, 'w') as _: pass
+</code></pre>
+<p>Convince ourselves that the files are there:</p>
+<pre><code>&gt;&gt;&gt; for f in 'abc': 
+...     with open(f) as _: pass 
+</code></pre>
+<p>And here's a function that recreates your code:</p>
+<pre><code>def gen_abc():
+    for f in 'abc':
+        with open(f) as file:
+            yield file
+</code></pre>
+<p>Here it looks like you can use the function:</p>
+<pre><code>&gt;&gt;&gt; [f.closed for f in gen_abc()]
+[False, False, False]
+</code></pre>
+<p>But let's create a list comprehension of all of the file objects first:</p>
+<pre><code>&gt;&gt;&gt; l = [f for f in gen_abc()]
+&gt;&gt;&gt; l
+[&lt;_io.TextIOWrapper name='a' mode='r' encoding='cp1252'&gt;, &lt;_io.TextIOWrapper name='b' mode='r' encoding='cp1252'&gt;, &lt;_io.TextIOWrapper name='c' mode='r' encoding='cp1252'&gt;]
+</code></pre>
+<p>And now we see they are all closed:</p>
+<pre><code>&gt;&gt;&gt; c = [f.closed for f in l]
+&gt;&gt;&gt; c
+[True, True, True]
+</code></pre>
+<p>This only works until the generator closes. Then the files are all closed.</p>
+<p>I doubt that is what you want, even if you're using lazy evaluation, your last file will probably be closed before you're done using it.</p>
+</div>
+<span class="comment-copy">The iterator would be cleaned up when it goes out of scope, which it should in the cases you mention.</span>
+<span class="comment-copy">If you save a reference to the generator in the consumer (for instance, <code>producer=select_files()</code>) then you could use its <code>.throw</code> method to tell it to shut down.  <a href="https://docs.python.org/3/reference/expressions.html#generator.throw" rel="nofollow noreferrer">docs.python.org/3/reference/expressions.html#generator.throw</a>.</span>
+<span class="comment-copy">@TerryJanReedy Generators have a <code>close</code> method which better serves the purpose of stopping a generator instead of throwing a random exception in there...</span>
+<span class="comment-copy">Anyway, the same issue happens if you simply yield the contents of the file: <code>with open(...) as f: for line in f: yield line</code>. The consumer may not exhaust the generator and hence the file may not be ever closed. This is an issue with "lazy I/O" in general. It's better to open files inside "eager" code and pass them to the lazy functions.</span>
+<span class="comment-copy">While this doesn't directly address OP's question... An alternative way to handle this situation is to use <a href="https://docs.python.org/3.6/library/fileinput.html" rel="nofollow noreferrer"><code>fileinput</code></a>.  See also <a href="http://stackoverflow.com/questions/16095855/whats-the-most-pythonic-way-to-iterate-over-all-the-lines-of-multiple-files/16095960#16095960" title="whats the most pythonic way to iterate over all the lines of multiple files">stackoverflow.com/questions/16095855/…</a></span>
+<span class="comment-copy">"The cleanup in this case is non-deterministic" - I am not sure I totally understand this statement. Does it mean that what happens depends on garbage-collector behaviour?</span>
+<span class="comment-copy">@lesnik -- Yes, that is what it means.</span>
+<span class="comment-copy">@lesnik -- I was thinking about this more tonight (maybe because it bothers me that I don't always clean these things up well in <i>my</i> code ...).  Anyway, it appears that there <i>is</i> a way force the generators to clean up when you're done with them.  I've re-written/updated the answer to explain how that is possible.</span>
+<span class="comment-copy">Special thanks for bringing attention to PEP-533 - it's a big surprise for me that garbage collector is involved here!</span>
+<span class="comment-copy">You mention that if iterator is exhausted "context manager cleans up (more or less) when you expect". Why "more or less"? Isn't situation straightforward in this case?</span>

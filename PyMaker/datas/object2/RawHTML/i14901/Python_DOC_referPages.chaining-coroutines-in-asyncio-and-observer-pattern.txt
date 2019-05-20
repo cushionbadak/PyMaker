@@ -1,0 +1,125 @@
+<div class="post-text" itemprop="text">
+<p>I'm having trouble wrapping my head around how coroutines are chained together. In a slightly less trivial example than hello world or factorials, I'd like to have a loop which continually watches file modification times, and then prints out the time whenever the file is touched:</p>
+<pre><code>#!/usr/bin/env python3
+import os
+import asyncio
+
+@asyncio.coroutine
+def pathmonitor(path):
+    modtime = os.path.getmtime(path)
+    while True:
+        new_time = os.path.getmtime(path)
+        if new_time != modtime:
+            modtime = new_time
+            yield modtime
+        yield from asyncio.sleep(1)
+
+@asyncio.coroutine
+def printer():
+    while True:
+        modtime = yield from pathmonitor('/home/users/gnr/tempfile')
+        print(modtime)
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(printer())
+loop.run_forever()
+</code></pre>
+<p>I would expect this to work - however, when I run it I get a:</p>
+<pre><code>RuntimeError: Task got bad yield: 1426449327.2590399
+</code></pre>
+<p>What am i doing wrong here?</p>
+<p>UPDATE: see my answer below for an example of the observer pattern (i.e. efficiently allow multiple registrants to get updates when a file gets touched) without using callbacks (you have to use Tasks).</p>
+<p>UPDATE2: there is a better fix for this: 3.5's <code>async for</code> (asynchronous iterators): <a href="https://www.python.org/dev/peps/pep-0492/" rel="nofollow">https://www.python.org/dev/peps/pep-0492/</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I got your code working by using <code>return</code> instead of <code>yield</code> in the chained coroutine, just like the <a href="https://docs.python.org/3/library/asyncio-task.html#example-chain-coroutines" rel="nofollow">chained coroutines example</a>:</p>
+<pre><code>#!/usr/bin/env python3
+import os
+import asyncio2
+
+@asyncio.coroutine
+def pathmonitor(path):
+    modtime = os.path.getmtime(path)
+    while True:
+        new_time = os.path.getmtime(path)
+        if new_time != modtime:
+            modtime = new_time
+            return modtime
+        yield from asyncio.sleep(1)
+
+
+@asyncio.coroutine
+def printer():
+    while True:
+        modtime = yield from pathmonitor('/tmp/foo.txt')
+        print(modtime)
+
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(printer())
+loop.run_forever()
+</code></pre>
+<p>Note that <code>printer()</code>'s loop will create a new <code>pathmonitor</code> generator for each iteration. Not sure if this is what you had in mind but it might be a start.</p>
+<p>I find the coroutines API and syntax a bit confusing myself. Here's some reading that I have found helpful:</p>
+<ul>
+<li><a href="https://docs.python.org/3/whatsnew/3.3.html#pep-380" rel="nofollow">What’s New In Python 3.3: "PEP 380: Syntax for Delegating to a Subgenerator"</a></li>
+<li><a href="https://www.python.org/dev/peps/pep-0380/#formal-semantics" rel="nofollow">PEP380: "Formal semantics"</a></li>
+<li><a href="https://docs.python.org/3/library/asyncio-task.html#example-chain-coroutines" rel="nofollow">asyncio: "Example: Chain coroutines"</a></li>
+<li><a href="http://www.cosc.canterbury.ac.nz/greg.ewing/python/yield-from/yf_current/Examples/binary_tree.py" rel="nofollow">Greg Ewing's "Binary Tree" example</a></li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>As others pointed out, my mistake was that I was trying to use a coroutine like a generator. Instead of relying on a generator for iteration, I needed to create multiple coroutines. Also, I needed to use tasks to implement the observer pattern without callbacks since multiple registrants can <code>yield from</code> the same task. My pathmonitor looks something like this:</p>
+<pre><code>import os
+import asyncio
+
+class PathInfo:
+
+    def __init__(self, path):
+        self.path = path
+        self.modtime = os.path.getmtime(path)
+        self.startTask()
+
+    def startTask(self):
+        self.task = asyncio.async(self._checkIfTouched())
+
+    def _checkIfTouched(self):
+        while True:
+            yield from asyncio.sleep(1)
+            newtime = os.path.getmtime(self.path)
+            if self.modtime != newtime:
+                self.modtime = newtime
+                return newtime
+
+class PathMonitor:
+
+    def __init__(self):
+        self._info = {}
+
+    @asyncio.coroutine
+    def wasTouched(self, path):
+        try:
+            info = self._info[path]
+        except KeyError:
+            self._info[path] = info = PathInfo(path)
+        if info.task.done():
+            info.startTask()
+        modtime = yield from info.task
+        return modtime
+
+def printer():
+    while True:
+        modtime = yield from mon.wasTouched('/tmp/myfile')
+        print(modtime)
+
+mon = PathMonitor()
+
+loop = asyncio.get_event_loop()
+asyncio.async(printer())
+loop.run_forever()
+</code></pre>
+</div>
+<span class="comment-copy">Thanks for the helpful answer- after looking at the docs a bit more I noticed that they state that a coroutine can only return or yield from - a simple yield is not allowed. I wonder why coroutines aren't able to use yield like a normal generator.</span>
+<span class="comment-copy">Yeah, it's curious. You could rewrite the <code>pathmonitor</code> as a regular generator and move the sleep to the <code>printer</code>. But I guess you wanted a chained coroutine.</span>
+<span class="comment-copy">Ah that's an interesting idea - I'll play around a bit to see what I can come up with. I have library code which uses callbacks to notify when a file gets touched and I'd like to see how to make it work with coroutines (or without callbacks). I would have a printer function, or a logger function, or a socket function which all might do something differently when the file gets touched.</span>
+<span class="comment-copy">@gnr You don't want <code>pathmonitor</code> to be a generator; coroutines and generators are not the same thing, and aren't interchangeable. While generators can potentially use both <code>yield</code> (normal case) or <code>yield from</code> (if it needs to yield all the values from a subgenerator), <code>asyncio</code> coroutines are only designed to use <code>yield from</code>, because <code>yield from</code> can be used to fetch a value actually <i>returned</i> from the sub-generator. a<code>yield subgenerator()</code> call will always return a generator object.</span>

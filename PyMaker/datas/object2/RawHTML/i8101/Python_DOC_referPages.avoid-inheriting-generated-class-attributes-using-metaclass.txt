@@ -1,0 +1,168 @@
+<div class="post-text" itemprop="text">
+<p>I was thinking of automatically adding child classes to parent for "chaining" using a metaclass. However, inheriting these attributes from parent classes messes thing up. Is there a nice way to avoid this?</p>
+<pre><code>class MetaError(type):
+    def __init__(cls, name, bases, attrs):
+        for base in bases:
+            setattr(base, name, cls)
+        super(MetaError, cls).__init__(name, bases, attrs)
+
+class BaseError(Exception, object):
+
+    def __init__(self, message):
+        super(BaseError, self).__init__(message)
+
+class HttpError(BaseError):
+    __metaclass__ = MetaError
+
+class HttpBadRequest(HttpError):
+    pass
+
+class HttpNotFound(HttpError):
+    pass
+
+class FileNotFound(HttpNotFound):
+    pass
+
+class InvalidJson(HttpBadRequest):
+    pass
+
+http = HttpError
+
+#  now I can do
+raise http.HttpNotFound('Not found')
+raise http.HttpNotFound.FileNotFound('File not found')
+raise http.HttpBadRequest.InvalidJson('Invalid json')
+
+#  unfortunately this also works
+raise http.HttpBadRequest.HttpBadRequest('Bad request')
+raise http.HttpBadRequest.HttpNotFound('Not found')
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Well, this turns out to be trickier than it seens at first - 
+because basically you want to have class inheritance relationship, but do not use the normal attribute lookup paths on class inheritance - 
+Otherwise, HTTPError, being a subclass of BaseError, for example, would always have all the attributs present in BaseError itself - Therefore,
+the chain <code>BaseError.HTTPError.HTTPError.HTTPError.HTTPError...</code> would always be valid.</p>
+<p>Fortunately, Python does <em>offer</em>  a mechanism to register classes as subclasses of other, without "physical" inheritance - that is, it is reported as subclass, but does not have the parent class in its bases or <code>__mro__</code> - and therefore, attribute lookup on the derived class (adopted?) does not search attributes in the "foster" parent.</p>
+<p>This mechanism is provided through the "<a href="https://docs.python.org/3/library/abc.html" rel="nofollow noreferrer">abstract base classes</a>" or "abc"s, through its ABCMeta Metaclass, and "register" method.</p>
+<p>And now, due to the fact you also probably want to declare
+your class hierarchy with the normal inheritance syntax - that is,
+being able to write <code>class HTTPError(BaseError):</code> to indicate the new
+class derives from BaseError - you get the actual "physical" inheritance.</p>
+<p>So, we can inherit from ABCMeta class (instead of <code>type</code>) and write 
+the <code>__new__</code> method so that the physical inheritance is excluded - 
+and we use the <code>setattr</code> for containment you intended with your code as well, and also, we trigger the needed call to <code>parentclass.register</code> directly on the metaclass. </p>
+<p>(Note that as we are now changing the base classes, we need to fiddle 
+in the <code>__new__</code> method of the metaclass, not on <code>__init__</code>:</p>
+<pre><code>from abc import ABCMeta
+
+class MetaError(ABCMeta):
+    def __new__(metacls, name, bases, attrs):
+
+        new_bases = []
+        base_iter = list(reversed(bases))
+        seen = []
+        register_this = None
+        while base_iter:
+            base = base_iter.pop(0)
+            if base in seen:
+                continue
+            seen.append(base)
+            if isinstance(base, MetaError):
+                register_this = base
+                base_iter = list(reversed(base.__mro__))  + base_iter
+            else:
+                new_bases.insert(0, base)
+        cls = super(MetaError, metacls).__new__(metacls, name, tuple(new_bases), attrs)
+        if register_this:
+            setattr(register_this, name, cls)
+            register_this.register(cls)
+        return cls
+</code></pre>
+<p>And for a quick test:</p>
+<pre><code>class BaseError(Exception):
+    __metaclass__ = MetaError
+class HTTPError(BaseError):
+    pass
+class HTTPBadRequest(HTTPError):
+    pass
+</code></pre>
+<p>In the interactive mode, check if it works as you intend:</p>
+<pre><code>In [38]: BaseError.HTTPError
+Out[38]: __main__.HTTPError
+
+In [39]: BaseError.HTTPError.HTTPError
+---------------------------------------------------------------------------
+AttributeError                            Traceback (most recent call last)
+&lt;ipython-input-39-5d5d03751646&gt; in &lt;module&gt;()
+----&gt; 1 BaseError.HTTPError.HTTPError
+
+AttributeError: type object 'HTTPError' has no attribute 'HTTPError'
+
+In [40]: HTTPError.__mro__
+Out[40]: (__main__.HTTPError, Exception, BaseException, object)
+
+In [41]: issubclass(HTTPError, BaseError)
+Out[41]: True
+
+In [42]: issubclass(HTTPBadRequest, BaseError)
+Out[42]: True
+
+In [43]: BaseError.HTTPError.HTTPBadRequest
+Out[43]: __main__.HTTPBadRequest
+
+In [44]: BaseError.HTTPBadRequest
+---------------------------------------------------------------------------
+AttributeError                            Traceback (most recent call last)
+&lt;ipython-input-44-b40d65ca66c6&gt; in &lt;module&gt;()
+----&gt; 1 BaseError.HTTPBadRequest
+
+AttributeError: type object 'BaseError' has no attribute 'HTTPBadRequest'
+</code></pre>
+<p>And then, most important of all, testing if the Exception hierarchy actually works in this way:</p>
+<pre><code>In [45]: try:
+   ....:     raise HTTPError
+   ....: except BaseError:
+   ....:     print("it works")
+   ....: except HTTPError:
+   ....:     print("not so much")
+   ....: 
+it works
+</code></pre>
+<p>A few notes:  no need to inherit from both <code>Exception</code> and <code>object</code> explicitly - <code>Exception</code> itself already inherits from <code>object</code>. And, most important: whatever project you are working on, do whatever is possible to move it to Python 3.x instead of Python 2. Python 2 is with the days counted, and there are many, many new features in Python 3 you are excluding yourself of using. (The code in this answer is Python 2/3 compatible, but for the <code>__metaclass__</code> usage declaration of course).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>A fairly naive global mapping solution that also seems to be working:</p>
+<pre><code>m = {}
+class MetaError(type):
+
+    def __init__(cls, name, bases, attrs):
+        for base in bases:
+            m[(base, name)] = cls 
+        super(MetaError, cls).__init__(name, bases, attrs)
+
+    def __getattribute__(self, value):
+        if (self, value) in m:
+            return m[self, value]
+        return type.__getattribute__(self, value)
+
+class BaseError(Exception):
+    __metaclass__ = MetaError
+
+class HttpError(BaseError):
+    pass
+
+class HttpBadRequest(HttpError):
+    pass
+
+class HttpNotFound(HttpError):
+    pass
+
+class FileNotFound(HttpNotFound):
+    pass
+
+class InvalidJson(HttpBadRequest):
+    pass
+</code></pre>
+</div>
+<span class="comment-copy">Thanks for the answer. I may well be the best road to take (alternatively it seems that a global mapping based solution would also work - posted as an answer)</span>

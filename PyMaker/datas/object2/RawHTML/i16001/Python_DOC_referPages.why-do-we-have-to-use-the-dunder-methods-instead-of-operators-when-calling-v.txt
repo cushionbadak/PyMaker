@@ -1,0 +1,127 @@
+<div class="post-text" itemprop="text">
+<p>Why do we have to use <code>__getitem__</code> rather than the usual operator access?</p>
+<pre><code>class MyDict(dict):
+    def __getitem__(self, key):
+        return super()[key]
+</code></pre>
+<p>We get <code>TypeError: 'super' object is not subscriptable</code>.</p>
+<p>Instead we must use <code>super().__getitem__(key)</code>, but I never fully understood why - what exactly is it that prevented super being implemented in a way that would allow the operator access?</p>
+<p>Subscriptable was just an example, I have the same question for <code>__getattr__</code>, <code>__init__</code>, etc.</p>
+<p>The <a href="https://docs.python.org/2/library/functions.html#super">docs</a> attempt to explain why, but I don't understand it.  </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>CPython's bug tracker's <a href="http://bugs.python.org/issue805304">issue 805304, "super instances don't support item assignment",</a> has Raymond Hettinger give a detailed explanation of perceived difficulties.</p>
+<p>The reason this doesn't work automatically is that such methods have to be defined on the class due to Python's caching of methods, whilst the proxied methods are found at runtime.</p>
+<p>He offers <a href="http://bugs.python.org/file1027/abstract2.diff">a patch</a> that would give a subset of this functionality:</p>
+<pre><code>+   if (o-&gt;ob_type == &amp;PySuper_Type) {
++       PyObject *result;
++       result = PyObject_CallMethod(o, "__setitem__", "(OO)", key, value);
++       if (result == NULL)
++           return -1;
++       Py_DECREF(result);
++       return 0;
++   }
++ 
+</code></pre>
+<p>so it is clearly <em>possible</em>.</p>
+<p>However, he concludes</p>
+<blockquote>
+<p>I've been thinking that this one could be left alone and just 
+  document that super objects only do their magic upon 
+  explicit attribute lookup.</p>
+<p>Otherwise, fixing it completely involves combing Python for 
+  every place that directly calls functions from the slots table, 
+  and then adding a followup call using attribute lookup if the 
+  slot is empty.</p>
+<p>When it comes to functions like repr(obj), I think we want 
+  the super object to identify itself rather than forwarding the 
+  call to the target object's __repr__() method.</p>
+</blockquote>
+<p>The argument seems to be that if <code>__dunder__</code> methods are proxied, then either <code>__repr__</code> is proxied or there is an inconsistency between them. <code>super()</code>, thus, might not want to proxy such methods lest it gets too near the programmer's equivalent of an uncanny valley.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>What you ask can be done, and easily. For instance:</p>
+<pre><code>class dundersuper(super):
+    def __add__(self, other):
+        # this works, because the __getattribute__ method of super is over-ridden to search 
+        # through the given object's mro instead of super's.
+        return self.__add__(other)
+
+super = dundersuper
+
+class MyInt(int):
+    def __add__(self, other):
+        return MyInt(super() + other)
+
+i = MyInt(0)
+assert type(i + 1) is MyInt
+assert i + 1 == MyInt(1)
+</code></pre>
+<p>So the reason that super works with magic methods isn't because it's not possible. The reason must lie elsewhere. One reason is that doing so would violate the contract of equals (<code>==</code>). That is equals is, amongst other criteria, symmetric. This means that if <code>a == b</code> is true then <code>b == a</code> must also be true. That lands us in a tricky situation, where <code>super(self, CurrentClass) == self</code>, but <code>self != super(self, CurrentClass)</code> eg.</p>
+<pre><code>class dundersuper(super):
+    def __eq__(self, other):
+        return self.__eq__(other)
+
+super = dundersuper
+
+class A:
+    def self_is_other(self, other):
+        return super() == other # a.k.a. object.__eq__(self, other) or self is other
+    def __eq__(self, other):
+        """equal if both of type A"""
+        return A is type(self) and A is type(other)
+
+class B:
+    def self_is_other(self, other):
+        return other == super() # a.k.a object.__eq__(other, super()), ie. False
+    def __eq__(self, other):
+        return B is type(self) and B is type(other)
+
+assert A() == A()
+a = A()
+assert a.self_is_other(a)
+assert B() == B()
+b = B()
+assert b.self_is_other(b) # assertion fails
+</code></pre>
+<p>Another reason is that once super is done searching it's given object's mro, it then has to give itself a chance to provide the requested attribute - super objects are still an objects in their own right -- we should be able to test for equality with other objects, ask for string representations, and introspect the object and class super is working with. This creates a problem if the dunder method is available on the super object, but not on object that the mutable object represents. For instance:</p>
+<pre><code>class dundersuper(super):
+    def __add__(self, other):
+        return self.__add__(other)
+    def __iadd__(self, other):
+        return self.__iadd__(other)
+
+super = dundersuper
+
+class MyDoubleList(list):
+    """Working, but clunky example."""
+    def __add__(self, other):
+        return MyDoubleList(super() + 2 * other)
+    def __iadd__(self, other):
+        s = super()
+        s += 2 * other  # can't assign to the result of a function, so we must assign 
+        # the super object to a local variable first
+        return s
+
+class MyDoubleTuple(tuple):
+    """Broken example -- iadd creates infinite recursion"""
+    def __add__(self, other):
+        return MyDoubleTuple(super() + 2 * other)
+    def __iadd__(self, other):
+        s = super()
+        s += 2 * other
+        return s
+</code></pre>
+<p>With the list example the function <code>__iadd__</code> could have been more simply written as</p>
+<pre><code>def __iadd__(self, other):
+    return super().__iadd__(other)
+</code></pre>
+<p>With the tuple example we fall into infinite recursion, this is because <code>tuple.__iadd__</code> does not exist. Therefore when looking up the attribute <code>__iadd__</code> on a super object the actual super object is checked for an <code>__iadd__</code> attribute (which does exist). We get that method and call it, which starts the whole process again. If we'd not written an <code>__iadd__</code> method on super and used <code>super().__iadd__(other)</code> then this would never have happened. Rather we'd get an error message about a super object not having the attribute <code>__iadd__</code>. Slightly cryptic, but less so than an infinite stack trace.</p>
+<p>So the reason super doesn't work with magic methods is that it creates more problems than it solves.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Dunder methods must be defined on the class, not the instance.  super() would need to have an implementation of every magic method in order to make this work.  It's not worth writing all that code and keeping it up-to-date with the language definition (e.g. the introduction of matrix multiplication in 3.5 created three new dunder methods), when you can just tell users to write out the dunder methods by hand.  That uses normal method lookup, which can be easily emulated.</p>
+</div>
+<span class="comment-copy"><a href="http://stackoverflow.com/questions/12047847/super-object-not-calling-getattr" title="super object not calling getattr">stackoverflow.com/questions/12047847/…</a></span>
+<span class="comment-copy">Also helpful:  <a href="https://docs.python.org/3/reference/datamodel.html#special-method-lookup" rel="nofollow noreferrer">docs.python.org/3/reference/…</a></span>
+<span class="comment-copy">FWIW, this seems to be a subset of my (now self-deleted) answer. The bounty says "the current answer is not convincing for me" so this one probably won't be either.</span>

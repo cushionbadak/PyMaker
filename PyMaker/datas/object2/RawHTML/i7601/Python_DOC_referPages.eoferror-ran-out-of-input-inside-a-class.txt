@@ -1,0 +1,141 @@
+<div class="post-text" itemprop="text">
+<p>I have the following code where I need to read multiple sensors at a time. I have set up threading and multiprocessing to do this task for me. When the threading and mutliprocessing code is outside of the main class, it works fine but the class can't use the data it retrives. When I put the mutlithreading code insdie the class, I run into an <code>EOFError: Ran out of input</code> error.</p>
+<p>Here is the code:</p>
+<pre><code>import os
+import multiprocessing
+from multiprocessing import Process, Pool
+import threading
+import queue
+import tkinter as tk
+from tkinter import *
+from tkinter import ttk
+import time
+import minimalmodbus
+import serial
+minimalmodbus.CLOSE_PORT_AFTER_EACH_CALL = True
+THREAD_LOCK = threading.Lock()
+
+class Application(tk.Frame):
+    def __init__(self, master=None):
+        super().__init__(master)
+
+        self.pack()
+
+        self.first_gas_labelframe = LabelFrame(self, text="Gas 1", width=100)
+        self.first_gas_labelframe.grid(row=0, column=0)
+
+        self.value_label = Label(self.first_gas_labelframe, text="Value")
+        self.value_label.grid(row=0, column=0)
+
+        self.unit_label = Label(self.first_gas_labelframe, text="Unit")
+        self.unit_label.grid(row=1, column=0)
+
+        self.temp_label = Label(self.first_gas_labelframe, text="Temp")
+        self.temp_label.grid(row=2, column=0)
+
+        self.temp_label6 = Label(self.first_gas_labelframe6, text="Temp")
+        self.temp_label6.grid(row=2, column=0)
+
+        self.timer_button = tk.Button(self, text='Start', command=self.start_run)
+        self.timer_button.grid(row=2, column=0)
+
+
+    def start_run(self):
+        self.all_thread()
+
+    def all_thread(self):
+        thread = threading.Thread(target=self.all_process)
+        thread.start()
+
+    def all_process(self):
+        all_ports = port_num()
+        gas = minimalmodbus.Instrument("COM3", 1)
+        gas.serial.baudrate = 9600
+        gas.serial.bytesize = 8
+        gas.serial.parity = serial.PARITY_NONE
+        gas.serial.stopbits = 1
+        gas.serial.timeout = 0.25
+        gas.mode = minimalmodbus.MODE_RTU
+
+        gas_list = [gas]
+        processes = []
+        while len(gas_list) &gt; 0:
+            val = 1
+            with THREAD_LOCK:
+                for sen in gas_list:
+                    proc = Process(target=self.main_reader, args=(sen, val))
+                    processes.append(proc)
+                    proc.start()
+                    val += 1
+                for sen in processes:
+                    sen.join()
+                time.sleep(1)
+
+    def main_reader(sen, val):
+        try:
+            read = sen.read_registers(0,42)
+        except OSError:
+            read = "Communication Error"
+        except ValueError:
+            read = "RTU Error"
+        print(read)
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    root.geometry("1000x600")
+    app = Application()
+    app.mainloop()
+</code></pre>
+<p>With some debugging, the problem happens at <code>proc.start()</code> but <code>proc</code> has data. The lists have data too, which is why I am confused why it is running out of input. Note: in my code there are six entries in the <code>gas_list</code></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You cannot use multiprocessing like that (well, you can, but the result will be unpredictable) - when you create a new process your <code>minimalmodbus.Instrument</code> object from the list doesn't get passed as a reference but as a whole new object. Python essentially runs a completely new Python interpreter instance whenever you <code>start()</code> a <code>multiprocess.Process</code> instance and since different processes get different stacks they don't get to share the internal memory so Python actually pickles the passed arguments, sends them to the Process and then unpickles them there creating an illusion that both processes (the parent and the child) have the same data.</p>
+<p>You can observe it yourself if instead of creating a new <code>multiprocessing.Process</code> you call <code>self.main_reader(pickle.loads(pickle.dumps(sen)), val)</code> (<code>val</code> also gets pickled but as a generic it's not of any importance here).</p>
+<p>The very same process happens to the <code>Application.main_reader()</code> method (although weirdly defined), too - the way you have it set up is that your whole <code>Application</code> instance actually gets recreated in the sub-process so that Python can call its <code>main_reader()</code> method.  </p>
+<p>What you can do instead is to pass needed arguments to recreate your original object to the sub-process function, and then have your object created when your function starts. For example, if you modify your <code>Application.all_process()</code> method as:</p>
+<pre><code>def all_process(self):
+    gas = {"__init__": ("COM3", 1)
+           "serial": {
+               "baudrate": 9600,
+               "bytesize": 8,
+               "parity": serial.PARITY_NONE,
+               "stopbits": 1,
+               "timeout": 0.25
+           },
+           "mode": minimalmodbus.MODE_RTU}
+
+    gas_list = [gas]
+    processes = []
+    while len(gas_list) &gt; 0:
+        val = 1
+        for sen in gas_list:
+            # we'll be calling the main_reader function outside of the Application instead
+            proc = multiprocessing.Process(target=main_reader, args=(sen, val))
+            processes.append(proc)
+            proc.start()
+            val += 1
+        for sen in processes:
+            sen.join()
+        time.sleep(1)
+        # you do plan to exit this loop, right?
+</code></pre>
+<p>And then have your <code>main_reader()</code> function defined outside of the <code>Application</code> class as:</p>
+<pre><code>def main_reader(data, val):  # notice it's outside of the Application scope
+    sen = minimalmodbus.Instrument(*data["__init__"])  # initialize Instrument
+    for k, v in data["serial"].items():  # apply the serial settings
+        setattr(sen.serial, k, v)
+    sen.mode = data["mode"]  # set the mode
+    try:
+        read = sen.read_registers(0, 42)
+    except OSError:
+        read = "Communication Error"
+    except ValueError:
+        read = "RTU Error"
+    print(read)
+</code></pre>
+<p>It should stop throwing errors. Also, you've used <code>threading.Lock</code> in your original code - I don't know what you were trying achieve with it, but it most certainly doesn't do what you think it does.</p>
+</div>
+<span class="comment-copy">Great answer! Looks like I have a lot to learn still. Is there anyway I could keep <code>main_reader</code> in the <code>Application</code> class so if I need to change labels in Tkinter I can reference it all within the same class?</span>
+<span class="comment-copy">@Evan - there is a way - somewhat. Check <a href="https://stackoverflow.com/a/44186168/7553525">this answer</a>, but it still creates a new instance, just in a more controllable way. If you only need to 'share' labels (strings), it might be better to create a separate structure/class in the global namespace that would hold the labels and then reference them from both, your <code>Application</code> class and from your standalone function. Just make sure you don't define that under the <code>__name__ == "__main__"</code> guard.</span>
+<span class="comment-copy">I need to change each label after the process, which would be every second. I just need a way to get <code>read</code> into <code>Application()</code>.</span>
+<span class="comment-copy">@Evan - in that case use a multiprocessing-aware structure to exchange the data. You can use <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Queue" rel="nofollow noreferrer"><code>multiprocessing.Queue</code></a> as a queue between your process(es) like in <a href="https://stackoverflow.com/a/44611399/7553525">this example</a> or you can create a <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.sharedctypes.multiprocessing.Manager" rel="nofollow noreferrer"><code>multiprocessing.Manager</code></a> and use its multiprocessing-aware lists and dictionaries to exchange the data between your main process and your subprocesses.</span>

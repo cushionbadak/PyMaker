@@ -1,0 +1,78 @@
+<div class="post-text" itemprop="text">
+<p>Consider this small python script <code>odd-read-blocking.py</code>:</p>
+<pre><code>#!/usr/bin/python
+
+import signal
+import sys
+
+sig = None
+
+
+def handler(signum, frame):
+    global sig
+    sig = signum
+
+
+signal.signal(signal.SIGINT, handler)
+signal.signal(signal.SIGTERM, handler)
+
+x = sys.stdin.read(3)
+
+print 'signal', sig
+print 'read bytes', len(x)
+
+exit(0)
+</code></pre>
+<p>I run this and feed it with two bytes of standard input data ('a' + '\n'):</p>
+<pre><code>&gt; echo a | ./odd-read-blocking.py 
+signal None
+read bytes 2
+&gt;
+</code></pre>
+<p>Fine.</p>
+<p>Now I feed it with the same two bytes (by typing 'a' + '\n' into its standard input). Please note that standard input is then not at EOF yet and potentially has more data to come. So the read blocks, as it expects one more byte. I use <kbd>Ctrl</kbd>+<kbd>C</kbd> on the script.</p>
+<pre><code>&gt; ./odd-read-blocking.py 
+a
+^Csignal 2
+read bytes 2
+&gt;
+</code></pre>
+<p>Fine. We see that two bytes have been read and signal 2 was received.</p>
+<p>Now I open a standard input stream, but do not send any byte on it. The read blocks as expected. If I now use <kbd>Ctrl</kbd>+<kbd>C</kbd> on the script, it will keep sitting there and wait. The read will not be interrupted. The SIGINT will not be processed.</p>
+<pre><code>&gt; ./odd-read-blocking.py 
+^C
+</code></pre>
+<p>Nothing here. Script still running (seemingly blocked at the read).</p>
+<p>Now hitting return once, then <kbd>Ctrl</kbd>+<kbd>C</kbd> again:</p>
+<pre><code>^Csignal 2
+read bytes 1
+&gt;
+</code></pre>
+<p>So, only after receiving at least some data (a single '\n' in this case) on its standard input will the script behave as I expect it and correctly interrupt the blocked read and tell me it has received signal 2 and read 1 byte.</p>
+<p>Alternative 1: instead of using <kbd>Ctrl</kbd>+<kbd>C</kbd> as shown above, I have tried this same thing using <code>kill <em>pid</em></code> from a separate terminal. The behaviour is the same.</p>
+<p>Alternative 2: instead of using the shell standard input as described above, I have done this:</p>
+<pre><code>&gt; sleep 2000 | ./odd-read-blocking.py
+</code></pre>
+<p>When using <code>kill <em>pid</em></code> to send SIGTERM to the <code>odd-read-blocking.py</code> process I get the same behaviour. Here, the script process can only be killed using SIGKILL (9).</p>
+<p>Why isn't the read interrupted, when it is blocking on an as yet empty but still active standard input stream?</p>
+<p>I find this odd. Who doesn't? Who can explain?</p>
+</div>
+<div class="post-text" itemprop="text">
+<h1>The short version</h1>
+<p>If a Python signal handler throws an exception to abandon an ongoing <code>file.read</code>, any data already read is <strong>lost</strong>.  (Any asynchronous exception, like the default <code>KeyboardInterrupt</code>, makes it basically impossible to prevent this sort of failure unless you have a <a href="https://simonmar.github.io/posts/2017-01-24-asynchronous-exceptions.html" rel="nofollow noreferrer">way to mask it</a>.)</p>
+<p>To minimize the need for this, <code>file.read</code> returns early (<em>i.e.</em>, with a shorter string than requested) when it is interrupted by a signal—note that this is in addition to the EOF and non-blocking I/O cases that are documented!  However, it can't do this when it has no data yet, since it returns the empty string to indicate EOF.</p>
+<h1>Details</h1>
+<p>As always, the way to understand behavior like this is with <code>strace</code>.</p>
+<h2>read(2)</h2>
+<p>The actual <code>read</code> system call has a dilemma when a signal arrives while the process is blocked.  First, the (C) signal handler gets invoked—but because that could happen between any two instructions, there's very little it can do beyond setting a flag (or writing to a self-pipe).  Then what?  If <code>SA_RESTART</code> is set, the call is resumed; otherwise…</p>
+<p>If no data has been transferred yet, <code>read</code> can fail and the client can check its signal flag.  It fails with the special <code>EINTR</code> to clarify that nothing actually went wrong with the I/O.</p>
+<p>If some data has already been written into the (userspace) buffer, it can't just return "failure", because data would be lost—the client can't know how much (if any) data is in the buffer.  So it just returns success (the number of bytes read so far)!  Short reads like this are always a possibility: the client has to call <code>read</code> again to check that it has reached end of file.  (Just like <code>file.read</code>, a short read of 0 bytes would <em>be</em> EOF.)  The client therefore has to check their signal flag after every read, whether it succeeds or not.  (Note that this is still not <a href="http://250bpm.com/blog:12" rel="nofollow noreferrer">perfectly reliable</a>, but it's good enough for many interactive use cases.)</p>
+<h2>file.read()</h2>
+<p>The system call isn't the whole story: after all, the normal configuration for a terminal has it return immediately after seeing a newline.  Python 2's low-level <code>file.read</code> is a <a href="https://docs.python.org/2.7/library/stdtypes.html#file.read" rel="nofollow noreferrer">wrapper for <code>fread</code></a>, which will issue another <code>read</code> if one is short.  But when a read fails with <code>EINTR</code>, <code>fread</code> returns early and <code>file.read</code> calls your (Python) signal handler.  (If you add output to it, you'll see that it's called immediately for each signal you send, even if <code>file.read</code> doesn't return.)</p>
+<p>Then it's faced with a dilemma similar to that for the system call: as discussed, a short read can't be empty because it means EOF.  Unlike a C signal handler, however, a Python one can do arbitrary work (including raising an exception to abort the I/O immediately, at the cost of risking data loss as mentioned at the beginning), and it's considered a convenient simplification to the interface to hide the possibility <code>EINTR</code>.  So the <code>fread</code> call is just silently repeated.</p>
+<h2>Python 3.5</h2>
+<p>The rules for retrying <a href="https://www.python.org/dev/peps/pep-0475/" rel="nofollow noreferrer">changed in 3.5</a>.  Now the <code>io.IOBase.read</code> resumes even if it has data in hand; this is more consistent, but it <a href="https://stackoverflow.com/a/49419451/8586227">forces</a> the use of exceptions to stop reading, which means that you can't opt to wait on some data in order not to risk losing any you already have.  The very heavyweight solution is to switch to multiplexed I/O and use <code>signal.set_wakeup_fd()</code>; this has the added advantage of allowing SIGINT to affect the main thread without having to bother with masking it in all the others.</p>
+</div>
+<span class="comment-copy">Thanks for your thorough answer Davis, it explains what I see (and adding a print in the handler function shows that the handler is actually called at the time I expect). Your suggestion of raising an exception in the handler function to abort the read (at the cost of possible data loss) solves my problem.</span>
+<span class="comment-copy">An alternative would have been to make Python's file.read() raise something like an InterruptedSysCallException. Are there obvious reasons this was not done? I am asking because raising an exception in the handler function and all its implications don't exactly make my code here a better place. In fact, this approach to a considerable degree negates the signal handler's purpose of allowing the program to react in a structured fashion to a signal that it receives at an arbitrary time.</span>
+<span class="comment-copy">@HerrB: There is <a href="https://docs.python.org/3/library/exceptions.html#InterruptedError" rel="nofollow noreferrer"><code>InterruptedError</code></a>, but throwing it into unsuspecting code even for a harmless signal like <code>SIGCHLD</code> was a source of bugs.  Perhaps the most correct (backward-incompatible) thing to do would be to return <code>""</code> on an interrupt and <code>None</code> on EOF.</span>

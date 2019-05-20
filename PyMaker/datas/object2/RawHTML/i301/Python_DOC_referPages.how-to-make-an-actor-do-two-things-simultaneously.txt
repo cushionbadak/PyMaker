@@ -1,0 +1,131 @@
+<div class="post-text" itemprop="text">
+<p>I define a <code>learner</code> and a <code>worker</code>. I wish that <code>learner</code> runs its member function <code>learn</code> in the background, and once in a while, <code>worker</code> sends <code>learner</code> some information to print.</p>
+<p>The following code is an example</p>
+<pre class="lang-py prettyprint-override"><code>import ray
+
+@ray.remote
+class Learner():
+    def __init__(self):
+        pass
+
+    def learn(self):
+        while True:
+            pass # do something, such as updating network 
+
+    def log_score(self, score):
+        print('worker', score)
+
+@ray.remote
+class Worker():
+    def __init__(self, learner):
+        self.learner = learner
+
+    def sample(self):
+        for i in range(1000000):
+            if i % 1000 == 0:
+                self.learner.log_score.remote(i)
+
+ray.init()
+
+learner = Learner.remote()
+worker = Worker.remote(learner)
+
+
+worker.sample.remote()
+learner.learn.remote()
+
+while True:
+    pass
+</code></pre>
+<p>However, <code>learner</code> will not run <code>log_score</code> until <code>learn</code> is complete, which is not what I want. I've thought of a way to make it work: Instead of calling <code>Learner.learn</code> explicitly, I have <code>Worker</code> call it. Specifically, I redefine <code>learn</code> and <code>sample</code> as follows</p>
+<pre class="lang-py prettyprint-override"><code>"""Learner"""
+def learn(self):
+    # no loop here
+    pass # do something, such as updating network 
+
+"""Worker"""
+def sample(self):
+    for i in range(1000000):
+        if i % 1000 == 0:
+            self.learner.learn.remote()
+            self.learner.log_score.remote(i)
+</code></pre>
+<p>Although this works, but now I have to control how often <code>learn</code> should be called, which seems kind of redundant. Is there any way better to achieve what I want?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is a great question. In Ray's actor model, each actor task is atomic in the sense that the actor will execute task at a time and will not begin a new one until the previous one has returned. This choice simplifies reasoning about concurrency, but makes it harder to have the actor do two things at once.</p>
+<p>To make something like this work, you essentially have two choices.</p>
+<ol>
+<li><p><strong>Threading:</strong> Have the actor do some work in a background thread and leave the actor's main thread idle so that it can execute new tasks.</p>
+<pre><code>import ray
+import threading
+import time
+
+@ray.remote
+class Actor(object):
+    def __init__(self):
+        self.value = 0
+        self.t = threading.Thread(target=self.update, args=())
+        self.t.start()
+
+    def update(self):
+        while True:
+            time.sleep(0.01)
+            self.value += 1
+
+    def get_value(self):
+        return self.value
+
+ray.init()
+
+# Create the actor. This will start a long-running thread in the background
+# that updates the value.
+a = Actor.remote()
+
+# Get the value a couple times.
+print(ray.get(a.get_value.remote()))
+print(ray.get(a.get_value.remote()))
+</code></pre></li>
+<li><p><strong>Smaller Units of Work:</strong> This means restructuring the code so that no actor method loops forever. In your example, you can make the <code>learn</code> function return after some number of passes through the loop. In that case, new <code>learn</code> tasks must continually be submitted. It's even possible to have the <code>learn</code> method submit return and submit itself in order to allow other methods to be scheduled in between. There are many ways to do this, which will depend on your application, but this one example is below.</p>
+<pre><code>import ray
+import threading
+import time
+
+@ray.remote
+class Actor(object):
+    def __init__(self):
+        self.value = 0
+
+    def set_handle_to_self(self, handle_to_self):
+        self.handle_to_self = handle_to_self
+
+    def learn(self):
+        for _ in range(10):
+            time.sleep(0.01)
+            self.value += 1
+
+        # Submit the learn task again so that the learning continues
+        # but other methods can be scheduled in between.
+        self.handle_to_self.learn.remote()
+
+    def get_value(self):
+        return self.value
+
+ray.init()
+
+# Create the actor. This will start a long-running thread in the background
+# that updates the value.
+a = Actor.remote()
+# Give the actor a handle to itself so that it can submit tasks to itself.
+a.set_handle_to_self.remote(a)
+
+# Start the learning, which will continue forever.
+a.learn.remote()
+
+# Get the value a couple times.
+print(ray.get(a.get_value.remote()))
+print(ray.get(a.get_value.remote()))
+</code></pre></li>
+</ol>
+</div>
+<span class="comment-copy">Look into <a href="https://docs.python.org/3/library/threading.html" rel="nofollow noreferrer">threading</a>.</span>

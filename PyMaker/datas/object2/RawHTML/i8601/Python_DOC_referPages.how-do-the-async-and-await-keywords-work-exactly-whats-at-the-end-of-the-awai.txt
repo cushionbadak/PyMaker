@@ -1,0 +1,171 @@
+<div class="post-text" itemprop="text">
+<p>I have this code:</p>
+<pre><code>async def foo(x):
+    yield x
+    yield x + 1
+
+async def intermediary(y):
+    await foo(y)
+
+def bar():
+    c = intermediary(5)
+</code></pre>
+<p>What do I put in bar to get the 5 and the 6 out of <code>c</code>?</p>
+<p>I'm asking because the <code>asyncio</code> library seems like a lot of magic. And I want to know exactly how the magic works.</p>
+<p>Maybe I want to write my own functions that call <code>read</code> or <code>write</code> and then inform some top level loop that I wrote that they're waiting for the file descriptor to become readable or writeable.</p>
+<p>And then, maybe I want that top level loop to be able to resume my read and write functions (and the whole intermediate chain between the top level loop and them) once those conditions become true.</p>
+<p>I already know how to <em>use</em> <code>asyncio</code> more or less. I wrote this <a href="https://bitbucket.org/omnifarious/puppy-2017-03-16-asyncio/src/tip/silly_async.py?at=default&amp;fileviewer=file-view-default" rel="nofollow noreferrer">little demo program</a> that computes squares after a delay but launches lots of those tasks that each append to a list after a random interval. It's kind of clumsily written, but it works.</p>
+<p>I want to know exactly what that program is doing under the hood. And in order to do that, I have to know how await on that sleep informs the top-level event loop that it wants to sleep (and be called again) for a bit and how the state of all the intermediate stack frames between the call to sleep and the top level event loop are frozen in place then reactivated when the delay is over.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Have you tried looking at the source for asyncio.sleep?</p>
+<pre><code>@coroutine                                                                       
+def sleep(delay, result=None, *, loop=None):                                     
+    """Coroutine that completes after a given time (in seconds)."""              
+    if delay == 0:                                                               
+        yield                                                                    
+        return result                                                            
+
+    if loop is None:                                                             
+        loop = events.get_event_loop()                                           
+    future = loop.create_future()                                                
+    h = future._loop.call_later(delay,                                           
+                                futures._set_result_unless_cancelled,            
+                                future, result)                                  
+    try:                                                                         
+        return (yield from future)                                               
+    finally:                                                                     
+        h.cancel()
+</code></pre>
+<p>Basically it uses loop.call_later to set a future, and then waits for the future. Not sure this entirely answers your questions, but it might help.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>So, I understand a lot better how to make what I was trying to do work. This is how my code should've read:</p>
+<pre><code>import types
+
+@types.coroutine
+def foo(x):
+    yield x
+    yield x + 1
+
+async def intermediary(y):
+    await foo(y)
+
+def bar():
+    c = intermediary(5)
+    try:
+        while True:
+            result = c.send(None)
+            print(f"Got {result} from the coroutine.")
+    except StopIteration as e:
+        print(f"StopIteration exception: {e!r}")
+</code></pre>
+<p>The basic answer is that the endpoint of this can be a normal generator decorated with <code>types.coroutine</code>. There are more ways of making this work, and this further modification of my code demonstrates them:</p>
+<pre><code>import types
+from collections.abc import Awaitable
+
+@types.coroutine
+def foo(x):
+    sent = yield x
+    print(f"foo was sent {sent!r}.")
+    sent = yield x + 1
+    print(f"foo was sent {sent!r}.")
+    return 'generator'
+
+class MyAwaitable(Awaitable):
+    def __init__(self, x):
+        super().__init__()
+        self.x_ = x
+    def __await__(self):
+        def gen(x):
+            for i in range(x-1, x+2):
+                sent = yield i
+                print(f"MyAwaitable was sent {sent!r}.")
+            return 'class'
+        return iter(gen(self.x_))
+
+async def intermediary(t, y):
+    awaited = await t(y)
+    print(f"Got {awaited!r} as value from await.")
+
+def runco(chain_end):
+    c = intermediary(chain_end, 5)
+    try:
+        sendval = None
+        while True:
+            result = c.send(sendval)
+            print(f"Got {result} from the coroutine.")
+            sendval = sendval + 1 if sendval is not None else 0
+    except StopIteration as e:
+        print(f"StopIteration exception: {e!r}")
+</code></pre>
+<p>As you can see, anything that defines an <code>__await__</code> method that returns an iterator can also be <code>await</code>ed upon. What really happens is that the thing being <code>await</code>ed upon is iterated over until it stops and then the <code>await</code> returns. The reason you do this is that the final thing at the end of the chain may encounter some kind of blocking condition. It can then report on that condition (or ask a callback to be set or something else) by <code>yield</code>ing or returning a value from the iterator (basically the same thing as <code>yield</code>ing). Then the top level loop can continue on to whatever other thing can be run.</p>
+<p>The nature of the whole chain of <code>await</code> calls is that when you then go back and ask for the next value from the iterator (call back into the blocked function telling it that maybe it isn't blocked now) the entire call stack is reactivated. This whole chain exists as a way to preserve the state of the call stack while the call is blocked. Basically a thread that voluntarily gives up control rather than having control wrested from it by a scheduler.</p>
+<p>The vision in my head of how <code>asyncio</code> worked internally when I asked this question is apparently how something called <a href="https://github.com/dabeaz/curio" rel="nofollow noreferrer">curio</a> works and is based on the end point routines <code>yield</code>ing some sort of indicator of what they're being blocked by and the top level loop that's running it all (<code>runco</code> in my example) then putting that in some sort of general pool of conditions to look for so it can resume the routine as soon as the condition it's blocked by changes. In <code>asyncio</code>, something much more complex happens, and it uses objects with the <code>__await__</code> method (like <code>MyAwaitable</code> in my example) and some sort of callback mechanism to make it all work.</p>
+<p>Brett Cannon wrote a really good article that talks about <a href="https://snarky.ca/how-the-heck-does-async-await-work-in-python-3-5/" rel="nofollow noreferrer">how generators evolved into coroutines</a>. It will go into far more detail than I can go into in a StackOverflow answer.</p>
+<p>One interesting tidbit I discovered is that when you do this:</p>
+<pre><code>def foo(x):
+    yield 11
+
+bar = types.coroutine(foo)
+</code></pre>
+<p>Both <code>foo</code> and <code>bar</code> become 'coroutines' and can be <code>await</code>ed on. All the decorator does is flip a bit in <code>foo.__code__.co_flags</code>. This is, of course, an implementation detail and should not be relied upon. I think this is something of a bug actually, and I may report it as such.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There is an <a href="https://docs.python.org/3/library/asyncio-task.html#example-chain-coroutines" rel="nofollow noreferrer">example in the documentation</a>, that looks almost exactly like what you are trying to do. It contains a sleep call (used instead of IO), so that the asyncio aspect makes sense.</p>
+<pre><code>import asyncio
+
+async def compute(x, y):
+    print("Compute %s + %s ..." % (x, y))
+    await asyncio.sleep(1.0)
+    return x + y
+
+async def print_sum(x, y):
+    result = await compute(x, y)
+    print("%s + %s = %s" % (x, y, result))
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(print_sum(1, 2))
+loop.close()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Going through the code you have supplied above, an <code>async def</code> that includes a <code>yield</code> creates an <a href="https://www.python.org/dev/peps/pep-0525/" rel="nofollow noreferrer"><strong>Asynchronous Generator</strong></a>:</p>
+<pre><code>async def foo(x):
+    yield x
+    yield x + 1
+</code></pre>
+<p>To consume data from it, use <code>async for</code>:</p>
+<pre><code>async def intermediary(y):
+    results = []
+    async for x in foo(y):
+        results.append(x)
+    return results
+</code></pre>
+<p>To consume a result from a simple coroutine such as <code>intermediary</code> from a regular function, you will need to create an event loop and to use <code>run_until_complete()</code>:</p>
+<pre><code>loop = asyncio.get_event_loop()
+result = loop.run_until_complete(intermediary(5))
+print(result)
+loop.close()
+</code></pre>
+</div>
+<span class="comment-copy">asyncio does not make sense without I/O. Please change your program to preform a bit of slow=blocking  I/O ops - for example get 5 and 6 from a remote server.</span>
+<span class="comment-copy">For more information on asyncio see <a href="https://docs.python.org/3/library/asyncio-task.html" rel="nofollow noreferrer">docs.python.org/3/library/asyncio-task.html</a></span>
+<span class="comment-copy">@PenguinBrian - Yeah, I've read those and more or less understand them. I've even written a working demo program that uses it. But I want to know how I would write my own <code>asyncio</code> library. Not necessarily because I'm going to, just because I want to know how it works. I've updated my question to reflect that. Thank you very much for trying to answer.</span>
+<span class="comment-copy">This video basically answered my question: <a href="https://www.youtube.com/watch?v=E-1Y4kSsAFc&amp;index=9&amp;list=PLaYLZDmkh3uz8nEiL3DziTBes5LDGqROx" rel="nofollow noreferrer">youtube.com/…</a></span>
+<span class="comment-copy">And this talk is even better: <a href="https://www.youtube.com/watch?v=ZzfHjytDceU&amp;index=8&amp;list=PLaYLZDmkh3uz8nEiL3DziTBes5LDGqROx" rel="nofollow noreferrer">youtube.com/…</a></span>
+<span class="comment-copy">It's a step in the right direction. Now, how is the future implemented? :-) Somewhere that chain of <code>await</code> calls ends in something.</span>
+<span class="comment-copy">@Omnifarious The chain of <code>await</code> actually ends with <a href="https://github.com/python/asyncio/blob/master/asyncio/futures.py#L380" rel="nofollow noreferrer">the future itself</a>. It bubbles up to <a href="https://github.com/python/asyncio/blob/master/asyncio/tasks.py#L239" rel="nofollow noreferrer">Task._step</a> where the next step is <a href="https://github.com/python/asyncio/blob/master/asyncio/tasks.py#L270" rel="nofollow noreferrer">scheduled as a callback</a> of the given future.</span>
+<span class="comment-copy">@Vincent - Interesting. Is there a function in there with the <code>@coroutine</code> decorator that yields an instruction to the event loop about when to call the future back?</span>
+<span class="comment-copy">@Omnifarious What you describe is actually how <a href="https://github.com/dabeaz/curio/blob/master/curio/traps.py" rel="nofollow noreferrer">curio traps</a> work. Asyncio has a different approach, entirely based on future.</span>
+<span class="comment-copy">@Vincent - Interesting. As a model for understanding how coroutines interact with the old generator framework, curio traps make a lot more sense to me. But I am curious as to how <code>asyncio</code> works as well. I learned that from David Beazly's talks, and so it's unsurprising that he would talk about how curio worked.</span>
+<span class="comment-copy">Your conclusion is a bit exaggerated, and there are a few other things to consider. Asyncio has been designed 5 years ago, 3 years before async/await was added to the language. An important aspect of its design is interoperability through a pluggable event loop interface, so it's easy for other frameworks to become asyncio compatible. And since most of the existing event loops were already based on callbacks, it made a lot of sense to build asyncio in a similar way.</span>
+<span class="comment-copy">Futures and coroutines have been built on top of this base, in order to provide a high-level interface. It's only later that people realized it was interesting to get rid of callbacks and futures to focus exclusively on coroutines instead. More information <a href="https://github.com/dabeaz/curio#other-resources" rel="nofollow noreferrer">here</a>. Also, see this <a href="https://gist.github.com/vxgmichel/9fa643218c60272b3c8f56a0c275305a" rel="nofollow noreferrer">example</a>.</span>
+<span class="comment-copy">@Vincent - Otherwise, do you feel this is a good answer?</span>
+<span class="comment-copy">It does indeed answer the first part of your question, though you might want to have a closer look at the concepts presented in <a href="http://stackoverflow.com/a/41208685/2846140">this answer</a>. Also, here's a <a href="https://snarky.ca/how-the-heck-does-async-await-work-in-python-3-5/" rel="nofollow noreferrer">great article by Brett Cannon</a>.</span>
+<span class="comment-copy">Using coroutines without I/O and without a loop does not make any sense.  Regular genetors and functions should be used instead.  A lot of work has been done recently in <code>asyncio</code>, and using <code>async def</code> for coroutines and async generators is the current best practice.  The code above shows only one part of the story - but to fully understand (and explain) why couroutines should be used, and why they were designed this way, they actually need to do some work, asynchronously.</span>
+<span class="comment-copy">Except, exactly how does <code>asyncio.sleep</code> work? How would I write my own?</span>
+<span class="comment-copy">Suppose I want to create my own event loop. Somewhere, that chain of <code>await</code>ed calls ends in something. What does it end with? How do I signal to the event loop that it should call me back at some point? I updated my question, so that might help with what my question is about.</span>
+<span class="comment-copy">I think it will be fair to ask a new question "How does asyncio works?" - I'll be happy to answer :-)  Let's continue in chat: <a href="http://chat.stackoverflow.com/rooms/138590/how-does-python-asyncio-work">chat.stackoverflow.com/rooms/138590/…</a></span>
+<span class="comment-copy">I'll be there in 5-10 minutes.</span>
+<span class="comment-copy">I answered my own question: <a href="http://stackoverflow.com/a/42938406/167958">stackoverflow.com/a/42938406/167958</a></span>

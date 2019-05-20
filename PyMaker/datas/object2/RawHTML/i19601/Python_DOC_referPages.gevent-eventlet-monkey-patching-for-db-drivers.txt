@@ -1,0 +1,43 @@
+<div class="post-text" itemprop="text">
+<p>After doing Gevent/Eventlet monkey patching - can I assume that whenever DB driver (eg <em>redis-py</em>, <em>pymongo</em>) uses IO through standard library (eg <code>socket</code>) it will be asynchronous?</p>
+<p>So using eventlets monkey patching is enough to make eg: <em>redis-py</em> non blocking in eventlet application?</p>
+<p>From what I know it should be enough if I take care about connection usage (eg to use different connection for each greenlet). But I want to be sure.</p>
+<p>If you known what else is required, or how to use DB drivers correctly with Gevent/Eventlet please type it also.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can assume it will be magically patched if all of the following are true.</p>
+<ul>
+<li>You're sure of the I/O is built on top of standard Python <code>socket</code>s or other things that <code>eventlet</code>/<code>gevent</code> monkeypatches. No files, no native (C) socket objects, etc.</li>
+<li>You pass <code>aggressive=True</code> to <code>patch_all</code> (or <code>patch_select</code>), or you're sure the library doesn't use <code>select</code> or anything similar.</li>
+<li>The driver doesn't use any (implicit) internal threads. (If the driver <em>does</em> use threads internally, <code>patch_thread</code> <em>may</em> work, but it may not.)</li>
+</ul>
+<p>If you're not sure, it's pretty easy to test—probably easier than reading through the code and trying to work it out. Have one greenlet that just does something like this:</p>
+<pre><code>while True:
+    print("running")
+    gevent.sleep(0.1)
+</code></pre>
+<p>Then have another that runs a slow query against the database. If it's monkeypatched, the looping greenlet will keep printing "running" 10 times/second; if not, the looping greenlet will not get to run while the program is blocked on the query.</p>
+<p>So, what do you do if your driver blocks? </p>
+<p>The easiest solution is to use a truly concurrent threadpool for DB queries. The idea is that you fire off each query (or batch) as a threadpool job and greenlet-block your <code>gevent</code> on the completion of that job. (For really simple cases, where you don't need many concurrent queries, you can just spawn a <code>threading.Thread</code> for each one instead, but usually you can't get away with that.)</p>
+<p>If the driver does significant CPU work (e.g., you're using something that runs an in-process cache, or even an entire in-process DBMS like sqlite), you want this threadpool to actually be implemented on top of processes, because otherwise the GIL may prevent your <code>greenlets</code> from running. Otherwise (especially if you care about Windows), you probably want to use OS threads. (However, this means you can't <code>patch_threads()</code>; if you need to do that, use processes.)</p>
+<p>If you're using <code>eventlet</code>, and you want to use threads, there's a built-in simple solution called <a href="http://eventlet.net/doc/threading.html#tpool-simple-thread-pool" rel="noreferrer"><code>tpool</code></a> that may be sufficient. If you're using <code>gevent</code>, or you need to use processes, this won't work. Unfortunately, blocking a greenlet (without blocking the whole event loop) on a real threading object is a bit different between <code>eventlet</code> and <code>gevent</code>, and not documented very well, but the <code>tpool</code> source should give you the idea. Beyond that part, the rest is just using <a href="http://docs.python.org/3/library/concurrent.futures.html" rel="noreferrer"><code>concurrent.futures</code></a> (see <a href="http://pypi.python.org/pypi/futures/2.1.3" rel="noreferrer"><code>futures</code></a> on pypi if you need this in 2.x or 3.1) to execute the tasks on a <code>ThreadPoolExecutor</code> or <code>ProcessPoolExecutor</code>. (Or, if you prefer, you can go right to <code>threading</code> or <code>multiprocessing</code> instead of using <code>futures</code>.)</p>
+<hr/>
+<blockquote>
+<p>Can you explain why I should use OS threads on Windows?</p>
+</blockquote>
+<p>The quick summary is: If you stick to threads, you can pretty much just write cross-platform code, but if you go to processes, you're effectively writing code for two different platforms.</p>
+<p>First, read the <a href="http://docs.python.org/3/library/multiprocessing.html#programming-guidelines" rel="noreferrer">Programming guidelines</a> for the <code>multiprocessing</code> module (both the "All platforms" section and the "Windows" section). Fortunately, a DB wrapper shouldn't run into most of this. You only need to deal with processes via the <code>ProcessPoolExecutor</code>. And, whether you wrap things up at the cursor-op level or the query level, all your arguments and return values are going to be simple types that can be pickled. Still, it's something you have to be careful about, which otherwise wouldn't be an issue.</p>
+<p>Meanwhile, Windows has very low overhead for its intra-process synchronization objects, but very high overhead for its inter-process ones. (It also has very fast thread creation and very slow process creation, but that's not important if you're using a pool.) So, how do you deal with that? I had a lot of fun creating OS threads to wait on the cross-process sync objects and signal the greenlets, but your definition of fun may vary.</p>
+<p>Finally, <code>tpool</code> can be adapted trivially to a <code>ppool</code> for Unix, but it takes more work on Windows (and you'll have to understand Windows to do that work).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>abarnert's answer is correct and very comprehensive. I just want to add that there is no "aggressive" patching in eventlet, probably gevent feature. Also if library uses <code>select</code> that is not a problem, because eventlet can monkey patch that too.</p>
+<p>Indeed, in most cases <code>eventlet.monkey_patch()</code> is all you need. Of course, it must be done before creating any sockets.</p>
+<p>If you still have any issues, feel free to open issue or write to eventlet mailing list or G+ community. All relevant links can be found at <a href="http://eventlet.net/" rel="nofollow">http://eventlet.net/</a></p>
+</div>
+<span class="comment-copy">Thanks for a great answer! Can you explain why I should use OS threads on Windows ("<i>especially if you care about Windows</i>")?</span>
+<span class="comment-copy">@RobertZaremba: I'll edit the answer, because it's a bit too long to fit in a comment.</span>
+<span class="comment-copy">Usually I avoid using threads, especially in Python.</span>
+<span class="comment-copy">@RobertZaremba: I know a lot of people preach that as some kind of dogma, but it's silly, if you understand the differences. Using <i>lots</i> of threads is always bad; if you need 1000 tasks running, use greenlets. Using threads to parallelize CPU-bound tasks doesn't work in Python; if you need that, use multiprocessing. But when neither of those are relevant, using greenlets or multiprocessing over threads means you're getting something which is designed to work as much like threads as possible but only gets 90% of the way there, for no actual benefit. Just use threads.</span>
+<span class="comment-copy">There is <code>gevent.threadpool</code>, at least in Gevent 1.x.</span>
+<span class="comment-copy">Yes, <code>aggressive</code> is <code>gevent</code>-specific. It means that everything that can't be patched gets deleted. So, if you just <code>monkey.patch_all()</code> (or <code>monkey.patch_select()</code>), your third-party library may find that, e.g., <code>select.epoll</code> exists and use that in preference to <code>select.select</code>, and end up blocking on <code>epoll</code>; if you do <code>monkey.patch_all(aggressive=True)</code>, <code>select.epoll</code> won't exist, the library will fall back to <code>select.select</code>, which is patched, and everything will be fine.</span>

@@ -1,0 +1,154 @@
+<div class="post-text" itemprop="text">
+<p>Is it possible to change the log level using fileConfig in python without restarting the application. If it cannot be achieved through fileConfig is there some other way to get the same result? </p>
+<p>Update: This was for an application running on a server, I wanted sys admins to be able to change a config file that would be picked during run time by application and change the log level dynamically. I was working with gevent at that time hence I've added my code as one of the answers which uses inotify to pick changes to config file.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>fileConfig</code> is a mechanism to configure the log level for you based on a file; you can dynamically change it at any time in your program.</p>
+<p>Call <a href="http://docs.python.org/2/library/logging.html#logging.Logger.setLevel" rel="noreferrer"><code>.setLevel()</code></a> on the logging object for which you want to change the log level. Usually you'd do that on the root:</p>
+<pre><code>logging.getLogger().setLevel(logging.DEBUG)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>In addition to the accepted answer: Depending on how you initialized the logger, you might also have to update the logger's handlers:</p>
+<pre><code>import logging
+
+level = logging.DEBUG
+logger = logging.getLogger()
+logger.setLevel(level)
+for handler in logger.handlers:
+    handler.setLevel(level)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>It is certainly possible to use <code>fileConfig()</code> to change logging configuration on the fly, though for simple changes a programmatic approach as suggested in Martijn Pieters' answer might be appropriate. Logging even provides a socket server to listen for config changes using the <code>listen()</code> / <code>stopListening()</code> APIs, as documented <a href="http://docs.python.org/2/howto/logging-cookbook.html#configuration-server-example" rel="noreferrer">here</a>. To get logging to listen on a particular port, you use</p>
+<pre><code>t = logging.config.listen(PORT_NUMBER)
+t.start()
+</code></pre>
+<p>and to stop listening, call</p>
+<pre><code>logging.config.stopListening()
+</code></pre>
+<p>To send data to the server, you can use e.g.</p>
+<pre><code>s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect(('localhost', PORT_NUMBER))
+with open(CONFIG_FILE) as f:
+    data_to_send = f.read()
+s.send(struct.pack('&gt;L', len(data_to_send)))
+s.send(data_to_send)
+s.close()
+</code></pre>
+<p><strong>Update:</strong> Due to backwards-compatibility constraints, the internal implementation of the <code>fileConfig()</code> call means that you can't specify <code>disable_existing_loggers=False</code> in the  call, which makes this feature less useful in certain scenarios. You can use the same API to send a JSON file using the dictConfig schema, which will allow better control over the reconfiguration. This requires Python 2.7/3.2 or above (where <code>dictConfig()</code> was added). Or, you can use the stdlib code to implement your own listener which works in the same way but which is tailored to your specific needs.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I finally settled with using inotify and gevent to check for the file write operation, and once I know the file has been changed then I go and set the level for each logger I have based on the config.</p>
+<pre><code>import gevent
+import gevent_inotifyx as inotify
+from gevent.queue import Queue
+
+class FileChangeEventProducer(gevent.Greenlet):
+    def __init__(self, fd, queue):
+        gevent.Greenlet.__init__(self)
+        self.fd = fd
+        self.queue = queue
+
+    def _run(self):
+        while True:
+            events = inotify.get_events(self.fd)
+            for event in events:
+                self.queue.put(event)
+                gevent.sleep(0)
+
+
+class FileChangeEventConsumer(gevent.Greenlet):
+    def __init__(self, queue, callBack):
+        gevent.Greenlet.__init__(self)
+        self.queue = queue
+        self.callback = callBack
+
+    def _run(self):
+        while True:
+            _ = self.queue.get()
+            self.callback()
+            gevent.sleep(0)
+
+
+class GeventManagedFileChangeNotifier:
+    def __init__(self, fileLocation, callBack):
+        self.fileLocation = fileLocation
+        self.callBack = callBack
+        self.queue = Queue()
+        self.fd = inotify.init()
+        self.wd = inotify.add_watch(self.fd, self.fileLocation, inotify.IN_CLOSE_WRITE)
+
+
+    def start(self):
+        producer = FileChangeEventProducer(self.fd, self.queue)
+        producer.start()
+        consumer = FileChangeEventConsumer(self.queue, self.callBack)
+        consumer.start()
+        return (producer, consumer)
+</code></pre>
+<p>The above code gets used like below,</p>
+<pre><code>    def _setUpLoggingConfigFileChangeNotifier(self):
+        loggingFileNameWithFullPath = self._getFullPathForLoggingConfig()
+        self.gFsNotifier = GeventManagedFileChangeNotifier(loggingFileNameWithFullPath, self._onLogConfigChanged)
+        self.fsEventProducer, self.fsEventConsumer = self.gFsNotifier.start()
+
+
+    def _onLogConfigChanged(self):
+        self.rootLogger.info('Log file config has changed - examining the changes')
+        newLoggingConfig = Config(self.resourcesDirectory, [self.loggingConfigFileName]).config.get('LOG')
+        self.logHandler.onLoggingConfigChanged(newLoggingConfig)
+</code></pre>
+<p>Once I have the new log file config I can wire in the right logging level for each logger from config. I just wanted to share the answer and it might help someone if they are trying to use it with gevent.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This might be what you are looking for:</p>
+<pre><code>import logging
+logging.getLogger().setLevel(logging.INFO)
+</code></pre>
+<p>Note that <code>getLogger()</code> called without any arguments returns the root logger.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Depending on your app, you first need to find a way for reloading that file or resetting the log level based on your own config file during execution.</p>
+<p>Easiest way would be to use a timer. Either use threading to do that, or make your async framework to do that (if you use any; they usually implement it).</p>
+<p>Using threading.Timer:</p>
+<pre><code>import threading
+import time
+
+
+def reset_level():
+    # you can reload your own config file or use logging.config.fileConfig here
+    print 'Something else'
+    pass
+
+
+t = threading.Timer(10, reset_level)
+t.start()
+
+while True:
+    # your app code
+    print 'Test'
+    time.sleep(2)
+</code></pre>
+<p>Output:</p>
+<pre><code>Test
+Test
+Test
+Test
+Test
+Something else
+Test
+Test
+</code></pre>
+<p>Update: 
+Please check the solution proposed by Martijn Pieters.</p>
+</div>
+<span class="comment-copy">Everyone using threads and timers to reset the logging level.  This is what signals were invented for.  You can signal a process using "SIGHUP" (which is the standard on *nix) to reload configuration.  In python you can install a signal handler that will catch this (event drive) and thus reload or reset a configuration.</span>
+<span class="comment-copy">I agree about using signals.  Suggest using SIGUSR1 or SIGUSR2 for this purpose instead of SIGHUP. The latter is sent when a process's controlling terminal disconnects.</span>
+<span class="comment-copy"><code>SIGUSR1</code>, <code>SIGUSR2</code> are only available for Unix-like system. You could use <code>logging.config.listen()</code> to listen for new configurations (<a href="https://docs.python.org/3/library/logging.config.html#logging.config.listen" rel="nofollow noreferrer">docs.python.org/3/library/…</a>)</span>
+<span class="comment-copy">Also see the answer by @sfinkens (and my comment there) in case you only want to change the setLevel for a particular handler.</span>
+<span class="comment-copy">Useful:  If you used a dictConfig to specify your Loggers, Handlers, etc, and you only want to setLevel on one particular Handler, you can use the .get_name() function in such a loop as is shown by @sfinkens here, and make sure you only change the level of the one you want.</span>
+<span class="comment-copy">Wow I saw this answer earlier today, but didn't notice the update. I struggled with exactly that issue. There is a bug filed to add the option.  <a href="http://bugs.python.org/issue26533" rel="nofollow noreferrer">bugs.python.org/issue26533</a>  Now I got around the issue in an underhanded way:</span>
+<span class="comment-copy"><code>python def my_fileConfig(fname, defaults=None, disable_existing_loggers=False):     """     This does _NOTHING_ but call fileConfig with disable_existing_loggers set     to False instead of true. It is intended to monkey patcn it out, so that the     config listener can be used without disabling all non-root loggers.     """     orig_fileConfig(fname, defaults, disable_existing_loggers)  orig_fileConfig = logging.config.fileConfig # HACK: Patch out fileConfig for my version. logging.config.fileConfig = my_fileConfig logging.config.fileConfig(config_path) </code></span>
+<span class="comment-copy">I don't think this fully answers the question.</span>
+<span class="comment-copy">I've used the above solution and the problem i'm facing (on rhel5 with python 2.4.3 and using ConcurrentLogHandler) is that for every reload of the config file, it add's a file handle and after running for a while it throws a "Too many open files" exception. So i agree with Travis Bear that the anwser from Martijn Pieters should be the accepted one.</span>

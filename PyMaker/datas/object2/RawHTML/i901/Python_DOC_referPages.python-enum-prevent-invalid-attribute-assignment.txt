@@ -1,0 +1,195 @@
+<div class="post-text" itemprop="text">
+<p>When I use the Functional API to create an enum, I get back an enum object that allows arbitrary assignment (i.e. it has a __dict__):</p>
+<pre><code>e = enum.Enum('Things',[('foo',1),('bar',2)])
+e.baz = 3
+</code></pre>
+<p>The item does not appear in the list:</p>
+<pre><code>list(e)
+[&lt;foo.foo: 1&gt;, &lt;foo.bar: 2&gt;]
+</code></pre>
+<p>But it can still be referenced:</p>
+<pre><code>if thing == e.baz: ...
+</code></pre>
+<p>Now while it seems unlikely to ever occur, one of the reasons I want to use an enum is to prevent spelling mistakes and string literals, and for those things to be caught when a module is imported or as early as possible.</p>
+<p>Is there a way to dynamically build an enum that behaves more like a __slots__ object that does not allow arbitrary attributes to be assigned?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>To make an enum class fully 'read-only', all that is required is a meta class that uses the <a href="https://docs.python.org/3/reference/datamodel.html#object.__setattr__" rel="nofollow noreferrer"><code>__setattr__</code> hook</a> that prevents <em>all</em> attribute assignments. Because the metaclass is attached to the class <em>after</em> it is created, there is no issue with assigning the proper enumerated values.</p>
+<p>Like Ethan's answer, I'm using the <code>EnumMeta</code> class as a base for the custom metaclass:</p>
+<pre><code>from enum import EnumMeta, Enum
+
+class FrozenEnumMeta(EnumMeta):
+    "Enum metaclass that freezes an enum entirely"
+    def __new__(mcls, name, bases, classdict):
+        classdict['__frozenenummeta_creating_class__'] = True
+        enum = super().__new__(mcls, name, bases, classdict)
+        del enum.__frozenenummeta_creating_class__
+        return enum
+
+    def __call__(cls, value, names=None, *, module=None, **kwargs):
+        if names is None:  # simple value lookup
+            return cls.__new__(cls, value)
+        enum = Enum._create_(value, names, module=module, **kwargs)
+        enum.__class__ = type(cls)
+        return enum
+
+    def __setattr__(cls, name, value):
+        members = cls.__dict__.get('_member_map_', {})
+        if hasattr(cls, '__frozenenummeta_creating_class__') or name in members:
+            return super().__setattr__(name, value)
+        if hasattr(cls, name):
+            msg = "{!r} object attribute {!r} is read-only"
+        else:
+            msg = "{!r} object has no attribute {!r}"
+        raise AttributeError(msg.format(cls.__name__, name))
+
+    def __delattr__(cls, name):
+        members = cls.__dict__.get('_member_map_', {})
+        if hasattr(cls, '__frozenenummeta_creating_class__') or name in members:
+            return super().__delattr__(name)
+        if hasattr(cls, name):
+            msg = "{!r} object attribute {!r} is read-only"
+        else:
+            msg = "{!r} object has no attribute {!r}"
+        raise AttributeError(msg.format(cls.__name__, name))
+
+class FrozenEnum(Enum, metaclass=FrozenEnumMeta):
+    pass
+</code></pre>
+<p>The above distinguishes between attributes that are already available and new attributes, for ease of diagnosing. It also blocks attribute <em>deletion</em>, which is probably just as important! </p>
+<p>It also provides both the metaclass and a <code>FrozenEnum</code> <em>base class</em> for enumerations; use this instead of <code>Enum</code>.</p>
+<p>To freeze a sample <code>Color</code> enumeration:</p>
+<pre><code>&gt;&gt;&gt; class Color(FrozenEnum):
+...     red = 1
+...     green = 2
+...     blue = 3
+...
+&gt;&gt;&gt; list(Color)
+[&lt;Color.red: 1&gt;, &lt;Color.green: 2&gt;, &lt;Color.blue: 3&gt;]
+&gt;&gt;&gt; Color.foo = 'bar'
+Traceback (most recent call last):
+    # ...
+AttributeError: 'Color' object has no attribute 'foo'
+&gt;&gt;&gt; Color.red = 42
+Traceback (most recent call last):
+    # ...
+Cannot reassign members.
+&gt;&gt;&gt; del Color.red
+Traceback (most recent call last):
+    # ...
+AttributeError: Color: cannot delete Enum member.
+</code></pre>
+<p>Note that <strong>all</strong> attribute changes are disallowed, no new attributes permitted, and deletions are blocked too. When names are enum members, we delegate to the original <code>EnumMeta</code> handling to keep the error messages stable.</p>
+<p>If your enum uses properties that alter attributes on the enum class, you'd either have to whitelist those, or allow for names starting with a single underscore to be set; in <code>__setattr__</code> determine what names would be permissible to set and use <code>super().__setattr__(name, value)</code> for those exceptions, just like the code now distinguishes between class construction and later alterations by using a flag attribute.</p>
+<p>The above class can be used just like <code>Enum()</code> to programmatically create an enumeration:</p>
+<pre><code>e = FrozenEnum('Things', [('foo',1), ('bar',2)]))
+</code></pre>
+<p>Demo:</p>
+<pre><code>&gt;&gt;&gt; e = FrozenEnum('Things', [('foo',1), ('bar',2)])
+&gt;&gt;&gt; e
+&lt;enum 'Things'&gt;
+&gt;&gt;&gt; e.foo = 'bar'
+Traceback (most recent call last):
+    # ...
+AttributeError: Cannot reassign members.
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Not necessarily easy, but possible.  We need to create a new <code>EnumMeta</code> type<sup>1</sup>, create the <code>Enum</code> normally, then reassign the type after the <code>Enum</code> is created:</p>
+<pre><code>from enum import Enum, EnumMeta
+
+class FrozenEnum(EnumMeta):
+    "prevent creation of new attributes"
+    def __getattr__(self, name):
+        if name not in self._member_map_:
+            raise AttributeError('%s %r has no attribute %r'
+                % (self.__class__.__name__, self.__name__, name))
+        return super().__getattr__(name)
+
+    def __setattr__(self, name, value):
+        if name in self.__dict__ or name in self._member_map_:
+            return super().__setattr__(name, value)
+        raise AttributeError('%s %r has no attribute %r'
+                % (self.__class__.__name__, self.__name__, name))
+
+class Color(Enum):
+    red = 1
+    green = 2
+    blue = 3
+
+Color.__class__ = FrozenEnum
+</code></pre>
+<p>and in use:</p>
+<pre><code>&gt;&gt;&gt; type(Color)
+&lt;class 'FrozenEnum'&gt;
+
+&gt;&gt;&gt; list(Color)
+[&lt;Color.red: 1&gt;, &lt;Color.green: 2&gt;, &lt;Color.blue: 3&gt;]
+
+&gt;&gt;&gt; Color.blue
+&lt;Color.blue: 3&gt;
+
+&gt;&gt;&gt; Color.baz = 3
+Traceback (most recent call last):
+  ...
+AttributeError: FrozenEnum 'Color' has no attribute 'baz'
+
+&gt;&gt;&gt; Color.baz
+Traceback (most recent call last):
+  ...
+AttributeError: 'FrozenEnum' object has no attribute 'baz'
+</code></pre>
+<p>Trying to reassign a member still gives the friendlier error:</p>
+<pre><code>&gt;&gt;&gt; Color.blue = 9
+Traceback (most recent call last):
+  ...
+AttributeError: Cannot reassign members.
+</code></pre>
+<p>In order to make the class reassignment a little easier, we can write a decorator to encapsulate the process:</p>
+<pre><code>def freeze(enum_class):
+    enum_class.__class__ = FrozenEnum
+    return enum_class
+</code></pre>
+<p>and in use:</p>
+<pre><code>@freeze
+class Color(Enum):
+    red = 1
+    green = 2
+    blue = 3
+</code></pre>
+<p>Note that it is still possible to overwrite ordinary attributes, such as functions:</p>
+<pre><code>@freeze
+class Color(Enum):
+    red = 1
+    green = 2
+    blue = 3
+    def huh(self):
+        print("Huh, I am %s!" % self.name)
+</code></pre>
+<p>and in use:</p>
+<pre><code>&gt;&gt;&gt; Color.huh
+&lt;function Color.huh at 0x7f7d54ae96a8&gt;
+
+&gt;&gt;&gt; Color.blue.huh()
+Huh, I am blue!
+
+&gt;&gt;&gt; Color.huh = 3
+&gt;&gt;&gt; Color.huh
+3
+&gt;&gt;&gt; Color.blue.huh()
+Traceback (most recent call last):
+  ...
+TypeError: 'int' object is not callable
+</code></pre>
+<p>Even that can be blocked, but I'll leave that (for now) as an exercise for someone else.</p>
+<hr/>
+<p><sup>1</sup>  This is only the second case I have seen where subclassing <code>EnumMeta</code> is required.  For the other, see <a href="https://stackoverflow.com/q/43730305/208880"><code>this question</code></a>.</p>
+<p><i>Disclosure:  I am the author of the <a href="https://docs.python.org/3/library/enum.html" rel="nofollow noreferrer">Python stdlib <code>Enum</code></a>, the <a href="https://pypi.python.org/pypi/enum34" rel="nofollow noreferrer"><code>enum34</code> backport</a>, and the <a href="https://pypi.python.org/pypi/aenum" rel="nofollow noreferrer">Advanced Enumeration (<code>aenum</code>)</a>  library.</i></p>
+</div>
+<span class="comment-copy">Thanks. I will mark this as the accepted answer. I hope something like this makes it into core one day.</span>
+<span class="comment-copy">I will admit I was hoping a low-rep user would see through the "trick" and get the rep bump, but a very nice answer all the same.</span>
+<span class="comment-copy">All you need to make your version properly frozen is for your <code>__setattr__</code> hook to <i>always</i> raise an <code>AttributeError</code>, rather than allow for setting specific attributes. That's fine because you assign the metaclass <b>after</b> the class has been created.</span>
+<span class="comment-copy">@MartijnPieters:  Yes, I know.  :)  I was hoping a newer user would see that and get the rep bump from the bounty.</span>
+<span class="comment-copy">Sorry if I stepped in where you hoped others would :-) I added a full metaclass / class combo and blocked deletions too, would that soften the disappointment a little? :-)</span>
+<span class="comment-copy">@MartijnPieters: Well.... if you clean up the tracebacks (similarly to mine), and modify <code>__delattr__</code> and <code>__setattr__</code> to pass through attempts to delete/change member values to <code>EnumMeta</code> (so the user gets the member-related error instead of the generic read-only error), then I'll be happy.  :)  Oh, and thanks for catching the <code>__delattr__</code> case.</span>
+<span class="comment-copy">Sure, both are indeed good improvements to make.</span>

@@ -1,0 +1,130 @@
+<div class="post-text" itemprop="text">
+<p>I have the below functioning properly, but for some reason the requests seem to be executing synchronously, instead of asynchronously.  </p>
+<p>My assumption now is that this is happening because of the <code>for record in records</code> for loop in the main function, but i'm not sure how to change this so that requests can execute async.  If this is not the case, what else would I need to change?</p>
+<pre><code>async def do_request(query_string):
+        base_url = 'https://maps.googleapis.com/maps/api/place/textsearch/json?'
+        params = {'key': google_api_key,
+                  'query': query_string}
+        async with aiohttp.ClientSession() as session:
+            async with session.request('GET', base_url, params=params) as resp:
+                return resp
+
+
+async def main():
+    create_database_and_tables()
+    records = prep_sample_data()[:100]
+
+    for record in records:
+        r = Record(record)
+
+        if not r.is_valid:
+            continue
+
+        query_string = r.generate_query_string()
+
+        resp = await do_request(query_string)
+        print("NOW WRITE TO DATABASE")
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You are awaiting on separate <code>do_request()</code> calls in sequence. Instead of awaiting on them directly (which blocks until the coroutine is done), use the <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.gather" rel="noreferrer"><code>asyncio.gather()</code> function</a> to have the event loop run them concurrently:</p>
+<pre><code>async def main():
+    create_database_and_tables()
+    records = prep_sample_data()[:100]
+
+    requests = []
+    for record in records:
+        r = Record(record)
+
+        if not r.is_valid:
+            continue
+
+        query_string = r.generate_query_string()
+
+        requests.append(do_request(query_string))
+
+    for resp in asyncio.gather(*requests):
+        print("NOW WRITE TO DATABASE")
+</code></pre>
+<p>The <code>asyncio.gather()</code> return value is a list of all the results the coroutines returned, in the same order you passed them to the <code>gather()</code> function.</p>
+<p>If you needed the original records to process the responses, you can pair up record and query string in several different ways:</p>
+<ul>
+<li>store valid records in a separate list and use <code>zip()</code> to pair them up again as you process the responses</li>
+<li>use a helper coroutine that takes the valid record, produces a query string, invokes the request, and returns the record and response together as a tuple.</li>
+</ul>
+<p>You can also mix in the response handling into a gathered coroutine; one that takes a record, produces the query string, awaits on <code>do_request</code> and then stores the result in the database when the response is ready.</p>
+<p>In other words, divide up your work that needs to happen consecutively, in coroutines and gather those.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Building off of Martijn's Answer</p>
+<p>If order of the requests don't matter to you too much (when it gets written to the database), you could write the responses to your database while fetching commands.</p>
+<p>Edit (to explain more): I use 2 semaphores here. 1 is to limit the number of connections through aiohttp. This will depend on your system. Most linux systems default to 1024. In my own personal experience, setting it lower than your OS max is preferable.</p>
+<p><code>max_coroutines</code> is to solve the problem of having too many coroutines ran at once.</p>
+<p>I use <code>asyncio.ensure_future()</code> so that we run the coroutines as we build the list. This way, you're not creating the full list of coroutines before executing any of them.</p>
+<pre><code># Limit the total number of requests you make by 512 open connections.
+max_request_semaphore = asyncio.BoundedSemaphore(512)
+max_coroutines = asyncio.BoundedSemaphore(10000)
+
+
+async def process_response(response):
+    print('Process your response to your database')
+
+
+async def do_request(query_string):
+    base_url = 'https://maps.googleapis.com/maps/api/place/textsearch/json?'
+    params = {'key': google_api_key,
+              'query': query_string}
+    async with max_request_semaphore:
+        async with aiohttp.ClientSession() as session:
+            async with session.request('GET', base_url, params=params) as resp:
+                return resp
+
+
+# Excuse me for the bad function naming
+async do_full_request(query_string):
+    resp = await do_request(query_string)
+    await process_response(resp)
+    max_coroutines.release()
+
+async def main():
+    create_database_and_tables()
+    records = prep_sample_data()[:100]
+
+    requests = []
+    for record in records:
+        r = Record(record)
+
+        if not r.is_valid:
+            continue
+
+        query_string = r.generate_query_string()
+
+        # Will prevent more than 10k coroutines created.
+        await max_coroutines.acquire()
+        requests.append(
+            asyncio.ensure_future(
+                do_full_request(query_string)))
+
+    # Now gather all the coroutines
+    await asyncio.gather(*requests)
+
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
+</code></pre>
+</div>
+<span class="comment-copy">You're <code>await</code>ing each response in the loop, that's explicitly blocking. You need to refactor with e.g. <code>asyncio.gather</code> to make the requests in parallel - build a list of tasks then execute them all. See e.g. <a href="https://pawelmhm.github.io/asyncio/python/aiohttp/2016/04/22/asyncio-aiohttp.html" rel="nofollow noreferrer">pawelmhm.github.io/asyncio/python/aiohttp/2016/04/22/…</a></span>
+<span class="comment-copy">@jonrsharpe would refactoring in this manner mean that i would not be able to write to a db, after each record's request is completed?  it looks like ` asyncio.gather()` waits for all future objects to finish</span>
+<span class="comment-copy">If you want to write separately for each request you could do it as part of each individual task you're scheduling.</span>
+<span class="comment-copy">@jonrsharpe hmm okay, this has gotten quite confusing!</span>
+<span class="comment-copy">@jonrsharpe: or gather, then process the responses from the returned list.</span>
+<span class="comment-copy">cool, this makes sense to me.  i think this will be problematic with the 1.3million reqs i need to make being stored in memory.  is there any way to do every thing on the fly, rather than waiting for all requests to finish before proceeding?</span>
+<span class="comment-copy">@metersk: then push the handling of the response into the coroutine you gather. You may want to use some kind of rate limiting to prevent overloading your network if you are going to do that many requests.</span>
+<span class="comment-copy">that sounds ideal to me and i will def be adding rate limiting.  how much different of an architecture would this pattern be.  i'm a bit confused on the implementation</span>
+<span class="comment-copy">@metersk: see <a href="//stackoverflow.com/q/45440900">Throttling Async Functions in Python Asyncio</a> for a rate limiting option. Also, creating 1.3 million coroutines may be a bit of an issue, maybe create them in batches.</span>
+<span class="comment-copy">@MartijnPieters  Even though I wasn't particularly looking for it, I found that question very interesting. TIL</span>

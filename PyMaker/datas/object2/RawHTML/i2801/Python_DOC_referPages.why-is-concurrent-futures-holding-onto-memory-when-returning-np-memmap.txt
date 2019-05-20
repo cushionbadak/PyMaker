@@ -1,0 +1,73 @@
+<div class="post-text" itemprop="text">
+<h1>The problem</h1>
+<p>My application is extracting a list of zip files in memory and writing the data to a temporary file. I then memory map the data in the temp file for use in another function. When I do this in a single process, it works fine, reading the data doesn't affect memory, max RAM is around 40MB. However when I do this using concurrent.futures the RAM goes up to 500MB.</p>
+<p>I have looked at <a href="https://stackoverflow.com/questions/34770169/using-concurrent-futures-without-running-out-of-ram">this</a> example and I understand I could be submitting the jobs in a nicer way to save memory during processing. But I don't think my issue is related, as I am not running out of memory during processing. The issue I don't understand is why it is holding onto the memory even after the memory maps are returned. Nor do I understand what is in the memory, since doing this in a single process does not load the data in memory. </p>
+<p>Can anyone explain what is actually in the memory and why this is different between single and parallel processing?</p>
+<p>PS I used <code>memory_profiler</code> for measuring the memory usage</p>
+<h1>Code</h1>
+<h2>Main code:</h2>
+<pre><code>def main():
+    datadir = './testdata'
+    files = os.listdir('./testdata')
+    files = [os.path.join(datadir, f) for f in files]
+    datalist = download_files(files, multiprocess=False)
+    print(len(datalist))
+    time.sleep(15)
+    del datalist # See here that memory is freed up
+    time.sleep(15)
+</code></pre>
+<h2>Other functions:</h2>
+<pre class="lang-py prettyprint-override"><code>def download_files(filelist, multiprocess=False):
+    datalist = []
+    if multiprocess:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=4) as executor:
+            returned_future = [executor.submit(extract_file, f) for f in filelist]
+        for future in returned_future:
+            datalist.append(future.result())
+    else:
+        for f in filelist:
+            datalist.append(extract_file(f))
+    return datalist
+
+def extract_file(input_zip):
+    buffer = next(iter(extract_zip(input_zip).values()))
+    with tempfile.NamedTemporaryFile() as temp_logfile:
+        temp_logfile.write(buffer)
+        del buffer
+        data = memmap(temp_logfile, dtype='float32', shape=(2000000, 4), mode='r')
+    return data
+
+def extract_zip(input_zip):
+    with ZipFile(input_zip, 'r') as input_zip:
+        return {name: input_zip.read(name) for name in input_zip.namelist()}
+</code></pre>
+<h2>Helper code for data</h2>
+<p>I can't share my actual data, but here's some simple code to create files that demonstrate the issue:</p>
+<pre><code>for i in range(1, 16):
+    outdir = './testdata'
+    outfile = 'file_{}.dat'.format(i)
+    fp = np.memmap(os.path.join(outdir, outfile), dtype='float32', mode='w+', shape=(2000000, 4))
+    fp[:] = np.random.rand(*fp.shape)
+    del fp
+    with ZipFile(outdir + '/' + outfile[:-4] + '.zip', mode='w', compression=ZIP_DEFLATED) as z:
+        z.write(outdir + '/' + outfile, outfile)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem is that you're trying to pass an <a href="https://docs.scipy.org/doc/numpy/reference/generated/numpy.memmap.html" rel="nofollow noreferrer"><code>np.memmap</code></a> between processes, and that doesn't work.</p>
+<p>The simplest solution is to instead pass the filename, and have the child process <code>memmap</code> the same file.</p>
+<hr/>
+<p>When you <a href="https://docs.python.org/3/library/multiprocessing.html#exchanging-objects-between-processes" rel="nofollow noreferrer">pass an argument to a child process or pool method via <code>multiprocessing</code></a>, or return a value from one (including doing so indirectly via a <a href="https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor" rel="nofollow noreferrer"><code>ProcessPoolExecutor</code></a>), it works by calling <a href="https://docs.python.org/3/library/pickle.html" rel="nofollow noreferrer"><code>pickle.dumps</code></a> on the value, passing the pickle across processes (the details vary, but it doesn't matter whether it's a <code>Pipe</code> or a <code>Queue</code> or something else), and then unpickling the result on the other side.</p>
+<p>A <code>memmap</code> is basically just an <a href="https://docs.python.org/3/library/mmap.html" rel="nofollow noreferrer"><code>mmap</code></a> object with an <code>ndarray</code> allocated in the <code>mmap</code>ped memory.</p>
+<p>And Python doesn't know how to pickle an <code>mmap</code> object. (If you try, you will either get a <code>PicklingError</code> or a <code>BrokenProcessPool</code> error, depending on your Python version.)</p>
+<p>A <code>np.memmap</code> <em>can</em> be pickled, because it's just a subclass of <code>np.ndarray</code>—but pickling and unpickling it actually copies the data and gives you a plain in-memory array. (If you look at <code>data._mmap</code>, it's <code>None</code>.) It would probably be nicer if it gave you an error instead of silently copying all of your data (the pickle-replacement library <code>dill</code> does exactly that: <code>TypeError: can't pickle mmap.mmap objects</code>), but it doesn't.</p>
+<hr/>
+<p>It's not impossible to pass the underlying file descriptor between processes—the details are different on every platform, but all of the major platforms have a way to do that. And you could then use the passed fd to build an <code>mmap</code> on the receiving side, then build a <code>memmap</code> out of that. And you could probably even wrap this up in a subclass of <code>np.memmap</code>. But I suspect if that weren't somewhat difficult, someone would have already done it, and in fact it would probably already be part of <code>dill</code>, if not <code>numpy</code> itself.</p>
+<p>Another alternative is to explicitly use the <a href="https://docs.python.org/3/library/multiprocessing.html#sharing-state-between-processes" rel="nofollow noreferrer">shared memory features of <code>multiprocessing</code></a>, and allocate the array in shared memory instead of a <code>mmap</code>.</p>
+<p>But the simplest solution is, as I said at the top, to just pass the filename instead of the object, and let each side <code>memmap</code> the same file. This does, unfortunately, mean you can't just use a delete-on-close <code>NamedTemporaryFile</code> (although the way you were using it was already non-portable and wouldn't have worked on Windows the same way it does on Unix), but changing that is still probably less work than the other alternatives.</p>
+</div>
+<span class="comment-copy">I'm not sure you can pass a <code>np.memmap</code> through <code>pickle</code> this way. Can you verify that <code>future.result()._mmap</code> is a map of the same file as <code>data._mmap</code> in the child tasks?</span>
+<span class="comment-copy"><code>future.result()</code> type is an np.memmap, I can see that it is returning the correct data. However, <code>future.result()._mmap</code> is showing as <code>None</code>, whereas <code>data._mmap</code> in the child function is showing as <code>mmap.mmap</code> object. What do you mean by I can't pass the <code>np.memmap</code> through <code>pickle</code>?</span>
+<span class="comment-copy">Multiprocessing (including via <code>concurrent.futures</code>) passes data between processes by pickling it, passing the pickle over an IPC pipe or queue, then unpickling on the other side. If you try this with an <code>mmap.mmap</code> you get an exception. If you try it with a <code>np.memmap</code> I’m not sure what happens, but my suspicion is that it pickles the array with all of its data, sends that, and unpickles it, so instead of getting an array mapping the same file, you end up with a copy of the array in newly-allocated memory. Which would explain exactly what you’re seeing.</span>
+<span class="comment-copy">I don’t know what it means when <code>data._mmap</code> is None (I’ll look it up when I get a chance), but that doesn’t sound promising—it seems at least possible that means your <code>memmap</code> really is a copy rather than a <code>mmap</code> under the covers. If so, the simplest solution is probably to just pass the filename back as the result, and have the main process memmap that filename.</span>
+<span class="comment-copy">You're right, passing <code>mmap.mmap</code> causes <code>BrokenProcessPool</code>. I think you're right with <code>np.memmap</code> too, it seems to be passing a copy of the data. Its difficult to verify since the returned type still says <code>np.memmap</code> but the memory usage is pretty much the size of the data.</span>

@@ -1,0 +1,131 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to set up a multiprocessing pool on Windows 10.</p>
+<p>Basically some cpus (12 in my case) should read from a <code>Qin</code>and write results to <code>Qout</code>. When writing <code>'end'</code> in <code>Qin</code> the process should stop.</p>
+<p>For some reason the process hangs.</p>
+<p>I developed a simple version:</p>
+<pre><code>from multiprocessing import Pool, Queue, Event
+import os,time
+
+
+def worker( Qin, Qout, event):
+    time.sleep(5)
+    while True:
+        item = Qin.get()
+        if item == 'end':
+            event.set()
+        else:
+            Qout.put(item)
+        time.sleep(1)
+
+def manager():
+    Qin,Qout,event= Queue(), Queue(), Event()
+    processes = os.cpu_count()
+    pool = Pool(processes=processes)
+    for _ in range(processes):
+        pool.apply_async(worker,args= (Qin,Qout,event,))
+    for i in range(100):
+        print(i)
+        Qin.put(i)
+
+    Qin.put('end')
+
+    pool.close()
+    event.wait()
+    pool.terminate()
+    return Qout
+
+Qout = manager()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You need to understand how correctly asynchronous programming works in python. When you call apply_async you get Future object. The Queue implementation in python relies on a system pipe to transmit the data from one process to another and some semaphores to protect the read and write on this pipe.</p>
+<pre><code>from multiprocessing import Pool, Queue, Event
+import os
+import time
+import multiprocessing
+
+def worker( Qin, Qout, event):
+    print('worker')
+    time.sleep(1)
+    event.set()
+
+def manager():
+    processes = multiprocessing.cpu_count()
+    m = multiprocessing.Manager()
+    Qin = m.Queue()
+    Qout = m.Queue()
+    event = m.Event()
+    pool = Pool(processes=processes)
+    result = pool.apply_async(worker, (Qin, Qout, event))
+    result.get()
+    pool.close()
+    event.wait()
+    return Qout
+
+if __name__ == '__main__':
+    Qout = manager()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think the reason your code hangs is because all the worker tasks end up waiting for something to appear on the input queue with the <code>item = Qin.get()</code> line at the same time because <code>get()</code> "blocks" waiting for something to be placed in the queue. One way to avoid that is to use the non-blocking <code>get_nowait()</code> method instead. Doing so requires code to handle any <code>Empty</code> exception it may raise, but it avoids having any further execution in that process effectively halted at that point.</p>
+<p>Also for things to work, you need to create and use a <code>multiprocessing.Manager</code> which creates a server process which holds Python objects and allows other processes to manipulate them via proxies. See the "Server process" part of the <a href="https://docs.python.org/3/library/multiprocessing.html#sharing-state-between-processes" rel="nofollow noreferrer"><strong>Sharing state between processes</strong></a> section of the documentation.</p>
+<p>Also, when using <code>multiprocessing</code> on Windows, it's very important to make sure the main process' code is executed conditionally by putting it inside an <code>if __name__ == '__main__':</code> statement. This is because of how the module has been  implemented on that platform—otherwise that code will be executed again each time another concurrent task is started (which involves it being <code>import</code>ed by them).</p>
+<p>Below is your code with the modification needed so it uses a <code>multiprocessing.Manager</code>. Note I changed the name of your <code>manager()</code> function to avoid confusion with the <code>multiprocessing.Manager</code> which it uses to create the shared objects.</p>
+<pre><code>import multiprocessing
+from queue import Empty as QueueEmpty
+import os
+import time
+
+END_MARKER = 'end'
+
+
+def worker(id, Qin, Qout, event):
+    while True:
+        try:
+            item = Qin.get_nowait()  # Non-blocking.
+        except QueueEmpty:
+            if event.is_set():  # Last item seen?
+               break
+            continue # Keep polling.
+
+        if item == END_MARKER:  # Last item?
+            event.set()
+            break  # Quit.
+
+        Qout.put('{} via worker {}'.format(item, id))
+        time.sleep(.25)
+
+
+def pool_manager():
+    processes = os.cpu_count()
+    pool = multiprocessing.Pool(processes=processes)
+    manager = multiprocessing.Manager()
+    Qin, Qout, event = manager.Queue(), manager.Queue(), manager.Event()
+
+    for i in range(100):
+        Qin.put(i)
+
+    Qin.put(END_MARKER)
+
+    for id in range(processes):
+        pool.apply_async(worker, (id, Qin, Qout, event))
+
+    pool.close()  # Done adding tasks.
+    pool.join()  # Wait for all tasks to complete.
+
+    return Qout
+
+
+if __name__ == '__main__':
+    print('Processing')
+    Qout = pool_manager()
+
+    print('Contents of Qout:')
+    while not Qout.empty():
+        item = Qout.get()
+        print(' ', item)
+
+    print('End of script')
+</code></pre>
+</div>
+<span class="comment-copy">If you're on windows you need a check for <code>__main__</code>, otherwise each process will call <code>manager</code> again, and again, and again... See <b>Safe importing of main module</b> in the <a href="https://docs.python.org/3/library/multiprocessing.html?highlight=process#the-spawn-and-forkserver-start-methods" rel="nofollow noreferrer">spawn and forkserver start methods</a> documentation</span>

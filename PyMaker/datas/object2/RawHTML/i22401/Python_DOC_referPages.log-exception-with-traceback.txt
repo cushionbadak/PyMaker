@@ -1,0 +1,195 @@
+<div class="post-text" itemprop="text">
+<p>How can I log my Python errors?</p>
+<pre><code>try:
+    do_something()
+except:
+    # How can I log my exception here, complete with its traceback?
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Use <a href="https://docs.python.org/library/logging.html#logging.exception" rel="noreferrer"><code>logging.exception</code></a> from with an <code>except:</code> handler to log the current exception, prepended with a message.</p>
+<pre><code>import logging
+LOG_FILENAME = '/tmp/logging_example.out'
+logging.basicConfig(filename=LOG_FILENAME, level=logging.DEBUG)
+
+logging.debug('This message should go to the log file')
+
+try:
+    run_my_stuff()
+except:
+    logging.exception('Got exception on main handler')
+    raise
+</code></pre>
+<p>Now looking at the log file, <code>/tmp/logging_example.out</code>:</p>
+<pre><code>DEBUG:root:This message should go to the log file
+ERROR:root:Got exception on main handler
+Traceback (most recent call last):
+  File "/tmp/teste.py", line 9, in &lt;module&gt;
+    run_my_stuff()
+NameError: name 'run_my_stuff' is not defined
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Use <code>exc_info</code> options may be better, remains warning or error title: </p>
+<pre><code>try:
+    # coode in here
+except Exception as e:
+    logging.error(e, exc_info=True)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>My job recently tasked me with logging all the tracebacks/exceptions from our application. I tried numerous techniques that others had posted online such as the one above but settled on a different approach. Overriding <code>traceback.print_exception</code>. </p>
+<p>I have a write up at <a href="http://www.bbarrows.com/blog/2012/09/24/implementing-exception-logging-in-python/" rel="noreferrer">http://www.bbarrows.com/</a> That would be much easier to read but Ill paste it in here as well.</p>
+<p>When tasked with logging all the exceptions that our software might encounter in the wild I tried a number of different techniques to log our python exception tracebacks. At first I thought that the python system exception hook, sys.excepthook would be the perfect place to insert the logging code. I was trying something similar to:</p>
+<pre><code>import traceback
+import StringIO
+import logging
+import os, sys
+
+def my_excepthook(excType, excValue, traceback, logger=logger):
+    logger.error("Logging an uncaught exception",
+                 exc_info=(excType, excValue, traceback))
+
+sys.excepthook = my_excepthook  
+</code></pre>
+<p>This worked for the main thread but I soon found that the my sys.excepthook would not exist across any new threads my process started. This is a huge issue because most everything happens in threads in this project.</p>
+<p>After googling and reading plenty of documentation the most helpful information I found was from the Python Issue tracker.</p>
+<p>The first post on the thread shows a working example of the <code>sys.excepthook</code> NOT persisting across threads (as shown below). Apparently this is expected behavior.</p>
+<pre><code>import sys, threading
+
+def log_exception(*args):
+    print 'got exception %s' % (args,)
+sys.excepthook = log_exception
+
+def foo():
+    a = 1 / 0
+
+threading.Thread(target=foo).start()
+</code></pre>
+<p>The messages on this Python Issue thread really result in 2 suggested hacks. Either subclass <code>Thread</code> and wrap the run method in our own try except block in order to catch and log exceptions or monkey patch <code>threading.Thread.run</code> to run in your own try except block and log the exceptions.</p>
+<p>The first method of subclassing <code>Thread</code> seems to me to be less elegant in your code as you would have to import and use your custom <code>Thread</code> class EVERYWHERE you wanted to have a logging thread. This ended up being a hassle because I had to search our entire code base and replace all normal <code>Threads</code> with this custom <code>Thread</code>. However, it was clear as to what this <code>Thread</code> was doing and would be easier for someone to diagnose and debug if something went wrong with the custom logging code. A custome logging thread might look like this:</p>
+<pre><code>class TracebackLoggingThread(threading.Thread):
+    def run(self):
+        try:
+            super(TracebackLoggingThread, self).run()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception, e:
+            logger = logging.getLogger('')
+            logger.exception("Logging an uncaught exception")
+</code></pre>
+<p>The second method of monkey patching <code>threading.Thread.run</code> is nice because I could just run it once right after <code>__main__</code> and instrument my logging code in all exceptions. Monkey patching can be annoying to debug though as it changes the expected functionality of something. The suggested patch from the Python Issue tracker was:</p>
+<pre><code>def installThreadExcepthook():
+    """
+    Workaround for sys.excepthook thread bug
+    From
+http://spyced.blogspot.com/2007/06/workaround-for-sysexcepthook-bug.html
+
+(https://sourceforge.net/tracker/?func=detail&amp;atid=105470&amp;aid=1230540&amp;group_id=5470).
+    Call once from __main__ before creating any threads.
+    If using psyco, call psyco.cannotcompile(threading.Thread.run)
+    since this replaces a new-style class method.
+    """
+    init_old = threading.Thread.__init__
+    def init(self, *args, **kwargs):
+        init_old(self, *args, **kwargs)
+        run_old = self.run
+        def run_with_except_hook(*args, **kw):
+            try:
+                run_old(*args, **kw)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except:
+                sys.excepthook(*sys.exc_info())
+        self.run = run_with_except_hook
+    threading.Thread.__init__ = init
+</code></pre>
+<p>It was not until I started testing my exception logging I realized that I was going about it all wrong.</p>
+<p>To test I had placed a</p>
+<pre><code>raise Exception("Test")
+</code></pre>
+<p>somewhere in my code. However, wrapping a a method that called this method was a try except block that printed out the traceback and swallowed the exception. This was very frustrating because I saw the traceback bring printed to STDOUT but not being logged. It was I then decided that a much easier method of logging the tracebacks was just to monkey patch the method that all python code uses to print the tracebacks themselves, traceback.print_exception.
+I ended up with something similar to the following:</p>
+<pre><code>def add_custom_print_exception():
+    old_print_exception = traceback.print_exception
+    def custom_print_exception(etype, value, tb, limit=None, file=None):
+        tb_output = StringIO.StringIO()
+        traceback.print_tb(tb, limit, tb_output)
+        logger = logging.getLogger('customLogger')
+        logger.error(tb_output.getvalue())
+        tb_output.close()
+        old_print_exception(etype, value, tb, limit=None, file=None)
+    traceback.print_exception = custom_print_exception
+</code></pre>
+<p>This code writes the traceback to a String Buffer and logs it to logging ERROR. I have a custom logging handler set up the 'customLogger' logger which takes the ERROR level logs and send them home for analysis.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can log all uncaught exceptions on the main thread by assigning a handler to <a href="https://docs.python.org/library/sys.html#sys.excepthook" rel="noreferrer"><code>sys.excepthook</code></a>, perhaps using the <a href="https://docs.python.org/3/library/logging.html#logging.debug" rel="noreferrer"><code>exc_info</code> parameter of Python's logging functions</a>:</p>
+<pre><code>import sys
+import logging
+
+logging.basicConfig(filename='/tmp/foobar.log')
+
+def exception_hook(exc_type, exc_value, exc_traceback):
+    logging.error(
+        "Uncaught exception",
+        exc_info=(exc_type, exc_value, exc_traceback)
+    )
+
+sys.excepthook = exception_hook
+
+raise Exception('Boom')
+</code></pre>
+<p>If your program uses threads, however, then note that threads created using <a href="https://docs.python.org/2/library/threading.html#thread-objects" rel="noreferrer"><code>threading.Thread</code></a> will <em>not</em> trigger <code>sys.excepthook</code> when an uncaught exception occurs inside them, as noted in <a href="http://bugs.python.org/issue1230540" rel="noreferrer">Issue 1230540</a> on Python's issue tracker. Some hacks have been suggested there to work around this limitation, like monkey-patching <code>Thread.__init__</code> to overwrite <code>self.run</code> with an alternative <code>run</code> method that wraps the original in a <code>try</code> block and calls <code>sys.excepthook</code> from inside the <code>except</code> block. Alternatively, you could just manually wrap the entry point for each of your threads in <code>try</code>/<code>except</code> yourself.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Uncaught exception messages go to STDERR, so instead of implementing your logging in Python itself you could send STDERR to a file using whatever shell you're using to run your Python script. In a Bash script, you can do this with output redirection, as <a href="http://tldp.org/HOWTO/Bash-Prog-Intro-HOWTO-3.html" rel="nofollow">described in the BASH guide</a>.</p>
+<h3>Examples</h3>
+<p>Append errors to file, other output to the terminal:</p>
+<pre><code>./test.py 2&gt;&gt; mylog.log
+</code></pre>
+<p>Overwrite file with interleaved STDOUT and STDERR output:</p>
+<pre><code>./test.py &amp;&gt; mylog.log
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>maybe not as stylish, but easier:</p>
+<pre><code>#!/bin/bash
+log="/var/log/yourlog"
+/path/to/your/script.py 2&gt;&amp;1 | (while read; do echo "$REPLY" &gt;&gt; $log; done)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>What I was looking for:</p>
+<pre><code>import sys
+import traceback
+
+exc_type, exc_value, exc_traceback = sys.exc_info()
+traceback_in_var = traceback.format_tb(exc_traceback)
+</code></pre>
+<p>See: </p>
+<ul>
+<li><a href="https://docs.python.org/3/library/traceback.html" rel="nofollow noreferrer">https://docs.python.org/3/library/traceback.html</a></li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>Heres a simple example taken from the <a href="http://docs.python.org/library/logging.html" rel="nofollow noreferrer">python 2.6 documentation</a>:</p>
+<pre><code>import logging
+LOG_FILENAME = '/tmp/logging_example.out'
+logging.basicConfig(filename=LOG_FILENAME,level=logging.DEBUG,)
+
+logging.debug('This message should go to the log file')
+</code></pre>
+</div>
+<span class="comment-copy">Looked over the django code for this, and I'm assuming the answer is no, but is there a way to limit the traceback to a certain amount of either characters or depth? The problem is that for large tracebacks, it takes pretty long.</span>
+<span class="comment-copy">Note that if you define a logger with <code>logger = logging.getLogger('yourlogger')</code>you have to write <code>logger.exception('...')</code>to have this working...</span>
+<span class="comment-copy">Can we modify this so that the message is printed with log level INFO?</span>
+<span class="comment-copy">I can never remember what the <code>exc_info=</code> kwarg is called; thanks!</span>
+<span class="comment-copy">This is identical to logging.exception, with the exception that the type is redundantly logged twice. Just use logging.exception unless you want a level other than error.</span>
+<span class="comment-copy">@Wyrmwood it's not identical as you have to supply a message to <code>logging.exception</code></span>
+<span class="comment-copy">@PeterWood and that message can be an empty string...</span>
+<span class="comment-copy">Quite an interesting approach. One question - <code>add_custom_print_exception</code> doesn't appear to be on the site you linked to, and instead there's some quite different final code there. Which one would you say is better / more final and why? Thanks!</span>
+<span class="comment-copy">Thanks, great answer!</span>
+<span class="comment-copy">There is a cut and paste typo.  on the delegated call to old_print_exception, limit and file should be passed limit and file, not None -- old_print_exception(etype, value, tb, limit, file)</span>
+<span class="comment-copy">For your last code block, rather than initializing a StringIO and printing the exception to it, you can just call <code>logger.error(traceback.format_tb())</code> (or format_exc() if you want the exception info too).</span>
+<span class="comment-copy">The question was how to log the traceback</span>

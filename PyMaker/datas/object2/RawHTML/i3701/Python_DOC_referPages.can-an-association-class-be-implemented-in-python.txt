@@ -1,0 +1,108 @@
+<div class="post-text" itemprop="text">
+<p>I have just started learning software development and I am modelling my system in a UML Class diagram. I am unsure how I would implement this in code. </p>
+<p>To keep things simple let’s assume the followimg example: 
+There is a Room and a Guest Class with association Room(0..<em>)-Guest(0..</em>) and an association class RoomBooking, which contains booking details. How would I model this in Python if my system wants to see all room bookings made by a particular guest?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Sure you can implement it in Python. But there is not a single way. Quite often you have a database layer where the association class is used with two foreign keys (in your case to the primaries of <code>Room</code> and <code>Guest</code>). So in order to search you would just code an according SQL to be sent. In case you want to cache this table you would code it like this (or similarly) with an associative array:</p>
+<pre><code>from collections import defaultdict
+
+class Room():
+    def __init__(self, num):
+        self.room_number = num
+
+    def key(self):
+        return str(self.room_number)
+
+class Guest():
+    def __init__(self, name):
+        self.name = name
+
+    def key(self):
+        return self.name
+
+def nested_dict(n, type):
+    if n == 1:
+        return defaultdict(type)
+    else:
+        return defaultdict(lambda: nested_dict(n-1, type))
+room_booking = nested_dict(2, str)
+
+class Room_Booking():
+    def __init__(self, date):
+        self.date = date
+
+
+room1 = Room(1)
+guest1 = Guest("Joe")
+
+room_booking[room1.key()][guest1.key()] = Room_Booking("some date")
+
+print(room_booking[room1.key()][guest1.key()])
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Most Python applications developed from a UML design are backed by a relational database, usually via an ORM. In which case your design is pretty trivial: your <code>RoomBooking</code> is a table in the database, and the way you look up all <code>RoomBooking</code> objects for a given <code>Guest</code> is just an ORM query. Keeping it vague rather than using a particular ORM syntax, something like this:</p>
+<pre><code>bookings = RoomBooking.select(Guest=guest)
+</code></pre>
+<hr/>
+<p>With an RDBMS but no ORM, it's not much different. Something like this:</p>
+<pre><code>sql = 'SELECT Room, Guest, Charge, Paid FROM RoomBooking WHERE Guest = ?'
+cur = db.execute(sql, (guest.id))
+bookings = [RoomBooking(*row) for row in cur]
+</code></pre>
+<hr/>
+<p>And this points to what you'd do if you're <em>not</em> using a RDBMS: any relation that would be stored as a table with a foreign key is instead stored as some kind of dict in memory.</p>
+<p>For example, you might have a dict mapping guests to sets of room bookings:</p>
+<pre><code>bookings = guest_booking[guest]
+</code></pre>
+<p>Or, alternatively, if you don't have a huge number of hotels, you might have this mapping implicit, with each hotel having a 1-to-1 mapping of guests to bookings:</p>
+<pre><code>bookings = [hotel.bookings[guest] for hotel in hotels]
+</code></pre>
+<hr/>
+<p>Since you're starting off with UML, you're probably thinking in strict OO terms, so you'll want to encapsulate this dict in some class, behind some mutator and accessor methods, so you can ensure that you don't accidentally break any invariants.</p>
+<p>There are a few obvious places to put it—a <code>BookingManager</code> object makes sense for the guest-to-set-of-bookings mapping, and the <code>Hotel</code> itself is such an obvious place for the per-hotel-guest-to-booking that I used it without thinking above.</p>
+<p>But another place to put it, which is closer to the ORM design, is in a class attribute on the <code>RoomBooking</code> type, accessed by classmethods. This also allows you to extend things if you later need to, e.g., look things up by hotel—you'd then put two dicts as class attributes, and ensure that a single method always updates both of them, so you know they're always consistent.</p>
+<p>So, let's look at that:</p>
+<pre><code>class RoomBooking
+    guest_mapping = collections.defaultdict(set)
+    hotel_mapping = collections.defaultdict(set)
+    def __init__(self, guest, room):
+        self.guest, self.room = guest, room
+    @classmethod
+    def find_by_guest(cls, guest):
+        return cls.guest_mapping[guest]
+    @classmethod
+    def find_by_hotel(cls, hotel):
+        return cls.hotel_mapping[hotel]
+    @classmethod
+    def add_booking(cls, guest, room):
+        booking = cls(guest, room)
+        cls.guest_mapping[guest].add(booking)
+        cls.hotel_mapping[room.hotel].add(booking)
+</code></pre>
+<p>Of course your <code>Hotel</code> instance probably needs to add the booking as well, so it can raise an exception if two different bookings cover the same room on overlapping dates, whether that happens in <code>RoomBooking.add_booking</code>, or in some higher-level function that calls both <code>Hotel.add_booking</code> and <code>RoomBooking.add_booking</code>.</p>
+<p>And if this is multi-threaded (which seems like a good possibility, given that you're heading this far down the Java-inspired design path), you'll need a big lock, or a series of fine-grained locks, around the whole transaction.</p>
+<p>For persistence, you probably want to store these mappings along with the public objects. But for a small enough data set, or for a server that rarely restarts, it might be simpler to just persist the public objects, and rebuild the mappings at load time by doing a bunch of <code>add_booking</code> calls as part of the load process.</p>
+<hr/>
+<p>If you want to make it even more ORM-style, you can have a single <code>find</code> method that takes keyword arguments and manually executes a "query plan" in a trivial way:</p>
+<pre><code>    @classmethod
+    def find(cls, guest=None, hotel=None):
+        if guest is None and hotel is None:
+            return {booking for bookings in cls.guest_mapping.values()
+                    for booking in bookings}
+        elif hotel is None:
+            return cls.guest_mapping[guest]
+        elif guest is None:
+            return cls.hotel_mapping[hotel]
+        else:
+            return {booking for booking in cls.guest_mapping[guest] 
+                    if booking.room.hotel == hotel}
+</code></pre>
+<p>But this is already pushing things to the point where you might want to go back and ask whether you were right to not use an ORM in the first place. If that sounds ridiculously heavy duty for your simple toy app, take a look at <code>sqlite3</code> for the database (which comes with Python, and which takes less work to use than coming up with a way to <code>pickle</code> or <code>json</code> all your data for persistence) and <code>SqlAlchemy</code> for the ORM. There's not much of a learning curve, and not much runtime overhead or coding-time boilerplate.</p>
+</div>
+<span class="comment-copy">The simplest thing to do is to have a dict somewhere mapping <code>Guest</code>s to <code>RoomBooking</code>s. If you want to hide that dict for encapsulation purposes, you could put it in a <code>RoomManager</code> object, or in your existing <code>Hotel</code> object, or just use classmethods on <code>RoomBooking</code> if it's a system-wide rather than a hotel-wide thing.</span>
+<span class="comment-copy">But meanwhile, unless you're mapping your classes to a relational database—in which case the answer is just a query using whatever ORM framework you're using—I don't know that I'd be using a <code>RoomBooking</code> class in the first place.</span>
+<span class="comment-copy">In Python associations are called "mappings" and it has a built-in one called <a href="https://docs.python.org/3/library/stdtypes.html#mapping-types-dict" rel="nofollow noreferrer"><code>dict</code></a> which sounds like what you want (so you don't have implement it yourself).</span>
+<span class="comment-copy">@abarnert why don't you make an answer from your comments? It seems to be a full answer. Add a code example and it's just perfect.</span>
+<span class="comment-copy">In UML an association class can have its own attribute and operations (I guess it's methods in Python) so how would that be implemented using a dictionary? Would the method then have to just be in either the Room or Guest? For example if the method calculates the number of workdays the guest's stay based on the total duration of stay.</span>

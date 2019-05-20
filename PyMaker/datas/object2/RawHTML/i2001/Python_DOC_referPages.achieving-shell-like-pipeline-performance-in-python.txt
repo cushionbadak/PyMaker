@@ -1,0 +1,89 @@
+<div class="post-text" itemprop="text">
+<p>[Edit: Read accepted answer first. The long investigation below stems from a subtle blunder in the timing measurement.]</p>
+<p>I often need to process extremely large (100GB+) text/CSV-like files containing highly redundant data that cannot practically be stored on disk uncompressed. I rely heavily on external compressors like lz4 and zstd, which produce stdout streams approaching 1GB/s.</p>
+<p>As such, I care a lot about the performance of Unix shell pipelines. But large shell scripts are difficult to maintain, so I tend to construct pipelines in Python, stitching commands together with careful use of <code>shlex.quote()</code>.</p>
+<p>This process is tedious and error-prone, so I'd like a "Pythonic" way to achieve the same end, managing the stdin/stdout file descriptors in Python without offloading to <code>/bin/sh</code>. However, I've never found a method of doing this without greatly sacrificing performance.</p>
+<p>Python 3's documentation recommends <a href="https://docs.python.org/3/library/subprocess.html#replacing-shell-pipeline" rel="nofollow noreferrer">replacing shell pipelines</a> with the <code>communicate()</code> method on <code>subprocess.Popen</code>. I've adapted this example to create the following test script, which pipes 3GB of <code>/dev/zero</code> into a useless <code>grep</code>, which outputs nothing:</p>
+<pre><code>#!/usr/bin/env python3
+from shlex import quote
+from subprocess import Popen, PIPE
+from time import perf_counter
+
+BYTE_COUNT = 3_000_000_000
+UNQUOTED_HEAD_CMD = ["head", "-c", str(BYTE_COUNT), "/dev/zero"]
+UNQUOTED_GREP_CMD = ["grep", "Arbitrary string which will not be found."]
+
+QUOTED_SHELL_PIPELINE = " | ".join(
+    " ".join(quote(s) for s in cmd)
+    for cmd in [UNQUOTED_HEAD_CMD, UNQUOTED_GREP_CMD]
+)
+
+perf_counter()
+proc = Popen(QUOTED_SHELL_PIPELINE, shell=True)
+proc.wait()
+print(f"Time to run using shell pipeline: {perf_counter()} seconds")
+
+perf_counter()
+p1 = Popen(UNQUOTED_HEAD_CMD, stdout=PIPE)
+p2 = Popen(UNQUOTED_GREP_CMD, stdin=p1.stdout, stdout=PIPE)
+p1.stdout.close()
+p2.communicate()
+print(f"Time to run using subprocess.PIPE: {perf_counter()} seconds")
+</code></pre>
+<p>Output:</p>
+<pre><code>Time to run using shell pipeline: 2.412427189 seconds
+Time to run using subprocess.PIPE: 4.862174164 seconds
+</code></pre>
+<p>The <code>subprocess.PIPE</code> approach is more than twice as slow as <code>/bin/sh</code>. If we raise the input size to 90GB (<code>BYTE_COUNT = 90_000_000_000</code>), we confirm this is not a constant-time overhead:</p>
+<pre><code>Time to run using shell pipeline: 88.796322932 seconds
+Time to run using subprocess.PIPE: 183.734968687 seconds
+</code></pre>
+<p>My assumption up to now was that <code>subprocess.PIPE</code> is simply a high-level abstraction for connecting file descriptors, and that data is never copied into the Python process itself. As expected, when running the above test <code>head</code> uses 100% CPU but <code>subproc_test.py</code> uses near-zero CPU and RAM.</p>
+<p>Given that, why is my pipeline so slow? Is this an intrinsic limitation of Python's <code>subprocess</code>? If so, what does <code>/bin/sh</code> do differently under the hood that makes it twice as fast?</p>
+<p>More generally, are there better methods for building large, high-performance subprocess pipelines in Python?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You're timing it wrong. Your <code>perf_counter()</code> calls don't start and stop a timer; they just return a number of seconds since some arbitrary starting point. That starting point probably happens to be the first <code>perf_counter()</code> call here, but it could be any point, even one in the future.</p>
+<p>The actual time taken by the <code>subprocess.PIPE</code> method is 4.862174164 - 2.412427189 = 2.449746975 seconds, not 4.862174164 seconds. This timing does not show a measurable performance penalty from <code>subprocess.PIPE</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Also, take this into account, for <code>Popen</code>:</p>
+<blockquote>
+<p>Changed in version 3.3.1: bufsize now defaults to -1 to enable
+  buffering by default to match the behavior that most code expects. In
+  versions prior to Python 3.2.4 and 3.3.1 it incorrectly defaulted to 0
+  which was unbuffered and allowed short reads. This was unintentional
+  and did not match the behavior of Python 2 as most code expected.</p>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<p>In python3 there is "the python way" and "the one we don't mention". (Though it pains me to abuse RAM, there does seem to be rather a lot of it available these days.)</p>
+<pre><code>#!/usr/bin/env python3
+# how you are "meant" to do it
+import subprocess
+ps = subprocess.Popen(('ip', 'a'), stdout=subprocess.PIPE)
+pt = subprocess.Popen(('grep', '192'), stdin=ps.stdout, stdout=subprocess.PIPE)
+pu = subprocess.Popen(('awk', '{print $2}'), stdin=pt.stdout, stdout=subprocess.PIPE)
+pv = subprocess.Popen(('sed', 's;/.*;;'), stdin=pu.stdout, stdout=subprocess.PIPE)
+#ps.wait()
+#ps.stdout.close()
+output = pv.communicate()[0]
+print(output.decode('utf-8').rstrip())
+
+# OR (the 1 we don't mention)
+import os
+print(os.popen('ip a|grep 192|awk \'{print $2}\'|sed \'s;/.*;;\'').read().rstrip())
+
+# or (the 1 we don't mention, pretending to be PEM compliant)
+cmd="ip a|grep 192|awk '{print $2}'|sed 's;/.*;;'"
+print(os.popen(cmd).read().rstrip())
+</code></pre>
+</div>
+<span class="comment-copy">Is this really the kind of data that should be processed locally? It sounds like it needs some kind of cluster technology</span>
+<span class="comment-copy">In most cases, the time to upload the data to another server is immensely greater than the runtime of the shell scripts I'm replacing. Any DBMS/Hadoop-like/"big data" tool I know of would take much longer still to ingest/ETL the data, let alone do the processing of my scripts. The tasks I'm considering are all perfectly viable on a single laptop today, and could be written in Bash. I just prefer Python control flow and would like to avoid shelling out if possible.</span>
+<span class="comment-copy">That's fair enough, I was curious whether the whole project should be hoisted into the cloud so the infrastructure already exists :)</span>
+<span class="comment-copy">BTW, the use of <code>shell=True</code> here is... unfortunate. If your <code>substring_which_will_never_be_found</code> contained <code>$(rm -rf ~)</code> in it, or -- worse -- <code>$(rm -rf ~)'$(rm -rf ~)'</code>, you'd have a <b>very</b> bad day. (Relying on <code>shlex.split()</code> isn't good form either -- if you have a name with a space, you want to keep it as <i>one name</i>; populate an array or tuple by hand, and you don't need to worry about your content being munged).</span>
+<span class="comment-copy">...moving towards the topic -- <b>yes</b>, <code>subprocess.PIPE</code> <b>is</b> a high-level abstraction for connecting file descriptors; <b>no</b>, the data isn't copied into the Python process's namespace. Why you're seeing a difference here is a good question -- I'd need to dig in; wouldn't be surprised if it were related to buffering settings on the file descriptors.</span>
+<span class="comment-copy">Wow, I am dumb. Thank you.</span>
+<span class="comment-copy">Seems some pythonistas like to bite at information that might be helpful without explaining their objection.</span>
+<span class="comment-copy">I think the downvote (not by me) is likely due to your answer being bad in multiple ways. First, you do not answer the question of the OP; second, you do not explain what you are doing; third you are using a deprecated function (<code>os.popen</code>) which, in Python 3, is implemented using <code>subprocess.Popen</code> anyway, as can be seen in <a href="https://stackoverflow.com/a/41678241/7738328">stackoverflow.com/a/41678241/7738328</a>; and fourth, comes with not explained assertion that it somehow absues RAM.</span>

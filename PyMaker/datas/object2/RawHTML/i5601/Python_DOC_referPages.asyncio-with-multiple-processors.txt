@@ -1,0 +1,92 @@
+<div class="post-text" itemprop="text">
+<p>As almost everyone is aware when they first look at threading in Python, there is the GIL that makes life miserable for people who actually want to do processing in parallel - or at least give it a chance.</p>
+<p>I am currently looking at implementing something like the Reactor pattern. Effectively I want to listen for incoming socket connections on one thread-like, and when someone tries to connect, accept that connection and pass it along to another thread-like for processing.</p>
+<p>I'm not (yet) sure what kind of load I might be facing. I know there is currently setup a 2MB cap on incoming messages. Theoretically we could get thousands per second (though I don't know if practically we've seen anything like that). The amount of time spent processing a message isn't <em>terribly</em> important, though obviously quicker would be better.</p>
+<p>I was looking into the Reactor pattern, and developed a small example using the <code>multiprocessing</code> library that (at least in testing) seems to work just fine. However, now/soon we'll have the <a href="http://docs.python.org/3.4/library/asyncio.html">asyncio</a> library available, which would handle the event loop for me.</p>
+<p>Is there anything that could bite me by combining <code>asyncio</code> and <code>multiprocessing</code>?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You should be able to safely combine <code>asyncio</code> and <code>multiprocessing</code> without too much trouble, though you shouldn't be using <code>multiprocessing</code> directly. The cardinal sin of <code>asyncio</code> (and any other event-loop based asynchronous framework) is blocking the event loop. If you try to use <code>multiprocessing</code> directly, any time you block to wait for a child process, you're going to block the event loop. Obviously, this is bad.</p>
+<p>The simplest way to avoid this is to use <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.BaseEventLoop.run_in_executor" rel="noreferrer"><code>BaseEventLoop.run_in_executor</code></a> to execute a function in a <a href="https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor" rel="noreferrer"><code>concurrent.futures.ProcessPoolExecutor</code></a>. <code>ProcessPoolExecutor</code> is a process pool implemented using <code>multiprocessing.Process</code>, but <code>asyncio</code> has built-in support for executing a function in it without blocking the event loop. Here's a simple example:</p>
+<pre><code>import time
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+
+def blocking_func(x):
+   time.sleep(x) # Pretend this is expensive calculations
+   return x * 5
+
+@asyncio.coroutine
+def main():
+    #pool = multiprocessing.Pool()
+    #out = pool.apply(blocking_func, args=(10,)) # This blocks the event loop.
+    executor = ProcessPoolExecutor()
+    out = yield from loop.run_in_executor(executor, blocking_func, 10)  # This does not
+    print(out)
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
+</code></pre>
+<p>For the majority of cases, this is function alone is good enough. If you find yourself needing other constructs from <code>multiprocessing</code>, like <code>Queue</code>, <code>Event</code>, <code>Manager</code>, etc., there is a third-party library called <a href="https://github.com/dano/aioprocessing" rel="noreferrer"><code>aioprocessing</code></a> (full disclosure: I wrote it), that provides <code>asyncio</code>-compatible versions of all the <code>multiprocessing</code> data structures. Here's an example demoing that:</p>
+<pre><code>import time
+import asyncio
+import aioprocessing
+import multiprocessing
+
+def func(queue, event, lock, items):
+    with lock:
+        event.set()
+        for item in items:
+            time.sleep(3)
+            queue.put(item+5)
+    queue.close()
+
+@asyncio.coroutine
+def example(queue, event, lock):
+    l = [1,2,3,4,5]
+    p = aioprocessing.AioProcess(target=func, args=(queue, event, lock, l)) 
+    p.start()
+    while True:
+        result = yield from queue.coro_get()
+        if result is None:
+            break
+        print("Got result {}".format(result))
+    yield from p.coro_join()
+
+@asyncio.coroutine
+def example2(queue, event, lock):
+    yield from event.coro_wait()
+    with (yield from lock):
+        yield from queue.coro_put(78)
+        yield from queue.coro_put(None) # Shut down the worker
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    queue = aioprocessing.AioQueue()
+    lock = aioprocessing.AioLock()
+    event = aioprocessing.AioEvent()
+    tasks = [ 
+        asyncio.async(example(queue, event, lock)),
+        asyncio.async(example2(queue, event, lock)),
+    ]   
+    loop.run_until_complete(asyncio.wait(tasks))
+    loop.close()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Yes, there are quite a few bits that may (or may not) bite you.</p>
+<ul>
+<li>When you run something like <code>asyncio</code> it expects to run on one thread or process. This does not (by itself) work with parallel processing. You somehow have to distribute the work while leaving the IO operations (specifically those on sockets) in a single thread/process.</li>
+<li>While your idea to hand off individual connections to a different handler process is nice, it is hard to implement. The first obstacle is that you need a way to pull the connection out of <code>asyncio</code> without closing it. The next obstacle is that you cannot simply send a file descriptor to a different process unless you use platform-specific (probably Linux) code from a C-extension.</li>
+<li>Note that the <code>multiprocessing</code> module is known to create a number of threads for communication. Most of the time when you use communication structures (such as <code>Queue</code>s), a thread is spawned. Unfortunately those threads are not completely invisible. For instance they can fail to tear down cleanly (when you intend to terminate your program), but depending on their number the resource usage may be noticeable on its own.</li>
+</ul>
+<p>If you really intend to handle individual connections in individual processes, I suggest to examine different approaches. For instance you can put a socket into listen mode and then simultaneously accept connections from multiple worker processes in parallel. Once a worker is finished processing a request, it can go accept the next connection, so you still use less resources than forking a process for each connection. Spamassassin and Apache (mpm prefork) can use this worker model for instance. It might end up easier and more robust depending on your use case. Specifically you can make your workers die after serving a configured number of requests and be respawned by a master process thereby eliminating much of the negative effects of memory leaks.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>See PEP 3156, in particular the section on Thread interaction:</p>
+<p><a href="http://www.python.org/dev/peps/pep-3156/#thread-interaction" rel="nofollow">http://www.python.org/dev/peps/pep-3156/#thread-interaction</a></p>
+<p>This documents clearly the new asyncio methods you might use, including run_in_executor(). Note that the Executor is defined in concurrent.futures, I suggest you also have a look there.</p>
+</div>
+<span class="comment-copy">the io event loop is in main process, if I want to send/recv via socket  in child process, how can I do that? I found I can't simply call  main_proc_loop.ensure_future(send_socket_data...) because they are in different process? what is the best way to achieve it? via queue?</span>
+<span class="comment-copy">I suppose my question was a bit ambiguous - when I mentioned I would send it off to a thread-like, I actually meant that they were separate event loops.</span>

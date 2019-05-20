@@ -1,0 +1,118 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to resolve this error: <code>RuntimeError: Cannot close a running event loop</code> in my asyncio process. I believe it's happening because there's a failure while tasks are still pending, and then I try to close the event loop. I'm thinking I need to await the remaining responses prior to closing the event loop, but I'm not sure how to accomplish that correctly in my specific situation.</p>
+<pre><code> def start_job(self):
+
+        if self.auth_expire_timestamp &lt; get_timestamp():
+            api_obj = api_handler.Api('Api Name', self.dbObj)
+            self.api_auth_resp = api_obj.get_auth_response()
+            self.api_attr = api_obj.get_attributes()
+
+
+        try:
+            self.queue_manager(self.do_stuff(json_data))
+        except aiohttp.ServerDisconnectedError as e:
+            logging.info("Reconnecting...")
+            api_obj = api_handler.Api('API Name', self.dbObj)
+            self.api_auth_resp = api_obj.get_auth_response()
+            self.api_attr = api_obj.get_attributes()
+            self.run_eligibility()
+
+async def do_stuff(self, data):
+
+    tasks = []
+
+    async with aiohttp.ClientSession() as session:
+        for row in data:
+            task = asyncio.ensure_future(self.async_post('url', session, row))
+            tasks.append(task)
+        result = await asyncio.gather(*tasks)
+    self.load_results(result)
+
+
+def queue_manager(self, method):
+    self.loop = asyncio.get_event_loop()
+    future = asyncio.ensure_future(method)
+    self.loop.run_until_complete(future)
+
+
+async def async_post(self, resource, session, data):
+        async with session.post(self.api_attr.api_endpoint + resource, headers=self.headers, data=data) as response:
+            resp = []
+            try:
+                headers = response.headers['foo']
+                content = await response.read()
+                resp.append(headers)
+                resp.append(content)
+            except KeyError as e:
+                logging.error('KeyError at async_post response')
+                logging.error(e)
+        return resp
+
+
+def shutdown(self):
+    //need to do something here to await the remaining tasks and then I need to re-start a new event loop, which i think i can do, just don't know how to appropriately stop the current one.
+    self.loop.close() 
+    return True
+</code></pre>
+<p>How can I handle the error and properly close the event loop so I can start a new one and essentially re-boot the whole program and continue on.</p>
+<p><strong>EDIT:</strong></p>
+<p>This is what I'm trying now, based on <a href="https://stackoverflow.com/a/30766124/4113027">this SO answer</a>. Unfortunately, this error only happens rarely, so unless I can force it, i will have to wait and see if it works. In my <code>queue_manager</code> method I changed it to this:</p>
+<pre><code>try:
+   self.loop.run_until_complete(future)
+except Exception as e:
+   future.cancel()
+   self.loop.run_until_complete(future)
+   future.exception()
+</code></pre>
+<p><strong>UPDATE:</strong></p>
+<p>I got rid of the <code>shutdown()</code> method and added this to my <code>queue_manager()</code> method instead and it seems to be working without issue:  </p>
+<pre><code>  try:
+        self.loop.run_until_complete(future)
+    except Exception as e:
+        future.cancel()
+        self.check_in_records()
+        self.reconnect()
+        self.start_job()
+        future.exception()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>To answer the question as originally stated, there is no need to <code>close()</code> a running loop, you can reuse the same loop for the whole program.</p>
+<p>Given the code in the update, your <code>queue_manager</code> could look like this:</p>
+<pre><code>try:
+    self.loop.run_until_complete(future)
+except Exception as e:
+    self.check_in_records()
+    self.reconnect()
+    self.start_job()
+</code></pre>
+<p>Cancelling <code>future</code> is not necessary and as far as I can tell has no effect. This is different from the <a href="https://stackoverflow.com/a/30766124/1600898">referenced answer</a> which specifically reacts to <code>KeyboardInterrupt</code>, special because it is raised by asyncio itself. <code>KeyboardInterrupt</code> can be propagated by <code>run_until_complete</code> without the future having actually completed. Handling <kbd>Ctrl-C</kbd> correctly in asyncio is very hard or even impossible (see <a href="https://vorpus.org/blog/control-c-handling-in-python-and-trio/" rel="nofollow noreferrer">here</a> for details), but fortunately the question is not about <kbd>Ctrl-C</kbd> at all, it is about exceptions raised by the coroutine. (Note that <code>KeyboardInterrupt</code> doesn't inherit from <code>Exception</code>, so in case of <kbd>Ctrl-C</kbd> the except body won't even execute.)</p>
+<blockquote>
+<p>I was canceling the future because in this instance there are remaining tasks pending and i want to essentially remove those tasks and start a fresh event loop.</p>
+</blockquote>
+<p>This is a correct thing to want to do, but the code in the (updated) question is only canceling a single future, the one already passed to <code>run_until_complete</code>. Recall that a future is a placeholder for a result value that will be provided at a later point. Once the value is provided, it can be retrieved by calling <code>future.result()</code>. If the "value" of the future is an exception, <code>future.result()</code> will raise that exception. <code>run_until_complete</code> has the contract that it will run the event loop for as long as it takes for the given future to produce a value, and then it returns that value. If the "value" is in fact an exception to raise, then <code>run_until_complete</code> will re-raise it. For example:</p>
+<pre><code>loop = asyncio.get_event_loop()
+fut = loop.create_future()
+loop.call_soon(fut.set_exception, ZeroDivisionError)
+# raises ZeroDivisionError, as that is the future's result,
+# manually set
+loop.run_until_complete(fut)
+</code></pre>
+<p>When the future in question is in fact a <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.Task" rel="nofollow noreferrer"><code>Task</code></a>, an asyncio-specific object that wraps a coroutine into a <code>Future</code>, the result of such future is the object returned by the coroutine. If the coroutine raises an exception, then retrieving the result will re-raise it, and so will <code>run_until_complete</code>:</p>
+<pre><code>async def fail():
+    1/0
+
+loop = asyncio.get_event_loop()
+fut = loop.create_task(fail())
+# raises ZeroDivisionError, as that is the future's result,
+# because the coroutine raises it
+loop.run_until_complete(fut)
+</code></pre>
+<p>When dealing with a task, <code>run_until_complete</code> finishing means that the coroutine has finished as well, having either returned a value or raised an exception, as determined by <code>run_until_complete</code> returning or raising.</p>
+<p>On the other hand, cancelling a task works by arranging for the task to be resumed and the <code>await</code> expression that suspended it to raise <code>CancelledError</code>. Unless the task specifically catches and suppresses this exception (which well-behaved asyncio code is not supposed to do), the task will stop executing and the <code>CancelledError</code> will become its result. However, if the coroutine is already finished when <code>cancel()</code> is called, then <code>cancel()</code> cannot do anything because there is no pending <code>await</code> to inject <code>CancelledError</code> into.</p>
+</div>
+<span class="comment-copy">Where is <code>shutdown</code> called from, and why do you try to <code>close</code> the event loop? An asyncio program is normally served by a single event loop instance throughout its lifetime.</span>
+<span class="comment-copy">the problem was that the API I was calling would be disconnected with tasks pending and I was trying to "reboot" without the whole app crashing. I added an update for what I've most recently added. It seems to be working, but i'm open to feedback.</span>
+<span class="comment-copy">Do you need <code>future.exception()</code> at the end? It seems like <code>run_until_complete</code> is correctly picking up the exception. Also, what is the point of canceling a future that is obviously already complete (as witnessed by <code>run_until_complete</code> raising)?</span>
+<span class="comment-copy">This answer - <a href="https://stackoverflow.com/a/30766124/4113027">stackoverflow.com/a/30766124/4113027</a> seemed to indicate I needed the <code>future.exception()</code> bit. As far as your other question, I was canceling the future because in this instance there are remaining tasks pending and i want to essentially remove those tasks and start a fresh event loop. In this scenario the server has disconnected before all the tasks complete so those remaining tasks aren't going to bring back any data anyway...maybe I'm not handling that correctly..?</span>
+<span class="comment-copy">In your code, both <code>cancel()</code> and <code>exception()</code> are unnecessary. <code>cancel()</code> because the future is already finished (with an exception) as evidenced by the fact that <code>run_until_complete</code> exited. See <a href="https://pastebin.com/spBbviT4" rel="nofollow noreferrer">this code</a> for a functionally equivalent example which runs without warning.</span>

@@ -1,0 +1,125 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to figure out how to port a threaded program to use <a href="https://docs.python.org/3/library/asyncio.html"><code>asyncio</code></a>. I have a lot of code which synchronizes around a few standard library <a href="https://docs.python.org/3.4/library/queue.html"><code>Queues</code></a>, basically like this: </p>
+<pre><code>import queue, random, threading, time
+
+q = queue.Queue()
+
+def produce():
+    while True:
+        time.sleep(0.5 + random.random())  # sleep for .5 - 1.5 seconds
+        q.put(random.random())
+
+def consume():
+    while True: 
+        value = q.get(block=True)
+        print("Consumed", value)
+
+threading.Thread(target=produce).start()
+threading.Thread(target=consume).start()
+</code></pre>
+<p>One thread creates values (possibly user input), and another thread does something with them. The point is that these threads are idle until there's new data, at which point they wake up and do something with it.  </p>
+<p>I'm trying to implement this pattern using asyncio, but I can't seem to figure out how to make it "go". </p>
+<p>My attempts look more or less like this (and don't do anything at all). </p>
+<pre><code>import asyncio, random
+
+q = asyncio.Queue()
+
+@asyncio.coroutine
+def produce():
+    while True: 
+        q.put(random.random())
+        yield from asyncio.sleep(0.5 + random.random())
+
+@asyncio.coroutine
+def consume():
+    while True:
+        value = yield from q.get()
+        print("Consumed", value)
+
+# do something here to start the coroutines. asyncio.Task()? 
+
+loop = asyncio.get_event_loop()
+loop.run_forever()
+</code></pre>
+<p>I've tried variations on using coroutines, not using them, wrapping stuff in Tasks, trying to make them create or return futures, etc. </p>
+<p>I'm starting to think that I have the wrong idea about how I should be using asyncio (maybe this pattern should be implemented in a different way that I'm not aware of).
+Any pointers would be appreciated. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Yes, exactly. Tasks are your friends:</p>
+<pre><code>import asyncio, random
+
+q = asyncio.Queue()
+
+@asyncio.coroutine
+def produce():
+    while True:
+        yield from q.put(random.random())
+        yield from asyncio.sleep(0.5 + random.random())
+
+@asyncio.coroutine
+def consume():
+    while True:
+        value = yield from q.get()
+        print("Consumed", value)
+
+
+loop = asyncio.get_event_loop()
+loop.create_task(produce())
+loop.create_task(consume())
+loop.run_forever()
+</code></pre>
+<p><code>asyncio.ensure_future</code> can be used for task creation also.</p>
+<p>And please keep in mind: <code>q.put()</code> is a <strong>coroutine</strong>, so you should to use <code>yield from q.put(value)</code>.</p>
+<p><strong>UPD</strong></p>
+<p>Switched from <code>asyncio.Task()</code>/<code>asyncio.async()</code> to new brand API <code>loop.create_task()</code> and <code>asyncio.ensure_future()</code> in example.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's what I use in production, moved to gist: <a href="https://gist.github.com/thehesiod/7081ab165b9a0d4de2e07d321cc2391d" rel="nofollow noreferrer">https://gist.github.com/thehesiod/7081ab165b9a0d4de2e07d321cc2391d</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>A bit later and maybe OT, have in mind that you can consume from the <code>Queue</code> from multiple tasks as they were independent consumers.</p>
+<p>The following snippet shows as an example how you can achieve the same thread pool pattern with <code>asyncio</code> tasks.</p>
+<pre><code>q = asyncio.Queue()
+
+async def sum(x):
+    await asyncio.sleep(0.1)  # simulates asynchronously
+    return x
+
+async def consumer(i):
+    print("Consumer {} started".format(i))
+    while True:
+        f, x = await q.get()
+        print("Consumer {} procesing {}".format(i, x))
+        r = await sum(x)
+        f.set_result(r)
+
+async def producer():
+    consumers = [asyncio.ensure_future(consumer(i)) for i in range(5)]
+    loop = asyncio.get_event_loop()
+    tasks = [(asyncio.Future(), x) for x in range(10)]
+    for task in tasks:
+        await q.put(task)
+
+    # wait until all futures are completed
+    results = await asyncio.gather(*[f for f, _ in tasks])
+    assert results == [r for _, r in tasks]
+
+    # destroy tasks
+    for c in consumers:
+        c.cancel()
+
+
+asyncio.get_event_loop().run_until_complete(producer())
+</code></pre>
+</div>
+<span class="comment-copy">Why are you leaving threading in favor of asyncio?</span>
+<span class="comment-copy">@dmmd - Not leaving, I use threads all the time. Asyncio is, however, convenient for some kinds of problems, particularly when they involve a lot of blocking I/O. And on systems without unlimited resources (raspberry pi's, "cloud" machines), sometimes asyncio can accomplish the same thing with less effort.</span>
+<span class="comment-copy">Good to know, thanks.</span>
+<span class="comment-copy">I'm curious as to whether or not a 'while True' loop is good to use for production code? Also is there a recommended way to test this?</span>
+<span class="comment-copy">@user772401 usually it depends on producer. For generating random sequence <code>while True</code> is good example, for reading from socket -- maybe, your code should wait a portion of new data from socket anyway.  For testing <i>my</i> example I suggest pinning random seed to constant value and analyzing consumed result. More complex scenarios require another technique.</span>
+<span class="comment-copy">ok thanks. What I was wondering about in regards to the while loop, is there some mechanism that says 'run this code forever'. Because I feel like if an exception occurs, than the while loop will break and you'll have to restart your program. Otherwise you'll have to wrap the code inside the 'while True' loop in a try/except so that if something exceptional happens it doesn't ruin the entire program but then that looks ugly...</span>
+<span class="comment-copy">Nice answer. I just have one small quirk. Quoting the documentation: <a href="https://docs.python.org/3/library/asyncio-task.html#task" rel="nofollow noreferrer">"Don’t directly create <code>Task</code> instances: use the <code>ensure_future()</code> function or the <code>BaseEventLoop.create_task()</code> method."</a></span>
+<span class="comment-copy">@FrederikAalund Updated answer anyway</span>
+<span class="comment-copy">Thanks, you helped me a lot! I needed a queue with options to add and process items. However, in my case i added following: <code>async def finish(self): 		await self._queue.join() 		await self.join()</code> And then using AsyncWorkerPool instance like this: <code>loop.run_until_complete(pool.finish())</code> to finish when there is nothing to process.</span>
+<span class="comment-copy">cool, updated with a few more options</span>

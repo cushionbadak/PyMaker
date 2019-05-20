@@ -1,0 +1,183 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to record grouping in expressions, like:</p>
+<pre><code>condition_a = Condition( "x = 5 ")
+condition_b = Condition( "y &gt; 6 " )
+condition_c = Condition( "z = 7 " )
+
+condition_c &amp; ( condition_a | condition_b )
+</code></pre>
+<p>These are expressions a user can write to configure a SQL query, so the above would ultimately be expressed as <code>x = 5 AND (y &gt; 6 OR z = 7)</code>.</p>
+<p>I tried this:</p>
+<pre><code>class Condition( object ) :
+    def __init__( self, expr ) :
+        ....
+
+    def __and__( self , other ) :
+        print 'calling and'
+        ....
+        return self
+
+    def __or__( self , other ) : 
+        print 'calling or'
+        ....
+        return self
+
+    def __call__( self , other ) :
+        print 'calling ()'
+        ....
+        return self
+</code></pre>
+<p>I would expect this code :</p>
+<pre><code>condition_a = Condition( "x = 5 ")
+condition_b = Condition( "y &gt; 6 " )
+condition_c = Condition( "z = 7 " )
+condition = condition_c &amp; ( condition_a | condition_b )
+expected =  "z = 7 AND ( x = 5 OR y &gt; 6 )" 
+</code></pre>
+<p>to print the <code>calling ()</code> but it does not. I just see :</p>
+<pre><code>calling or
+calling and
+</code></pre>
+<p>It seems I am not using a call, so something like <code>condition_a(1)</code>, so <code>__call__</code> is not called.</p>
+<p>Is there a way to achieve what I want? You can check the expected which is what I want to have (<em>and</em> and <em>or</em> works, it's just I don't have the parenthesis around part of the expression). </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, the <code>(...)</code> parentheses in your expression are not a call expression. They are just there to group your expressions. </p>
+<p>Python does not preserve grouping parentheses. They only are used by the parser to build an <em>abstract syntax tree</em>, and grouping influences in what order expressions are executed.</p>
+<p>The expression</p>
+<pre><code>A &amp; B | C
+</code></pre>
+<p>is parsed into a tree of <code>BinOp</code> objects, like this:</p>
+<pre><code>      |
+    /   \
+   &amp;      C
+ /   \
+A     B
+</code></pre>
+<p><code>&amp;</code> binds more tightly here, so <code>A &amp; B</code> is executed before the <code>|</code> operator is executed. That's because the <a href="https://docs.python.org/3/reference/expressions.html#operator-precedence" rel="nofollow noreferrer"><code>|</code> operator has a lower <em>precedence</em> than <code>&amp;</code></a>.</p>
+<p>Parentheses tell the parser to build separate trees for everything between <code>(...)</code> before putting that into the tree, so the expression</p>
+<pre><code>A &amp; (B | C)
+</code></pre>
+<p>becomes</p>
+<pre><code>   &amp;
+ /   \
+A     |
+    /   \
+  B       C
+</code></pre>
+<p>The parentheses are gone, all that is left is the tree of expressions, and Python knows know in what order you need to execute those expressions; the <code>|</code> is executed first, on <code>B</code> and <code>C</code>, and the result of this expression is then used in the <code>&amp;</code> operator.</p>
+<p>You can look at those AST objects with the <a href="https://docs.python.org/3/library/ast.html" rel="nofollow noreferrer"><code>ast</code> module</a>:</p>
+<pre><code>&gt;&gt;&gt; import ast
+&gt;&gt;&gt; print(ast.dump(ast.parse('A &amp; B | C').body[0].value)))
+BinOp(
+    left=BinOp(
+        left=Name(id='A', ctx=Load()),
+        op=BitAnd(),
+        right=Name(id='B', ctx=Load())
+    ),
+    op=BitOr(),
+    right=Name(id='C', ctx=Load()))
+)
+&gt;&gt;&gt; print(ast.dump(ast.parse('A &amp; (B | C)').body[0].value))
+BinOp(
+    left=Name(id='A', ctx=Load()),
+    op=BitAnd(),
+    right=BinOp(
+        left=Name(id='B', ctx=Load()),
+        op=BitOr(),
+        right=Name(id='C', ctx=Load())
+    )
+)
+</code></pre>
+<p>(I unwrapped the outer <code>Module</code> and <code>Expr</code> objects to focus on the <code>BinOp</code> trees, and manually indented the nested objects).</p>
+<p>and you can see the order of operations change when you look at the resulting bytecode with the <a href="https://docs.python.org/3/library/dis.html" rel="nofollow noreferrer"><code>dis</code> module</a>:</p>
+<pre><code>&gt;&gt;&gt; dis.dis(compile('A &amp; B | C', '', 'eval'))
+  1           0 LOAD_NAME                0 (A)
+              2 LOAD_NAME                1 (B)
+              4 BINARY_AND
+              6 LOAD_NAME                2 (C)
+              8 BINARY_OR
+             10 RETURN_VALUE
+&gt;&gt;&gt; dis.dis(compile('A &amp; (B | C)', '', 'eval'))
+  1           0 LOAD_NAME                0 (A)
+              2 LOAD_NAME                1 (B)
+              4 LOAD_NAME                2 (C)
+              6 BINARY_OR
+              8 BINARY_AND
+             10 RETURN_VALUE
+</code></pre>
+<p>(<code>LOAD_NAME</code> puts a value on the stack, and <code>BINARY_OR</code> and <code>BINARY_AND</code> take the top 2 values from the stack and push back the result).</p>
+<p>All this means that <em>parentheses cannot be retrieved this way</em>. They are gone, they were only there to inform the order of operations.</p>
+<p>What you need to do then, is maintain the <em>syntax tree</em>; you can still reconstruct that from the execution. You could just <em>always</em> include parentheses when you then output your result:</p>
+<pre><code>class Expr(object):
+    def __or__(self, other):
+        return BinOp(self, '|', other)
+
+    def __and__(self, other):
+        return BinOp(self, '&amp;', other)
+
+class BinOp(Expr):
+    def __init__(self, left, oper, right):
+        self.left, self.oper, self.right = left, oper, right
+
+    def __repr__(self):
+        return "({} {} {})".format(self.left, self.oper, self.right)
+
+class Condition(Expr):
+    def __init__(self, expr):
+        self.expr = expr
+
+    def __repr__(self):
+        return self.expr
+</code></pre>
+<p>When printing a <code>BinOp</code> object, you'll <em>always</em> get parentheses:</p>
+<pre><code>&gt;&gt;&gt; condition_a = Condition( "x = 5 ")
+&gt;&gt;&gt; condition_b = Condition( "y &gt; 6 " )
+&gt;&gt;&gt; condition_c = Condition( "z = 7 " )
+&gt;&gt;&gt; condition_c &amp; ( condition_a | condition_b )
+(z = 7  | (x = 5  | y &gt; 6 ))
+&gt;&gt;&gt; condition_c &amp; condition_a | condition_b
+((z = 7  | x = 5 ) | y &gt; 6 )
+</code></pre>
+<p>This is <em>fine</em>, because the SQL parser treats parentheses the same way; just to group expressions.</p>
+<p>The next step is to add <em>precedence</em> information to your binary operators. You can then decide if you have to have parentheses around a sub-expression or not; only when the left sub-expression has a lower precedence, or the right has a lower or equal precedence, would you need them:</p>
+<pre><code># Condition stays the same
+
+class Expr(object):
+    precedence = float('inf')
+
+    def __or__(self, other):
+        return BinOp(self, '|', other)
+
+    def __and__(self, other):
+        return BinOp(self, '&amp;', other)
+
+class BinOp(Expr):
+    def __init__(self, left, oper, right):
+        self.left, self.oper, self.right = left, oper, right
+        self.precedence = '|&amp;'.index(oper)  # 0 or 1
+
+    def __repr__(self):
+        left, right = self.left, self.right
+        if left.precedence &lt; self.precedence:
+            left = '({})'.format(left)
+        if right.precedence &lt;= self.precedence:
+            right = '({})'.format(right)
+        return "{} {} {}".format(left, self.oper, right)
+</code></pre>
+<p>Now parentheses only show up when the expression requires them:</p>
+<pre><code>&gt;&gt;&gt; condition_c &amp; ( condition_a | condition_b )
+z = 7  &amp; (x = 5  | y &gt; 6 )
+&gt;&gt;&gt; condition_c &amp; condition_a | condition_b
+z = 7  &amp; x = 5  | y &gt; 6
+&gt;&gt;&gt; condition_c &amp; (condition_a &amp; condition_b)
+z = 7  &amp; (x = 5  &amp; y &gt; 6 )
+</code></pre>
+<p>If you are going to extend this system (adding in more operator types), you'll have to expand on the concept of precedence there; the above example only has <code>0</code> and <code>1</code> for the binary operators, but you'll have to naturally expand on these values if you have more.</p>
+<p>I'd also <em>strongly</em> urge you to look at <a href="https://www.sqlalchemy.org/" rel="nofollow noreferrer">SQLAlchemy</a>, which already implements all this, and much more.</p>
+</div>
+<span class="comment-copy">@ghostrider: You'll have to explain more precisely what you want to actually happen. If you specifically want to handle parentheses (which isn't possible in the way you want), I don't think you're going about this the right way. What if you write <code>x = condition_a | condition_b</code> and then <code>condition = condition_c &amp; x</code>? It's identical to what you have, but with no parentheses. Creating an <code>Expression</code> class or something similar and having <code>c1 | c2</code> produce a <code>Expression(c1, '|', c2)</code> is enough to "encode" the parentheses.</span>
+<span class="comment-copy">@Blender yes I want to specifically handle parentheses - so probably need to change my approach. Well on the example you have that's fine - want I want is that if the user puts <code>()</code> around a query - then there are shown in the produced query. will edit again with more details.</span>
+<span class="comment-copy">@ghostrider: Python doesn't expose any direct way to see the exact syntax used. You could instead parse the user input as a string instead of defining operations between objects. Out of curiosity, why do you even care about parentheses? <code>x AND y</code> and <code>((((((x) AND (y))))))</code> are equivalent.</span>
+<span class="comment-copy">@Blender that's true but <code>a1 Or a2 And b</code>  the order matters in SQL execution. this is intepreted as <code>a1 Or (a2 And b)</code> and I want user to have the option to explicitly use it as <code>(a1 Or a2) And b</code></span>
+<span class="comment-copy">thank you very much! will read more info on the above but it seems to do what I wanted!</span>

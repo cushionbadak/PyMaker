@@ -1,0 +1,126 @@
+<div class="post-text" itemprop="text">
+<p>OS: linux <br/>
+Python version: 3.6</p>
+<p>I'm trying to extend a C application with Python runtime. The C application uses <code>pthread</code> and I tried to use <code>multiprocessing</code> <code>forkserver</code> in Python runtime but faced a problem. When I try to kill the program with <code>SIGINT</code> signal (by hitting <kbd>Ctrl</kbd>+<kbd>C</kbd> in the terminal) the worker processes get killed but the main program hangs.</p>
+<p>Here is a toy program that produces the same problem.</p>
+<pre class="lang-c prettyprint-override"><code>#include &lt;Python.h&gt;
+#include &lt;pthread.h&gt;
+
+void * thread_start(void *unsed)
+{
+    PyObject *fs_mod = PyImport_AddModule("fs");
+    PyObject *apply_fn = PyObject_GetAttrString(fs_mod, "apply");
+    PyObject *job_fn = PyObject_GetAttrString(fs_mod, "job");
+    PyObject *job_args = Py_BuildValue("()");
+    PyObject_CallFunctionObjArgs(apply_fn, job_fn, job_args, NULL);
+    printf("finished\n");
+    return NULL;
+}
+
+int main(){
+    Py_Initialize();
+    PyRun_SimpleString(
+        "import sys; sys.path.append('...');"
+        "sys.argv=['a.out'];"  // prepare a dummy argument to avoid error in forkserver
+        "import fs\n"
+        "if __name__ == '__main__': fs.init()");
+
+    while(1){
+        pthread_t thread;
+        pthread_create(&amp;thread, 0, &amp;thread_start, NULL);
+        printf("joing\n");
+        pthread_join(thread, 0);
+    }
+}
+</code></pre>
+<pre class="lang-py prettyprint-override"><code>import multiprocessing as mp
+
+pool = None
+
+
+def job():
+    import time
+    print("running..")
+    time.sleep(5)
+
+def init():
+    global pool
+    mp.set_start_method('forkserver')
+    pool = mp.Pool(1)
+
+def apply(*args):
+    global pool
+    return pool.apply(*args)
+</code></pre>
+<p>I don't exactly know how Linux signal works. I tried to catch <code>SIGINT</code> signal in the main python process with signal module, but it seems that main it doesn't get to receive the signal. How would I be able to make this application die gracefully on <code>SIGINT</code> without hanging forever?</p>
+<hr/>
+<p>By reading ViKiG answer, I realized that I can first catch the <code>KeyboardInterrupt</code>(or <code>SIGINT</code>) exception in the worker processes and send some sentinel value to the main process to notify the exception and shut down the application.</p>
+<p>After skimming through the CPython forkserver implementation, I potentially concluded that the author of the library intentionally made the main process ignore the <code>SIGINT</code>. I guess, currently, that the recommended way is to catch the exception in the worker processes, not in the main one.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I changed <code>job</code> function to handle <code>CTRL+C</code> interrupts:</p>
+<pre><code>    def job():
+        import time
+        try:    
+            while True:
+                print("running..")
+                time.sleep(5)
+        except KeyboardInterrupt:
+            print 'Exiting job..'
+</code></pre>
+<p>My test program is exiting cleanly after above change.</p>
+<p>AFTER EDIT:</p>
+<p>I added this to my C program</p>
+<pre><code>    #include&lt;signal.h&gt;
+
+    void handler() {printf("Exiting main.."); exit(0);}
+</code></pre>
+<p>Modified <code>main</code> as:</p>
+<pre><code>    int main() {
+        signal(SIGINT, handler);
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>Py_Initialize()</code> will install python's own singal handler, call <code>Py_InitializeEx(0)</code> instead:</p>
+<blockquote>
+<p>void Py_InitializeEx(int initsigs)</p>
+<p>This function works like
+  Py_Initialize() if initsigs is 1. If initsigs is 0, it skips
+  initialization registration of signal handlers, which might be useful
+  when Python is embedded.</p>
+</blockquote>
+<p>see more on its <a href="https://docs.python.org/3/c-api/init.html#c.Py_InitializeEx" rel="nofollow noreferrer">doc</a>, and <a href="https://github.com/python/cpython/blob/v3.6.3/Python/pylifecycle.c#L471-L481" rel="nofollow noreferrer">cpython source</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It turned out that I don't have to catch the exception in the main process. I solved the problem by catching the <code>KeyboardInterrupt</code>(or <code>SIGINT</code>) exception in the worker processes and send some sentinel value to the main process to notify the exception and shut down the application.</p>
+<pre><code>import multiprocessing as mp
+
+
+pool = None
+
+
+def job():
+    try:
+        import time
+        print("running..")
+        time.sleep(5)
+        return True
+    except KeyboardInterrupt:
+        print("Exiting..")
+        return False
+...
+
+def apply(*args):
+    global pool
+    ret = pool.apply(*args)
+    if ret:
+        return pool.apply(*args)
+    else:
+        print("Gracefully die")
+</code></pre>
+</div>
+<span class="comment-copy">I searched on <a href="https://stackoverflow.com/questions/1112343/how-do-i-capture-sigint-in-python">python tag and SIGINT to find this answered question</a>.</span>
+<span class="comment-copy">Possible duplicate of <a href="https://stackoverflow.com/questions/1112343/how-do-i-capture-sigint-in-python">How do I capture SIGINT in Python?</a></span>
+<span class="comment-copy">@jwdonahue I tried signal module but failed to catch the SIGINT signal. That’s why I mentioned that “the main process doesn’t get to receive SIGINT signal”</span>
+<span class="comment-copy">Thank you for your experiment, but I just realized that I wrote a little wrong example for my case. I'm really sorry but I let me please change the example a bit(The infinite loop should be in the main process, not in the worker process)</span>
+<span class="comment-copy">Thank you for your comment, but I think that is not exactly how you make Python runtime die gracefully.</span>

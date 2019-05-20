@@ -1,0 +1,50 @@
+<div class="post-text" itemprop="text">
+<p>I was just reviewing some code that created a C extension module for Python which didn't contain enough error-checking. It was easy enough in most cases but when it comes to the module-init function I wasn't sure.</p>
+<p>Just for the sake of discussion, let's take the (abriged) <a href="https://github.com/python/cpython/blob/v3.6.3/Modules/itertoolsmodule.c#L4671-L4676" rel="nofollow noreferrer">module-init function for <code>itertools</code></a> (yes, the one shipped by CPython):</p>
+<pre class="lang-c prettyprint-override"><code>m = PyModule_Create(&amp;itertoolsmodule);
+if (m == NULL)
+    return NULL;
+
+for (i=0 ; typelist[i] != NULL ; i++) {
+    if (PyType_Ready(typelist[i]) &lt; 0)
+        return NULL;
+    name = strchr(typelist[i]-&gt;tp_name, '.');
+    assert (name != NULL);
+    Py_INCREF(typelist[i]);
+    PyModule_AddObject(m, name+1, (PyObject *)typelist[i]);
+}
+
+return m;
+</code></pre>
+<p>It does check if <code>PyModule_Create</code> fails (which is good), then it checks if <code>PyType_Ready</code> fails (which is good) but it doesn't <code>Py_DECREF(m)</code> in that case (which is suprising/confusing) but it totally fails to check if <code>PyModule_AddObject</code> fails. According to <a href="https://docs.python.org/3/c-api/module.html#c.PyModule_AddObject" rel="nofollow noreferrer">it's documentation</a> it <em>can</em> fail:</p>
+<blockquote>
+<p>Add an object to module as name. This is a convenience function which can be used from the module’s initialization function. This steals a reference to value. Return -1 on error, 0 on success.</p>
+</blockquote>
+<p>ok, maybe it seemed like overkill to break the module initialization just in case a type couldn't be added. But even in case they didn't want to abort creating the module completely: it should leak a reference for <code>typelist[i]</code>, correct?</p>
+<p>Lots of built-in CPython C modules don't do thorough error checking and handling in the module-init function (that's probably why the C extension I'm fixing doesn't have them either) and they are typically very strict with these kind of issues and potential leaks. So my question is basically: Are the error checks important in the module-init function especially when it comes to <code>PyModule_Add*</code> functions (like <code>PyModule_AddObject</code>)? Or can they be omitted like CPython does in many places?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'm generally in favour of rigorous error checking when using Python's C API - people very often write long, multistep functions, don't check for any errors, and then act puzzled when it mysteriously fails. In this case (module initialization) you can justify being slightly lax with error checking:</p>
+<p>The main reason is that these functions will only really fail because of errors in your C code and they will do this repeatably - it's almost impossible that they will fail unpredictably on an unsuspecting user. Taking <a href="https://github.com/python/cpython/blob/762bf40438a572a398e500c74e38f9894ea20a45/Python/modsupport.c#L614" rel="nofollow noreferrer"><code>PyModule_AddObject</code></a> as an example, it can fail because:</p>
+<ul>
+<li>The first argument passed is not a module (your mistake!)</li>
+<li>The object passed is <code>NULL</code> (you should be checking for this earlier)</li>
+<li>The module doesn't have a <code>__dict__</code> (I don't know how this happens, but I can't see it happening by accident to a module that you've just created)</li>
+<li><code>PyDict_SetItemString</code> fails (most likely caused by <code>PyUnicode_FromString</code> failing).</li>
+</ul>
+<p>As you point out in the comments, the latter could be caused by a <code>MemoryError</code> (which could happen at any time and is unpredictable). However, when you're getting <code>MemoryError</code>s from allocating ~10 character strings, it's unlikely that the Python interpreter will manage to keep going much longer.</p>
+<p>So I think my conclusion is "if your module seems to be working you probably don't need this error checking, but if things are going wrong then it's useful for finding out where". The one thing I might add is a final check for errors right before you return the module:</p>
+<pre><code>if (PyErr_Occurred()) return NULL;
+/* or */
+if (PyErr_Occurred()) {
+    /* print a warning? */
+    PyErr_Clear();
+    return m;
+}
+</code></pre>
+<p>The reason for this is that Python can behave quite oddly if the error indicator is set but you don't return <code>NULL</code> (you'll get exceptions raised at odd times that don't make sense). Therefore, a quick final check has some value.</p>
+<hr/>
+<p>With respect to reference handling when module initialization fails: it's obviously "best" to do it right, but I think you can justify skipping it. This is code that runs once (so you can't lose large amounts of memory by repeatedly losing small amounts). If an error occurs then the most likely option is that the program aborts (so all memory  is recovered). Even if you don't abort, the size of the leak is likely to be pretty small (~100 bytes, realistically).</p>
+</div>
+<span class="comment-copy">I think this is too opinion-based to really be answerable. But some thoughts... 1) reference counting in the event of an unexpected error isn't really important - you lose one object, it only happens once, and the chances are the program will probably abort anyway. 2) Most of the failure modes of <code>PyModule_AddObject</code> will either always happen (i.e. you don't pass it a module) or never happen. Once you know that your module works it's probably pretty safe not to check.</span>
+<span class="comment-copy">@DavidW Feel free to vote-to-close if you think it's unanswerable because it's opinion-based. But your thoughts make sense. The only (unpredictable) failure cause is probably a <code>MemoryError</code> (char-&gt;unicode) and it wouldn't make sense to address this at module import anyway. Could make sense to post it as answer (at least if you don't think it should be closed :) )</span>

@@ -1,0 +1,121 @@
+<div class="post-text" itemprop="text">
+<p>I have the following code:</p>
+<pre><code>@asyncio.coroutine
+def do_something_periodically():
+    while True:
+        asyncio.async(my_expensive_operation())
+        yield from asyncio.sleep(my_interval)
+        if shutdown_flag_is_set:
+            print("Shutting down")
+            break
+</code></pre>
+<p>I run this function until complete. The problem occurs when shutdown is set - the function completes and any pending tasks are never run. (You see this as an error</p>
+<pre><code>task: &lt;Task pending coro=&lt;report() running at script.py:33&gt; wait_for=&lt;Future pending cb=[Task._wakeup()]&gt;&gt;
+</code></pre>
+<p>). How do I schedule a shutdown correctly?</p>
+<p>To give some context, I'm writing a system monitor which reads from /proc/stat every 5 seconds, computes the cpu usage in that period, and then sends the result to a server. I want to keep scheduling these monitoring jobs until I receive sigterm, when I stop scheduling, wait for all current jobs to finish, and exit gracefully.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can retrieve unfinished tasks and run the loop again until they finished, then close the loop or exit your program.</p>
+<pre><code>pending = asyncio.Task.all_tasks()
+loop.run_until_complete(asyncio.gather(*pending))
+</code></pre>
+<ul>
+<li>pending is a list of pending tasks.</li>
+<li>asyncio.gather() allows to wait on several tasks at once.</li>
+</ul>
+<p>If you want to ensure all the tasks are completed inside a coroutine (maybe you have a "main" coroutine), you can do it this way, for instance:</p>
+<pre><code>@asyncio.coroutine
+def do_something_periodically():
+    while True:
+        asyncio.async(my_expensive_operation())
+        yield from asyncio.sleep(my_interval)
+        if shutdown_flag_is_set:
+            print("Shutting down")
+            break
+
+    yield from asyncio.gather(*asyncio.Task.all_tasks())
+</code></pre>
+<p>Also, in this case, since all the tasks are created in the same coroutine, you already have access to the tasks:</p>
+<pre><code>@asyncio.coroutine
+def do_something_periodically():
+    tasks = []
+    while True:
+        tasks.append(asyncio.async(my_expensive_operation()))
+        yield from asyncio.sleep(my_interval)
+        if shutdown_flag_is_set:
+            print("Shutting down")
+            break
+
+    yield from asyncio.gather(*tasks)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>As of Python 3.7 the above answer uses multiple <strong>deprecated APIs</strong> (asyncio.async and Task.all_tasks,@asyncio.coroutine, yield from, etc.) and you should rather use this:</p>
+<pre><code>import asyncio
+
+
+async def my_expensive_operation(expense):
+    print(await asyncio.sleep(expense, result="Expensive operation finished."))
+
+
+async def do_something_periodically(expense, interval):
+    while True:
+        asyncio.create_task(my_expensive_operation(expense))
+        await asyncio.sleep(interval)
+
+
+loop = asyncio.get_event_loop()
+coro = do_something_periodically(1, 1)
+
+try:
+    loop.run_until_complete(coro)
+except KeyboardInterrupt:
+    coro.close()
+    tasks = asyncio.all_tasks(loop)
+    expensive_tasks = {task for task in tasks if task._coro.__name__ != coro.__name__}
+    loop.run_until_complete(asyncio.gather(*expensive_tasks))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You might also consider using <a href="https://docs.python.org/3/library/asyncio-task.html#shielding-from-cancellation" rel="nofollow noreferrer">asyncio.shield</a>, although by doing this way you won't get <em>ALL</em> the running tasks finished but only <em>shielded</em>. But it still can be useful in some scenarios.</p>
+<p>Besides that, as of Python 3.7 we also can use the high-level API method <a href="https://docs.python.org/3/library/asyncio-task.html#running-an-asyncio-program" rel="nofollow noreferrer">asynio.run</a> here. As Python core developer, Yury Selivanov suggests:
+<a href="https://youtu.be/ReXxO_azV-w?t=636" rel="nofollow noreferrer">https://youtu.be/ReXxO_azV-w?t=636</a><br/>
+<strong>Note:</strong> asyncio.run function has been added to asyncio in Python 3.7 on a provisional basis.</p>
+<p>Hope that helps!</p>
+<pre><code>import asyncio
+
+
+async def my_expensive_operation(expense):
+    print(await asyncio.sleep(expense, result="Expensive operation finished."))
+
+
+async def do_something_periodically(expense, interval):
+    while True:
+        asyncio.create_task(my_expensive_operation(expense))
+        # using asyncio.shield
+        await asyncio.shield(asyncio.sleep(interval))
+
+
+coro = do_something_periodically(1, 1)
+
+if __name__ == "__main__":
+    try:
+        # using asyncio.run
+        asyncio.run(coro)
+    except KeyboardInterrupt:
+        print('Cancelled!')
+</code></pre>
+</div>
+<span class="comment-copy">To give some context, I'm writing a system monitor which reads from /proc/stat every 5 seconds, computes the cpu usage in that period, and then sends the result to a server. I want to keep scheduling these monitoring jobs until I receive sigterm, when I stop scheduling, wait for all current jobs to finish, and exit gracefully.</span>
+<span class="comment-copy">have you tried <code>yield from my_expensive_operation() \n yield from asyncio.sleep(my_interval - timer() % my_interval)</code> instead?</span>
+<span class="comment-copy">I could just sleep for long enough that I know everything has finished, but this doesn't seem very clean. I was wondering if there was a way to schedule tasks and then run the loop until all scheduled tasks are complete. In javascript (node.js), if the main program reaches the end but there are callbacks set, then the process runs until all callbacks are removed.</span>
+<span class="comment-copy">Oh sorry I see what you mean - you mean to not schedule with async, rather make the current process wait until the previous one is finished. It just feels like you should be able to do what I want to do (schedule tasks) and then wait till they are all finished.</span>
+<span class="comment-copy">Keep the futures returned by <code>async()</code> (remove finished jobs). In principle, you could get all current Task instance (there might be a class attribute).</span>
+<span class="comment-copy">Very helpful! Just a note about the second method: I <i>think</i> that each task you append to the list represents an open file descriptor — this means that on (say) Linux, you could hit your open file limit (<code>ulimit -n</code>) before the coroutine is finished.</span>
+<span class="comment-copy">Hi, What do you mean by "represents"? AFAIK, tasks don't open file objects.</span>
+<span class="comment-copy">I have found, using the second method, that I get error messages about having too many open file descriptors. I <i>think</i> that each task requires a file descriptor to work. Note that a "file descriptor" is not the same thing as an open file, they might be also be those used by the <a href="http://www.gnu.org/software/libc/manual/html_node/Waiting-for-I_002fO.html#index-file-descriptor-sets_002c-for-select" rel="nofollow noreferrer"><code>select()</code></a> call (which I believe the <code>asyncio</code> library uses). So if you have a user limit of a few thousand open file descriptors, and many more tasks than that, you may encounter problems.</span>
+<span class="comment-copy">Having said that, I haven't actually confirmed that this is the problem, because I found other ways to solve the problem. The "too many file descriptors" error could have been related to some other mistake I made. So I could well be wrong about this.</span>
+<span class="comment-copy">I can confirm that the only file descriptors opened by asyncio for its own use are the selector and a self-pipe, so 3 file descriptors. A Task object don't hold any resource object by itself so it must be an unrelated bug.</span>
+<span class="comment-copy">The flag shutdown_flag_is_set will never be set inside do_something_periodically. The KeyboardInterrupt will already have caused do_something_periodically to exit</span>
+<span class="comment-copy">True, I have added another approach</span>

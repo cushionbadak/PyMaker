@@ -1,0 +1,116 @@
+<div class="post-text" itemprop="text">
+<h1>TL;DR</h1>
+<p>My question is simple - where is the code responsible to <strong>raise</strong> <code>ConnectionResetError</code> on cpython3 following a call to <code>self._sslobj.read(len, buffer)</code> on <code>ssl.py</code>?</p>
+<h1>Background</h1>
+<p>I'm getting sometimes <a href="https://docs.python.org/3/library/exceptions.html#ConnectionResetError" rel="noreferrer"><code>ConnectionResetError</code></a> when trying to connect to S3 with ssl. this error occurs rarely so its tricky to reproduce it.</p>
+<pre><code># trimmed stacktrace
+File "/MYPROJECT/MY_FUNC.py", line 123, in &lt;genexpr&gt;
+rows = (row for row in reader)
+File "/XXX/lib/python3.6/csv.py", line 112, in _next_
+row = next(self.reader)
+File "/XXX/lib/python3.6/tarfile.py", line 706, in readinto
+buf = self.read(len(b))
+File "/XXX/lib/python3.6/tarfile.py", line 695, in read
+b = self.fileobj.read(length)
+File "/XXX/lib/python3.6/gzip.py", line 276, in read
+return self._buffer.read(size)
+File "/XXX/lib/python3.6/_compression.py", line 68, in readinto
+data = self.read(len(byte_view))
+File "/XXX/lib/python3.6/gzip.py", line 469, in read
+buf = self._fp.read(io.DEFAULT_BUFFER_SIZE)
+File "/XXX/lib/python3.6/gzip.py", line 91, in read
+self.file.read(size-self._length+read)
+File "/XXX/lib/python3.6/site-packages/s3fs/core.py", line 1311, in read
+self._fetch(self.loc, self.loc + length)
+File "/XXX/lib/python3.6/site-packages/s3fs/core.py", line 1292, in _fetch
+req_kw=self.s3.req_kw)
+File "/XXX/lib/python3.6/site-packages/s3fs/core.py", line 1496, in _fetch_range
+return resp['Body'].read()
+File "/XXX/lib/python3.6/site-packages/botocore/response.py", line 74, in read
+chunk = self._raw_stream.read(amt)
+File "/XXX/lib/python3.6/site-packages/botocore/vendored/requests/packages/urllib3/response.py", line 239, in read
+data = self._fp.read()
+File "/XXX/lib/python3.6/http/client.py", line 462, in read
+s = self._safe_read(self.length)
+File "/XXX/lib/python3.6/http/client.py", line 612, in _safe_read
+chunk = self.fp.read(min(amt, MAXAMOUNT))
+File "/XXX/lib/python3.6/socket.py", line 586, in readinto
+return self._sock.recv_into(b)
+File "/XXX/lib/python3.6/ssl.py", line 1009, in recv_into
+return self.read(nbytes, buffer)
+File "/XXX/lib/python3.6/ssl.py", line 871, in read
+return self._sslobj.read(len, buffer)
+File "/XXX/lib/python3.6/ssl.py", line 631, in read
+v = self._sslobj.read(len, buffer)
+ConnectionResetError: [Errno 104] Connection reset by peer
+</code></pre>
+<h1>What i've tried</h1>
+<p>looking at <code>ssl.py:631</code> gives me no further clues - <strong>we have to go deeper!:</strong></p>
+<pre><code>    def read(self, len=1024, buffer=None):
+    """Read up to 'len' bytes from the SSL object and return them.
+
+    If 'buffer' is provided, read into this buffer and return the number of
+    bytes read.
+    """
+    if buffer is not None:
+        v = self._sslobj.read(len, buffer)  # &lt;--- exception here
+    else:
+        v = self._sslobj.read(len)
+    return v
+</code></pre>
+<p>i've tried searching it <a href="https://github.com/python/cpython/search?l=Python&amp;p=1&amp;q=ConnectionResetError" rel="noreferrer">on CPython repo</a> but AFAICS nothing seems to raise it, i suspect its hidden in SSL implementation or on some mapping between <code>OSError</code> to <code>ConnectionError</code> subclasses.</p>
+<p>my final goal is to write py2 &amp; py3 compatible code for handling this exceptions (<code>ConnectionError</code> is new on py3) by comparing the module's py2 &amp; py3 versions that raises this error.</p>
+<p><br/></p>
+<h1>Update - py2 &amp; py3 catch for <code>ConnectionError</code> subclasses</h1>
+<p>my question origins was to find a way to catch <code>ConnectionError</code> and its subclasses on python2 &amp; python3, so here it is:</p>
+<pre><code>import errno
+
+# ref: https://docs.python.org/3/library/exceptions.html#ConnectionError
+_CONNECTION_ERRORS = frozenset({
+    errno.ECONNRESET,  # ConnectionResetError
+    errno.EPIPE, errno.ESHUTDOWN,  # BrokenPipeError
+    errno.ECONNABORTED,  # ConnectionAbortedError
+    errno.ECONNREFUSED,  # ConnectionRefusedError
+})
+
+try:
+    ...
+except OSError as e:
+    if e.errno not in _CONNECTION_ERRORS:
+        raise
+    print('got ConnectionError - %e' % e)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>ConnectionResetError</code> is raised when <a href="https://en.cppreference.com/w/c/error/errno" rel="nofollow noreferrer"><code>errno</code></a> is <code>ECONNRESET</code>. <code>errno</code> is how libc indicates whether or not an error occurred in a system call.</p>
+<p>You could search <code>ConnectionResetError</code> in <code>Objects/exceptions.c</code> to find out how this exception type get initialized and added to <code>errnomap</code> dict.</p>
+<p>In the case of <code>self._sslobj.read</code> raised <code>ConnectionResetError</code>, <code>_sslobj.read</code> is implemented with <code>_ssl__SSLSocket_read_impl</code>, the actual ssl read is done with openssl's <code>SSL_read</code>:</p>
+<pre><code>count = SSL_read(self-&gt;ssl, mem, len);
+_PySSL_UPDATE_ERRNO_IF(count &lt;= 0, self, count);
+</code></pre>
+<p>as the error occurred, <code>_PySSL_UPDATE_ERRNO_IF</code> will set <code>(sock)-&gt;ssl_errno = SSL_ERROR_SYSCALL</code> and <code>(sock)-&gt;c_errno = ECONNRESET</code>.</p>
+<p>later, in <code>PySSL_SetError</code>:</p>
+<pre><code>    err = obj-&gt;ssl_errno;
+    switch (err) {
+    ...
+    case SSL_ERROR_SYSCALL:
+
+        if (obj-&gt;c_errno) {
+            errno = obj-&gt;c_errno;
+            return PyErr_SetFromErrno(PyExc_OSError);
+        }
+</code></pre>
+<p><code>PyErr_SetFromErrno(PyExc_OSError)</code> equals with:</p>
+<pre><code>OSError(errno.ECONNRESET, 'Connection reset by peer', ...)
+</code></pre>
+<p>when <code>OSError</code> constructs with an <code>errno</code>, <a href="https://github.com/python/cpython/blob/v3.6.5/Objects/exceptions.c#L970-L974" rel="nofollow noreferrer">it will lookup a more specified subclass</a>, by lookup <code>errno</code> value in the aforementioned <code>errnomap</code> dict:</p>
+<pre><code>newtype = PyDict_GetItem(errnomap, myerrno);
+if (newtype) {
+    assert(PyType_Check(newtype));
+    type = (PyTypeObject *) newtype;
+}
+</code></pre>
+<p>it actually returns and raises out a <code>ConnectionResetError</code> exception.</p>
+</div>
+<span class="comment-copy">so, what is your question then, would you edit it to clarify a bit?</span>
+<span class="comment-copy">the question is same as written in TL;DR and your answer seems to be correct :) but i want to wait a bit longer before accepting to see if any other answers appear</span>

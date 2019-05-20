@@ -1,0 +1,65 @@
+<div class="post-text" itemprop="text">
+<p>Right, this is <em>extremely</em> obscure...</p>
+<p>So on Windows, when you hit control-C to interrupt a console program, this sends a <code>CTRL_C_EVENT</code> to the process. You can also do this manually via <a href="https://msdn.microsoft.com/en-us/library/windows/desktop/ms683155(v=vs.85).aspx" rel="nofollow noreferrer"><code>GenerateConsoleCtrlEvent</code></a>. In Python, <code>os.kill</code> acts as a wrapper around the C-level <code>GenerateConsoleCtrlEvent</code>, and allows us to send a <code>CTRL_C_EVENT</code> to the current process by doing:</p>
+<pre><code>os.kill(os.getpid(), signal.CTRL_C_EVENT)
+</code></pre>
+<p>However, this doesn't just go to the current process – it actually goes to the whole "process group" that this process is a part of.</p>
+<p>I have a test suite which calls <code>os.kill</code> like you see above, as part of some tests to make sure my program's control-C handling works correctly. When running this test suite on appveyor, though, this causes a problem, because apparently some of appveyor's infrastructure is in the same "progress group" and gets broken.</p>
+<p>The solution is that we need to spawn the test suite with the <code>CREATE_NEW_PROCESS_GROUP</code> flag set, so that its <code>CTRL_C_EVENT</code>s don't "leak" to the parent. That's easily done. BUT...</p>
+<p>If I use <code>CREATE_NEW_PROCESS_GROUP</code> and run the child script using <code>python whatever.py</code>, then it works as expected: the <code>CTRL_C_EVENT</code> is confined to the child.</p>
+<p>If I use <code>CREATE_NEW_PROCESS_GROUP</code> and run the child script using <code>py whatever.py</code> (i.e., using the <a href="https://docs.python.org/3/using/windows.html#python-launcher-for-windows" rel="nofollow noreferrer">python launcher</a>, which is supposed to be equivalent to running <code>python</code> directly), then the <code>CREATE_NEW_PROCESS_GROUP</code> seems not to have any effect: the <code>CTRL_C_EVENT</code> affects the parent as well!</p>
+<p>Here's a minimal sample program that just uses <code>os.kill</code> on itself and then checks that it worked (minor wrinkle: <code>CREATE_NEW_PROCESS_GROUP</code> sets <code>CTRL_C_EVENT</code> to be ignored in child processes, so there's a bit of fluff here using <code>SetConsoleCtrlHandler</code> to un-ignore it):
+<a href="https://github.com/njsmith/appveyor-ctrl-c-test/blob/master/a.py" rel="nofollow noreferrer">https://github.com/njsmith/appveyor-ctrl-c-test/blob/master/a.py</a></p>
+<p>Here's the wrapper script I use to run the above program:
+<a href="https://github.com/njsmith/appveyor-ctrl-c-test/blob/master/run-a.py" rel="nofollow noreferrer">https://github.com/njsmith/appveyor-ctrl-c-test/blob/master/run-a.py</a></p>
+<p>If the wrapper script runs <code>python a.py</code>, then everything works. If the wrapper script runs <code>py a.py</code>, then the wrapper script receives a <code>KeyboardInterrupt</code>.</p>
+<p>So my question is: what the heck is going on here? What is the <code>py</code> launcher doing differently from <code>python</code> that causes the <code>CTRL_C_EVENT</code> to "leak" into the parent process, even though it's in a different process group? And how is that even possible?</p>
+<p>(I originally discovered this because running <code>pytest a.py</code> acts like <code>py a.py</code>, i.e. is broken, but <code>python -m pytest a.py</code> works, presumably because the <code>pytest</code> entry point <a href="https://docs.python.org/3/using/windows.html#shebang-lines" rel="nofollow noreferrer">uses the <code>py</code> launcher</a>.)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Every process is in a process group. It either inherits its parent's group, or it gets created as the leader of a new group via the <code>CREATE_NEW_PROCESS_GROUP</code> creation flag. As far as I know, <code>GenerateConsoleCtrlEvent</code> is the only API that uses process groups, and there's no API to query the process group ID. You could grab it from the <code>ProcessParameters</code> in the PEB, but that involves using undocumented internal structures. No one should do that, so <code>GenerateConsoleCtrlEvent</code> should only send to either group 0 to broadcast an event or to a child process that you know was created as a new group.</p>
+<p>The problem that you've uncovered here is that sending an event to a process that's attached to the console but not the leader of a group gets silently handled as if the target were group 0. Specifically in your case you're starting py.exe as the group leader and then trying to send <code>CTRL_C_EVENT</code> to python.exe, i.e. <code>os.getpid()</code>. You'd have to send to <code>os.getppid()</code> in this case. </p>
+<p>This problem is common with Python scripts on Windows because of the confusing implementation of <code>os.kill</code>. It conflates process IDs and process group IDs. It would have been less confusing had <code>GenerateConsoleCtrlEvent</code> been used for  <code>os.killpg</code> (currently not implemented on Windows) and <code>TerminateProcess</code> alone used for <code>os.kill</code>. </p>
+<p>Experiencing random hangs when calling <code>os.kill(os.getpid(), signal.CTRL_C_EVENT);</code> <code>time.sleep(10)</code> may be due to a race condition. <code>time.sleep</code> is implemented by <code>pysleep</code> in Modules/timemodule.c. On Windows, when called in the main thread, it waits on an event that gets set by the signal handler for <code>SIGINT</code> (but not <code>SIGBREAK</code> for some reason). The possible race here is that <code>pysleep</code> resets the event before waiting on it. The signal handler executes on a new thread, and occasionally it may have already set the event before <code>pysleep</code> resets it. This is conceivable since executing CPython bytecode is relatively slow. That said, I'd expect it to be a close race because there are a lot of steps involved to create the control handler thread, as the following overview shows for Windows 10.</p>
+<pre class="lang-none prettyprint-override"><code>1. Console Client -- Main Thread (python.exe)
+   kernelbase!GenerateConsoleCtrlEvent
+   kernelbase!ConsoleCallServer
+   ntdll!NtDeviceIoControlFile
+
+2. Device Driver (condrv.sys)
+   condrv!CdpDispatchDeviceControl
+
+    3a. Console Server (conhost.exe)
+        ntdll!NtDeviceIoControlFile
+        conhostv2!SrvGenerateConsoleCtrlEvent
+        conhostv2!ProcessCtrlEvents
+        user32!ConsoleControl
+        ntdll!CsrClientCallServer
+        ntdll!NtRequestWaitReplyPort (ALPC)
+
+    3b. Windows Server (csrss.exe)
+        ntdll!NtAlpcSendWaitReceivePort
+        winsrv!SrvEndTask
+        winsrv!CreateCtrlThread
+        ntdll!NtCreateThreadEx (Control Thread)
+
+    3c. Console Client -- Control Thread (python.exe)
+        kernelbase!CtrlRoutine
+        ucrtbase!ctrlevent_capture (Emulate SIGINT)
+        python36!signal_handler
+        kernelbase!SetEvent (SIGINT Event -- Race with step 4)
+
+4. Console Client -- Main Thread (python.exe)
+   python36!pysleep
+   kernelbase!ResetEvent (SIGINT Event -- Race with step 3c)
+   kernelbase!WaitForSingleObjectEx (SIGINT Event)
+   python36!PyErr_CheckSignals       
+   python36!signal_default_int_handler
+</code></pre>
+<p>If the race condition is the problem, then giving <code>time.sleep</code> enough time to reset the event before <code>GenerateConsoleCtrlEvent</code> gets called should resolve it. Try calling <code>os.kill</code> using a <code>threading.Timer</code> with a small delay. </p>
+</div>
+<span class="comment-copy">According to the documentation (see the first link in your question) you can't specify a process group when sending a CTRL+C signal, i.e., <code>dwProcessGroupId</code> always has to be zero, which sends the signal to every process that share the console of the calling process.  So it is the call to <code>python</code> that is behaving oddly, not the call to <code>py</code>. :-)</span>
+<span class="comment-copy">Huh, true. That's clearly not what actually happens, though. Reading it again though, I realized that what <i>might</i> explain this is if <code>dwProcessGroupId=0</code> means send <code>CTRL_C_EVENT</code> to all processes on the console, regardless of process group id, <i>and</i> if you set <code>dwProcessGroupId</code> to the PID of a process that <i>isn't</i> a group leader, it acts like setting it to 0. Then the special thing about <code>py</code> would be that we make <code>py</code> a group leader, but <code>py</code> spawns <code>python</code> to run the code, so <code>python</code> isn't a group leader.</span>
+<span class="comment-copy">@eryksun: my current guess is that the bug is that <code>GenerateConsoleCtrlEvent</code> treats an invalid group id as it were 0 (meaning "all groups"). I agree that <code>os.kill</code>'s way of wrapping it is pretty confusing, but that's not the issue.</span>
+<span class="comment-copy">@eryksun: Oh interesting, thanks! I'll accept if you post that as an answer. …I've actually given up on this for now anyway because even when I do everything "right" (either properly passing a group leader or spawning a new console), then I'm still getting random hangs; I call <code>GenerateConsoleCtrlEvent</code> but then no signal arrives. Weirdly, this seems to go away if I increase debugging output, almost as if printing more stuff to the console makes events be delivered more reliably? I'm not even sure how to phrase this as a question, but throwing this out there in case it rings a bell for you…</span>
+<span class="comment-copy">Thanks, this is a great answer! And good point about the race condition – I'm not sure if that's what I was hitting, but I <a href="https://bugs.python.org/issue30151" rel="nofollow noreferrer">filed a bug</a> anyway :-). I can imagine that I could have been if it was triggering some heuristics in the scheduler or something... I'm able to reliably hit <a href="https://bugs.python.org/issue30038" rel="nofollow noreferrer">this race condition</a> b/c apparently writing to a socket from the signal handler that another thread is <code>select</code>ing on deterministically switches control to that other thread...</span>

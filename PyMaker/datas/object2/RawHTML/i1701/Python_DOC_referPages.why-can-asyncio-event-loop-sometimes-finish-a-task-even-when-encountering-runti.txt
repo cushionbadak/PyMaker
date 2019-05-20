@@ -1,0 +1,92 @@
+<div class="post-text" itemprop="text">
+<p>I've been playing around with Python's <code>asyncio</code>. I think I have a reasonable understanding by now. But the following behavior puzzles me.</p>
+<p><strong>test.py</strong>:</p>
+<pre><code>from threading import Thread
+import asyncio
+
+async def wait(t):
+    await asyncio.sleep(t)
+    print(f'waited {t} sec')
+
+def run(loop):
+    loop.run_until_complete(wait(2))
+
+loop = asyncio.get_event_loop()
+t = Thread(target=run, args=(loop,))
+t.start()
+loop.run_until_complete(wait(1))
+t.join()
+</code></pre>
+<p>This code is wrong. <em>I know that</em>. The event loop can't be run while it's running, and it's generally not thread safe.</p>
+<p>My question: why can <code>wait(1)</code> <em>sometimes</em> still finish its job?</p>
+<p>Here's the output from two consecutive runs:</p>
+<pre><code>&gt;&gt;&gt; py test.py
+... Traceback (most recent call last):
+...   File "test.py", line 14, in &lt;module&gt;
+...     loop.run_until_complete(wait(1))
+...   File "C:\Python\Python37\lib\asyncio\base_events.py", line 555, in run_until_complete
+...     self.run_forever()
+...   File "C:\Python\Python37\lib\asyncio\base_events.py", line 510, in run_forever
+... 
+...     raise RuntimeError('This event loop is already running')
+... RuntimeError: This event loop is already running
+... waited 2 sec
+
+&gt;&gt;&gt; py test.py
+... Traceback (most recent call last):
+...   File "test.py", line 14, in &lt;module&gt;
+...     loop.run_until_complete(wait(1))
+...   File "C:\Python\Python37\lib\asyncio\base_events.py", line 555, in run_until_c
+... omplete
+...     self.run_forever()
+...   File "C:\Python\Python37\lib\asyncio\base_events.py", line 510, in run_forever
+... 
+...     raise RuntimeError('This event loop is already running')
+... RuntimeError: This event loop is already running
+... waited 1 sec
+... waited 2 sec
+</code></pre>
+<p>The first run's behavior is what I expected - the main thread fails, but the event loop still runs <code>wait(2)</code> to finish in the thread <code>t</code>.</p>
+<p>The second run is puzzling, how can <code>wait(1)</code> do its job when the <code>RuntimeError</code> is already thrown? I guess it has to do with thread synchronization and the non-thread-safe nature of the event loop. But I don't know exactly how this works.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Ohhh... never mind. I read the code of <code>asyncio</code> and figured it out. It's actually quite simple.</p>
+<p><code>run_until_complete</code> calls <code>ensure_future(future, loop=self)</code> <em>before</em> it checks <code>self.is_running()</code> (which is done in <code>run_forever</code>). Since the loop is already running, it can pick up the task before the <code>RuntimeError</code> is thrown. Of course it doesn't always happen because of the race condition.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Exceptions are thrown <em>per thread</em>. The runtime error is raised in a different thread from the event loop. The event loop continues to execute, regardless.</p>
+<p>And <code>wait(1)</code> can sometimes finish it's job because you can get lucky. The <code>asyncio</code> loop internal data structures are not guarded against race conditions caused by using threads (which is why there are <a href="https://docs.python.org/3/library/asyncio-dev.html#asyncio-multithreading" rel="nofollow noreferrer">specific thread-support methods</a> you should use instead). But the nature of race conditions is such that it depends on the exact order of events and that order can change each time you run your program, depending on what else your OS is doing at the time.</p>
+<p>The <code>run_until_complete()</code> method <em>first</em> calls <a href="https://docs.python.org/3/library/asyncio-future.html#asyncio.ensure_future" rel="nofollow noreferrer"><code>asyncio.ensure_task()</code></a> to add the coroutine to the task queue with a 'done' callback attached that will stop the event loop again, then calls <code>loop.run_forever()</code>. When the coroutine returns, the callback stops the loop. The <code>loop.run_forever()</code> call throws the <code>RuntimeError</code> here.</p>
+<p>When you do this from a thread, the task gets added to a deque object attached to the loop, and if that happens at the right moment (e.g. when the running loop is not busy emptying the queue), the running loop in the main thread will find it, and execute it, <em>even if the <code>loop.run_forever()</code> call raised an exception</em>. </p>
+<p>All this relies on implementation details. Different versions of Python will probably exhibit different behaviour here, and if you install an alternative loop (e.g. <a href="https://github.com/magicstack/uvloop" rel="nofollow noreferrer"><code>uvloop</code></a>), there will almost certainly be different behaviour again.</p>
+<p>If you want to schedule coroutines from a different thread, use <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.run_coroutine_threadsafe" rel="nofollow noreferrer"><code>asyncio.run_coroutine_threadsafe()</code></a>; it would :</p>
+<pre><code>from threading import Thread
+import asyncio
+
+async def wait(t):
+    print(f'going to wait {t} seconds')
+    await asyncio.sleep(t)
+    print(f'waited {t} sec')
+
+def run(loop):
+    asyncio.run_coroutine_threadsafe(wait(2), loop)
+
+loop = asyncio.get_event_loop()
+t = Thread(target=run, args=(loop,))
+t.start()
+loop.run_until_complete(wait(1))
+t.join()
+</code></pre>
+<p>The above doesn't actually complete the <code>wait(2)</code> coroutine because the <code>wait(1)</code> coroutine is being run with <code>loop.run_until_complete()</code> so its callback stops the loop again before the 2 second wait is over. But the coroutine is actually started:</p>
+<pre><code>going to wait 1 seconds
+going to wait 2 seconds
+waited 1 sec
+</code></pre>
+<p>but if you made the main-thread coroutine take longer (with, say, <code>wait(3)</code>) then the one scheduled from the thread would also complete. You'd have to do additional work to ensure that there are no more pending tasks scheduled to run with the loop before you shut it down.</p>
+</div>
+<span class="comment-copy">Because threading is unsafe but sometimes you get lucky.</span>
+<span class="comment-copy">That was my vague guess as well, but I'm asking for a more specific answer. I've actually figured it out. Please see my answer.</span>
+<span class="comment-copy">@Chenfeng: that's exactly what my answer is saying :-)</span>
+<span class="comment-copy">Oh well... I didn't see your edits before I posted mine. Thanks anyway.</span>
+<span class="comment-copy">On your additional info: I find it better to call <code>run_forever</code> in a separate thread, and schedule tasks onto the loop from other threads. Once all tasks are completed as indicated by the <code>concurrent.futures.Future</code> returned by <code>run_coroutine_threadsafe</code>, use <code>loop.call_soon_threadsafe(loop.stop)</code> to stop the loop, and use <code>thread.join()</code> to make sure the loop has actually stopped. This ensures that all tasks are done, and all events happen in proper order. No guessing game.</span>
+<span class="comment-copy">@Chenfeng: closely related: <a href="//stackoverflow.com/q/53107032">How can you wait for completion of a callback submitted from another thread?</a>. <code>thread.join()</code> is probably fine if all the thread does is run the loop.</span>

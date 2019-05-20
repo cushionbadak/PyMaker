@@ -1,0 +1,225 @@
+<div class="post-text" itemprop="text">
+<p>I need a 64 bit to 16 bit perfect hash function for a sparsely populated list of keys.</p>
+<p>I have a dictionary in python which has 48326 keys of length 64-bits. I would like to create a minimum perfect hash for this list of keys. (I don't want to have to wait for a few days to calculate the MPH so i am ok with it mapping to a 16 bit hash also)</p>
+<p>The objective is to eventually port this dictionary to C as an array which contains the dict values and the index is calculated by the Minimum perfect hash function taking key as input . I cannot use external hashing libraries in the C port of the application I am building</p>
+<p>Question:
+Is there any python library which will take my keys as input and provide me the hashing parameters and (based on a defined algorithm used for hashing) as an output.</p>
+<p>I found a library <a href="https://pypi.org/project/perfection/" rel="nofollow noreferrer">perfection 2.0.0</a> but since my keys are of 64 bit form, this just hung. (even when I tested it on a subset of 2000 keys)</p>
+<p><strong>EDIT</strong>
+As suggested in comments I looked at <a href="http://stevehanov.ca/blog/index.php?id=119" rel="nofollow noreferrer">Steve Hanov's Algo</a> and modified the hash function to take a 64 bit integer (changing values of the FNV Prime and offset as per this <a href="https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function" rel="nofollow noreferrer">wiki page</a>)</p>
+<p>while I got the result, unfortunately the Maps return -ve index values while i can make it work it means i have to add another 4 cycles to the hash calculations by checking for -ve index </p>
+<p>would like to avoid this</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Personally, I'd just generate a table with <a href="https://www.gnu.org/software/gperf/" rel="nofollow noreferrer"><code>gperf</code></a>, or for a large number of keys, with <a href="http://cmph.sourceforge.net/" rel="nofollow noreferrer">CMPH</a>, and be done with it.</p>
+<p>If you must do this in Python, then I found <a href="http://stevehanov.ca/blog/index.php?id=119" rel="nofollow noreferrer">this blog post</a> with some Python 2 code that is very efficient at turning <em>string</em> keys into a minimal perfect hash, using an intermediary table. </p>
+<p>Adapting the code in the post to your requirements, produces a minimal perfect hash for 50k items in under 0.35 seconds:</p>
+<pre><code>&gt;&gt;&gt; import random
+&gt;&gt;&gt; testdata = {random.randrange(2**64): random.randrange(2**64)
+...             for __ in range(50000)}  # 50k random 64-bit keys
+&gt;&gt;&gt; import timeit
+&gt;&gt;&gt; timeit.timeit('gen_minimal_perfect_hash(testdata)', 'from __main__ import  gen_minimal_perfect_hash, testdata', number=10)
+3.461486832005903
+</code></pre>
+<p>The changes I made:</p>
+<ul>
+<li>I switched to Python 3, followed the Python styleguide and make the code more Pythonic</li>
+<li>I am turning 64-bit unsigned integers into 8-byte bytestrings with <a href="https://docs.python.org/3/library/stdtypes.html#int.to_bytes" rel="nofollow noreferrer"><code>int.to_bytes()</code></a></li>
+<li>Instead of storing negative numbers, I am using a flag to distinguish between direct and hash-input values in the intermediary table</li>
+</ul>
+<p>The adapted code:</p>
+<pre><code># Easy Perfect Minimal Hashing
+# By Steve Hanov. Released to the public domain.
+# Adapted to Python 3 best practices and 64-bit integer keys by Martijn Pieters
+#
+# Based on:
+# Edward A. Fox, Lenwood S. Heath, Qi Fan Chen and Amjad M. Daoud,
+# "Practical minimal perfect hash functions for large databases", CACM, 35(1):105-121
+# also a good reference:
+# Compress, Hash, and Displace algorithm by Djamal Belazzougui,
+# Fabiano C. Botelho, and Martin Dietzfelbinger
+from itertools import count, groupby
+
+
+def fnv_hash_int(value, size, d=0x811c9dc5):
+    """Calculates a distinct hash function for a given 64-bit integer.
+
+    Each value of the integer d results in a different hash value. The return
+    value is the modulus of the hash and size.
+
+    """
+    # Use the FNV algorithm from http://isthe.com/chongo/tech/comp/fnv/
+    # The unsigned integer is first converted to a 8-character byte string.
+    for c in value.to_bytes(8, 'big'):
+        d = ((d * 0x01000193) ^ c) &amp; 0xffffffff
+
+    return d % size
+
+
+def gen_minimal_perfect_hash(dictionary, _hash_func=fnv_hash_int):
+    """Computes a minimal perfect hash table using the given Python dictionary.
+
+    It returns a tuple (intermediate, values). intermediate and values are both
+    lists. intermediate contains the intermediate table of indices needed to
+    compute the index of the value in values; a tuple of (flag, d) is stored, where
+    d is either a direct index, or the input for another call to the hash function.
+    values contains the values of the dictionary.
+
+    """
+    size = len(dictionary)
+
+    # Step 1: Place all of the keys into buckets
+    buckets = [[] for __ in dictionary]
+    intermediate = [(False, 0)] * size
+    values = [None] * size
+
+    for key in dictionary:
+        buckets[_hash_func(key, size)].append(key)
+
+    # Step 2: Sort the buckets and process the ones with the most items first.
+    buckets.sort(key=len, reverse=True)
+    # Only look at buckets of length greater than 1 first; partitioned produces
+    # groups of buckets of lengths &gt; 1, then those of length 1, then the empty
+    # buckets (we ignore the last group).
+    partitioned = (g for k, g in groupby(buckets, key=lambda b: len(b) != 1))
+    for bucket in next(partitioned, ()):
+        # Try increasing values of d until we find a hash function
+        # that places all items in this bucket into free slots
+        for d in count(1):
+            slots = {}
+            for key in bucket:
+                slot = _hash_func(key, size, d=d)
+                if values[slot] is not None or slot in slots:
+                    break
+                slots[slot] = dictionary[key]
+            else:
+                # all slots filled, update the values table; False indicates
+                # these values are inputs into the hash function
+                intermediate[_hash_func(bucket[0], size)] = (False, d)
+                for slot, value in slots.items():
+                    values[slot] = value
+                break
+
+    # The next group is buckets with only 1 item. Process them more quickly by
+    # directly placing them into a free slot.
+    freelist = (i for i, value in enumerate(values) if value is None)
+
+    for bucket, slot in zip(next(partitioned, ()), freelist):
+        # These are 'direct' slot references
+        intermediate[_hash_func(bucket[0], size)] = (True, slot)
+        values[slot] = dictionary[bucket[0]]
+
+    return (intermediate, values)
+
+
+def perfect_hash_lookup(key, intermediate, values, _hash_func=fnv_hash_int):
+    "Look up a value in the hash table defined by intermediate and values"
+    direct, d = intermediate[_hash_func(key, len(intermediate))]
+    return values[d if direct else _hash_func(key, len(values), d=d)]
+</code></pre>
+<p>The above produces two lists with 50k entries each; the values in the first table are <code>(boolean, integer)</code> tuples with the integers in the range <code>[0, tablesize)</code> (in theory the values could range up to 2^16 but I'd be very surprised if it ever took 65k+ attempts to find a slot arrangement for your data). Your table size is &lt; 50k, so the above arrangement makes it possible to store the entries in this list in 4 bytes (<code>bool</code> and <code>short</code> make 3, but <a href="http://www.catb.org/esr/structure-packing/" rel="nofollow noreferrer">alignment rules</a> add one byte padding) when expressing this as a C array.</p>
+<p>A quick test to see of the hash tables are correct and produce the right output again:</p>
+<pre><code>&gt;&gt;&gt; tables = gen_minimal_perfect_hash(testdata)
+&gt;&gt;&gt; for key, value in testdata.items():
+...     assert perfect_hash_lookup(key, *tables) == value
+...
+</code></pre>
+<p>You only need to implement the lookup function in C:</p>
+<ul>
+<li>The <code>fnv_hash_int</code> operation can take a pointer to your 64-bit integer, then just cast that pointer to an array of 8-bit values and increment an index 8 times to access each separate byte; use a <a href="https://stackoverflow.com/questions/3022552/is-there-any-standard-htonl-like-function-for-64-bits-integers-in-c">suitable function to ensure big-endian (network) order</a>.</li>
+<li>You don't need to mask with <code>0xffffffff</code> in C, as overflow on a C integer value is automatically discarded anyway.</li>
+<li><code>len(intermediate) == len(values) == len(dictionary)</code> and can be captured in a constant.</li>
+<li>Assuming C99, store the intermediate table as an array of a struct type with <code>flag</code> being a <code>bool</code>, <code>d</code> as an unsigned <code>short</code>; that's just 3 bytes, plus 1 padding byte to align on a 4-byte boundary. The datatype in the <code>values</code> array depends on the values in your input dictionary.</li>
+</ul>
+<p>If you forgive my C skills, here's a sample implementation:</p>
+<p><code>mph_table.h</code></p>
+<pre class="lang-c prettyprint-override"><code>#include "mph_generated_table.h"
+#include &lt;arpa/inet.h&gt;
+#include &lt;stdint.h&gt;
+
+#ifndef htonll
+// see https://stackoverflow.com/q/3022552
+#define htonll(x) ((1==htonl(1)) ? (x) : ((uint64_t)htonl((x) &amp; 0xFFFFFFFF) &lt;&lt; 32) | htonl((x) &gt;&gt; 32))
+#endif
+
+uint64_t mph_lookup(uint64_t key);
+</code></pre>
+<p><code>mph_table.c</code></p>
+<pre class="lang-c prettyprint-override"><code>#include "mph_table.h"
+#include &lt;stdbool.h&gt;
+#include &lt;stdint.h&gt;
+
+#define FNV_OFFSET 0x811c9dc5
+#define FNV_PRIME 0x01000193
+
+uint32_t fnv_hash_modulo_table(uint32_t d, uint64_t key) {
+    d = (d == 0) ? FNV_OFFSET : d;
+    uint8_t* keybytes = (uint8_t*)&amp;key;
+    for (int i = 0; i &lt; 8; ++i) {
+        d = (d * FNV_PRIME) ^ keybytes[i];
+    }
+    return d % TABLE_SIZE;
+}
+
+uint64_t mph_lookup(uint64_t key) {
+    _intermediate_entry entry = 
+        mph_tables.intermediate[fnv_hash_modulo_table(0, htonll(key))];
+    return mph_tables.values[
+        entry.flag ?
+            entry.d : 
+            fnv_hash_modulo_table((uint32_t)entry.d, htonll(key))];
+}
+</code></pre>
+<p>which would rely on a generated header file, produced from:</p>
+<pre><code>from textwrap import indent
+
+template = """\
+#include &lt;stdbool.h&gt;
+#include &lt;stdint.h&gt;
+
+#define TABLE_SIZE %(size)s
+
+typedef struct _intermediate_entry {
+    bool flag;
+    uint16_t d;
+} _intermediate_entry;
+typedef struct mph_tables_t {
+    _intermediate_entry intermediate[TABLE_SIZE];
+    uint64_t values[TABLE_SIZE];
+} mph_tables_t;
+
+static const mph_tables_t mph_tables = {
+    {  // intermediate
+%(intermediate)s
+    },
+    {  // values
+%(values)s
+    }
+};
+"""
+
+tables = gen_minimal_perfect_hash(dictionary)
+size = len(dictionary)
+cbool = ['false, ', 'true,  ']
+perline = lambda i: zip(*([i] * 10))
+entries = (f'{{{cbool[e[0]]}{e[1]:#06x}}}' for e in tables[0])
+intermediate = indent(',\n'.join([', '.join(group) for group in perline(entries)]), ' ' * 8)
+entries = (format(v, '#018x') for v in tables[1])
+values = indent(',\n'.join([', '.join(group) for group in perline(entries)]), ' ' * 8)
+
+with open('mph_generated_table.h', 'w') as generated:
+    generated.write(template % locals())
+</code></pre>
+<p>where <code>dictionary</code> is your input table.</p>
+<p>Compiled with <code>gcc -O3</code> the hash function is inlined (loop unrolled) and the whole <code>mph_lookup</code> function clocks in at 300 CPU instructions. A quick benchmark looping through all 50k random keys I generated shows my 2.9 GHz Intel Core i7 laptop can look up 50 million values for those keys per second (0.02 microseconds per key).</p>
+</div>
+<span class="comment-copy">Did you look at <a href="http://stevehanov.ca/blog/index.php?id=119" rel="nofollow noreferrer">stevehanov.ca/blog/index.php?id=119</a>, which explains how to create a minimal perfect hash using an intermediary table and the Python code for that approach? Their timing results are very encouraging, 50k keys takes only 11 seconds.</span>
+<span class="comment-copy">I have looked at it. I even modified to code to take integers instead of string. given that these keys are rather large. ran for about 3 hours and hung</span>
+<span class="comment-copy">Have you considered converting your 64-bit key to a binary string? It'll only be 8 bytes long.</span>
+<span class="comment-copy">i cant do this as then i will have to convert my 64 bit int into an 8 byte which will add 24 cpu cycles to the hashing also, the current hashing also takes 24 CPU cycles already, this will significantly slow down performance</span>
+<span class="comment-copy">You don't need to convert anything at all; just take a pointer to your 64-bit integer and take the 8 bytes that are there. Adjust the <code>'little'</code> to <code>'big'</code> in my answer if your platform stores such an integer in big-endian order.</span>
+<span class="comment-copy">I am currently using something similar to this as ponied out there are is the issue of negative index, which slows down the lookup in c as i will need to add an if statement if (hash&lt;0) {return lookup[-hash-1];}</span>
+<span class="comment-copy">@SiddharthChabra: Have you tried using gperf at all yet?</span>
+<span class="comment-copy">@SiddharthChabra: I've proposed a different storage format now.</span>
+<span class="comment-copy">Minor nitpick: that struct type: <code>{bool flag; unsigned short d;}</code> would have size 4 in both this order and the other. And that is assuming bool is 1 byte (if it's 4 then the size will be 8)</span>
+<span class="comment-copy">@PaulStelian: reordering won't get us anything here (there will still be 1 byte padding), so it's fine to leave the order in the struct be.</span>

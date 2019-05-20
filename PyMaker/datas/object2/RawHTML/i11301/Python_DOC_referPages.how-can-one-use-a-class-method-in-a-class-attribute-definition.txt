@@ -1,0 +1,190 @@
+<div class="post-text" itemprop="text">
+<p>All is in the title. I'd like to create a class method and a class attribute, both constructed only once, when the class is created, using the first in the second's definition.</p>
+<p>With my best try, I just get a <code>TypeError: 'classmethod' object is not callable</code>.</p>
+<p>Here is my code :</p>
+<pre><code>import numpy as np
+
+class Foo( object ) :
+
+    @classmethod
+    def bar( cls, x ) :
+        return x+1
+
+    bar_vect = np.vectorize( bar )
+
+Foo.bar_vect( np.array([ 1, 2, 3 ]) )
+
+&gt;&gt; TypeError: 'classmethod' object is not callable
+</code></pre>
+<h2>EDIT 1 :</h2>
+<p><a href="https://stackoverflow.com/questions/37569798/how-can-one-use-a-class-method-in-a-class-attribute-definition">'classmethod' object is not callable</a> is a problem raising the same error, but with a lot of workarounds. My question is meant to go straight to the point and have a clear idea of how to use <code>@classmethod</code> without a scope giving access to <code>cls</code>.</p>
+<p>Another try that I made was the following :</p>
+<pre><code>import numpy as np
+
+class Foo( object ) :
+
+    @classmethod
+    def bar( cls, x ) :
+        return x+1
+
+    bar_vect = np.vectorize( bar )
+
+&gt;&gt; NameError: name 'Foo' is not defined
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>@classmethod</code>s are implemented as a special object that gets processed using <a href="https://docs.python.org/3/howto/descriptor.html" rel="nofollow noreferrer">the descriptor protocol</a> when looked up on the class; inside the definition, as a raw name (unqualified), it's a special <code>classmethod</code> object, not a normal function and it's not bound to the class properly. If you check the <a href="https://docs.python.org/3/howto/descriptor.html#static-methods-and-class-methods" rel="nofollow noreferrer">pure Python definition of <code>classmethod</code></a>, you'll note it's just a normal object that implements <code>__init__</code> (for construction) and <code>__get__</code> (for descriptor lookup), but not <code>__call__</code>, meaning that if you have the raw <code>classmethod</code> object, it's not actually a <a href="https://docs.python.org/3/library/functions.html?highlight=callable#callable" rel="nofollow noreferrer">callable</a> at all.</p>
+<p>The trick is to qualify the reference so the "magic" happens to bind it to the class, and move the qualified reference outside the <code>class</code> definition (so <code>Foo</code> is a defined name and can be referenced for binding) changing:</p>
+<pre><code>class Foo(object):
+    ... rest of class ...
+    bar_vect = np.vectorize(bar)  # Indented and unqualified, BAD
+</code></pre>
+<p>to:</p>
+<pre><code>class Foo(object):
+    ... rest of class ...
+# Must qualify both bar_vect and bar, since no longer in class definition
+Foo.bar_vect = np.vectorize(Foo.bar)  # Dedented, so Foo is defined for referencing, GOOD
+</code></pre>
+<p>Note that since you're using a <code>classmethod</code>, I suspect you may eventually be interested in subclassing and overriding <code>bar</code>. As written, you'd need to explicitly redefine <code>bar_vect</code> after defining each subclass, or it would use the inherited <code>bar_vect</code>, based on <code>Foo.bar</code>, even if the subclass defines its own <code>bar</code> <code>classmethod</code>. Explicitly redefining <code>bar_vect</code> each time is an option, but the other approach is to use metaclasses to implicitly define <code>bar_vect</code> when a class redefines <code>bar</code>:</p>
+<pre><code>class BarVectorized(type):
+    def __new__(cls, name, bases, namespace, **kwargs):
+        newcls = type.__new__(cls, name, bases, dict(namespace))
+        # Make vectorized wrapper for this class (must use new wrapper
+        # even if bar unchanged, so cls in bar is correct for lookup of
+        # other class attributes/methods)
+        try:
+            newcls.bar_vect = np.vectorize(newcls.bar)
+        except AttributeError:
+            pass  # Allow class w/o bar; remove try/except if class must have bar
+        return newcls
+
+class Foo(object):
+    __metaclass__ = BarVectorized
+    @classmethod
+    def bar(cls, x): return x + 1
+
+class Foo2(Foo):
+    ADD = 2  # Hardcoded 1 is dumb, use class attribute instead!
+    @classmethod
+    def bar(cls, x):
+        return x + cls.ADD
+
+class Foo3(Foo2):
+    ADD = 3  # Provide new class attr to change Foo2.bar behavior when called via Foo3
+
+&gt;&gt;&gt; Foo.bar_vect([1,2,3])
+array([2, 3, 4])
+&gt;&gt;&gt; Foo2.bar_vect([1,2,3])
+array([3, 4, 5])
+&gt;&gt;&gt; Foo3.bar_vect([1,2,3])
+array([4, 5, 6])
+</code></pre>
+<p>No need to define <code>bar_vect</code> explicitly at all, and <code>bar_vect</code> seamlessly uses the most local classes' definition of <code>bar</code> available at class definition time, so unless <code>bar</code> is redefined after class definition, it always works, and it works as efficiently as possible. To make it use <code>bar</code> live, you'd need to resort to more extreme measures that perform dynamic lookup and (barring a cache) reconstruction of the <code>np.vectorize</code> object on each use, which is suboptimal to say the least.</p>
+<p>For completeness, a dynamic caching based solution (hat tip to <a href="https://stackoverflow.com/a/37570908/364696">Tadhg McDonald-Jensen's answer</a>) that uses a dynamically populating cache that adds minimal overhead (and more importantly in my opinion, abstracts out the boilerplate code that's irrelevant to the work) for the case where the cache entry already exists by using a <code>dict</code> subclass defining <code>__missing__</code>:</p>
+<pre><code>import operator
+import numpy as np
+
+class ClassAttrRegistry(dict):
+    '''Dictionary keyed by classes which returns optionally wrapped cached attributes'''
+    __slots__ = '_wrapper', '_attrgetter'
+    def __init__(self, attr, wrapperfunc=lambda x: x):
+        self._wrapper = wrapperfunc
+        self._attrgetter = operator.attrgetter(attr)
+    def __missing__(self, cls):
+        self[cls] = wrapped = self._wrapper(self._attrgetter(cls))
+        return wrapped
+
+class Foo(object):
+    @classmethod
+    def bar(cls, x):
+        return x + 1
+
+    # Dunder prefix makes cache private to Foo methods; if subclass overrides bar_vect,
+    # assumed it's more complex than "vectorized bar"; cache should not be used
+    __bar_vect_registry = ClassAttrRegistry('bar', np.vectorize)
+    @classmethod
+    def bar_vect(cls, x):
+        # Get cached vectorized bar (creating if needed) then call it
+        return cls.__bar_vect_registry[cls](x)
+</code></pre>
+<p>Subclasses don't need to (and should not) override <code>bar_vect</code> (and can't accidentally access <code>__bar_vect_registry</code> because it's name mangled such that only methods defined by <code>Foo</code> will see it; change name to <code>_bar_vect_registry</code>, one underscore, if it should be accessible to subclasses), they just override <code>bar</code> and <code>Foo</code>'s <code>bar_vect</code> will create/cache vectorized accessors when <code>bar_vect</code> is first accessed on the subclass (or an instance thereof).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your confusion to why this is not an easy work around is understandable, let me elaborate on to why using <code>classmethod</code> in this way isn't going to work...</p>
+<p>The way <code>classmethod</code> works is that it creates a descriptor, an object that implements <code>__get__</code> when it is retrieved as an attribute on an object.</p>
+<p>So when you do <code>Foo.bar</code> it basically loads the <code>bar</code> classmethod and calls:</p>
+<pre><code>bar.__get__(None, Foo)
+</code></pre>
+<p>Where the <code>None</code> represents the instance (there is None because it is on the class itself) and the second argument represents the class, a classmethod is not callable because then it would not have a class to bind it too!</p>
+<p>Not only this but the class object to bind it too doesn't exist until the <code>class</code> definition block has ended (and the metaclass <code>type</code> actually puts it together) so the bare minimum is to create <code>bar_vect</code> after the class is actually defined:</p>
+<pre><code>class Foo( object ):
+    a = 1 #lets use an example that actually uses the class
+    @classmethod
+    def bar( cls, x ):
+        return x+cls.a
+
+Foo.bar_vect = np.vectorize( Foo.bar )
+</code></pre>
+<p>This will work sure, but then you break the functionality of subclasses, what if you wanted to change <code>a</code>?</p>
+<pre><code>class Subfoo(Foo):
+    a = 3 #this will have no effect on 
+
+assert Subfoo.bar_vect(np.array([ 1, 2, 3 ])) == np.array([ 4, 5, 6 ])
+#this SHOULD work but doesn't because you bound bar_Vect to just Foo
+#subclasses mean nothing to your class method
+</code></pre>
+<p>The only way to make it work in this case is to recreate the <code>np.vectorize</code> at least one for each subclass, the simplest version is to just do it every time you call <code>bar_vect</code>:</p>
+<pre><code>class Foo( object ):
+    a = 1
+    @classmethod
+    def bar( cls, x ):
+        return x+cls.a
+    @classmethod
+    def bar_vect(cls,arg):
+        return np.vectorize(cls.bar)(arg)
+</code></pre>
+<p>This is obviously undesirable because it calls <code>np.vectorize</code> every time <code>x.bar_vect</code> is used, however you could make a record of all the classes and only make it when a new class is used:</p>
+<pre><code>_bar_vect_registry = {}
+@classmethod
+def bar_vect(cls,arg):
+    try:
+        return cls._bar_vect_registry[cls](arg)
+    except KeyError:
+        cls._bar_vect_registry[cls] = np.vectorize(cls.bar)
+        return cls._bar_vect_registry[cls](arg)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You real problem is that you try to use <code>bar</code> before the class if fully constructed, so you do not get the expected object.</p>
+<p>Here is a simplified example:</p>
+<pre><code>class Foo:
+    @classmethod
+    def bar(cls, x):
+        print ('bar called in', cls, 'with', x)
+    barv = str(bar)
+
+print(str(Foo.bar))
+print(Foo.barv)
+</code></pre>
+<p>gives:</p>
+<pre><code>&lt;bound method Foo.bar of &lt;class '__main__.Foo'&gt;&gt;
+&lt;classmethod object at 0x00000000035B0320&gt;
+</code></pre>
+<p>That shows that <em>until the class is fully constructed</em>, the methods identifier are only bound to the method definitions and not to the real methods.</p>
+<p>If you want achieve what you want, you must define the class variable outside of class definition (after last line), as explained by @ShadowRanger</p>
+</div>
+<span class="comment-copy">I can't understand the downvote. The question is legitimate and its redaction follows the guidelines. What is the point of downvoting this ?</span>
+<span class="comment-copy">Possible duplicate of <a href="http://stackoverflow.com/questions/11058686/classmethod-object-is-not-callable">'classmethod' object is not callable</a> (Note: Not down-voter, but searching your error message would have led you to a similar question instantly)</span>
+<span class="comment-copy"><a href="http://stackoverflow.com/questions/11058686/classmethod-object-is-not-callable">'classmethod' object is not callable</a> doesn't get right to the point as my question do.</span>
+<span class="comment-copy">True. It's the same fundamental problem, but a more indirect expression. Removing my close vote (if I can).</span>
+<span class="comment-copy">I tried this already : <code>NameError: name 'Foo' is not defined</code></span>
+<span class="comment-copy">@Thrastylon: Ah, whoops. My mistake for testing in interactive interpreter with <code>Foo</code> already defined. You need to dedent the definition of <code>bar_vect</code> outside the class definition so <code>Foo</code> is defined first. I'll update.</span>
+<span class="comment-copy">Don't worry, I made <b>exactly</b> the same error doing my own interactive work to find a solution.</span>
+<span class="comment-copy">This solution makes sense indeed. I am just amazed there is no solution to encapsulate it in the class definition so I can have all in the same place (the class definition scope).</span>
+<span class="comment-copy">@Thrastylon: Yar, when defined outside the class and then assigned, it's a little weird (in a way that works for you). Because <code>numpy.vectorize</code> is a callable object, not a plain function, it doesn't try to convert it to an unbound method on <code>Foo</code> (that would be bound and have <code>self</code> passed on call). The downside is that it's not a <code>classmethod</code>, it's effectively a <code>staticmethod</code> that only wraps <code>Foo.bar</code>; even if a subclass defined a new <code>bar</code>, the subclasses inherited <code>bar_vect</code> would still wrap <code>Foo.bar</code>. You'd need metaclasses or (cached) properties to work around that.</span>
+<span class="comment-copy">The registry idea is good, thank's for sharing. I had no use for <code>subclasses</code> in my particular case, but this is definitely an improvement for a more scalable architecture.</span>
+<span class="comment-copy">do you need the <code>classmethod</code> at all? you could just do <code>@np.vectorize; def bar_vect(x):....</code> if that is the final result you are after.</span>
+<span class="comment-copy">if you are using the <code>class</code> block to define a group of functions (everything is a <code>classmethod</code> and you have no intention on subclasses or instances) then I'd recommend you use a module instead of a class as that is what modules are intended for.</span>
+<span class="comment-copy">@Thrastylon, @Tadhg: Yeah, <code>@classmethod</code> is only useful if you need to handle subclasses (or need to use class attributes and would prefer to avoid repeating the class name over and over); otherwise, you'd use <code>@staticmethod</code>, or, as Tadhg points out, for a callable object type like <code>np.vectorize</code>, you can use clever tricks using <code>np.vectorize</code> as a decorator (which has the implicit effect of making the decorated method act like a <code>staticmethod</code> thanks to <code>np.vectorize</code> not being a function, but rather a more general callable object that lacks binding behaviors).</span>
+<span class="comment-copy">@TadhgMcDonald-Jensen: It's not completely unreasonable to use non-instantiated classes for namespacing, but yeah, if the number of namespaces and entries in each namespace is high, it's better for code organization and efficiency to use separate sub-modules/sub-packages in a higher level package, rather than a bunch of classes in a module. Separate modules mean you can avoid loading unused code, but it can introduce annoying cross-module dependencies (possibly cyclic) if the namespaces reference each other; if they all cross-reference, then you don't avoid loading dead code anyway.</span>
+<span class="comment-copy">Really enligthening complement to @ShadowRanger's answer, thank's.</span>

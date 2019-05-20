@@ -1,0 +1,91 @@
+<div class="post-text" itemprop="text">
+<p>When running Python from a Linux shell (same behavior observed in both bash and ksh), and generating a SIGINT with a Ctl-C keypress, I have discovered behavior that I am unable to understand, and which has frustrated me considerably.</p>
+<p>When I press Ctl-C, the Python process appropriately terminates, but the shell continues to the next command on the line.</p>
+<pre><code>$ python -c "import time; time.sleep(100)"; echo END
+^CTraceback (most recent call last):
+  File "&lt;string&gt;", line 1, in &lt;module&gt;
+KeyboardInterrupt
+END
+</code></pre>
+<p>In contrast, I had expected, and would like, that the shell processes the signal in such a way that execution does not continue to the next command on the line, as I see when I call the sleep function from a bash subshell instead of from Python.</p>
+<pre><code>$ bash -c "sleep 100"; echo END
+^C
+</code></pre>
+<p>Python 2 and 3 are installed on my system, and while the above capture was generated running Python 2, both behave the same way.  </p>
+<pre><code>$ python --version
+Python 2.7.14
+$ python3 --version
+Python 3.6.3
+</code></pre>
+<p>My best explanation is that when I press Ctl-C while the Python process is running, the signal somehow goes directly to the Python process, whereas normally it is handled by the calling shell, then propagated to the subprocess.  However, I have no idea why or how Python is causing this difference.</p>
+<p>The examples above are trivial tests but the behavior is also observed in real-world uses.  Installing custom signal handlers does not resolve the issue.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The behavior of any program that gets a CTRL+C is up to that program. Usually the behavior is to exit, but some programs might just abort some internal procedure instead of stopping the whole program. It's even possible (though it may be considered bad manners) for a program to ignore the keystroke completely.</p>
+<p>The behavior of the program is defined by the signal handlers it has set up. The C library provides default signal handlers (which do things like exit on SIGTERM and SIGINT), but a program can provide its own handlers that will run instead. Not all signals allow arbitrary responses. For instance, SIGSEGV (a seg-fault) requires the program to exit, though it can configure its signal handlers to make a core dump or not. SIGKILL can't be handled at all (the OS kernel takes care of it).</p>
+<p>To customize signal handlers in Python, you'll want to use <a href="https://docs.python.org/3/library/signal.html" rel="nofollow noreferrer">the <code>signal</code> module</a> from the standard library. You can call <code>signal.signal</code> to set your own signal handler function for any of the signals defined by your system's C library. Typing CTRL+C is going to send SIGINT on any UNIX-based system, so that's probably what you'll want to handle if you want your own behavior.</p>
+<p>Try something like this:</p>
+<pre><code>import signal
+import sys
+import time
+
+def interrupt_handler(sig, frame):
+    sys.exit(1)
+
+signal.signal(signal.SIGINT, interrupt_handler)
+
+time.sleep(100)
+</code></pre>
+<p>If you run this script and interrupt it with CTRL+C, it should exit silently, just like your bash script does.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>After considerable digging I found a few loosely related questions on Stack Overflow that eventually led me to an <a href="https://www.cons.org/cracauer/sigint.html" rel="nofollow noreferrer">article describing the proper handling of SIGINT</a>.  (The most relevant section is <em>How to be a proper program</em>.) </p>
+<p>From this information, I was able to solve the problem.  Without it, I would have never have come close.</p>
+<p>The solution is best illustrated by beginning with a bash script that cannot be terminated by a keyboard interrupt, but which does hide the ugly stack trace from Python's KeyboardInterrupt exception:</p>
+<pre><code>#!/usr/bin/env bash                                                             
+echo "Press Ctrl-C to stop...  No sorry it won't work."
+while true
+do
+      python -c '
+import time, signal
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+time.sleep(100) 
+'
+done
+</code></pre>
+<p>The change that makes the outer script process the interrupt is:</p>
+<pre><code>echo "Press Ctrl-C to stop..."
+while true
+do
+      python -c ' 
+import time, signal, os
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+time.sleep(100)
+'
+done
+</code></pre>
+<p>However, this solution makes it impossible to use a custom handler (for example, to perform cleanup).  If doing so is required, then a more sophisticated approach is needed:</p>
+<pre><code>#!/usr/bin/env bash
+echo "Press [CTRL+C] to stop ..."
+while true
+do
+      python -c '
+import time, sys, signal, os
+def handle_int(signum, frame):
+    # Cleanup code here
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+signal.signal(signal.SIGINT, handle_int)
+time.sleep(100)
+'
+done 
+</code></pre>
+<p>The reason appears to be that unless the inner process terminates through executing the default SIGINT handler provided by the system, the parent bash process does not realize that the child has terminated because of a keyboard interrupt, and does not itself terminate.  </p>
+<p>I have not fully understood all the ancillary issues quite yet, such as whether the parent process is not receiving the SIGINT from the system, or is receiving a signal, but ignoring it.  I also have no idea what the default handler does or how the parent detects that it was called.  If I am able to learn more, I will offer an update.</p>
+<p>I must advance the question of whether the current behavior of Python should be considered a design flaw in Python.  I have seen various manifestations of this issue over the years when calling Python from a shell script, but have not had the luxury of investigation until now.  I have not found a single article through a web search, however, on the topic.  If the issue does represent a flaw, it surprised me to observe that not many developers are affected.</p>
+</div>
+<span class="comment-copy">Learned something new, thanks for the answer.</span>
+<span class="comment-copy">My question relates to whether bash continues processing to the next command on the line, not to whether Python prints a stack trace.  This difference is shown by whether "END" is printed to the console.  If you reread the question, you will see where I indicate that custom signal handlers do not appear to solve this particular problem, even though, as you say, they would be the way to avoid the stack trace.</span>
+<span class="comment-copy">Ah, I understand. For that purpose you should really be using <code>&amp;&amp;</code> between your commands on the command line, rather than <code>;</code>. The <code>&amp;&amp;</code> will make it so that the second command only runs if the first command exited with code <code>0</code> (which usually means success). Python will set code <code>1</code> if it's interrupted (by default, you don't need a custom signal handler for that, though mine does it too). I have no idea why the shell sometimes runs the command after the <code>;</code> and sometimes doesn't. You might want to tag the question with <code>bash</code> (or whatever your shell is) to get an answer about that behavior.</span>
+<span class="comment-copy">My desire is for the second part to run even if the first part experiences an internal failure that produces a non-zero return code, but not if I choose to interrupt with the keyboard.  This behavior appears to how bash and ksh normally treats the <code>;</code> command terminator.  Since the discrepancy appears when the first command is a Python script, and is unchanged across shells (bash vs ksh), I inferred a Python idiosyncrasy and assumed the shells are not the source of confusion.  I have however followed your advice to add a tag for bash.  I also added one for ksh.</span>
+<span class="comment-copy">I'm pretty sure Python knows nothing at all about other commands being run on the same command line entry. So it can't do anything about the behavior, which I'd guess has something to do with shells running themselves versus running other programs. Can you run the commands from a multi-line shell script?</span>

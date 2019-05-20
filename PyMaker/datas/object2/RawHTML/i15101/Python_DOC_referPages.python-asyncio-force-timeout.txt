@@ -1,0 +1,103 @@
+<div class="post-text" itemprop="text">
+<p>Using asyncio a coroutine can be executed with a timeout so it gets cancelled after the timeout:</p>
+<pre><code>@asyncio.coroutine
+def coro():
+    yield from asyncio.sleep(10)
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(asyncio.wait_for(coro(), 5))
+</code></pre>
+<p>The above example works as expected (it times out after 5 seconds).</p>
+<p>However, when the coroutine doesn't use <code>asyncio.sleep()</code> (or other asyncio coroutines) it doesn't seem to time out. Example:</p>
+<pre><code>@asyncio.coroutine
+def coro():
+    import time
+    time.sleep(10)
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(asyncio.wait_for(coro(), 1))
+</code></pre>
+<p>This takes more than 10 seconds to run because the <code>time.sleep(10)</code> isn't cancelled. Is it possible to enforce the cancellation of the coroutine in such a case?</p>
+<p>If asyncio should be used to solve this, how could I do that?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, you can't interrupt a coroutine unless it yields control back to the event loop, which means it needs to be inside a <code>yield from</code> call. <code>asyncio</code> is single-threaded, so when you're blocking on the <code>time.sleep(10)</code> call in your second example, there's no way for the event loop to run. That means when the timeout you set using <code>wait_for</code> expires, the event loop won't be able to take action on it. The event loop doesn't get an opportunity to run again until <code>coro</code> exits, at which point its too late.</p>
+<p>This is why in general, you should always avoid any blocking calls that aren't asynchronous; any time a call blocks without yielding to the event loop, nothing else in your program can execute, which is probably not what you want. If you really need to do a long, blocking operation, you should try to use <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.BaseEventLoop.run_in_executor"><code>BaseEventLoop.run_in_executor</code></a> to run it in a thread or process pool, which will avoid blocking the event loop:</p>
+<pre><code>import asyncio
+import time
+from concurrent.futures import ProcessPoolExecutor
+
+@asyncio.coroutine
+def coro(loop):
+    ex = ProcessPoolExecutor(2)
+    yield from loop.run_in_executor(ex, time.sleep, 10)  # This can be interrupted.
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(asyncio.wait_for(coro(loop), 1))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Thx @dano for your answer. If running a <code>coroutine</code> is not a hard requirement, here is a reworked, more compact version</p>
+<pre><code>import asyncio, time, concurrent
+
+timeout = 0.5
+loop = asyncio.get_event_loop()
+future = asyncio.wait_for(loop.run_in_executor(None, time.sleep, 2), timeout)
+try:
+    loop.run_until_complete(future)
+    print('Thx for letting me sleep')
+except concurrent.futures.TimeoutError:
+    print('I need more sleep !')
+</code></pre>
+<p>For the curious, a little debugging in my <code>Python 3.5.2</code> showed that passing <code>None</code> as an executor results in the creation of a <code>_default_executor</code>, as follows:</p>
+<pre><code># _MAX_WORKERS = 5
+self._default_executor = concurrent.futures.ThreadPoolExecutor(_MAX_WORKERS)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The examples I've seen for timeout handling are very trivial. Given reality, my app is bit more complex. The sequence is:</p>
+<ol>
+<li>When a client connects to server, have the server create another connection to internal server</li>
+<li>When the internal server connection is ok, wait for the client to send data. Based on this data we may make a query to internal server.</li>
+<li>When there is data to send to internal server, send it. Since internal server sometimes doesn't respond fast enough, wrap this request into a timeout.</li>
+<li>If the operation times out, collapse all connections to signal the client about error</li>
+</ol>
+<p>To achieve all of the above, while keeping the event loop running, the resulting code contains following code:</p>
+<pre><code>def connection_made(self, transport):
+    self.client_lock_coro = self.client_lock.acquire()
+    asyncio.ensure_future(self.client_lock_coro).add_done_callback(self._got_client_lock)
+
+def _got_client_lock(self, task):
+    task.result() # True at this point, but call there will trigger any exceptions
+    coro = self.loop.create_connection(lambda: ClientProtocol(self),
+                                           self.connect_info[0], self.connect_info[1])
+    asyncio.ensure_future(asyncio.wait_for(coro,
+                                           self.client_connect_timeout
+                                           )).add_done_callback(self.connected_server)
+
+def connected_server(self, task):
+    transport, client_object = task.result()
+    self.client_transport = transport
+    self.client_lock.release()
+
+def data_received(self, data_in):
+    asyncio.ensure_future(self.send_to_real_server(message, self.client_send_timeout))
+
+def send_to_real_server(self, message, timeout=5.0):
+    yield from self.client_lock.acquire()
+    asyncio.ensure_future(asyncio.wait_for(self._send_to_real_server(message),
+                                                   timeout, loop=self.loop)
+                                  ).add_done_callback(self.sent_to_real_server)
+
+@asyncio.coroutine
+def _send_to_real_server(self, message):
+    self.client_transport.write(message)
+
+def sent_to_real_server(self, task):
+    task.result()
+    self.client_lock.release()
+</code></pre>
+</div>
+<span class="comment-copy">Another useful example here: <a href="https://github.com/calebmadrigal/asyncio-examples/blob/master/run_in_executor.py" rel="nofollow noreferrer">github.com/calebmadrigal/asyncio-examples/blob/master/…</a></span>
+<span class="comment-copy">This answer doesn't seem to answer the actual question, I also don't think this is helpful either. (Hence the downvote.) Imo too much unrelated things are done in the code and the actual timeout handling isn't demonstrated clearly. I hope this feedback helps.</span>
+<span class="comment-copy">Thanks for you feedback. The actual question is about coroutine can be executed with a timeout, which my code does. As I stated in my answer, there is no code to be found in the entire Internet where coroutine is executed with timeout <i>without</i> using <code>loop.run_until_complete()</code>, so that's why I posted this. Also given the constraint, the number of methods/functions seems to be mandatory. Feel free to provide more optimized code.</span>

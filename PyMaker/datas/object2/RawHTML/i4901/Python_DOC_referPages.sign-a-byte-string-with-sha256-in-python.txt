@@ -1,0 +1,139 @@
+<div class="post-text" itemprop="text">
+<p>Currently I have some code that signs a byte string with the SHA256 algorithm using the native OpenSSL binary, the code calls an external process, sends the parameters, and receive the result back into the Python code.</p>
+<p>The current code is as follows:</p>
+<pre><code>signed_digest_proc = subprocess.Popen(
+    ['openssl', 'dgst', '-sha256', '-sign', tmp_path],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE
+)
+signed_digest_proc.stdin.write(original_string)
+signed_digest, _ = signed_digest_proc.communicate()
+
+base64.encodestring(signed_digest).decode().replace('\n', '')
+</code></pre>
+<p>When <code>original_string</code> is too big, I might have problems with the result (from the communication with an external process I think), that's why I'm trying to change it to a Python only solution:</p>
+<pre><code>import hmac, hashlib
+h = hmac.new(bytes(key_pem(), 'ASCII'), original_string, hashlib.sha256)
+result = base64.encodestring(h).decode().replace('\n', '')
+</code></pre>
+<p>This result in a completely different string than the first one. </p>
+<p>What would be the way to implement the original code without calling an external process?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <code>openssl</code> command you used does three things:</p>
+<ul>
+<li>Create a hash of the data, using SHA256</li>
+<li>If RSA is used, pad out the message to a specific length, using PKCS#1 1.5</li>
+<li>Sign the (padded) hash, using the private key you provided. It'll depend on the type of key what algorithm was used.</li>
+</ul>
+<p>The <code>hmac</code> module does not serve the same function.</p>
+<p>You'll need to install a cryptography package like <a href="https://cryptography.io/en/latest/" rel="nofollow noreferrer"><code>cryptography</code></a> to replicate what <code>openssl dgst -sign</code> does. <code>cryptography</code> uses OpenSSL as a backend, so it will produce the same output.</p>
+<p>You can then</p>
+<ul>
+<li>load the key with the <a href="https://cryptography.io/en/latest/hazmat/primitives/asymmetric/serialization/#cryptography.hazmat.primitives.serialization.load_pem_private_key" rel="nofollow noreferrer"><code>load_pem_private_key()</code> function</a>. This returns the right type of object for the algorithm used.</li>
+<li><p>use the key to sign the message; each key type has a <code>sign()</code> method, and this method will take care of hashing the message for you if you so wish. See for example the <a href="https://cryptography.io/en/latest/hazmat/primitives/asymmetric/rsa/#signing" rel="nofollow noreferrer"><em>Signing</em> section for RSA</a>.</p>
+<p>However, you'll need to provide different kinds of config for the different <code>.sign()</code> methods. Only the RSA, DSA and Elliptic Curve keys can be used to create a signed digest.</p></li>
+</ul>
+<p>You'll have to switch between the types to get the signature right:</p>
+<pre><code>from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa, utils
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
+# configuration per key type, each lambda takes a hashing algorithm
+_signing_configs = (
+    (dsa.DSAPrivateKey, lambda h: {
+        'algorithm': h}),
+    (ec.EllipticCurvePrivateKey, lambda h: {
+        'signature_algorithm': ec.ECDSA(h)}),
+    (rsa.RSAPrivateKey, lambda h: {
+        'padding': padding.PKCS1v15(),
+        'algorithm': h
+    }),
+)
+
+def _key_singing_config(key, hashing_algorithm):
+    try:
+        factory = next(
+            config
+            for type_, config in _signing_configs
+            if isinstance(key, type_)
+        )
+    except StopIteration:
+        raise ValueError('Unsupported key type {!r}'.format(type(key)))
+    return factory(hashing_algorithm)
+
+def sign(private_key, data, algorithm=hashes.SHA256()):
+    with open(private_key, 'rb') as private_key:
+        key = serialization.load_pem_private_key(
+            private_key.read(), None, default_backend())
+
+    return key.sign(data, **_key_singing_config(key, algorithm))
+</code></pre>
+<p>If you need to hash a large amount of data, you can hash the data yourself first, in chunks, before passing in just the digest and the special <a href="https://cryptography.io/en/latest/hazmat/primitives/asymmetric/utils/#cryptography.hazmat.primitives.asymmetric.utils.Prehashed" rel="nofollow noreferrer"><code>util.Prehashed()</code> object</a>:</p>
+<pre><code>def sign_streaming(private_key, data_iterable, algorithm=hashes.SHA256()):
+    with open(private_key, 'rb') as private_key:
+        key = serialization.load_pem_private_key(
+            private_key.read(), None, default_backend())
+
+    hasher = hashes.Hash(algorithm, default_backend())
+    for chunk in data_iterable:
+        hasher.update(chunk)
+    digest = hasher.finalize()
+    prehashed = utils.Prehashed(algorithm)
+
+    return key.sign(digest, **_key_singing_config(key, prehashed))
+
+with open(large_file, 'rb') as large_file:
+    signature = sign_streaming(private_key_file, iter(lambda: large_file.read(2 ** 16), b''))
+</code></pre>
+<p>This uses the <a href="https://docs.python.org/3/library/functions.html#iter" rel="nofollow noreferrer"><code>iter()</code> function</a> to read data from a binary file in chunks of 64 kilobytes.</p>
+<p>Demo; I'm using an RSA key I generated in /tmp/test_rsa.pem. Using the command-line to produce a signed digest for <em>Hello world!</em>:</p>
+<pre><code>$ echo -n 'Hello world!' | openssl dgst -sign /tmp/test_rsa.pem -sha256 | openssl base64
+R1bRhzEr+ODNThyYiHbiUackZpx+TCviYR6qPlmiRGd28wpQJZGnOFg9tta0IwkT
+HetvITcdggXeiqUqepzzT9rDkIw6CU7mlnDRcRu2g76TA4Uyq+0UzW8Ati8nYCSx
+Wyu09YWaKazOQgIQW3no1e1Z4HKdN2LtZfRTvATk7JB9/nReKlXgRjVdwRdE3zl5
+x3XSPlaMwnSsCVEhZ8N7Gf1xJf3huV21RKaXZw5zMypHGBIXG5ngyfX0+aznYEve
+x1uBrtZQwUGuS7/RuHw67WDIN36aXAK1sRP5Q5CzgeMicD8d9wr8St1w7WtYLXzY
+HwzvHWcVy7kPtfIzR4R0vQ==
+</code></pre>
+<p>or using the Python code:</p>
+<pre><code>&gt;&gt;&gt; signature = sign(keyfile, b'Hello world!')
+&gt;&gt;&gt; import base64
+&gt;&gt;&gt; print(base64.encodebytes(signature).decode())
+R1bRhzEr+ODNThyYiHbiUackZpx+TCviYR6qPlmiRGd28wpQJZGnOFg9tta0IwkTHetvITcdggXe
+iqUqepzzT9rDkIw6CU7mlnDRcRu2g76TA4Uyq+0UzW8Ati8nYCSxWyu09YWaKazOQgIQW3no1e1Z
+4HKdN2LtZfRTvATk7JB9/nReKlXgRjVdwRdE3zl5x3XSPlaMwnSsCVEhZ8N7Gf1xJf3huV21RKaX
+Zw5zMypHGBIXG5ngyfX0+aznYEvex1uBrtZQwUGuS7/RuHw67WDIN36aXAK1sRP5Q5CzgeMicD8d
+9wr8St1w7WtYLXzYHwzvHWcVy7kPtfIzR4R0vQ==
+</code></pre>
+<p>Although the line lengths differ, the base64 data the two output is clearly the same.</p>
+<p>Or, using a generated file with random binary data, size 32kb:</p>
+<pre><code>$ dd if=/dev/urandom of=/tmp/random_data.bin bs=16k count=2
+2+0 records in
+2+0 records out
+32768 bytes transferred in 0.002227 secs (14713516 bytes/sec)
+$ cat /tmp/random_data.bin | openssl dgst -sign /tmp/test_rsa.pem -sha256 | openssl base64
+b9sYFdRzpBtJTan7Pnfod0QRon+YfdaQlyhW0aWabia28oTFYKKiC2ksiJq+IhrF
+tIMb0Ti60TtBhbdmR3eF5tfRqOfBNHGAzZxSaRMau6BuPf5AWqCIyh8GvqNKpweF
+yyzWNaTBYATTt0RF0fkVioE6Q2LdfrOP1q+6zzRvLv4BHC0oW4qg6F6CMPSQqpBy
+dU/3P8drJ8XCWiJV/oLhVehPtFeihatMzcZB3IIIDFP6rN0lY1KpFfdBPlXqZlJw
+PJQondRBygk3fh+Sd/pGYzjltv7/4mC6CXTKlDQnYUWV+Rqpn6+ojTElGJZXCnn7
+Sn0Oh3FidCxIeO/VIhgiuQ==
+</code></pre>
+<p>Processing the same file in Python:</p>
+<pre><code>&gt;&gt;&gt; with open('/tmp/random_data.bin', 'rb') as random_data:
+...     signature = sign_streaming('/tmp/test_rsa.pem', iter(lambda: random_data.read(2 ** 16), b''))
+...
+&gt;&gt;&gt; print(base64.encodebytes(signature).decode())
+b9sYFdRzpBtJTan7Pnfod0QRon+YfdaQlyhW0aWabia28oTFYKKiC2ksiJq+IhrFtIMb0Ti60TtB
+hbdmR3eF5tfRqOfBNHGAzZxSaRMau6BuPf5AWqCIyh8GvqNKpweFyyzWNaTBYATTt0RF0fkVioE6
+Q2LdfrOP1q+6zzRvLv4BHC0oW4qg6F6CMPSQqpBydU/3P8drJ8XCWiJV/oLhVehPtFeihatMzcZB
+3IIIDFP6rN0lY1KpFfdBPlXqZlJwPJQondRBygk3fh+Sd/pGYzjltv7/4mC6CXTKlDQnYUWV+Rqp
+n6+ojTElGJZXCnn7Sn0Oh3FidCxIeO/VIhgiuQ==
+</code></pre>
+</div>
+<span class="comment-copy">You are doing <b>two</b> things with <code>openssl</code>, neither of which use an HMAC signature. You are producing a regular SHA256 digest, and then you also <b>sign</b> the digest.</span>
+<span class="comment-copy">To sign, look at the <code>cryptography</code> package, and pick one of the algorithms, based on the private key type you have (DSA, RSA, ..). Then read the <i>Signing</i> section. E.g. for RSA there is <a href="https://cryptography.io/en/latest/hazmat/primitives/asymmetric/rsa/" rel="nofollow noreferrer">documentation on how to sign a message</a>.</span>
+<span class="comment-copy">Thank you, your example code made it very clear and now I'm getting the same results as the original OpenSSL implementation.</span>

@@ -1,0 +1,58 @@
+<div class="post-text" itemprop="text">
+<p>I am using a C extension module in Python (call it ext) using ctypes to access a C library.  I have two ctypes structures, Foo and Bar, which circularly point to one another. Explicitly, Bar holds a ctypes pointer to an instance of Foo, and Foo holds a void pointer (for long reasons) that gets assigned to an instance of Bar, i.e.</p>
+<pre><code>class Foo(Structure):
+    _fields_ = [("number", c_int), 
+                ("ptr", c_void_p)]
+
+class Bar(Structure):
+    _fields_ = [("ptr", POINTER(Foo))]
+    def __init__(self, f):
+        ext.init(byref(f), byref(self))
+
+f = Foo()
+b = Bar(f)
+</code></pre>
+<p>where the C code for <code>ext.init</code>, which assigns the pointers, looks like this:</p>
+<pre><code>void init(struct Foo* f, struct Bar* b){
+  f-&gt;ptr = b;
+  b-&gt;ptr = f;
+}
+</code></pre>
+<p>I can now print <code>number</code> with</p>
+<pre><code>print(b.ptr.contents.number)
+</code></pre>
+<p>But if I access this variable a second time, I get this error:  </p>
+<pre><code>"python(1104,0x7fff75425300) malloc: *** error for object 0x10706b6e0:
+ pointer being freed was not allocated"
+</code></pre>
+<p>I believe ctypes always makes a new object whenever you retrieve an attribute, so maybe the problem is that Bar can't release the memory ptr points to since it didn't allocate it?  If it makes a difference, Foo and Bar are in different C extensions.</p>
+<p><strong>UPDATE</strong></p>
+<p>I think I understand things slightly better now.  When I call</p>
+<pre><code>print(b.ptr.contents.number)
+</code></pre>
+<p>(I think) a new python object is created for b.ptr.contents.  Then, when it goes out of scope after the print statement, <code>Foo.__del__</code> gets called (I'm at least sure of the last part, since I added a print statement in <code>Foo.__del__</code>).</p>
+<p><code>Foo.__del__</code> is set up to call a function in the C library to free all the pointers in the instance (the real struct is more complicated than above).  </p>
+<p>I don't understand how the object <code>b.ptr.contents</code> gets created.  If it doesn't call <code>Foo.__init__</code>, then the memory for the pointers wouldn't get allocated, so maybe it would make sense that I get the error above?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Thanks @eryksun for solving this for me.  In case it's useful to others, the problem was that I had:</p>
+<pre><code>class Foo(Structure):
+   ...
+   def __del__(self):
+      ext.free_pointers(byref(self))
+</code></pre>
+<p>where <code>free_pointers</code> was a C function that freed all the pointers in C's Foo struct instance.  As eryksun points out, when I access <code>b.ptr.contents</code>, this makes a Foo instance, but it has a member <code>_b_needsfree_</code> that's set to 0 (so that your original instance in C doesn't get deallocated whenever you access the pointer), so all I had to do to fix the problem, is check this variable, i.e.,</p>
+<pre><code>class Foo(Structure):
+   ...
+   def __del__(self):
+      if self._b_needsfree_ == 1:
+         ext.free_pointers(byref(self))
+</code></pre>
+</div>
+<span class="comment-copy">Instead of storing the pointer in a Python attribute set in <code>__init__</code>, you should include it in <code>_fields_</code>: <code>[('ptr', POINTER(Foo))]</code></span>
+<span class="comment-copy">Thanks for the points.  I realized I had some duplicated code, so I simplified things to only have the ptr as part of <i>fields</i>, and I realized that perhaps part of the problem is that the classes circularly point to one another.  I've edited the question to reflect this.</span>
+<span class="comment-copy">Your library should not free the memory referenced by the pointers. It didn't allocate this memory; ctypes did and will free it when the Python objects referenced as  <code>f</code> and <code>b</code> get deallocated. If your C library expects to use those pointers indefinitely, then your Python code needs to keep the target structure instances referenced somewhere. The library also needs some way to signal your Python code when it's ok to unreference those objects, such as a ctypes callback function.</span>
+<span class="comment-copy"><code>b.ptr.contents</code> returns an instance of <code>Foo</code> that doesn't own the buffer pointed at by its internal <code>b_ptr</code>, i.e. <code>_b_needsfree_ == 0</code>. So it won't itself try to free this memory, but if you do something nonsensical in <code>Foo.__del__</code>, then all bets are off.</span>
+<span class="comment-copy">Thanks @eryksun, that's really helpful.  Do you mean that if <code>_b_needsfree_</code> == 0, it won't call <code>Foo.__del__</code>?  <code>Foo.__del__</code> is definitely called, and I have it set up to call a C function that frees all the pointers in <code>Foo</code>.   Is that therefore nonsensical?  Do I need to have something like <code>_b_needsfree_</code> as a field in Foo to check whether I should call the C function to free the pointers in my <code>Foo.__del__</code>?</span>
+<span class="comment-copy">What does <code>free_pointers</code> do? Is this just setting references held by the library to <code>NULL</code>? It shouldn't call <code>free</code> on the address <code>byref(self)</code>; ctypes does that in its <a href="https://docs.python.org/3/c-api/typeobj.html#c.PyTypeObject.tp_clear" rel="nofollow noreferrer"><code>tp_clear</code></a> function, <a href="https://hg.python.org/cpython/file/v3.4.3/Modules/_ctypes/_ctypes.c#l2468" rel="nofollow noreferrer"><code>PyCData_clear</code></a>.</span>
+<span class="comment-copy">Thanks for the pointers to the functions in the source code. We have it set up to free all the pointers within Foo, but not the pointer to the instance (byref(self)). From your comment that sounds like the right thing to do?  I really appreciate your help!</span>

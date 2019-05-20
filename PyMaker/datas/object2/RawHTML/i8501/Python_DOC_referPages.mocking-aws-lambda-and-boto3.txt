@@ -1,0 +1,120 @@
+<div class="post-text" itemprop="text">
+<p>I have a lambda (python) which returns a json representation of a customer profile.  It does this by starting with a top level account json, then reading linked json files until it runs out of links.  The function that does the reading from s3 is recursive, but the recursion will only ever be one level deep.</p>
+<p>Here's the method that actually gets the json content from a given key. (bucket is known)</p>
+<pre><code>def get_index_from_s3(key):
+    try:
+        response = s3.get_object(
+            Bucket=bucket,
+            Key=key
+        )
+        body = response.get('Body')
+        content = body.read().decode('utf-8')
+    except ClientError as ex:
+        # print 'EXCEPTION MESSAGE: {}'.format(ex.response['Error']['Code'])
+        content = '{}'
+
+    message = json.loads(content)
+    return message
+</code></pre>
+<p>The code returns the json found at the specified key, or an empty dictionary in the event that get_object fails due to a ClientError (which is what results from NoSuchKey).</p>
+<p>I've tested this, and it works.  The first call to the function gets a chunk of json. That json is parsed, a link is found, a second call is made, and the profile is built.  If I delete the object at the linked key, I just get a default, empty representation, as intended.</p>
+<p>My problem comes from testing this.
+I've written a couple of test classes, each has an arrange method, and they share an act method.</p>
+<p>For my happy path, I use the following arrange:</p>
+<pre><code>def arrange(self):
+    super(WhenCognitoAndNerfFoundTestCase, self).arrange()
+    # self.s3_response = self.s3.get_object.return_value
+    self.s3_body = self.s3.get_object.return_value.get.return_value
+    self.s3_body.read.return_value.decode.side_effect = [
+        self.cognito_content,
+        self.nerf_content]
+    signed_url = "https://this.is/a/signed/url/index.html"
+    self.s3.generate_presigned_url.return_value = signed_url
+</code></pre>
+<p>This does exactly what I want.  s3_response is the return_value of get_object, which has a Body attribute returned by get, and a subsequent read value returns a json string.  I use the side_effect set to a list of json strings so that I can cause a different string to be returned on each call (only two)
+<code>content = body.read().decode('utf-8')</code></p>
+<p>But when I want to test the case of missing content in the second bucket, I get stymied. My current attempt at this arrangement is as follows:</p>
+<pre><code>def arrange(self):
+    super(WhenCognitoOnlyFoundTestCase, self).arrange()
+    # self.s3_response = MagicMock()
+    # botocore.response.StreamingBody
+    self.s3.get_object.side_effect = [{},
+                                      ClientError]
+    # self.s3_response = self.s3.get_object.return_value
+    self.s3_body = self.s3.get_object.return_value.get.return_value
+    self.s3_body.read.return_value.decode.return_value = \
+        self.cognito_content
+</code></pre>
+<p>Running the test yields this:</p>
+<pre><code>    def get_index_from_s3(key):
+        try:
+            response  = s3.get_object(
+                Bucket=bucket,
+                Key=key
+            )
+            body = response.get('Body')
+&gt;           content = body.read().decode('utf-8')
+E            AttributeError: 'NoneType' object has no attribute 'read'
+
+master_profile.py:66: AttributeError
+</code></pre>
+<p>This makes sense because the read method is on the Body attribute of the s3.get_object response, which is None in this scenario.</p>
+<p>So my question is, how do I mock this thing so that I can test it?  The difficulty of mocking a response of get_object is that, although it's just a dictionary, the Body attribute is a <code>botocore.response.StreamingBody</code> which I do not know how to mock.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As a rule of thumb you should aim to make your questions self-contained. To illustrate some of the things you were doing wrong I slightly modified your initial function to make it self-contained.</p>
+<p>Let's imagine we have the <code>s3_module</code> we want to test defined as follows: </p>
+<pre><code>import boto3
+from botocore.exceptions import ClientError
+import json
+
+s3 = boto3.client('s3')
+
+def get_index_from_s3(key):
+    try:
+        response = s3.get_object(
+            Bucket='bucket',
+            Key=key
+        )
+        body = response.get('Body')
+        content = body.read().decode('utf-8')
+    except ClientError as ex:
+        import ipdb; ipdb.set_trace()
+        # print 'EXCEPTION MESSAGE: {}'.format(ex.response['Error']['Code'])
+        content = '{}'
+
+    message = json.loads(content)
+    return message
+</code></pre>
+<p>In order to test it, we could write a another module <code>s3_test</code> with a test similar to this:</p>
+<pre><code>import pytest
+from unittest.mock import patch, Mock, MagicMock
+from botocore.exceptions import ClientError
+import json
+
+from s3_module import get_index_from_s3
+
+
+@patch('s3_module.s3.get_object')
+def test_get_index_from_s3(s3_get_mock):
+
+    body_mock = Mock()
+    body_mock.read.return_value.decode.return_value = json.dumps('first_response')
+    s3_get_mock.side_effect = [{'Body': body_mock}, ClientError(MagicMock(), MagicMock())]
+
+    first_response = get_index_from_s3('key1')
+    assert  first_response == 'first_response'
+    second_response = get_index_from_s3('key2')
+    assert  second_response == {}
+</code></pre>
+<p>Compared to your solution you were missing some points:</p>
+<ul>
+<li><p><code>self.s3.get_object.side_effect</code> should return an object for the first response that works with the rest of your code, i.e. a dictionary containing the <code>Body</code> key whose content can be <code>read()</code>, <code>decoded()</code> and be used by <code>json.load()</code></p></li>
+<li><p><code>self.s3.get_object.side_effect</code> should return a <code>ClientError</code> exception properly constructed for the second response</p></li>
+</ul>
+<p>You can check more about how to build the <code>ClientError</code> exception in the botocore docs: <a href="http://botocore.readthedocs.io/en/latest/client_upgrades.html#error-handling" rel="nofollow noreferrer">http://botocore.readthedocs.io/en/latest/client_upgrades.html#error-handling</a></p>
+<p>You can find more about patching and mocking in the docs: <a href="https://docs.python.org/3/library/unittest.mock.html" rel="nofollow noreferrer">https://docs.python.org/3/library/unittest.mock.html</a>.</p>
+<p>Usually the section about where to patch is really useful: <a href="https://docs.python.org/3/library/unittest.mock.html#where-to-patch" rel="nofollow noreferrer">https://docs.python.org/3/library/unittest.mock.html#where-to-patch</a></p>
+</div>
+<span class="comment-copy">You might want to check out the <a href="http://botocore.readthedocs.io/en/latest/reference/stubber.html" rel="nofollow noreferrer">botocore stubber</a></span>
+<span class="comment-copy">@JordonPhillips : stubber is really some nice new tricks. Another way of doing "not so mock"  mock run, is setting up fake-s3. <a href="https://github.com/jubos/fake-s3" rel="nofollow noreferrer">github.com/jubos/fake-s3</a></span>

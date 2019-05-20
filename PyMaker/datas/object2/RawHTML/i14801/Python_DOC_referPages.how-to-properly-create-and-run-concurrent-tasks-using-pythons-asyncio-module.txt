@@ -1,0 +1,129 @@
+<div class="post-text" itemprop="text">
+<p>I am trying to properly understand and implement two concurrently running <a href="https://docs.python.org/3/library/asyncio-task.html#task" rel="noreferrer"><code>Task</code></a> objects using Python 3's relatively new <a href="https://docs.python.org/3/library/asyncio.html" rel="noreferrer"><code>asyncio</code></a> module.</p>
+<p>In a nutshell, asyncio seems designed to handle asynchronous processes and concurrent <code>Task</code> execution over an event loop. It promotes the use of <code>await</code> (applied in async functions) as a callback-free way to wait for and use a result, without blocking the event loop. (Futures and callbacks are still a viable alternative.)</p>
+<p>It also provides the <code>asyncio.Task()</code> class, a specialized subclass of <code>Future</code>  designed to wrap coroutines. Preferably invoked by using the <code>asyncio.ensure_future()</code> method. The intended use of asyncio tasks is to allow independently running tasks to run 'concurrently' with other tasks within the same event loop. My understanding is that <code>Tasks</code> are connected to the event loop which then automatically keeps driving the coroutine between <code>await</code> statements.</p>
+<p>I like the idea of being able to use concurrent Tasks without needing to use one of the <a href="https://docs.python.org/dev/library/concurrent.futures.html" rel="noreferrer"><code>Executor</code></a> classes, but I haven't found much elaboration on implementation. </p>
+<p>This is how I'm currently doing it:</p>
+<pre><code>import asyncio
+
+print('running async test')
+
+async def say_boo():
+    i = 0
+    while True:
+        await asyncio.sleep(0)
+        print('...boo {0}'.format(i))
+        i += 1
+
+async def say_baa():
+    i = 0
+    while True:
+        await asyncio.sleep(0)
+        print('...baa {0}'.format(i))
+        i += 1
+
+# wrap in Task object
+# -&gt; automatically attaches to event loop and executes
+boo = asyncio.ensure_future(say_boo())
+baa = asyncio.ensure_future(say_baa())
+
+loop = asyncio.get_event_loop()
+loop.run_forever()
+</code></pre>
+<p>In the case of trying to concurrently run two looping Tasks, I've noticed that unless the Task has an internal <code>await</code> expression, it will get stuck in the <code>while</code> loop, effectively blocking other tasks from running (much like a normal <code>while</code> loop). However, as soon the Tasks have to (a)wait, they seem to run concurrently without an issue. </p>
+<p>Thus, the <code>await</code> statements seem to provide the event loop with a foothold for switching back and forth between the tasks, giving the effect of concurrency.</p>
+<p>Example output with internal <code>await</code>:</p>
+<pre><code>running async test
+...boo 0
+...baa 0
+...boo 1
+...baa 1
+...boo 2
+...baa 2
+</code></pre>
+<p>Example output <em>without</em> internal <code>await</code>:</p>
+<pre><code>...boo 0
+...boo 1
+...boo 2
+...boo 3
+...boo 4
+</code></pre>
+<h1>Questions</h1>
+<p>Does this implementation pass for a 'proper' example of concurrent looping Tasks in <code>asyncio</code>? </p>
+<p>Is it correct that the only way this works is for a <code>Task</code> to provide a blocking point (<code>await</code> expression) in order for the event loop to juggle multiple tasks?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Yes, any coroutine that's running inside your event loop will block other coroutines and tasks from running, unless it </p>
+<ol>
+<li>Calls another coroutine using <code>yield from</code> or <code>await</code> (if using Python 3.5+).</li>
+<li>Returns.</li>
+</ol>
+<p>This is because <code>asyncio</code> is single-threaded; the only way for the event loop to run is for no other coroutine to be actively executing. Using <code>yield from</code>/<code>await</code> suspends the coroutine temporarily, giving the event loop a chance to work.</p>
+<p>Your example code is fine, but in many cases, you probably wouldn't want long-running code that isn't doing asynchronous I/O running inside the event loop to begin with. In those cases, it often makes more sense to use <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.BaseEventLoop.run_in_executor" rel="noreferrer"><code>BaseEventLoop.run_in_executor</code></a> to run the code in a background thread or process. <code>ProcessPoolExecutor</code> would be the better choice if your task is CPU-bound, <code>ThreadPoolExecutor</code> would be used if you need to do some I/O that isn't <code>asyncio</code>-friendly.</p>
+<p>Your two loops, for example, are completely CPU-bound and don't share any state, so the best performance would come from using <code>ProcessPoolExecutor</code> to run each loop in parallel across CPUs:</p>
+<pre><code>import asyncio
+from concurrent.futures import ProcessPoolExecutor
+
+print('running async test')
+
+def say_boo():
+    i = 0
+    while True:
+        print('...boo {0}'.format(i))
+        i += 1
+
+
+def say_baa():
+    i = 0
+    while True:
+        print('...baa {0}'.format(i))
+        i += 1
+
+if __name__ == "__main__":
+    executor = ProcessPoolExecutor(2)
+    loop = asyncio.get_event_loop()
+    boo = asyncio.ensure_future(loop.run_in_executor(executor, say_boo))
+    baa = asyncio.ensure_future(loop.run_in_executor(executor, say_baa))
+
+    loop.run_forever()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You don't necessarily need a <code>yield from x</code> to give control over to the event loop.</p>
+<p>In your example, I think the <em>proper</em> way would be to do a <code>yield None</code> or equivalently a simple <code>yield</code>, rather than a <code>yield from asyncio.sleep(0.001)</code>:</p>
+<pre class="lang-py prettyprint-override"><code>import asyncio
+
+@asyncio.coroutine
+def say_boo():
+  i = 0
+  while True:
+    yield None
+    print("...boo {0}".format(i))
+    i += 1
+
+@asyncio.coroutine
+def say_baa():
+  i = 0
+  while True:
+    yield
+    print("...baa {0}".format(i))
+    i += 1
+
+boo_task = asyncio.async(say_boo())
+baa_task = asyncio.async(say_baa())
+
+loop = asyncio.get_event_loop()
+loop.run_forever()
+</code></pre>
+<p>Coroutines are just plain old Python generators.
+Internally, the <code>asyncio</code> event loop keeps a record of these generators and calls <code>gen.send()</code> on each of them one by one in a never ending loop. Whenever you <code>yield</code>, the call to <code>gen.send()</code> completes and the loop can move on. (I'm simplifying it; take a look around <a href="https://hg.python.org/cpython/file/3.4/Lib/asyncio/tasks.py#l265">https://hg.python.org/cpython/file/3.4/Lib/asyncio/tasks.py#l265</a> for the actual code)  </p>
+<p>That said, I would still go the <code>run_in_executor</code> route if you need to do CPU intensive computation without sharing data.</p>
+</div>
+<span class="comment-copy">Yes, task atomically executes itself from <code>yield from</code> to next <code>yield from</code>.</span>
+<span class="comment-copy">Thanks. Great timing as I was just wondering about this very topic re: using executors.</span>
+<span class="comment-copy">Trying the above code and am finding that the boo Task is blocking baa from running unless I add the yield from asyncio.sleep(0) into each of the while True loops?</span>
+<span class="comment-copy">Also re-worked the run_in_executor bits as follows: loop.run_in_executor(executor, asyncio.Task(say_boo()))</span>
+<span class="comment-copy">@shongololo Sorry, fixed. <code>asyncio.async</code> should be used, instead of the <code>asyncio.Task</code> constructor directly. We don't want <code>say_boo</code> and <code>say_baa</code> to be coroutines, they should just be ordinary functions that run outside of the event loop, so you shouldn't add <code>yield from</code> calls to them or wrap them in an <code>asyncio.Task</code>.</span>
+<span class="comment-copy">Looks like <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.async" rel="nofollow noreferrer">asyncio.async</a> is an alias to <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.ensure_future" rel="nofollow noreferrer">ensure_future</a> and is now deprecated</span>
+<span class="comment-copy">Works in Python 3.4 but doesn't seem to work in Python 3.5. Is there a similar approach for 3.5? (<code>None</code> seems to be more elegant than using <code>asyncio.sleep()</code> everywhere...)</span>
+<span class="comment-copy">Since Python 3.5, the <i>right</i> way to do this is with a <code>asyncio.sleep(0)</code>. <a href="https://github.com/python/asyncio/issues/284" rel="nofollow noreferrer">See this discussion.</a></span>

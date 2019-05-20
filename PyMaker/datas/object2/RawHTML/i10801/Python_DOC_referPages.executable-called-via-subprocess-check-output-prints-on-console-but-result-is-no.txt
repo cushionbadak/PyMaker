@@ -1,0 +1,279 @@
+<div class="post-text" itemprop="text">
+<p>On a Windows machine, I'm trying to call an external executable from Python and gather its outputs for further processing. Because a local path variable has to be set before calling the executable, I created a batch script that </p>
+<ul>
+<li>first calls another script to set %PATH% and </li>
+<li>then calls the executable with the parameters given to it.</li>
+</ul>
+<p>The *.bat file looks like this:</p>
+<pre><code>@echo off
+call set_path.bat
+@echo on
+executable.exe %*
+</code></pre>
+<p>And the Python code like this: </p>
+<pre><code>print("before call");
+result = subprocess.check_output([batfile, parameters], stderr=subprocess.STDOUT, shell=True);
+print("after call");
+
+print("------- ------- ------- printing result ------- ------- ------- ");
+print(result);
+print("------- ------- ------- /printing result ------- ------- ------- ");
+</code></pre>
+<p>Now, technically, this works. The executable is called with the intended parameters, runs, finishes and produces results. I know this, because they are mockingly displayed in the very console in which the Python script is running.</p>
+<p>However, the result string only contains what the batch script returns, not the executables outputs:</p>
+<blockquote>
+<p>before call</p>
+<p>hello? yes, this is executable.exe </p>
+<p>after call</p>
+<p>------- ------- ------- printing result ------- ------- -------</p>
+<p>C:\Users\me\Documents\pythonscript\execute\executable.exe "para1|para2|para3"</p>
+<p>------- ------- ------- /printing result ------- ------- -------</p>
+</blockquote>
+<p>The subprocess.check_output command itself somehow prints the intended output to the console, what it returns only contains the batch file's outputs after @echo is on again.</p>
+<p><strong>How can I access and save the executable's output to a string for further work?</strong> </p>
+<p>Or do I have to somehow modify the batch file to catch and print the output, so that it will end upt in check_output's results? If so, how could I go about doing that?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If a program writes directly to the console (e.g. by opening the <code>CONOUT$</code> device) instead of to the process standard handles, the only option is to read the console screen buffer directly. To make this simpler, start with a new, empty screen buffer. Create, size, initialize, and activate a new screen buffer via the following functions:</p>
+<ul>
+<li><a href="https://msdn.microsoft.com/en-us/library/ms682122" rel="nofollow"><code>CreateConsoleScreenBuffer</code></a></li>
+<li><a href="https://msdn.microsoft.com/en-us/library/ms683172" rel="nofollow"><code>GetConsoleScreenBufferInfoEx</code></a> (Minimum supported client: Windows Vista)</li>
+<li><a href="https://msdn.microsoft.com/en-us/library/ms686039" rel="nofollow"><code>SetConsoleScreenBufferInfoEx</code></a> (Minimum supported client: Windows Vista)</li>
+<li><a href="https://msdn.microsoft.com/en-us/library/ms686125" rel="nofollow"><code>SetConsoleWindowInfo</code></a></li>
+<li><a href="https://msdn.microsoft.com/en-us/library/ms682663" rel="nofollow"><code>FillConsoleOutputCharacter</code></a></li>
+<li><a href="https://msdn.microsoft.com/en-us/library/ms686010" rel="nofollow"><code>SetConsoleActiveScreenBuffer</code></a></li>
+</ul>
+<p>Make sure to request <code>GENERIC_READ | GENERIC_WRITE</code> access when calling <code>CreateConsoleScreenBuffer</code>. You'll need read access later in order to read the contents of the screen. </p>
+<p>Specifically for Python, use <a href="https://docs.python.org/3/library/ctypes.html" rel="nofollow">ctypes</a> to call functions in the Windows console API. Also, if you wrap the handle with a C file descriptor via <code>msvcrt.open_osfhandle</code>, then you can pass it as the <code>stdout</code> or <code>stderr</code> argument of <code>subprocess.Popen</code>. </p>
+<p>The file descriptor or handle for the screen buffer can't be read directly via <code>read</code>, <code>ReadFile</code>, or even <code>ReadConsole</code>. If you have a file descriptor, get the underlying handle via <code>msvcrt.get_osfhandle</code>. Given a screen buffer handle, call <a href="https://msdn.microsoft.com/en-us/library/ms684969" rel="nofollow"><code>ReadConsoleOutputCharacter</code></a> to read from the screen. The <code>read_screen</code> function in the sample code below demonstrates reading from the beginning of the screen buffer up to the cursor position.</p>
+<p>A process needs to be attached to a console in order to use the console API. To that end, I've included a simple <code>allocate_console</code> context manager to temporarily open a console. This is useful in a GUI application, which normally isn't attached to a console.</p>
+<p>The following example was tested in Windows 7 and 10, in Python 2.7 and 3.5.</p>
+<h2>ctypes definitions</h2>
+<pre><code>import os
+import contextlib
+import msvcrt
+import ctypes
+from ctypes import wintypes
+
+kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+
+GENERIC_READ  = 0x80000000
+GENERIC_WRITE = 0x40000000
+FILE_SHARE_READ  = 1
+FILE_SHARE_WRITE = 2
+CONSOLE_TEXTMODE_BUFFER = 1
+INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+STD_OUTPUT_HANDLE = wintypes.DWORD(-11)
+STD_ERROR_HANDLE = wintypes.DWORD(-12)
+
+def _check_zero(result, func, args):
+    if not result:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return args
+
+def _check_invalid(result, func, args):
+    if result == INVALID_HANDLE_VALUE:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return args
+
+if not hasattr(wintypes, 'LPDWORD'): # Python 2
+    wintypes.LPDWORD = ctypes.POINTER(wintypes.DWORD)
+    wintypes.PSMALL_RECT = ctypes.POINTER(wintypes.SMALL_RECT)
+
+class COORD(ctypes.Structure):
+    _fields_ = (('X', wintypes.SHORT),
+                ('Y', wintypes.SHORT))
+
+class CONSOLE_SCREEN_BUFFER_INFOEX(ctypes.Structure):
+    _fields_ = (('cbSize',               wintypes.ULONG),
+                ('dwSize',               COORD),
+                ('dwCursorPosition',     COORD),
+                ('wAttributes',          wintypes.WORD),
+                ('srWindow',             wintypes.SMALL_RECT),
+                ('dwMaximumWindowSize',  COORD),
+                ('wPopupAttributes',     wintypes.WORD),
+                ('bFullscreenSupported', wintypes.BOOL),
+                ('ColorTable',           wintypes.DWORD * 16))
+    def __init__(self, *args, **kwds):
+        super(CONSOLE_SCREEN_BUFFER_INFOEX, self).__init__(
+                *args, **kwds)
+        self.cbSize = ctypes.sizeof(self)
+
+PCONSOLE_SCREEN_BUFFER_INFOEX = ctypes.POINTER(
+                                    CONSOLE_SCREEN_BUFFER_INFOEX)
+LPSECURITY_ATTRIBUTES = wintypes.LPVOID
+
+kernel32.GetStdHandle.errcheck = _check_invalid
+kernel32.GetStdHandle.restype = wintypes.HANDLE
+kernel32.GetStdHandle.argtypes = (
+    wintypes.DWORD,) # _In_ nStdHandle
+
+kernel32.CreateConsoleScreenBuffer.errcheck = _check_invalid
+kernel32.CreateConsoleScreenBuffer.restype = wintypes.HANDLE
+kernel32.CreateConsoleScreenBuffer.argtypes = (
+    wintypes.DWORD,        # _In_       dwDesiredAccess
+    wintypes.DWORD,        # _In_       dwShareMode
+    LPSECURITY_ATTRIBUTES, # _In_opt_   lpSecurityAttributes
+    wintypes.DWORD,        # _In_       dwFlags
+    wintypes.LPVOID)       # _Reserved_ lpScreenBufferData
+
+kernel32.GetConsoleScreenBufferInfoEx.errcheck = _check_zero
+kernel32.GetConsoleScreenBufferInfoEx.argtypes = (
+    wintypes.HANDLE,               # _In_  hConsoleOutput
+    PCONSOLE_SCREEN_BUFFER_INFOEX) # _Out_ lpConsoleScreenBufferInfo
+
+kernel32.SetConsoleScreenBufferInfoEx.errcheck = _check_zero
+kernel32.SetConsoleScreenBufferInfoEx.argtypes = (
+    wintypes.HANDLE,               # _In_  hConsoleOutput
+    PCONSOLE_SCREEN_BUFFER_INFOEX) # _In_  lpConsoleScreenBufferInfo
+
+kernel32.SetConsoleWindowInfo.errcheck = _check_zero
+kernel32.SetConsoleWindowInfo.argtypes = (
+    wintypes.HANDLE,      # _In_ hConsoleOutput
+    wintypes.BOOL,        # _In_ bAbsolute
+    wintypes.PSMALL_RECT) # _In_ lpConsoleWindow
+
+kernel32.FillConsoleOutputCharacterW.errcheck = _check_zero
+kernel32.FillConsoleOutputCharacterW.argtypes = (
+    wintypes.HANDLE,  # _In_  hConsoleOutput
+    wintypes.WCHAR,   # _In_  cCharacter
+    wintypes.DWORD,   # _In_  nLength
+    COORD,            # _In_  dwWriteCoord
+    wintypes.LPDWORD) # _Out_ lpNumberOfCharsWritten
+
+kernel32.ReadConsoleOutputCharacterW.errcheck = _check_zero
+kernel32.ReadConsoleOutputCharacterW.argtypes = (
+    wintypes.HANDLE,  # _In_  hConsoleOutput
+    wintypes.LPWSTR,  # _Out_ lpCharacter
+    wintypes.DWORD,   # _In_  nLength
+    COORD,            # _In_  dwReadCoord
+    wintypes.LPDWORD) # _Out_ lpNumberOfCharsRead
+</code></pre>
+<h2>functions</h2>
+<pre><code>@contextlib.contextmanager
+def allocate_console():
+    allocated = kernel32.AllocConsole()
+    try:
+        yield allocated
+    finally:
+        if allocated:
+            kernel32.FreeConsole()
+
+@contextlib.contextmanager
+def console_screen(ncols=None, nrows=None):
+    info = CONSOLE_SCREEN_BUFFER_INFOEX()
+    new_info = CONSOLE_SCREEN_BUFFER_INFOEX()
+    nwritten = (wintypes.DWORD * 1)()
+    hStdOut = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+    kernel32.GetConsoleScreenBufferInfoEx(
+           hStdOut, ctypes.byref(info))
+    if ncols is None:
+        ncols = info.dwSize.X
+    if nrows is None:
+        nrows = info.dwSize.Y
+    elif nrows &gt; 9999:
+        raise ValueError('nrows must be 9999 or less')
+    fd_screen = None
+    hScreen = kernel32.CreateConsoleScreenBuffer(
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None, CONSOLE_TEXTMODE_BUFFER, None)
+    try:
+        fd_screen = msvcrt.open_osfhandle(
+                        hScreen, os.O_RDWR | os.O_BINARY)
+        kernel32.GetConsoleScreenBufferInfoEx(
+               hScreen, ctypes.byref(new_info))
+        new_info.dwSize = COORD(ncols, nrows)
+        new_info.srWindow = wintypes.SMALL_RECT(
+                Left=0, Top=0, Right=(ncols - 1),
+                Bottom=(info.srWindow.Bottom - info.srWindow.Top))
+        kernel32.SetConsoleScreenBufferInfoEx(
+                hScreen, ctypes.byref(new_info))
+        kernel32.SetConsoleWindowInfo(hScreen, True,
+                ctypes.byref(new_info.srWindow))
+        kernel32.FillConsoleOutputCharacterW(
+                hScreen, u'\0', ncols * nrows, COORD(0,0), nwritten)
+        kernel32.SetConsoleActiveScreenBuffer(hScreen)
+        try:
+            yield fd_screen
+        finally:
+            kernel32.SetConsoleScreenBufferInfoEx(
+                hStdOut, ctypes.byref(info))
+            kernel32.SetConsoleWindowInfo(hStdOut, True,
+                    ctypes.byref(info.srWindow))
+            kernel32.SetConsoleActiveScreenBuffer(hStdOut)
+    finally:
+        if fd_screen is not None:
+            os.close(fd_screen)
+        else:
+            kernel32.CloseHandle(hScreen)
+
+def read_screen(fd):
+    hScreen = msvcrt.get_osfhandle(fd)
+    csbi = CONSOLE_SCREEN_BUFFER_INFOEX()
+    kernel32.GetConsoleScreenBufferInfoEx(
+        hScreen, ctypes.byref(csbi))
+    ncols = csbi.dwSize.X
+    pos = csbi.dwCursorPosition
+    length = ncols * pos.Y + pos.X + 1
+    buf = (ctypes.c_wchar * length)()
+    n = (wintypes.DWORD * 1)()
+    kernel32.ReadConsoleOutputCharacterW(
+        hScreen, buf, length, COORD(0,0), n)
+    lines = [buf[i:i+ncols].rstrip(u'\0')
+                for i in range(0, n[0], ncols)]
+    return u'\n'.join(lines)
+</code></pre>
+<h2>example</h2>
+<pre><code>if __name__ == '__main__':
+    import io
+    import textwrap
+    import subprocess
+
+    text = textwrap.dedent('''\
+        Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do
+        eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut
+        enim ad minim veniam, quis nostrud exercitation ullamco laboris
+        nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor
+        in reprehenderit in voluptate velit esse cillum dolore eu
+        fugiat nulla pariatur. Excepteur sint occaecat cupidatat non
+        proident, sunt in culpa qui officia deserunt mollit anim id est
+        laborum.''')
+
+    cmd = ("python -c \""
+           "print('piped output');"
+           "conout = open(r'CONOUT$', 'w');"
+           "conout.write('''%s''')\"" % text)
+
+    with allocate_console() as allocated:
+        with console_screen(nrows=1000) as fd_conout:
+            stdout = subprocess.check_output(cmd).decode()
+            conout = read_screen(fd_conout)
+            with io.open('result.txt', 'w', encoding='utf-8') as f:
+                f.write(u'stdout:\n' + stdout)
+                f.write(u'\nconout:\n' + conout)
+</code></pre>
+<h2>output</h2>
+<pre class="lang-none prettyprint-override"><code>stdout:
+piped output
+
+conout:
+Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do
+eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut
+enim ad minim veniam, quis nostrud exercitation ullamco laboris
+nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor
+in reprehenderit in voluptate velit esse cillum dolore eu
+fugiat nulla pariatur. Excepteur sint occaecat cupidatat non
+proident, sunt in culpa qui officia deserunt mollit anim id est
+laborum.
+</code></pre>
+</div>
+<span class="comment-copy">Check <a href="http://stackoverflow.com/a/18244152/524743">this</a> for multiline output</span>
+<span class="comment-copy">If you run <code>executable &gt; nul</code>, does it still output to the console? If so, it's ignoring the standard handles and directly opening <code>CONOUT$</code>.</span>
+<span class="comment-copy">@Samuel Thanks, but the problem is not that the output consists of multiple lines, but that it is not what it should be .</span>
+<span class="comment-copy">@eryksun I'm not sure, if I understand you correctly. I added "&gt; nul" to the last line of the .bat file, so that it now reads: "executable.exe %* &gt; nul". This did not change anything about the described scenario, aside from the result string now being "C:\Users\me\Documents\pythonscript\execute\executable.exe "para1|para2|para3"  1&gt;nul".</span>
+<span class="comment-copy">@buggy if you just run your batch file from command line. Will it give the output of executable.exe</span>
+<span class="comment-copy">Wow, thanks for this detailed answer! I got it to work with only one minor change on Windows 8.1, with Python 2.7.11 from Anaconda2 and can now parse the executable's output.</span>
+<span class="comment-copy">There was an AttributeError (<code>'module' object has no attribute 'LPDWORD'</code>) in the ctypes definitions part. And in fact, when I open wintypes.py it does not contain LPDWORD. Defining it manually, <code>localLPDWORD = ctypes.POINTER(wintypes.DWORD)</code>, and using <code>localLPDWORD</code> instead of <code>wintypes.LPDWORD</code> fixed this.</span>
+<span class="comment-copy">Still remaining is a UnicodeDecodeError that I cannot really trace down to anywhere in the code, but it does not stop the script from creating the correct output.</span>
+<span class="comment-copy">I made some changes to support Python 2. <code>read_screen</code> returns a Unicode string, so your code needs to be careful to decode byte strings (2.x <code>str</code>) before mixing them with its output. Also, when writing Unicode to files you should use <code>io.open</code> (it's backported to 2.7 from Python 3) and preferably UTF-8 encoding.</span>

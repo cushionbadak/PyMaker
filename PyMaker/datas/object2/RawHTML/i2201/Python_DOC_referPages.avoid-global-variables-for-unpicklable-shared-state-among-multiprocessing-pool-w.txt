@@ -1,0 +1,180 @@
+<div class="post-text" itemprop="text">
+<p>I frequently find myself writing programs in Python that construct a large (megabytes) read-only data structure and then use that data structure to analyze a very large (hundreds of megabytes in total) list of small records.  Each of the records can be analyzed in parallel, so a natural pattern is to set up the read-only data structure and assign it to a global variable, then create a <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.Pool" rel="noreferrer"><code>multiprocessing.Pool</code></a> (which implicitly copies the data structure into each worker process, via <code>fork</code>) and then use <code>imap_unordered</code> to crunch the records in parallel.  The skeleton of this pattern tends to look like this:</p>
+<pre><code>classifier = None
+def classify_row(row):
+    return classifier.classify(row)
+
+def classify(classifier_spec, data_file):
+    global classifier
+    try:
+        classifier = Classifier(classifier_spec)
+        with open(data_file, "rt") as fp, \
+             multiprocessing.Pool() as pool:
+            rd = csv.DictReader(fp)
+            yield from pool.imap_unordered(classify_row, rd)
+    finally:
+        classifier = None
+</code></pre>
+<p>I'm not happy with this because of the global variable and the implicit coupling between <code>classify</code> and <code>classify_row</code>.  Ideally, I would like to write</p>
+<pre><code>def classify(classifier_spec, data_file):
+    classifier = Classifier(classifier_spec)
+    with open(data_file, "rt") as fp, \
+         multiprocessing.Pool() as pool:
+        rd = csv.DictReader(fp)
+        yield from pool.imap_unordered(classifier.classify, rd)
+</code></pre>
+<p>but this does not work, because the Classifier object usually contains objects which cannot be pickled (because they are defined by extension modules whose authors didn't care about that); I have also read that it would be really slow if it did work, because the Classifier object would get copied into the worker processes on <em>every invocation</em> of the bound method.</p>
+<p>Is there a better alternative?  I only care about 3.x.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This was surprisingly tricky. The key here is to preserve read-access to variables that are available at fork-time without serialization. Most solutions to sharing memory in multiprocessing end up serializing. I tried using a <code>weakref.proxy</code> to pass in a classifier without serialization, but that didn't work because both dill and pickle will try to follow and serialize the referent. <em>However</em>, a module-ref works.</p>
+<p>This organization gets us close:</p>
+<pre><code>import multiprocessing as mp
+import csv
+
+
+def classify(classifier, data_file):
+
+    with open(data_file, "rt") as fp, mp.Pool() as pool:
+        rd = csv.DictReader(fp)
+        yield from pool.imap_unordered(classifier.classify, rd)
+
+
+def orchestrate(classifier_spec, data_file):
+    # construct a classifier from the spec; note that we can
+    # even dynamically import modules here, using config values
+    # from the spec
+    import classifier_module
+    classifier_module.init(classifier_spec)
+    return classify(classifier_module, data_file)
+
+
+if __name__ == '__main__':
+    list(orchestrate(None, 'data.txt'))
+</code></pre>
+<p>A few changes to note here:</p>
+<ul>
+<li>we add an <code>orchestrate</code> method for some DI goodness; orchestrate figures out how to construct/initialize a classifier, and hands it to <code>classify</code>, decoupling the two</li>
+<li><code>classify</code> only needs to assume that the <code>classifier</code> parameter has a <code>classify</code> method; it doesn't care if it's an instance or a module</li>
+</ul>
+<p>For this Proof of Concept, we provide a Classifier that is obviously not serializable:</p>
+<pre><code># classifier_module.py
+def _create_classifier(spec):
+
+    # obviously not pickle-able because it's inside a function
+    class Classifier():
+
+        def __init__(self, spec):
+            pass
+
+        def classify(self, x):
+            print(x)
+            return x
+
+    return Classifier(spec)
+
+
+def init(spec):
+    global __classifier
+    __classifier = _create_classifier(spec)
+
+
+def classify(x):
+    return __classifier.classify(x)
+</code></pre>
+<p>Unfortunately, there's still a global in here, but it's now nicely encapsulated inside a module as a private variable, and the module exports a tight interface composed of the <code>classify</code> and <code>init</code> functions.</p>
+<p>This design unlocks some possibilities:</p>
+<ul>
+<li><code>orchestrate</code> can import and init different classifier modules, based on what it sees in <code>classifier_spec</code></li>
+<li>one could also pass an instance of some <code>Classifier</code> class to <code>classify</code>, as long as this instance is serializable and has a classify method of the same signature</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you want to use forking, I don't see a way around using a global. But I also don't see a reason why you would have to feel bad about using a global in this case, you're not manipulating a global list with multi-threading or so.</p>
+<p>It's possible to cope with the ugliness in your example, though. You want to pass <code>classifier.classify</code> directly, but the <code>Classifier</code> object contains objects which cannot be pickled. </p>
+<pre><code>import os
+import csv
+import uuid
+from threading import Lock
+from multiprocessing import Pool
+from weakref import WeakValueDictionary
+
+class Classifier:
+
+    def __init__(self, spec):
+        self.lock = Lock()  # unpickleable
+        self.spec = spec
+
+    def classify(self, row):
+        return f'classified by pid: {os.getpid()} with spec: {self.spec}', row
+</code></pre>
+<p>I suggest we subclass <code>Classifier</code> and define <code>__getstate__</code> and <code>__setstate__</code> to enable pickling. Since you're using forking anyway, all state it has to pickle, is information how to get a reference to a forked global instance. Then we'll just update the pickled object's <code>__dict__</code> with the <code>__dict__</code> of the forked instance (which hasn't gone through the reduction of pickling) and your instance is complete again.</p>
+<p>To achieve this without additional boilerplate, the subclassed <code>Classifier</code> instance has to generate a name for itself and register this as a global variable. This first reference, will be a weak reference, so the instance can be garbage collected when the user expects it. The second reference is created by the user when he assigns <code>classifier = Classifier(classifier_spec)</code>. This one, doesn't have to be global.</p>
+<p>The generated name in the example below is generated with help of standard-lib's <code>uuid</code> module. An uuid is converted to a string and edited into a valid identifier (it wouldn't have to be, but it's convenient for debugging in interactive mode).</p>
+<pre><code>class SubClassifier(Classifier):
+
+    def __init__(self, spec):
+        super().__init__(spec)
+        self.uuid = self._generate_uuid_string()
+        self.pid = os.getpid()
+        self._register_global()
+
+    def __getstate__(self):
+        """Define pickled content."""
+        return {'uuid': self.uuid}
+
+    def __setstate__(self, state):
+        """Set state in child process."""
+        self.__dict__ = state
+        self.__dict__.update(self._get_instance().__dict__)
+
+    def _get_instance(self):
+        """Get reference to instance."""
+        return globals()[self.uuid][self.uuid]
+
+    @staticmethod
+    def _generate_uuid_string():
+        """Generate id as valid identifier."""
+        # return 'uuid_' + '123' # for testing
+        return 'uuid_' + str(uuid.uuid4()).replace('-', '_')
+
+    def _register_global(self):
+        """Register global reference to instance."""
+        weakd = WeakValueDictionary({self.uuid: self})
+        globals().update({self.uuid: weakd})
+
+    def __del__(self):
+        """Clean up globals when deleted in parent."""
+        if os.getpid() == self.pid:
+            globals().pop(self.uuid)
+</code></pre>
+<p>The sweet thing here is, the boilerplate is totally gone. You don't have to mess manually with declaring and deleting globals since the instance manages everything itself in background:</p>
+<pre><code>def classify(classifier_spec, data_file, n_workers):
+    classifier = SubClassifier(classifier_spec)
+    # assert globals()['uuid_123']['uuid_123'] # for testing
+    with open(data_file, "rt") as fh, Pool(n_workers) as pool:
+        rd = csv.DictReader(fh)
+        yield from pool.imap_unordered(classifier.classify, rd)
+
+
+if __name__ == '__main__':
+
+    PATHFILE = 'data.csv'
+    N_WORKERS = 4
+
+    g = classify(classifier_spec='spec1', data_file=PATHFILE, n_workers=N_WORKERS)
+    for record in g:
+        print(record)
+
+   # assert 'uuid_123' not in globals() # no reference left
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <a href="https://docs.python.org/3.8/library/multiprocessing.html#module-multiprocessing.sharedctypes" rel="nofollow noreferrer"><code>multiprocessing.sharedctypes</code></a> module provides functions for allocating ctypes objects from shared memory which can be inherited by child processes, i.e., parent and children can access the shared memory.</p>
+<p>You could use<br/>
+1. <code>multiprocessing.sharedctypes.RawArray</code> to allocate a ctypes array from the shared memory.<br/>
+2. <code>multiprocessing.sharedctypes.RawValue</code> to allocate a ctypes object from the shared memory.</p>
+<p>Dr Mianzhi Wang has written a <a href="https://research.wmz.ninja/articles/2018/03/on-sharing-large-arrays-when-using-pythons-multiprocessing.html" rel="nofollow noreferrer">very detailed document</a> on this. You could share multiple <code>multiprocessing.sharedctypes</code> objects.</p>
+<p>You may find the <a href="https://stackoverflow.com/questions/52495824/">solution here</a> useful to you.</p>
+</div>
+<span class="comment-copy">Note this design only works if Classifier remains a singleton since a second instantiation would override the data.</span>

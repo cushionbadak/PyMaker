@@ -1,0 +1,94 @@
+<div class="post-text" itemprop="text">
+<p>The following test works fine:</p>
+<pre class="lang-py prettyprint-override"><code>import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine.url import URL
+from sqlalchemy_utils import database_exists, create_database
+
+@pytest.fixture()
+def db_engine():
+    engine = create_engine(
+        URL('postgres',
+            username='postgres', password='postgres', database='my_database')
+    )
+    if not database_exists(engine.url):
+        create_database(engine.url)
+    return engine
+
+
+def test_new_table_is_empty(db_engine):
+    try:
+        db_engine.execute(text('CREATE SCHEMA test_schema;'))
+        db_engine.execute(text('CREATE TABLE test_schema.new_table ();'))
+        result = db_engine.execute(text('SELECT * FROM test_schema.new_table;'))
+        assert result.rowcount == 0
+    finally:
+        try:
+            del result  # The result would block the dropping of
+                        # SCHEMA "test_schema" in the following cleanup.
+        except NameError:
+            pass
+        db_engine.execute(text('DROP SCHEMA IF EXISTS test_schema CASCADE;'))
+</code></pre>
+<p>But <strong>if I make it fail</strong> by changing <code>assert result.rowcount == 0</code> to <code>assert result.rowcount == 1</code>, it <strong>will hang indefinitely</strong> on the last line (where the schema should be dropped) and can't even be aborted by [<strong>Ctrl</strong>+<strong>c</strong>]. I have to <code>kill</code> the <code>py.test</code> process (or the <code>python</code> process, depending on how I invoked the test runner) to terminate it. (If I append</p>
+<pre class="lang-py prettyprint-override"><code>if __name__ == "__main__":
+    test_new_table_is_empty(db_engine())
+</code></pre>
+<p>and run the file as a normal python script instead of through <code>py.test</code>, I get the expected <code>AssertionError</code>.)</p>
+<p>However, if I just replace the assertion by <code>assert False</code> (and run with <code>py.test</code> again), the test suit finishes with one failed test, as expected. Thus, I assume that pytest retains a reference to <code>result</code> iff the assertion failed, probably for the error analysis it displays with the stack trace. <strong>Is that the case?</strong></p>
+<p><strong>How can and should I avoid the blocking?</strong> Should I only ever make test assertions on data fetched from the result rather than on properties of the <a href="http://docs.sqlalchemy.org/en/rel_1_0/core/connections.html#sqlalchemy.engine.ResultProxy" rel="nofollow"><code>ResultProxy</code></a> itself?</p>
+</div>
+<div class="post-text" itemprop="text">
+<h1>TL;DR</h1>
+<p>Call</p>
+<pre><code>result.close()
+</code></pre>
+<p>instead of</p>
+<pre><code>del result
+</code></pre>
+<h1>Answers to your specific questions:</h1>
+<blockquote>
+<p>I assume that pytest retains a reference to <code>result</code> iff the assertion failed, probably for the error analysis it displays with the stack trace. <strong>Is that the case?</strong></p>
+</blockquote>
+<p>That is still my working assumption. If someone knows better, please enlighten me.</p>
+<blockquote>
+<p><strong>How can and should I avoid the blocking?</strong></p>
+</blockquote>
+<p>Instead of <code>del</code>eting the <code>ResultProxy</code> <code>result</code>, explicitly <a href="http://docs.sqlalchemy.org/en/rel_1_0/core/connections.html#sqlalchemy.engine.ResultProxy.close" rel="nofollow"><code>close()</code></a> it in your <code>finally</code> clause:</p>
+<pre><code>def test_new_table_is_empty(db_engine):
+    try:
+        db_engine.execute(text('CREATE SCHEMA test_schema;'))
+        db_engine.execute(text('CREATE TABLE test_schema.new_table ();'))
+        result = db_engine.execute(text('SELECT * FROM test_schema.new_table;'))
+        assert result.rowcount == 0
+    finally:
+        try:
+            result.close()  # Release row and table locks.
+        except NameError:
+            pass
+        db_engine.execute(text('DROP SCHEMA IF EXISTS test_schema CASCADE;'))
+</code></pre>
+<p>That will <a href="http://docs.sqlalchemy.org/en/rel_1_0/glossary.html#term-releases" rel="nofollow">release</a> all row and table locks held by <code>result</code>.</p>
+<p>To <del>avoid the clutter of nested <code>try</code> clauses</del> move the clutter of nested <code>try</code> clauses somewhere else, you can use <a href="https://docs.python.org/3/library/contextlib.html#contextlib.closing" rel="nofollow"><code>with contextlib.closing(...):</code></a>:</p>
+<pre><code>from contextlib import closing
+
+# ...
+
+def test_new_table_is_empty(db_engine):
+    try:
+        db_engine.execute(text('CREATE SCHEMA test_schema;'))
+        db_engine.execute(text('CREATE TABLE test_schema.new_table ();'))
+        with closing(
+                db_engine.execute(text('SELECT * FROM test_schema.new_table;'))
+        ) as result:
+            assert result.rowcount == 0
+    finally:
+        db_engine.execute(text('DROP SCHEMA IF EXISTS test_schema CASCADE;'))
+</code></pre>
+<blockquote>
+<p>Should I only ever make test assertions on data fetched from the result rather than on properties of the <a href="http://docs.sqlalchemy.org/en/rel_1_0/core/connections.html#sqlalchemy.engine.ResultProxy" rel="nofollow"><code>ResultProxy</code></a> itself?</p>
+</blockquote>
+<p>That would only work if you fetch <strong>all</strong> rows, thereby exhausting the <code>ResultProxy</code>, which would implicitly <a href="http://docs.sqlalchemy.org/en/rel_1_0/core/connections.html#sqlalchemy.engine.ResultProxy._soft_close" rel="nofollow"><code>_soft_close()</code></a> it. If the result had (maybe unexpectedly) more rows than you'd fetch, the result would stay open and continue to potentially hold locks that'd keep the following cleanup from being executed.</p>
+<p>As you're only interested in the rowcount in your test and not in the actual result's content, explicitly closing is the better choice than fetching results you won't use, except maybe for counting them or computing their length.</p>
+</div>
+<span class="comment-copy">For those wondering: I'm not using the common pattern of wrapping the test in a DB transaction that will be rolled back after the test, because the real code under test makes DB commits.</span>

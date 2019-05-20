@@ -1,0 +1,285 @@
+<div class="post-text" itemprop="text">
+<p>I have <strong>two classes A and B, each one storing references to objects of the other class</strong> in lists:</p>
+<pre><code>class A:
+    def __init__(self,name):
+        self.name = name
+        self.my_Bs = []
+    def registerB(self,b):
+        self.my_Bs.append(b)
+
+class B:
+    def __init__(self,name):
+        self.name = name
+        self.my_As = []
+    def registerA(self,a):
+        self.my_As.append(a)
+</code></pre>
+<p>Now, my app builds two lists, one of objects of A, one of objects of B, having cross references.</p>
+<pre><code># a list of As, a list of Bs
+list_of_As = [A('firstA'), A('secondA')]
+list_of_Bs = [B('firstB'), B('secondB')]
+# example of one cross-reference
+list_of_As[0].registerB(list_of_Bs[1])
+list_of_Bs[1].registerA(list_of_As[0])
+</code></pre>
+<p>Obviously, if I call <code>json.dumps()</code> on either <code>list_of_...</code>, I get a circular reference error.</p>
+<p>What I want to do to circumvent that issue is to dump JSON with list of <strong>elements <code>name</code> attributes</strong> instead of lists of <strong>objects themselves</strong>:</p>
+<pre><code># This is what I want to obtain for
+# the JSON for list_of_As
+[
+    {'name' : 'firstA', 'my_Bs': ['secondB']},
+    {'name' : 'secondA', 'my_Bs': []}
+]
+</code></pre>
+<p>The only way I can think of is to maintain in each class an additional list of strings (respectively <code>my_Bs_names</code> and <code>my_As_names</code>) and to use <code>JSONEncoder</code> as follows:</p>
+<pre><code>class MyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, 'A'):
+            return { # filter out the list of B objects
+                k: v for k, v in obj.__dict__.items() if k != 'my_Bs'
+            }
+        if isinstance(obj, 'B'):
+            return { # filter out the list of A objects
+                k: v for k, v in obj.__dict__.items() if k != 'my_As'
+            }
+        return super(MyEncoder, self).default(obj)
+
+# Use the custom encoder to dump JSON for list_of_As
+print json.dumps(list_of_As, cls=MyEncoder)
+</code></pre>
+<p>If I am not mistaken, I would get the following result:</p>
+<pre><code># This is what I obtain for
+# the JSON for list_of_As with the code above
+[
+    {'name' : 'firstA', 'my_Bs_names': ['secondB']},
+    {'name' : 'secondA', 'my_Bs_names': []}
+]
+</code></pre>
+<p><strong>Is there a more elegant way of getting this result? For instance one that does not require any additional lists of strings?</strong></p>
+</div>
+<div class="post-text" itemprop="text">
+<h1>General <code>JSONEncoder</code> class that prevents circular reference error</h1>
+<p>The following encoder class <code>MyEncoder</code> performs recursive encoding of the nested objects until a circular reference is detected, whose "name" attribute is returned instead of the object itself. </p>
+<pre class="lang-py prettyprint-override"><code>import json
+class MyEncoder(json.JSONEncoder):
+    def __init__(self, *args, **argv):
+        super().__init__(*args, **argv)
+        self.proc_objs = []
+    def default(self, obj):
+        if isinstance(obj,(A,B)):
+            if obj in self.proc_objs:
+                return obj.name # short circle the object dumping
+            self.proc_objs.append(obj)
+            return obj.__dict__
+        return obj
+
+json.dumps(list_of_As, cls=MyEncoder, check_circular=False, indent=2)
+</code></pre>
+<p>Output:</p>
+<pre><code>[
+  { "name": "firstA",
+    "my_Bs": [
+      { "name": "secondB",
+        "my_As": [ "firstA" ]
+      }
+    ]
+  },
+  { "name": "secondA", "my_Bs": [] }
+]
+</code></pre>
+<h1>Using a custom <code>toJSON</code> method</h1>
+<p>You can implement a <a href="https://stackoverflow.com/a/15538391/6238076">serializer method</a> in your classes.</p>
+<pre class="lang-py prettyprint-override"><code>class JSONable:
+    def toJSON(self):
+        d = dict()
+        for k,v in self.__dict__.items():
+            # save a list of "name"s of the objects in "my_As" or "my_Bs"
+            d[k] = [o.name for o in v] if isinstance(v, list) else v
+        return d
+
+class A(JSONable):
+    def __init__(self,name):
+        self.name = name
+        self.my_Bs = []
+    def register(self,b):
+        self.my_Bs.append(b)
+
+class B(JSONable):
+    def __init__(self,name):
+        self.name = name
+        self.my_As = []
+    def register(self,a):
+        self.my_As.append(a)
+
+json.dumps(list_of_As, default=lambda x: x.toJSON(), indent=2)
+</code></pre>
+<p>Output:</p>
+<pre><code>[
+  { "name":  "firstA",  "my_Bs": [  "secondB" ] },
+  { "name":  "secondA", "my_Bs": [] }
+]
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The best-practice approach is to record the <code>id()</code> values of objects already seen, when encoding. <code>id()</code> values are unique for objects with overlapping lifetimes, and when encoding, you can generally count on the objects not being short-lived. This works on any object type, and doesn't require the objects to be hashable.</p>
+<p>Both the <a href="https://docs.python.org/3/library/copy.html" rel="nofollow noreferrer"><code>copy</code></a> and <a href="https://docs.python.org/3/library/pickle.html" rel="nofollow noreferrer"><code>pickle</code></a> modules use this technique in a <code>memo</code> dictionary that maps <code>id()</code> values to their object for later reference.</p>
+<p>You can use this technique here too; you really only need to keep a <em>set</em> of the ids to detect that you can return the <code>.name</code> attribute. Using a set makes testing for repeated references fast and efficient (membership testing takes O(1) constant time, as opposed to lists, which take O(N) linear time):</p>
+<pre><code>class CircularEncoder(json.JSONEncoder):
+    def __init__(self, *args, **kwargs):
+        kwargs['check_circular'] = False  # no need to check anymore
+        super(CircularEncoder, self).__init__(*args, **kwargs)
+        self._memo = set()
+
+    def default(self, obj):
+        if isinstance(obj, (A, B)):
+            d = id(obj)
+            if d in self._memo:
+                return obj.name
+            self._memo.add(d)
+            return vars(obj)
+        return super(CircularEncoder, self).default(obj)
+</code></pre>
+<p>then use <code>json.dumps()</code> with this class:</p>
+<pre><code>json.dumps(list_of_As, cls=CircularEncoder)
+</code></pre>
+<p>For your sample input, this produces:</p>
+<pre><code>&gt;&gt;&gt; print(json.dumps(list_of_As, cls=CircularEncoder, indent=2))
+[
+  {
+    "name": "firstA",
+    "my_Bs": [
+      {
+        "name": "secondB",
+        "my_As": [
+          "firstA"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "secondA",
+    "my_Bs": []
+  }
+]
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>How about this?</p>
+<ul>
+<li>Classes like <code>A</code> and <code>B</code> only need to specify a class attribute (<code>_deep_fields</code>) listing their attributes that may lead to circular dependencies (need to be "shallow"-serialized)</li>
+<li>They also need to inherit from <code>ShallowSerializable</code> which simply ignores attributes in <code>_deep_fields</code> if <code>shallow</code> is <code>True</code></li>
+<li>The encoder encodes all keys of the object, but calls <code>make_shallow</code> on all values, to make sure that <code>shallow=True</code> is sent to any objects that inherit from <code>ShallowSerializable</code></li>
+<li>The solution is generic, in the sense that any other class that needs to implement this behavior only needs to inherit from <code>ShallowSerializable</code> &amp; define <code>_deep_fields</code>.</li>
+</ul>
+<pre class="lang-py prettyprint-override"><code>class ShallowSerializable(object):
+     _deep_fields = set()
+     def get_dict(self,  shallow=False):
+         return {
+             k: v
+             for k, v in self.__dict__.items()
+             if not shallow or k not in self._deep_fields
+         }
+
+class A(ShallowSerializable):
+    _deep_fields = {'my_Bs'}
+
+    def __init__(self,name):
+        self.name = name
+        self.my_Bs = []
+
+     def registerB(self,b):
+        self.my_Bs.append(b)
+
+class B(ShallowSerializable):
+    _deep_fields = {'my_As'}
+
+    def __init__(self,name):
+        self.name = name
+        self.my_As = []
+
+    def registerA(self,a):
+        self.my_As.append(a)
+
+
+class MyEncoder(json.JSONEncoder):
+    def make_shallow(self, obj):
+        if isinstance(obj, ShallowSerializable):
+            return obj.get_dict(shallow=True)
+        elif isinstance(obj, dict):
+            return {k: self.make_shallow(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self.make_shallow(x) for x in obj]
+        else:
+            return obj
+
+    def default(self, obj):
+        return {
+            k: self.make_shallow(v)
+            for k, v in obj.__dict__.items()
+        }
+
+</code></pre>
+<p>Usage:</p>
+<pre class="lang-py prettyprint-override"><code>list_of_As = [A('firstA'), A('secondA')]
+list_of_Bs = [B('firstB'), B('secondB')]
+# example of one cross-reference
+list_of_As[0].registerB(list_of_Bs[1])
+list_of_Bs[1].registerA(list_of_As[0])
+
+json.dumps(list_of_As, cls=MyEncoder)
+&gt;&gt;&gt; '[{"my_Bs": [{"name": "secondB"}], "name": "firstA"}, {"my_Bs": [], "name": "secondA"}]'
+
+json.dumps(list_of_Bs, cls=MyEncoder)
+&gt;&gt;&gt; '[{"my_As": [], "name": "firstB"}, {"my_As": [{"name": "firstA"}], "name": "secondB"}]'
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You Can do it by changing what string representation of object or say representation of python object made through python magic method this how many libraries changing their console and string representation insted of using hexes of class in return </p>
+<p><a href="https://onlinegdb.com/Hy3VfaqLV" rel="nofollow noreferrer">Run Code Here</a></p>
+<pre><code>import json
+class A:
+    def __init__(self,name):
+        self.name = name
+        self.my_Bs = []
+
+    def registerB(self,b):
+        self.my_Bs.append(b)
+
+    def __str__(self):
+        _storage = {
+            "name" : self.name,
+            "my_Bs": [obj.name for obj in self.my_Bs]
+        }
+        return json.dumps(_storage)
+
+    __repr__ = __str__
+
+class B:
+    def __init__(self,name):
+        self.name = name
+        self.my_As = []
+
+    def registerA(self,a):
+        self.my_As.append(a)
+
+    def __str__(self):
+        _storage = {
+            "name" : self.name,
+            "my_Bs" : [obj.name for obj in self.my_As]
+        }
+        return json.dumps(_storage)
+
+    __repr__ = __str__
+
+
+# a list of As, a list of Bs
+list_of_As = [A('firstA'), A('secondA')]
+list_of_Bs = [B('firstB'), B('secondB')]
+# example of one cross-reference
+list_of_As[0].registerB(list_of_Bs[1])
+list_of_Bs[1].registerA(list_of_As[0])
+str(list_of_As) # will make it done without  more overhead
+</code></pre>
+<p>You can also now optimise your code because it is just changing your representation how it represented without extra class bundle</p>
+</div>
+<span class="comment-copy">I’m not sure that calling your class “generic” is applicable, since your solution (like mine) explicitly tests for specific classes, and requires a <code>.name</code> attribute. Note that using a list to track already-seen objects means your solution will degrade quadraticly with every increase in the number of objects to serialise (as <code>in</code> on a list takes O(N) time and you test objects N times).</span>

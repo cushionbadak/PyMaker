@@ -1,0 +1,112 @@
+<div class="post-text" itemprop="text">
+<p>I have a pet project with the following logic:</p>
+<pre><code>import asyncio, multiprocessing
+
+async def sub_main():
+    print('Hello from subprocess')
+
+def sub_loop():
+    asyncio.get_event_loop().run_until_complete(sub_main())
+
+def start():
+    multiprocessing.Process(target=sub_loop).start()
+
+start()
+</code></pre>
+<p>If you run it, you'll see:</p>
+<pre><code>Hello from subprocess
+</code></pre>
+<p>That is good. But what I have to do is to make <code>start()</code> coroutine instead:</p>
+<pre><code>async def start():
+    multiprocessing.Process(target=sub_loop).start()
+</code></pre>
+<p>To run it, I have to do something like that:</p>
+<pre><code>asyncio.get_event_loop().run_until_complete(start())
+</code></pre>
+<p>Here is the issue: when sub process is created, it gets the whole Python environment cloned, so event loop is already running there:</p>
+<pre><code>Process Process-1:
+Traceback (most recent call last):
+  File "/usr/lib/python3.5/multiprocessing/process.py", line 249, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.5/multiprocessing/process.py", line 93, in run
+    self._target(*self._args, **self._kwargs)
+  File "test.py", line 7, in sub_loop
+    asyncio.get_event_loop().run_until_complete(sub_main())
+  File "/usr/lib/python3.5/asyncio/base_events.py", line 361, in run_until_complete
+    self.run_forever()
+  File "/usr/lib/python3.5/asyncio/base_events.py", line 326, in run_forever
+    raise RuntimeError('Event loop is running.')
+RuntimeError: Event loop is running.
+</code></pre>
+<p>I tried to destroy it on subprocess side with no luck but I think that the correct way is to prevent its sharing with subprocess though. Is it possible somehow? </p>
+<p><strong>UPDATE</strong>:
+Here is the full failing code:</p>
+<pre><code>import asyncio, multiprocessing
+
+import asyncio.unix_events
+
+async def sub_main():
+    print('Hello from subprocess')
+
+def sub_loop():
+    asyncio.get_event_loop().run_until_complete(sub_main())
+
+
+async def start():
+    multiprocessing.Process(target=sub_loop).start()
+
+asyncio.get_event_loop().run_until_complete(start())
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>First, you should consider using <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.BaseEventLoop.run_in_executor" rel="noreferrer">loop.run_in_executor</a> with a <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Executor" rel="noreferrer">ProcessPoolExecutor</a> if you plan to run python subprocesses from within the loop. As for your problem, you can use the <a href="https://docs.python.org/3.4/library/asyncio-eventloops.html#event-loop-policies-and-the-default-policy" rel="noreferrer">event loop policy</a> functions to set a new loop:</p>
+<pre><code>import asyncio
+from concurrent.futures import ProcessPoolExecutor
+
+async def sub_main():
+    print('Hello from subprocess')
+
+def sub_loop():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(sub_main())
+
+async def start(executor):
+    await asyncio.get_event_loop().run_in_executor(executor, sub_loop)
+
+if __name__ == '__main__':
+    executor = ProcessPoolExecutor()
+    asyncio.get_event_loop().run_until_complete(start(executor))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You should always add a check to see how you're running the code (the <code>if __name__ == '__main__':</code> part. Your subprocess is running everything in the module a 2nd time, giving you <em>grief</em> (couldn't resist).</p>
+<pre><code>import asyncio, multiprocessing
+
+async def sub_main():
+    print('Hello from subprocess')
+
+def sub_loop():
+    asyncio.get_event_loop().run_until_complete(sub_main())
+
+
+async def start():
+    multiprocessing.Process(target=sub_loop).start()
+
+if __name__ == '__main__':
+    asyncio.get_event_loop().run_until_complete(start())
+</code></pre>
+</div>
+<span class="comment-copy">I don't have time for a full answer, but you may want to consider a design where (a) your multiprocessing stuff is done by a script that can be invoked using eg. <code>subprocess.Popen([sys.executable, "the_script.py"], ...)</code> (b) this script communicates with its parent on eg. <code>stdout</code> using a designed protocol (it could be totally simple, eg. single byte control characters to the script and status updates back) and (c) using the <a href="https://docs.python.org/3/library/asyncio-subprocess.html" rel="nofollow noreferrer">asyncio subprocess API</a>.</span>
+<span class="comment-copy">(I don't mean you should use <code>subprocess.Popen</code> and asyncio's subprocess API at the same time, just that you should write your script so that it <i>could be</i> controlled as any language-agnostic subprocess.)</span>
+<span class="comment-copy">@detly Thank for the suggestion, but there is a plenty of data which should be inherited by subprocess. If there is a simple solution to avoid the mentioned problem, I'd prefer it rather then rewriting all multiprocessing stuff by hand.</span>
+<span class="comment-copy">That's fair enough, it's not a trivial undertaking.</span>
+<span class="comment-copy">I think that this is possible since I've found a hack which seems to be working but only on unix platform. <code>sub_loop</code> can start with <code>asyncio.set_event_loop(asyncio.unix_events._UnixSelectorEventLoop())</code> which will create a new loop for the subprocess while the parent's one would be (hopefully) garbage collected</span>
+<span class="comment-copy">Right... I seem to be blind since I've missed this obvious function <code>asyncio.new_event_loop()</code>. Thanks! Could you please explain to me what is the profit of <code>ProcessPoolExecutor</code> in that case?</span>
+<span class="comment-copy">@Grief <code>run_in_executor</code> is a coroutine so you can easily join your subprocess using <code>await</code> or <code>asyncio.wait_for</code> for instance. <code>ProcessPoolExecutor</code> also lets you specify a number of workers.</span>
+<span class="comment-copy">Thanks for pointing out the need for creating a new event loop in the created subprocess. This was the key bit I was missing - otherwise was getting a very cryptic <code>Bad file descriptor</code> error.</span>
+<span class="comment-copy">I guess this is only unix-related since this ends up with the same result, I mean exactly the same exception.</span>
+<span class="comment-copy">@Grief:  I'll see if I can replicate your issue in a linux env.</span>
+<span class="comment-copy">By the way, they changed that part in the python3 documentation. It was <code>For an explanation of why (on Windows) the if __name__ == '__main__' part is necessary, see Programming guidelines.</code> in <a href="https://docs.python.org/2/library/multiprocessing.html#multiprocessing-programming" rel="nofollow noreferrer">docs.python.org/2/library/…</a> and now it is just <code>For an explanation of why the if __name__ == '__main__' part is necessary, see Programming guidelines.</code> I believe that nothing changed under the hood here and the removal of Windows mention is just a push toward cross platform coding.</span>
+<span class="comment-copy">@Grief: ...well, now your question is interesting (to me).  Different results on windows and linux.  I get your exception running on linux.</span>
+<span class="comment-copy">I guess I can try-catch exception and do <code>asyncio.set_event_loop(asyncio.unix_events._UnixSelectorEventLoop())</code> if error occurred. At least as a workaround for now. However, I'd prefer something more reliable.</span>

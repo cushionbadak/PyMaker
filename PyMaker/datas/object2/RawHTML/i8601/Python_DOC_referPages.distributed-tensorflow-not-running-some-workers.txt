@@ -1,0 +1,135 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to get a very simple example of distributed TensorFlow working. However, I'm having a bug that appears non-deterministically between runs. On some runs, it works perfectly. Outputting something along the lines of:</p>
+<pre><code>Worker 2 | step 0
+Worker 0 | step 0
+Worker 1 | step 0
+Worker 3 | step 0
+Worker 2 | step 1
+Worker 0 | step 1
+Worker 1 | step 1
+Worker 3 | step 1
+...
+</code></pre>
+<p>However, every once in a while, one or more of the workers fails to run, resulting in output like this:</p>
+<pre><code>Worker 0 | step 0
+Worker 3 | step 0
+Worker 0 | step 1
+Worker 3 | step 1
+Worker 0 | step 2
+Worker 3 | step 2
+...
+</code></pre>
+<p>If I run the loop indefinitely, it seems that the missing workers always startup at some point, but only minutes later, which isn't practical.</p>
+<p>I've found that two things make the issue go away (but make the program useless): 1. Not declaring any tf Variables inside the <code>with tf.device(tf.train.replica_device_setter())</code> scope. If I even declare one variable (e.g. <code>nasty_var</code> below), the issue starts cropping up. and 2. setting the <code>is_chief</code> param in <code>tf.train.MonitoredTrainingSession()</code> to <code>True</code> for all workers. This causes the bug to go away even if variables are declared, but it seems wrong to make all of the workers the chief. The way I'm currently setting it below - <code>is_chief=(task_index == 0)</code> - is taken directly from a TensorFlow tutorial.</p>
+<p>Here's the simplest code I can get to replicate the issue. (You may have to run multiple times to see the bug, but it almost always shows up within 5 runs</p>
+<pre><code>from multiprocessing import Process
+import tensorflow as tf
+from time import sleep
+from numpy.random import random_sample
+
+cluster = tf.train.ClusterSpec({'ps': ['localhost:2222'],
+                                'worker': ['localhost:2223',
+                                           'localhost:2224',
+                                           'localhost:2225',
+                                           'localhost:2226']})
+
+
+def create_worker(task_index):
+    server = tf.train.Server(cluster, job_name='worker', task_index=task_index)
+
+    with tf.device(tf.train.replica_device_setter(worker_device="/job:worker/task:%d" % task_index, cluster=cluster)):
+        nasty_var = tf.Variable(0)  # This line causes the problem. No issue when this is commented out.
+
+    with tf.train.MonitoredTrainingSession(master=server.target, is_chief=(task_index == 0)):
+        for step in xrange(10000):
+            sleep(random_sample())  # Simulate some work being done.
+            print 'Worker %d | step %d' % (task_index, step)
+
+
+def create_ps(task_index):
+    param_server = tf.train.Server(cluster, job_name='ps',
+                                   task_index=task_index)
+    param_server.join()
+
+# Launch workers and ps in separate processes.
+processes = []
+for i in xrange(len(cluster.as_dict()['worker'])):
+    print 'Forking worker process ', i
+    p = Process(target=create_worker, args=[i])
+    p.start()
+    processes.append(p)
+
+for i in xrange(len(cluster.as_dict()['ps'])):
+    print 'Forking ps process ', i
+    p = Process(target=create_ps, args=[i])
+    p.start()
+    processes.append(p)
+
+for p in processes:
+    p.join()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'm guessing the cause here is the implicit coordination protocol in how a <a href="https://www.tensorflow.org/api_docs/python/tf/train/MonitoredTrainingSession" rel="noreferrer"><code>tf.train.MonitoredTrainingSession</code></a> starts, which is implemented <a href="https://github.com/tensorflow/tensorflow/blob/f843fb989162fe3f7dec00aebba32551c831bb66/tensorflow/python/training/session_manager.py#L347" rel="noreferrer">here</a>:</p>
+<ul>
+<li><p>If this session is the chief:</p>
+<ul>
+<li>Run the variable initializer op.</li>
+</ul></li>
+<li><p>Else (if this session is not the chief):</p>
+<ul>
+<li>Run an op to check if the variables has been initialized.</li>
+<li>While any of the variables has not yet been initialized.
+
+<ul>
+<li>Wait 30 seconds.</li>
+<li>Try creating a new session, and checking to see if the variables have been initialized.</li>
+</ul></li>
+</ul></li>
+</ul>
+<p>(I discuss the rationale behind this protocol in a <a href="https://youtu.be/la_M6bCV91M?t=18m50s" rel="noreferrer">video about Distributed TensorFlow</a>.)</p>
+<p>When every session is the chief, or there are no variables to initialize, the <code>tf.train.MonitoredTrainingSession</code> will always start immediately. However, once there is a single variable, and you only have a single chief, you will see that the non-chief workers have to wait for the chief to act.</p>
+<p>The reason for using this protocol is that it is robust to various processes failing, and the delay—while very noticeable when running everything on a single process—is short compared to the expected running time of a typical distributed training job.</p>
+<p>Looking at <a href="https://github.com/tensorflow/tensorflow/blob/f843fb989162fe3f7dec00aebba32551c831bb66/tensorflow/python/training/session_manager.py#L347" rel="noreferrer">the implementation again</a>, it does seem that this 30-second timeout should be configurable (as the <code>recovery_wait_secs</code> argument to <a href="https://www.tensorflow.org/api_docs/python/tf/train/SessionManager" rel="noreferrer"><code>tf.train.SessionManager()</code></a>), but there is currently no way to set this timeout when you create a <code>tf.train.MonitoredTrainingSession</code>, because it uses a hardcoded set of arguments <a href="https://github.com/tensorflow/tensorflow/blob/f843fb989162fe3f7dec00aebba32551c831bb66/tensorflow/python/training/monitored_session.py#L417" rel="noreferrer">for creating a session manager</a>.
+This seems like an oversight in the API, so please feel free to open a feature request on the <a href="https://github.com/tensorflow/tensorflow/issues" rel="noreferrer">GitHub issues page</a>!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As mrry said, the problem exists because:</p>
+<ol>
+<li>Non-chief relies on chief to initialize the model.</li>
+<li>If it isn't initialized, then it waits for 30 secs.</li>
+</ol>
+<p>Performance-wise, there's no difference to wait for the chief and kicks in at the next 30s. However, I was doing a research recently which required me to enforce strictly synchronized update, and this problem needed to be taken care of.</p>
+<p>The key here is to use a barrier, depending on your distributed setting. Assume you are using thread-1 to run ps, and thread-2~5 to run workers, then you only need to:</p>
+<ol>
+<li>Instead of using a MonitoredTrainingSession, use a tf.train.Supervisor, which enables you to set recovery_wait_secs, with default=30s. Change it to 1s to reduce your wait time.</li>
+</ol>
+<blockquote>
+<p>sv = tf.train.Supervisor(is_chief=is_chief,
+                                   logdir=...
+                                   init_op=...
+                                   ...
+                                   recovery_wait_secs=1s)</p>
+<p>sess = sv.prepare_or_wait_for_session(server.target,
+  config=sess_config)</p>
+</blockquote>
+<ol start="2">
+<li>Use a <a href="https://docs.python.org/3/library/threading.html#barrier-objects" rel="nofollow noreferrer">barrier</a>. Assume you are using threads:</li>
+</ol>
+<p>In main:</p>
+<pre><code>barrier = threading.Barrier(parties=num_workers)
+
+for i in range(num_workers):
+    threads.append(threading.Thread(target=run_model, args=("worker", i, barrier, )))
+threads.append(threading.Thread(target=run_model, args=("ps", 0, barrier, )))
+</code></pre>
+<p>In actual training function:</p>
+<pre><code>_ = sess.run([train_op], feed_dict=train_feed)
+barrier.wait()
+</code></pre>
+<p>Then just proceeds happily. The barrier will make sure that all models reaches this step, and there's for sure no race conditions.</p>
+</div>
+<span class="comment-copy">Thanks for the answer! This helps me understand why those two changes would make the issue go away; however, I still don't understand why some of the non-chief workers would recognize that the variables have been initialized and start working, while some don't (especially since they are all local)</span>
+<span class="comment-copy">Do all the non-chief workers <i>eventually</i> start? If so, I think this can be explained by a race between the <code>run()</code> call that performs initialization and the <code>run()</code> call that checks to see if the variables have been initialized.</span>
+<span class="comment-copy">Yes, they all eventually start if I run the loop indefinitely, but the slower ones sometimes wont start until  minutes after the first non-chief workers, which doesn't line up with the 30s timeout</span>
+<span class="comment-copy">Can you try running with the following environment variables set: <code>GRPC_VERBOSITY_LEVEL=DEBUG GRPC_TRACE=all</code>? It's possible that it's hitting a timeout and retry loop at some other level of the stack, and looking for retries at the network level would make it clearer what was being retried.</span>

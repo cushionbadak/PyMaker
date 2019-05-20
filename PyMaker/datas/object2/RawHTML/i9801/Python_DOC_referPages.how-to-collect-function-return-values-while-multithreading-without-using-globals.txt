@@ -1,0 +1,138 @@
+<div class="post-text" itemprop="text">
+<p>So I'm trying to work out a generic solution that will collect all values from a function and append them to a list that is later accessible.  This is to be used during <code>concurrent.futures</code> or <code>threading</code> type tasks.  Here is a solution I have using a global <code>master_list</code>:</p>
+<pre><code>from concurrent.futures import ThreadPoolExecutor
+
+master_list = []
+def return_from_multithreaded(func):
+    # master_list = []
+    def wrapper(*args, **kwargs):
+        # nonlocal master_list
+        global master_list
+        master_list += func(*args, **kwargs)
+    return wrapper
+
+
+@return_from_multithreaded
+def f(n):
+    return [n]
+
+
+with ThreadPoolExecutor(max_workers=20) as exec:
+    exec.map(f, range(1, 100))
+
+print(master_list)
+</code></pre>
+<p>I would like to find a solution that does not include globals, and perhaps can return the commented out <code>master_list</code> that is stored as a closure?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you don't want to use globals, don't discard the results of <code>map</code>. <code>map</code> is giving you back the values returned by each function, you just ignored them. This code could be made much simpler by using <code>map</code> for its intended purpose:</p>
+<pre><code>def f(n):
+    return n  # No need to wrap in list
+
+with ThreadPoolExecutor(max_workers=20) as exec:
+    master_list = list(exec.map(f, range(1, 100)))
+
+print(master_list)
+</code></pre>
+<p>If you need a <code>master_list</code> that shows the results computed so far (maybe some other thread is watching it), you just make the loop explicit:</p>
+<pre><code>def f(n):
+    return n  # No need to wrap in list
+
+master_list = []
+with ThreadPoolExecutor(max_workers=20) as exec:
+    for result in exec.map(f, range(1, 100)):
+        master_list.append(result)
+
+print(master_list)
+</code></pre>
+<p>This is what the Executor model is designed for; normal threads aren't intended to return values, but Executors provided a channel for returning values under the covers so you don't have to manage it yourself. Internally, this is using Queues of some form or another, with additional metadata to keep the results in order, but you don't need to deal with that complexity; from your perspective, it's equivalent to the regular <code>map</code> function, it just happens to parallelize the work.</p>
+<hr/>
+<p><strong>Update</strong> to cover dealing with exceptions:</p>
+<p><code>map</code> will raise any exceptions raised in the workers when the result is hit. Thus, as written, the first set of code will not store anything if any of the tasks fail (the <code>list</code> will be partially constructed, but thrown away when the exception raises). The second example will only keep results before the first exception is thrown, with the rest discarded (you'd have to store the <code>map</code> iterator and use some awkward code to avoid it). If you need to store all successful results, ignoring failures (or just logging them in some way), it's easiest to use <code>submit</code> to create a <code>list</code> of <code>Future</code> objects, then wait on them, either serially or in order of completion, wrapping the <code>.result()</code> calls in <code>try</code>/<code>except</code> to avoid throwing away good results. For example, to store results in order of submission, you'd do:</p>
+<pre><code>master_list = []
+with ThreadPoolExecutor(max_workers=20) as exec:
+    futures = [exec.submit(f, i) for i in range(1, 100)]
+    exec.shutdown(False)  # Optional: workers terminate as soon as all futures finish,
+                          # rather than waiting for all results to be processed
+    for fut in futures:
+        try:
+            master_list.append(fut.result())
+        except Exception:
+            ... log error here ...
+</code></pre>
+<p>For more efficient code, you can retrieve results in order of completion, not submission, using <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.as_completed" rel="nofollow noreferrer"><code>concurrent.futures.as_completed</code></a> to eagerly retrieve results as they finish. The only change from the previous code is that:</p>
+<pre><code>    for fut in futures:
+</code></pre>
+<p>becomes:</p>
+<pre><code>    for fut in concurrent.futures.as_completed(futures):
+</code></pre>
+<p>where <code>as_completed</code> does the work of <code>yield</code>ing completed/cancelled futures as soon as they complete, instead of delaying until all futures submitted earlier complete and get handled.</p>
+<p>There are more complicated options involving using <code>add_done_callback</code> so the main thread isn't involved in explicitly handling the results at all, but that's usually unnecessary, and often confusing, so it's best avoided if possible.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I have faced this issue in the past: <a href="https://stackoverflow.com/questions/40536287/running-multiple-asynchronous-function-and-get-the-returned-value-of-each-functi"><em>Running multiple asynchronous function and get the returned value of each function</em></a>. This was my approach to do it:</p>
+<pre><code>def async_call(func_list):
+    """
+    Runs the list of function asynchronously.
+
+    :param func_list: Expects list of lists to be of format
+        [[func1, args1, kwargs1], [func2, args2, kwargs2], ...]
+    :return: List of output of the functions
+        [output1, output2, ...]
+    """
+    def worker(function, f_args, f_kwargs, queue, index):
+        """
+        Runs the function and appends the output to list, and the Exception in the case of error
+        """
+        response = {
+            'index': index,  # For tracking the index of each function in actual list.
+                             # Since, this function is called asynchronously, order in
+                             # queue may differ
+            'data': None,
+            'error': None
+        }
+
+        # Handle error in the function call
+        try:
+            response['data'] = function(*f_args, **f_kwargs)
+        except Exception as e:
+            response['error'] = e  # send back the exception along with the queue
+
+        queue.put(response)
+    queue = Queue()
+    processes = [Process(target=worker, args=(func, args, kwargs, queue, i)) \
+                    for i, (func, args, kwargs) in enumerate(func_list)]
+
+    for process in processes:
+        process.start()
+
+    response_list = []
+    for process in processes:
+        # Wait for process to finish
+        process.join()
+
+        # Get back the response from the queue
+        response = queue.get()
+        if response['error']:
+            raise response['error']   # Raise exception if the function call failed
+        response_list.append(response)
+
+    return [content['data'] for content in sorted(response_list, key=lambda x: x['index'])]
+</code></pre>
+<p>Sample run:</p>
+<pre><code>def my_sum(x, y):
+    return x + y
+
+def your_mul(x, y):
+    return x*y
+
+my_func_list = [[my_sum, [1], {'y': 2}], [your_mul, [], {'x':1, 'y':2}]]
+
+async_call(my_func_list)
+# Value returned: [3, 2]
+</code></pre>
+</div>
+<span class="comment-copy">+1 for sharing the nice piece of information. I had one doubt, how does it behave if exception is raised by the passed function? Does it handles that?</span>
+<span class="comment-copy">@Moinuddin In my experience, to do error handling with ThreadPoolExcecutors instead of <code>map</code> you use <code>submit</code>, which returns a future, and then call <code>future.result()</code> after it has completed.  This will raise any exceptions that were caught.</span>
+<span class="comment-copy">@flybonzai: Yar. Make a <code>list</code> of <code>Future</code>s, then, if order of results matters, just iterate the <code>list</code> and call <code>result</code> on them sequentially (wrapped in <code>try</code>/<code>except</code> to handle exceptions raised in the worker). If order of results doesn't matter, <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.as_completed" rel="nofollow noreferrer">use <code>concurrent.futures.as_completed</code></a> which yields the <code>Future</code> objects as they finish (successfully or due to an exception); again, you call <code>result</code> in a <code>try</code>/<code>except</code> block to handle errors. The latter is generally more efficient if order unimportant.</span>
+<span class="comment-copy">@MoinuddinQuadri: I updated the answer to cover recovering from exceptions.</span>

@@ -1,0 +1,174 @@
+<div class="post-text" itemprop="text">
+<p>I would like to use a queue for passing data from a parent to a child process which is launched via <code>multiprocessing.Process</code>. However, since the parent process uses Python's new <code>asyncio</code> library, the queue methods need to be non-blocking. As far as I understand, <code>asyncio.Queue</code> is made for inter-task communication and cannot be used for inter-process communication. Also, I know that <code>multiprocessing.Queue</code> has the <code>put_nowait()</code> and <code>get_nowait()</code> methods but I actually need coroutines that would still block the current task (but not the whole process). Is there some way to create coroutines that wrap <code>put_nowait()</code>/<code>get_nowait()</code>? On another note, are the threads that <code>multiprocessing.Queue</code> uses internally compatible after all with an event loop running in the same process?</p>
+<p>If not, what other options do I have? I know I could implement such a queue myself by making use of asynchronous sockets but I hoped I could avoid that… </p>
+<p><strong>EDIT:</strong>
+I also considered using pipes instead of sockets but it seems <code>asyncio</code> is not compatible with <a href="https://docs.python.org/dev/library/multiprocessing.html#multiprocessing.Pipe" rel="noreferrer"><code>multiprocessing.Pipe()</code></a>. More precisely, <code>Pipe()</code> returns a tuple of <a href="https://docs.python.org/dev/library/multiprocessing.html#multiprocessing.Connection" rel="noreferrer"><code>Connection</code></a> objects which are <em>not</em> file-like objects. However, <code>asyncio.BaseEventLoop</code>'s methods <a href="https://docs.python.org/3.4/library/asyncio-eventloop.html#watch-file-descriptors" rel="noreferrer"><code>add_reader()</code>/<code>add_writer()</code></a> methods and <a href="https://docs.python.org/3.4/library/asyncio-eventloop.html#connect-pipes" rel="noreferrer"><code>connect_read_pipe()</code>/<code>connect_write_pipe()</code></a> all expect file-like objects, so it is impossible to asynchronously read from/write to such a <code>Connection</code>. In contrast, the usual file-like objects that the <code>subprocess</code> package uses as pipes pose no problem at all and <a href="https://code.google.com/p/tulip/source/browse/examples/child_process.py" rel="noreferrer">can easily be used in combination with <code>asyncio</code></a>.</p>
+<p><strong>UPDATE:</strong>
+I decided to explore the pipe approach a bit further: I converted the <code>Connection</code> objects  returned by <code>multiprocessing.Pipe()</code> into file-like objects by retrieving the file descriptor via <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Connection.fileno" rel="noreferrer"><code>fileno()</code></a> and passing it to <code>os.fdopen()</code>. Finally, I passed the resulting file-like object to the event loop's <code>connect_read_pipe()</code>/<code>connect_write_pipe()</code>. (There is some <a href="https://groups.google.com/forum/#!topic/python-tulip/6tRswyRhwE4" rel="noreferrer">mailing list discussion</a> on a related issue if someone is interested in the exact code.) However, <code>read()</code>ing the stream gave me an <code>OSError: [Errno 9] Bad file descriptor</code> and I didn't manage to fix this. Also considering the <a href="https://docs.python.org/3/library/asyncio-eventloops.html#windows" rel="noreferrer">missing support for Windows</a>, I will not pursue this any further. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here is an implementation of a <code>multiprocessing.Queue</code> object that can be used with <code>asyncio</code>. It provides the entire <code>multiprocessing.Queue</code> interface, with the addition of <code>coro_get</code> and <code>coro_put</code> methods, which are <code>asyncio.coroutine</code>s that can be used to asynchronously get/put from/into the queue. The implementation details are essentially the same as the second example of my other answer: <code>ThreadPoolExecutor</code> is used to make the get/put asynchronous, and a <code>multiprocessing.managers.SyncManager.Queue</code> is used to share the queue between processes. The only additional trick is implementing <code>__getstate__</code> to keep the object picklable despite using a non-picklable <code>ThreadPoolExecutor</code> as an instance variable.</p>
+<pre><code>from multiprocessing import Manager, cpu_count
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+def AsyncProcessQueue(maxsize=0):
+    m = Manager()
+    q = m.Queue(maxsize=maxsize)
+    return _ProcQueue(q)   
+
+class _ProcQueue(object):
+    def __init__(self, q):
+        self._queue = q
+        self._real_executor = None
+        self._cancelled_join = False
+
+    @property
+    def _executor(self):
+        if not self._real_executor:
+            self._real_executor = ThreadPoolExecutor(max_workers=cpu_count())
+        return self._real_executor
+
+    def __getstate__(self):
+        self_dict = self.__dict__
+        self_dict['_real_executor'] = None
+        return self_dict
+
+    def __getattr__(self, name):
+        if name in ['qsize', 'empty', 'full', 'put', 'put_nowait',
+                    'get', 'get_nowait', 'close']:
+            return getattr(self._queue, name)
+        else:
+            raise AttributeError("'%s' object has no attribute '%s'" % 
+                                    (self.__class__.__name__, name))
+
+    @asyncio.coroutine
+    def coro_put(self, item):
+        loop = asyncio.get_event_loop()
+        return (yield from loop.run_in_executor(self._executor, self.put, item))
+
+    @asyncio.coroutine    
+    def coro_get(self):
+        loop = asyncio.get_event_loop()
+        return (yield from loop.run_in_executor(self._executor, self.get))
+
+    def cancel_join_thread(self):
+        self._cancelled_join = True
+        self._queue.cancel_join_thread()
+
+    def join_thread(self):
+        self._queue.join_thread()
+        if self._real_executor and not self._cancelled_join:
+            self._real_executor.shutdown()
+
+@asyncio.coroutine
+def _do_coro_proc_work(q, stuff, stuff2):
+    ok = stuff + stuff2
+    print("Passing %s to parent" % ok)
+    yield from q.coro_put(ok)  # Non-blocking
+    item = q.get() # Can be used with the normal blocking API, too
+    print("got %s back from parent" % item)
+
+def do_coro_proc_work(q, stuff, stuff2):
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(_do_coro_proc_work(q, stuff, stuff2))
+
+@asyncio.coroutine
+def do_work(q):
+    loop.run_in_executor(ProcessPoolExecutor(max_workers=1),
+                         do_coro_proc_work, q, 1, 2)
+    item = yield from q.coro_get()
+    print("Got %s from worker" % item)
+    item = item + 25
+    q.put(item)
+
+if __name__  == "__main__":
+    q = AsyncProcessQueue()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(do_work(q))
+</code></pre>
+<p>Output:</p>
+<pre><code>Passing 3 to parent
+Got 3 from worker
+got 28 back from parent
+</code></pre>
+<p>As you can see, you can use the <code>AsyncProcessQueue</code> both synchronously and asynchronously, from either the parent or child process. It doesn't require any global state, and by encapsulating most of the complexity in a class, is more elegant to use than my original answer.</p>
+<p>You'll probably be able to get better performance using sockets directly, but getting that working in a cross-platform way seems to be pretty tricky. This also has the advantage of being usable across multiple workers, won't require you to pickle/unpickle yourself, etc.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <code>multiprocessing</code> library isn't particularly well-suited for use with <code>asyncio</code>, unfortunately. Depending on how you were planning to use the <code>multiprocessing</code>/<code>multprocessing.Queue</code>, however, you may be able to replace it completely with a <a href="https://docs.python.org/3.4/library/concurrent.futures.html#processpoolexecutor" rel="nofollow"><code>concurrent.futures.ProcessPoolExecutor</code></a>:</p>
+<pre><code>import asyncio
+from concurrent.futures import ProcessPoolExecutor
+
+
+def do_proc_work(stuff, stuff2):  # This runs in a separate process
+    return stuff + stuff2
+
+@asyncio.coroutine
+def do_work():
+    out = yield from loop.run_in_executor(ProcessPoolExecutor(max_workers=1),
+                                          do_proc_work, 1, 2)
+    print(out)
+
+if __name__  == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(do_work())
+</code></pre>
+<p>Output:</p>
+<pre><code>3
+</code></pre>
+<p>If you absolutely need a <code>multiprocessing.Queue</code>, It seems like it will behave ok when combined with <code>ProcessPoolExecutor</code>:</p>
+<pre><code>import asyncio
+import time
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+
+def do_proc_work(q, stuff, stuff2):
+    ok = stuff + stuff2
+    time.sleep(5) # Artificial delay to show that it's running asynchronously
+    print("putting output in queue")
+    q.put(ok)
+
+@asyncio.coroutine
+def async_get(q):
+    """ Calls q.get() in a separate Thread. 
+
+    q.get is an I/O call, so it should release the GIL.
+    Ideally there would be a real non-blocking I/O-based 
+    Queue.get call that could be used as a coroutine instead 
+    of this, but I don't think one exists.
+
+    """
+    return (yield from loop.run_in_executor(ThreadPoolExecutor(max_workers=1), 
+                                           q.get))
+
+@asyncio.coroutine
+def do_work(q):
+    loop.run_in_executor(ProcessPoolExecutor(max_workers=1),
+                         do_proc_work, q, 1, 2)
+    coro = async_get(q) # You could do yield from here; I'm not just to show that it's asynchronous
+    print("Getting queue result asynchronously")
+    print((yield from coro))
+
+if __name__  == "__main__":
+    m = multiprocessing.Manager()
+    q = m.Queue() # The queue must be inherited by our worker, it can't be explicitly passed in
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(do_work(q))
+</code></pre>
+<p>Output:</p>
+<pre><code>Getting queue result asynchronously
+putting output in queue
+3
+</code></pre>
+</div>
+<span class="comment-copy">How is the child process being launched?</span>
+<span class="comment-copy">The child process is created via <code>multiprocessing.Process</code>.</span>
+<span class="comment-copy">Accepted. :) Thank you very much for your time and effort!</span>
+<span class="comment-copy">@balu No problem. Very interesting question! I'm still hoping we see some better integration of <code>asyncio</code> and <code>multiprocessing</code> (similar to <code>asyncio.subprocess</code>), or at least a process-safe version of <code>asyncio.Queue</code>, in the standard library at some point, but for now this seems like a decent stopgap.</span>
+<span class="comment-copy">For what it's worth, I ended up taking this idea and building a complete library, called <a href="https://github.com/dano/aioprocessing" rel="nofollow noreferrer"><code>aioprocessing</code></a>, that provides similar functionality for all the <code>multiprocessing</code> classes.</span>
+<span class="comment-copy">I really need a queue since both processes run indefinitely and I will need to pass data from one to the other all the time. More specifically, the child process forwards queries to an SQLite database that arrive through the queue. The reasoning behind this was, ironically, to be able to run those queries asynchronously by putting them in a queue and executing them in a different process (as SQLite calls are blocking).  Anyway, your 2nd suggestion looks interesting. Though, I feel it's more efficient and, considering the global state, more elegant to just use a socket.</span>
+<span class="comment-copy">By the way: Could you explain why it's not possible to explicitly pass the queue to the worker?</span>
+<span class="comment-copy">@balu Attempting to pass a <code>multprocessing.Queue</code> directly raises <code>RuntimeError: Queue objects should only be shared between processes through inheritance</code>. Letting the <code>Queue</code> be inherited in the example code works on Linux, but I found it actually hangs on Windows. Using a <code>multprocessing.manager.Queue</code> (which <i>can</i> be passed explicitly between processes) seems to work on all platforms, though. I've updated my answer to reflect that.</span>
+<span class="comment-copy">Thank you for your answer. I'm a bit confused, now, because the code example in the <a href="https://docs.python.org/3/library/multiprocessing.html#exchanging-objects-between-processes" rel="nofollow noreferrer">Python docs</a> explicitly passes a <code>multiprocessing.Queue</code> to <code>multiprocessing.Process</code>.</span>
+<span class="comment-copy">@balu Yes, I'm not exactly what about the implementation makes it legal, but you're allowed to pass a <code>Queue</code> to the constructor of a <code>Process</code> or a <code>Pool</code> (using the <code>initializer</code>/<code>initargs</code> keyword arguments). However, if you try to pass a <code>Queue</code> to a <code>pool.apply</code> call, it will raise the <code>RuntimeError</code>. It appears that if you pass the queue along prior to the child process actually starting, it's allowed. In the case of <code>pool.apply</code> and passing it to a <code>ProcessPoolExecutor</code>, the child process is already started, so the <code>Queue</code> can't be passed.</span>

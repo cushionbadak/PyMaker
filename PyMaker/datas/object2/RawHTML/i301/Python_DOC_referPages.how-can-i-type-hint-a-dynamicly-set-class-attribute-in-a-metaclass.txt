@@ -1,0 +1,156 @@
+<div class="post-text" itemprop="text">
+<p>When I dynamically set the attribute of a class:</p>
+<pre><code>from typing import TypeVar, Generic, Optional, ClassVar, Any
+
+class IntField:
+    type = int
+
+class PersonBase(type):
+    def __new__(cls):
+        for attr, value in cls.__dict__.items():
+            if not isinstance(value, IntField):
+                continue
+            setattr(cls, attr, value.type())
+        return cls
+
+class Person(PersonBase):
+    age = IntField()
+
+person = Person()
+
+print(type(Person.age)) # &lt;class 'int'&gt;
+print(type(person.age)) # &lt;class 'int'&gt;
+person.age = 25 # Incompatible types in assignment (expression has type "int", variable has type "IntField")
+</code></pre>
+<p>The type of the <code>age</code> attribute will be of type <code>int</code>, but MyPy cannot follow that.</p>
+<p>Is there a way I can make MyPy understand?</p>
+<p>Django has it implemented:</p>
+<pre><code>from django.db import models
+
+class Person(models.Model):
+    age = models.IntegerField()
+
+person = Person()
+print(type(Person.age)) # &lt;class 'django.db.models.query_utils.DeferredAttribute'&gt;
+print(type(person.age)) # &lt;class 'int'&gt;
+person.age = 25  # No error
+</code></pre>
+<p>How does Django do this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since you define the field on the class, the practical approach is to type-hint the field. Note that you must tell <code>mypy</code> to not check the line itself, though.</p>
+<pre><code>class Person(PersonBase):
+    age: int = IntField()  # type: ignore
+</code></pre>
+<p>This is the least change, but rather inflexible.</p>
+<hr/>
+<p>You can create automatically typed, generic hints by using a helper function with a fake signature:</p>
+<pre><code>from typing import Type, TypeVar
+
+
+T = TypeVar('T')
+
+
+class __Field__:
+    """The actual field specification"""
+    def __init__(self, *args, **kwargs):
+        self.args, self.kwargs = args, kwargs
+
+
+def Field(tp: Type[T], *args, **kwargs) -&gt; T:
+    """Helper to fake the correct return type"""
+    return __Field__(tp, *args, **kwargs)  # type: ignore
+
+
+class Person:
+    # Field takes arbitrary arguments
+    # You can @overload Fields to have them checked as well
+    age = Field(int, True, object())
+</code></pre>
+<p>This is how the <code>attrib</code> library provides its legacy hints. This style allows to hide all the magic/hacks of the annotations.</p>
+<hr/>
+<p>Since a metaclass can inspect annotations, there is no need to store the type on the Field. You can use a bare <code>Field</code> for metadata, and an annotation for the type:</p>
+<pre><code>from typing import Any
+
+
+class Field(Any):  # the (Any) part is only valid in a .pyi file!
+    """Field description for Any type"""
+
+
+class MetaPerson(type):
+    """Metaclass that creates default class attributes based on fields"""
+    def __new__(mcs, name, bases, namespace, **kwds):
+        for name, value in namespace.copy().items():
+            if isinstance(value, Field):
+                # look up type from annotation
+                field_type = namespace['__annotations__'][name]
+                namespace[name] = field_type()
+        return super().__new__(mcs, name, bases, namespace, **kwds)
+
+
+class Person(metaclass=MetaPerson):
+    age: int = Field()
+</code></pre>
+<p>This is how the <code>attrib</code> provides its Python 3.6+ attributes. It is both generic and conforming to annotation style. Note that this can also be used with a regular baseclass instead of a metaclass.</p>
+<pre><code>class BasePerson:
+     def __init__(self):
+         for name, value in type(self).__dict__.items():
+             if isinstance(value, Field):
+                 field_type = self.__annotations__[name]
+                 setattr(self, name, field_type())
+
+
+class Person(BasePerson):
+    age: int = Field()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Patrick Haugh is right, I am trying to solve this the wrong way. Descriptors are the way to go:</p>
+<pre><code>from typing import TypeVar, Generic, Optional, ClassVar, Any, Type
+
+FieldValueType = TypeVar('FieldValueType')
+
+
+class Field(Generic[FieldValueType]):
+
+    value_type: Type[FieldValueType]
+
+    def __init__(self) -&gt; None:
+        self.value: FieldValueType = self.value_type()
+
+    def __get__(self, obj, objtype) -&gt; 'Field':
+        print('Retrieving', self.__class__)
+        return self
+
+    def __set__(self, obj, value):
+        print('Updating', self.__class__)
+        self.value = value
+
+    def to_string(self):
+        return self.value
+
+class StringField(Field[str]):
+    value_type = str
+
+class IntField(Field[int]):
+    value_type = int
+
+    def to_string(self):
+        return str(self.value)
+
+
+class Person:
+    age = IntField()
+
+person = Person()
+person.age = 25
+print(person.age.to_string())
+</code></pre>
+<p><code>MyPy</code> can fully understand this. Thanks!</p>
+</div>
+<span class="comment-copy">I'm not sure about Django, but this pattern is frequently implemented using <a href="https://docs.python.org/3/howto/descriptor.html" rel="nofollow noreferrer">descriptors</a>.</span>
+<span class="comment-copy">What is <code>type(Person.age)</code> in each case?</span>
+<span class="comment-copy">@jdehesa I put the result of the print in the comment. In both cases it is <code>&lt;class 'int'&gt;</code>.</span>
+<span class="comment-copy">No, I meant <code>Person.age</code>, the class attribute, not the instance.</span>
+<span class="comment-copy">Ah my bad. I added to the snippets. Interesting to see that in my case it already is an int before instantiating something.</span>
+<span class="comment-copy">Using mypy 0.670, it infers <code>age</code> as type <code>Any</code> - basically untyped.</span>

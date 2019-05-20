@@ -1,0 +1,102 @@
+<div class="post-text" itemprop="text">
+<p>As a simple example, consider the network equivalent of /dev/zero, below. (Or more realistically, just a web server sending a large file.)</p>
+<p>If a client disconnects early, you get a barrage of log messages:</p>
+<pre><code>WARNING:asyncio:socket.send() raised exception.
+</code></pre>
+<p>But I'm not finding any way to catch said exception. The hypothetical server continues reading gigabytes from disk and sending them to a dead socket, with no effort on the client's part, and you've got yourself a DoS attack.</p>
+<p>The only thing I've found from the docs is to yield from a read, with an empty string indicating closure. But that's no good here because a normal client isn't going to send anything, blocking the write loop.</p>
+<p>What's the right way to detect failed writes, or be notified that the TCP connection has been closed, with the streams API or otherwise?</p>
+<p>Code:</p>
+<pre><code>from asyncio import *
+import logging
+
+@coroutine
+def client_handler(reader, writer):
+    while True:
+        writer.write(bytes(1))
+        yield from writer.drain()
+
+logging.basicConfig(level=logging.INFO)
+loop = get_event_loop()
+coro = start_server(client_handler, '', 12345)
+server = loop.run_until_complete(coro)
+loop.run_forever()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is a little bit strange, but you can actually allow an exception to reach the <code>client_handler</code> coroutine by forcing it to yield control to the event loop for one iteration:</p>
+<pre><code>import asyncio
+import logging
+
+@asyncio.coroutine
+def client_handler(reader, writer):
+    while True:
+        writer.write(bytes(1))
+        yield  # Yield to the event loop
+        yield from writer.drain()
+
+logging.basicConfig(level=logging.INFO)
+loop = asyncio.get_event_loop()
+coro = asyncio.start_server(client_handler, '', 12345)
+server = loop.run_until_complete(coro)
+loop.run_forever()
+</code></pre>
+<p>If I do that, I get this output when I kill the client connection:</p>
+<pre><code>ERROR:asyncio:Task exception was never retrieved
+future: &lt;Task finished coro=&lt;client_handler() done, defined at aio.py:4&gt; exception=ConnectionResetError(104, 'Connection reset by peer')&gt;
+Traceback (most recent call last):
+  File "/usr/lib/python3.4/asyncio/tasks.py", line 238, in _step
+    result = next(coro)
+  File "aio.py", line 9, in client_handler
+    yield from writer.drain()
+  File "/usr/lib/python3.4/asyncio/streams.py", line 301, in drain
+    raise exc
+  File "/usr/lib/python3.4/asyncio/selector_events.py", line 700, in write
+    n = self._sock.send(data)
+ConnectionResetError: [Errno 104] Connection reset by peer
+</code></pre>
+<p>I'm really not quite sure why you need to explicitly let the event loop get control for the exception to get through - don't have time at the moment to dig into it. I assume some bit needs to get flipped to indicate the connection dropped, and calling <code>yield from writer.drain()</code> (which can short-circuit going through the event loop) in a loop is preventing that from happening, but I'm really not sure. If I get a chance to investigate, I'll update the answer with that info.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I did some digging into the <code>asyncio</code> source to expand on <a href="https://stackoverflow.com/a/32190862/5256417">dano's</a> answer on why the exceptions aren't being raised without explicitly passing control to the event loop. Here's what I've found.</p>
+<p>Calling <code>yield from wirter.drain()</code> gives the control over to the <a href="https://hg.python.org/cpython/file/3.4/Lib/asyncio/streams.py#l292" rel="nofollow noreferrer"><code>StreamWriter.drain</code></a> coroutine. This coroutine <a href="https://hg.python.org/cpython/file/3.4/Lib/asyncio/streams.py#l301" rel="nofollow noreferrer">checks</a> for and raises any exceptions that that the <a href="https://hg.python.org/cpython/file/3.4/Lib/asyncio/streams.py#l204" rel="nofollow noreferrer"><code>StreamReaderProtocol</code></a> set on the <a href="https://hg.python.org/cpython/file/3.4/Lib/asyncio/streams.py#l307" rel="nofollow noreferrer"><code>StreamReader</code></a>. But since we passed control over to <a href="https://hg.python.org/cpython/file/3.4/Lib/asyncio/streams.py#l292" rel="nofollow noreferrer"><code>drain</code></a>, the protocol hasn't had the chance to set the exception yet. <a href="https://hg.python.org/cpython/file/3.4/Lib/asyncio/streams.py#l292" rel="nofollow noreferrer"><code>drain</code></a> then gives control over to the <a href="https://hg.python.org/cpython/file/3.4/Lib/asyncio/streams.py#l192" rel="nofollow noreferrer"><code>FlowControlMixin._drain_helper</code></a> coroutine. This coroutine the returns immediately because some more flags haven't been set yet, and the control ends up back with the coroutine that called <code>yield from wirter.drain()</code>.</p>
+<p>And so we have gone full circle without giving control to the event loop to allow it handle other coroutines and bubble up the exceptions to <code>writer.drain()</code>.</p>
+<p><code>yield</code>ing before a <code>drain()</code> gives the transport/protocol a chance to set the appropriate flags and exceptions.</p>
+<p>Here's a mock up of what's going on, with all the nested calls collapsed:</p>
+<pre><code>import asyncio as aio
+
+def set_exception(ctx, exc):
+  ctx["exc"] = exc
+
+@aio.coroutine
+def drain(ctx):
+  if ctx["exc"] is not None:
+    raise ctx["exc"]
+
+  return
+
+@aio.coroutine
+def client_handler(ctx):
+  i = 0
+  while True:
+    i += 1
+    print("write", i)
+    # yield # Uncommenting this allows the loop.call_later call to be scheduled.
+    yield from drain(ctx)
+
+CTX = {"exc": None}
+
+loop = aio.get_event_loop()
+# Set the exception in 5 seconds
+loop.call_later(5, set_exception, CTX, Exception("connection lost"))
+loop.run_until_complete(client_handler(CTX))
+loop.close()
+</code></pre>
+<p>This should probably fixed upstream in the Streams API by the <code>asyncio</code> developers.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The stream based API doesn't have a callback you can specify for when the connection is closed. But the Protocol API does, so use it instead: <a href="https://docs.python.org/3/library/asyncio-protocol.html#connection-callbacks" rel="nofollow">https://docs.python.org/3/library/asyncio-protocol.html#connection-callbacks</a></p>
+</div>
+<span class="comment-copy"><b>Update:</b> This is now <a href="https://github.com/python/asyncio/pull/280" rel="nofollow noreferrer">fixed</a> upstream in the <code>asyncio</code> library.</span>
+<span class="comment-copy">Thanks for this explanation. I have been struggling with a remote socket that forcibly closes the connection and I wasn't sure what to do. I catch the exception and add logic to deal with it. Looks like I should be using a connection callback instead. But I wanted to use the Stream API to avoid callbacks!</span>
+<span class="comment-copy">Not the answer I was hoping for, but I did say "or otherwise" so I guess it's fair. To me, a warning means I'm doing something wrong. But you're saying there's no "right" way to do it with streams?</span>

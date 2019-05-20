@@ -1,0 +1,64 @@
+<div class="post-text" itemprop="text">
+<p>I am using multi-threading and try to use <code>threading.Condition</code> to synchronize between threads. The problem is like this:</p>
+<p>I have a main thread. In some cases, it will do this:</p>
+<pre><code>if not is_flag_set():
+    with condition:
+        condition.wait(120)
+</code></pre>
+<p>The reason it does this is because it tries to give background thread some chances to do <code>do_something()</code> before it moves forward:</p>
+<pre><code>do_something()
+set_flag()
+with condition:
+    condition.notifyAll()
+</code></pre>
+<p>The <code>flag</code> is a shared resource considered by both main thread and the background thread. I do add lock when threads try to access the flag. However, I think the method here does not solve the problem. Main thread may check the flag first and then the background thread can set the flag and do <code>notifyAll</code>. This will cause the main thread actually waste 120 seconds.</p>
+<p>I want a method which can make sure the main thread will wait for background thread only if the <code>do_something()</code> from background thread is not finished.</p>
+<p>Edit: Just realize I forgot the <code>with</code> statement.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think you're missing the point of a <code>Condition</code>: you have to check the condition predicate/variable <em>inside</em> the condition object, not outside.</p>
+<p>The while point of <code>condition.wait()</code> is that it will wait until it's been notified. And it will wait cheaply, not using CPU power and burning down your battery; it does absolutely nothing until it's notified. So, if you use them properly, they do exactly what you ask: "wait for background thread only if the <code>do_something()</code> from background thread is not finished."</p>
+<p>But you have to use them right. On the main thread, do this:</p>
+<pre><code>with condition:
+    condition.wait_for(is_flag_set)
+    do_stuff()
+</code></pre>
+<p>Then, on the background thread, you notify it like this:</p>
+<pre><code>do_something()
+with condition:
+    set_flag()
+    condition.notify()
+</code></pre>
+<hr/>
+<p>I've removed the timeout for simplicity. If you want to make sure that it waits until the background thread does <code>do_something()</code>, or 2 minutes, whichever comes sooner:</p>
+<pre><code>with condition:
+    if condition.wait_for(is_flag_set, 120):
+        do_stuff_after_flag_set()
+    else:
+        do_stuff_after_timeout()
+</code></pre>
+<p>Now, you're guaranteed that either <code>do_stuff_after_flag_set</code> gets called only after <code>do_something</code> finished on the background thread, or <code>do_stuff_after_timeout</code> gets called because the background thread took too long.</p>
+<hr/>
+<p>If you want to understand the problem with your (edited) existing code:</p>
+<pre><code>if not is_flag_set():
+    with condition:
+        condition.wait(120)
+</code></pre>
+<p>You're worried that the main thread can check the flag before the condition is set. Well, of course it can; you put the <code>if</code> before doing anything with the condition. That's why you have to use <code>wait_for</code>, or a <code>while</code> loop around <code>wait</code>, as in <a href="https://docs.python.org/3/library/threading.html#condition-objects" rel="nofollow">the example in the docs</a>; it's the only way to be sure the flag is checked when you've been notified that it's ready to be checked.</p>
+<p>Also, notice that you're not really synchronizing <em>anything</em> here. If the call to <code>is_flag_set</code> and <code>set_flag</code> don't happen inside the <code>with condition:</code>, the flag isn't synchronized between threads. (With CPython on most platforms, you will almost always get away with that, but if you're looking for what you can almost always get away with instead of what's correct, you really don't need a <code>Condition</code> in the first place…)</p>
+<hr/>
+<p>Some notes:</p>
+<ul>
+<li><p>If you don't have Python 3.2 or later, you only have <code>wait</code>, not <code>wait_for</code>, and there's no way to tell whether the wait succeeded or timed out. Other than the timeout issue, <code>c.wait_for(is_flag_set)</code> is basically the same as <code>while not is_flag_set(): c.wait()</code>. So you can build <code>wait_for</code> yourself (notice that the <a href="https://docs.python.org/3/library/threading.html" rel="nofollow">docs</a> link to the <a href="https://hg.python.org/cpython/file/default/Lib/threading.py#l201" rel="nofollow">source</a>), or you can find a backport on PyPI.</p></li>
+<li><p>If you want to know <em>why</em> you need to do things this way, Wikipedia's <a href="http://en.wikipedia.org/wiki/Monitor_%28synchronization%29" rel="nofollow">Monitor</a> article explains pretty nicely the problems that are solved by this extra complexity. (In the cases where you've thought through all the race conditions and know you don't need a <code>Condition</code>, use an <code>Event</code> instead.)</p></li>
+<li><p>Notice that I used <code>notify</code> rather than <code>notify_all</code> (or <code>notifyAll</code>, which is another name for <code>notify_all</code> but has been deprecated since Python 2.6). If there's only one waiter, you only need to notify one waiter; it's simpler under the covers, and clearer about your intent. (If someone sees <code>notify_all</code>, they're liable to assume that you're using a thread pool, which you're not.)</p></li>
+<li><p>Also notice that I put the <code>do_stuff()</code> inside the lock. This doesn't actually matter either way unless you're going to reset the flag and set it again later. But if it does, this protects you from "missed cycle" bugs.</p></li>
+<li><p>Finally, it's not <em>really</em> true that you need a <code>wait_for</code> or a loop around <code>wait</code>; if the flag is only assigned once in the entire program, and the condition is only notified once, an <code>if</code> after the <code>wait</code>, instead of before as you tried, will have the same effect. (Then again, so will using an <code>Event</code> or other simpler sync object.) But it's better to just do it the safe way; then, you won't accidentally add races or deadlocks when you later edit something that doesn't seem related…</p></li>
+</ul>
+</div>
+<span class="comment-copy">As a side note: <code>notifyAll</code> has been deprecated since Python 2.6; use <code>notify_all</code>. But really, if you only have one waiter, why aren't you just using <code>notify</code>?</span>
+<span class="comment-copy">I simplified the problem here. Actually the background thread will probably notify more than 1 threads. Also, thanks for pointing out this!</span>
+<span class="comment-copy">I don't want to remove the timeout from the code. I want the main thread wait for at most 2 mins no matter what happens. I feel like, in this answer, the main thread wait until the background thread is finished.</span>
+<span class="comment-copy">Yes, in this answer, the main thread waits until the background thread is finished. But if you want it to wait no more than 2 minutes, just put the timeout back in (and decide what to do if it times out). If that isn't clear, I can edit the answer.</span>
+<span class="comment-copy">OK, edited to explain about timeouts.</span>
+<span class="comment-copy">Very nice explanation! Thanks a lot!</span>

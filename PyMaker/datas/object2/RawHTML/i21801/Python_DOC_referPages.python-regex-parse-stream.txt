@@ -1,0 +1,94 @@
+<div class="post-text" itemprop="text">
+<p>Is there any way to use regex match on a stream in python?
+like</p>
+<pre><code>reg = re.compile(r'\w+')
+reg.match(StringIO.StringIO('aa aaa aa'))
+</code></pre>
+<p>And I don't want to do this by getting the value of the whole string. I want to know if there's any way to match regex on a srtream(on-the-fly).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I had the same problem. The first thought was to implement a <code>LazyString</code> class, which acts like a string but only reading as much data from the stream as currently needed (I did this by reimplementing <code>__getitem__</code> and <code>__iter__</code> to fetch and buffer characters up to the highest position accessed...). </p>
+<p>This didn't work out (I got a "TypeError: expected string or buffer" from <code>re.match</code>), so I looked a bit into the implementation of the <code>re</code> module in the standard library. </p>
+<p>Unfortunately using regexes on a stream seems not possible. The core of the module is implemented in C and this implementation expects the whole input to be in memory at once (I guess mainly because of performance reasons). There seems to be no easy way to fix this.</p>
+<p>I also had a look at <a href="http://www.dabeaz.com/ply/">PYL</a> (Python LEX/YACC), but their lexer uses <code>re</code> internally, so this wouldnt solve the issue.</p>
+<p>A possibility could be to use <a href="http://www.antlr.org/">ANTLR</a> which supports a Python backend. It constructs the lexer using pure python code and seems to be able to operate on input streams. Since for me the problem is not that important (I do not expect my input to be extensively large...), I will probably not investigate that further, but it might be worth a look.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>In the specific case of a file, if you can memory-map the file with <a href="https://docs.python.org/3/library/mmap.html" rel="noreferrer"><code>mmap</code></a> and if you're working with bytestrings instead of Unicode, you can feed a memory-mapped file to <code>re</code> as if it were a bytestring and it'll just work. This is limited by your address space, not your RAM, so a 64-bit machine with 8 GB of RAM can memory-map a 32 GB file just fine.</p>
+<p>If you can do this, it's a really nice option. If you can't, you have to turn to messier options.</p>
+<hr/>
+<p>The 3rd-party <a href="https://pypi.python.org/pypi/regex/" rel="noreferrer"><code>regex</code></a> module (not <code>re</code>) offers partial match support, which can be used to build streaming support... but it's messy and has plenty of caveats. Things like lookbehinds and <code>^</code> won't work, zero-width matches would be tricky to get right, and I don't know if it'd interact correctly with other advanced features <code>regex</code> offers and <code>re</code> doesn't. Still, it seems to be the closest thing to a complete solution available.</p>
+<p>If you pass <code>partial=True</code> to <code>regex.match</code>, <code>regex.fullmatch</code>, <code>regex.search</code>, or <code>regex.finditer</code>, then in addition to reporting complete matches, <code>regex</code> will also report things that could be a match if the data was extended:</p>
+<pre><code>In [10]: regex.search(r'1234', '12', partial=True)
+Out[10]: &lt;regex.Match object; span=(0, 2), match='12', partial=True&gt;
+</code></pre>
+<p>It'll report a partial match instead of a complete match if more data could change the match result, so for example, <code>regex.search(r'[\s\S]*', anything, partial=True)</code> will always be a partial match.</p>
+<p>With this, you can keep a sliding window of data to match, extending it when you hit the end of the window and discarding consumed data from the beginning. Unfortunately, anything that would get confused by data disappearing from the start of the string won't work, so lookbehinds, <code>^</code>, <code>\b</code>, and <code>\B</code> are out. Zero-width matches would also need careful handling. Here's a proof of concept that uses a sliding window over a file or file-like object:</p>
+<pre><code>import regex
+
+def findall_over_file_with_caveats(pattern, file):
+    # Caveats:
+    # - doesn't support ^ or backreferences, and might not play well with
+    #   advanced features I'm not aware of that regex provides and re doesn't.
+    # - Doesn't do the careful handling that zero-width matches would need,
+    #   so consider behavior undefined in case of zero-width matches.
+    # - I have not bothered to implement findall's behavior of returning groups
+    #   when the pattern has groups.
+    # Unlike findall, produces an iterator instead of a list.
+
+    # bytes window for bytes pattern, unicode window for unicode pattern
+    # We assume the file provides data of the same type.
+    window = pattern[:0]
+    chunksize = 8192
+    sentinel = object()
+
+    last_chunk = False
+
+    while not last_chunk:
+        chunk = file.read(chunksize)
+        if not chunk:
+            last_chunk = True
+        window += chunk
+
+        match = sentinel
+        for match in regex.finditer(pattern, window, partial=not last_chunk):
+            if not match.partial:
+                yield match.group()
+
+        if match is sentinel or not match.partial:
+            # No partial match at the end (maybe even no matches at all).
+            # Discard the window. We don't need that data.
+            # The only cases I can find where we do this are if the pattern
+            # uses unsupported features or if we're on the last chunk, but
+            # there might be some important case I haven't thought of.
+            window = window[:0]
+        else:
+            # Partial match at the end.
+            # Discard all data not involved in the match.
+            window = window[match.start():]
+            if match.start() == 0:
+                # Our chunks are too small. Make them bigger.
+                chunksize *= 2
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This seems to be an old problem. As I have posted to a <a href="https://stackoverflow.com/questions/13004359/regular-expression-on-stream-instead-of-string">a similar question</a>, you may want to subclass the Matcher class of my solution <a href="https://github.com/gitagon/streamsearch-py" rel="nofollow">streamsearch-py</a> and perform regex matching in the buffer. Check out the kmp_example.py for a template. If it turns out classic Knuth-Morris-Pratt matching is all you need, then your problem would be solved right now with this little open source library :-)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Yes - using the <code>getvalue</code> method:</p>
+<pre><code>import cStringIO
+import re
+
+data = cStringIO.StringIO("some text")
+regex = re.compile(r"\w+")
+regex.match(data.getvalue())
+</code></pre>
+</div>
+<span class="comment-copy">that's against the idea of regex.</span>
+<span class="comment-copy">@SlientGhost: Not necessarily. You could want to parse some (infinite) stream using regexes, always matching at the current beginning of the stream and return the matches as an iterator (and consuming just the characters matched from the stream).</span>
+<span class="comment-copy">@MartinStettner: Well, you could if it was an automata-theoretic matcher without backrefs (and a few other things too, such as lookahead constraints). As long as the RE can compile to a single finite automaton (either NFA or DFA), it can match things in one pass and so can handle spotting matches an infinite stream. (But Python uses PCRE, which is not automata-theoretic and which needs all the bytes there earlier.)</span>
+<span class="comment-copy">@DonalFellows I looked at <a href="http://www.pcre.org/pcre.txt" rel="nofollow noreferrer">pcre.org/pcre.txt</a> and found no indication that the PCRE algorithm were not based on automata theory. For implementing backrefs and lookaheads of course it would need to maintain an internal buffer but this wouldn't prevent a mechanism like, say, some kind of <code>needmore</code> callback to work, (and for many cases, the buffer would not need to be very large compared to the possibly infinity stream size).</span>
+<span class="comment-copy">@MartinStettner: It's one of these things that some people “just know”. Stack-based matchers can support a richer language — that's how you really tell — but <i>need</i> a token stream they can back up within. (I guess it comes of studying these things way back when I was a CS undergraduate.)</span>
+<span class="comment-copy">Well researched, interesting. Perhaps <a href="http://www.acooke.org/rxpy/" rel="nofollow noreferrer">acooke.org/rxpy</a> is a reasonable alternative?</span>
+<span class="comment-copy">I just found another solution: pexpect (<a href="http://pexpect.readthedocs.org/en/latest/api/pexpect.html" rel="nofollow noreferrer">pexpect.readthedocs.org/en/latest/api/pexpect.html</a>)</span>
+<span class="comment-copy">well that's the same thing as feeding it a string, i was wondering if there's any way to parse a stream</span>

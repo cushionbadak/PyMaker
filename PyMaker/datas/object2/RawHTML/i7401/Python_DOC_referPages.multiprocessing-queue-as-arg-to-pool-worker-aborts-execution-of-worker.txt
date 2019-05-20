@@ -1,0 +1,69 @@
+<div class="post-text" itemprop="text">
+<p>I'm actually finding it hard to believe that I've run into the issue I have, it seems like it would be a big bug in the python multiprocessing module... Anyways the problem I've run into is that whenever I pass a multiprocessing.Queue to a multiprocessing.Pool worker as an argument the pool worker never executes its code. I've been able to reproduce this bug even on a very simple test that is a slightly modified version of example code found in the python <a href="https://docs.python.org/2/library/multiprocessing.html" rel="nofollow noreferrer">docs</a>.</p>
+<p>Here is the original version of the example code for Queues:</p>
+<pre><code>from multiprocessing import Process, Queue
+
+def f(q):
+    q.put([42, None, 'hello'])
+
+
+if __name__ == '__main__':
+    q = Queue()
+    p = Process(target=f, args=(q,))
+    p.start()
+    print(q.get())  # prints "[42, None, 'hello']"
+    p.join()
+</code></pre>
+<p>Here is my modified version of the example code for Queues:</p>
+<pre><code>from multiprocessing import Queue, Pool
+
+def f(q):
+    q.put([42, None, 'hello'])
+
+if __name__ == '__main__':
+    q = Queue()
+    p = Pool(1)
+    p.apply_async(f,args=(q,))
+    print(q.get()) # prints "[42, None, 'hello']"
+    p.close()
+    p.join()
+</code></pre>
+<p>All I've done is make p a process pool of size 1 instead of a multiprocessing.Process object and the result is that the code hangs on the print statement forever because nothing was ever written to the Queue! Of course I tested this in its original form and it works fine. My OS is windows 10 and my python version is 3.5.x, anyone have any idea why this is happening?</p>
+<p>Update: Still no idea why this example code works with a multiprocessing.Process and not a multiprocessing.Pool but I found a <a href="https://stackoverflow.com/questions/3217002/how-do-you-pass-a-queue-reference-to-a-function-managed-by-pool-map-async">work around</a> I'm content with (Alex Martelli's answer). Apparently you can just make a global list of multiprocessing.Queues and pass each process and index to use, I'm going to avoid using a managed queue because they are slower. Thanks Guest for showing me the link.</p>
+</div>
+<div class="post-text" itemprop="text">
+<h1>Problem</h1>
+<p>When you call <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.Pool.apply_async" rel="nofollow noreferrer"><code>apply_async</code></a> it returns a <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.AsyncResult" rel="nofollow noreferrer"><code>AsyncResult</code></a> object and leaves the workload distribution to a separate thread (see also <a href="https://stackoverflow.com/a/45184127/3767239">this answer</a>). This thread encounters the problem that the <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Queue" rel="nofollow noreferrer"><code>Queue</code></a> object can't be <a href="https://docs.python.org/3/library/pickle.html" rel="nofollow noreferrer">pickled</a> and therefore the requested work can't be distributed (and eventually executed). We can see this by calling <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.AsyncResult.get" rel="nofollow noreferrer"><code>AsyncResult.get</code></a>:</p>
+<pre><code>r = p.apply_async(f,args=(q,))
+r.get()
+</code></pre>
+<p>which raises a <code>RuntimeError</code>:</p>
+<pre><code>RuntimeError: Queue objects should only be shared between processes through inheritance
+</code></pre>
+<p>However this <code>RuntimeError</code> is only raised in the main thread once you request the result because it actually occurred in a different thread (and thus needs a way to be transmitted).</p>
+<p>So what happens when you do</p>
+<pre><code>p.apply_async(f,args=(q,))
+</code></pre>
+<p>is that the target function <code>f</code> is never invoked because one of it's arguments (<code>q</code>) can't be pickled. Therefore <code>q</code> never receives an item and remains empty and for that reason the call to <code>q.get</code> in the main thread blocks forever.</p>
+<h1>Solution</h1>
+<p>With <code>apply_async</code> you don't have to manage the result queues manually but they are readily provided to you in form of <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.AsyncResult" rel="nofollow noreferrer"><code>AsyncResult</code></a> objects. So you can modify the code to simply return from the target function:</p>
+<pre><code>from multiprocessing import Queue, Pool
+
+def f():
+    return [42, None, 'hello']
+
+if __name__ == '__main__':
+    q = Queue()
+    p = Pool(1)
+    result = p.apply_async(f)
+    print(result.get())
+</code></pre>
+</div>
+<span class="comment-copy">You may want to take a look at <a href="https://stackoverflow.com/a/30039159/3767239">#1</a>, <a href="https://stackoverflow.com/q/3217002/3767239">#2</a>, <a href="https://stackoverflow.com/q/9908781/3767239">#3</a>, <a href="https://stackoverflow.com/a/42659752/3767239">#4</a>, <a href="https://stackoverflow.com/a/25558333/3767239">#5</a>. It seems the reason is that the <code>Queue</code> instance cannot be pickled. However I don't understand why this deadlocks the underlying in-queue of the process. Using <code>Ctrl+C</code> with pool size of 2 revealed that it was stuck at <code>task = inqueue.get()</code> where it would request the target function. That's a bit puzzling.</span>
+<span class="comment-copy">Note that with asynchronous programming you don't need to manually deal with result queues - <code>apply_async</code> returns a <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.AsyncResult" rel="nofollow noreferrer"><code>AsyncResult</code></a> instance which can be used to get the result: <code>result.get()</code>. This uses an underlying result (out-) queue and so you simply need to <code>return</code> in your target function. Also if you use <code>result.get()</code> and you passed a <code>Queue</code> instance as an argument to the target function it will raise a <code>RuntimeError</code>. However I'm curious why this doesn't happen for your example.</span>
+<span class="comment-copy">See my comment to your answer. My goal isn't a "result queue" this is just a trivial example. I need a queue that is continually written to and processed.</span>
+<span class="comment-copy">Interesting but I don't see how the code works when you just use a multiprocessing.Process instead of a multiprocessing.Pool they both create new processes so wouldn't the Queue need to be pickled for both methods? Also using the AsyncResult workaround isn't really viable for me because I need a bunch of worker Processes that are continually writing to a Queue that is then read and processed by another worker Process.</span>
+<span class="comment-copy">@profPlum For those questions I'd like to refer to <a href="https://stackoverflow.com/a/45184127/3767239">this answer</a>. The essence is that the <code>Pool</code> starts the processes right away while the <code>Process</code> gets started after it received the <code>Queue</code> instance (no pickling required here, the process is not yet running). You can use <a href="https://docs.python.org/3/library/multiprocessing.html#managers" rel="nofollow noreferrer"><code>Manager</code></a>s to share objects between processes or use the <code>initializer</code> and <code>initargs</code> keyword arguments of <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.Pool" rel="nofollow noreferrer"><code>Pool</code></a>.</span>
+<span class="comment-copy">ah ok not really sure why the fact that the process is already running requires pickling but with that explanation and info about the initializer and initargs I'll accept your answer</span>
+<span class="comment-copy">@profPlum It's due to the way that information is shared between processes. On Unix-like systems they use sockets for that purpose and in order to send a (Python) object through a socket it gets pickled. The <code>Process</code> instance in Python will spawn off a system process when started, so prior to this you can share Python objects as usual with that instance. But for sharing with a running process they have to use the OS' way for inter-process communication.</span>
+<span class="comment-copy">I see, thanks for the more detailed explanation makes more sense now</span>

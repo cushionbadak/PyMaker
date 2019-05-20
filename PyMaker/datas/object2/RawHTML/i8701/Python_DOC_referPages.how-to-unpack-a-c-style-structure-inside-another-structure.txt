@@ -1,0 +1,151 @@
+<div class="post-text" itemprop="text">
+<p>I am receiving data via socket interface from an application (<code>server</code>) written in C. The data being posted has the following structure. I am receiving data with a client written in Python.</p>
+<pre class="lang-c prettyprint-override"><code>struct hdr
+{
+   int  Id;
+   char PktType;
+   int  SeqNo;
+   int  Pktlength;
+};
+
+struct trl
+{
+     char Message[16];
+     long long info;
+};
+
+struct data
+{
+    char value[10];
+    double result;
+    long long count;
+    short int valueid;
+};
+
+ typedef struct
+ {
+     struct hdr hdr_buf;
+     struct data data_buf[100];
+     struct trl trl_buf;
+ } trx_unit;
+</code></pre>
+<p>How do I <code>unpack</code> the received data to access my inner data buffer?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Using the <a href="https://docs.python.org/3/library/struct.html#module-struct" rel="nofollow noreferrer">struct</a> library is the way to go.  However, you will have to know a bit more about the C program that is serializing the data.  Consider the <code>hdr</code> structure.  If the C program is sending it using the naive approach:</p>
+<pre><code>struct hdr header;
+send(sd, &amp;hdr, sizeof(header), 0);
+</code></pre>
+<p>Then your client cannot safely interpret the bytes that are sent to it because there is an indeterminate amount of padding inserted between the struct members.  In particular, I would expect three bytes of padding following the <code>PktType</code> member.</p>
+<p>The safest way to approach sending around binary data is to have the server and client serialize the bytes directly to ensure that there is no additional padding and to make the byte ordering of multibyte integers explicit.  For example:</p>
+<pre><code>/*
+ * Send a header over a socket.
+ *
+ * The header is sent as a stream of packed bytes with
+ * integers in "network" byte order.  For example, a
+ * header value of:
+ *   Id: 0x11223344
+ *   PktType: 0xff
+ *   SeqNo: 0x55667788
+ *   PktLength: 0x99aabbcc
+ * 
+ * is sent as the following byte stream:
+ *   11 22 33 44 ff 55 66 77 88 99 aa bb cc
+ */
+void
+send_header(int sd, struct hdr const* header)
+{   /* NO ERROR HANDLING */
+    uint32_t num = htonl((uint32_t)header-&gt;Id);
+    send(sd, &amp;num, sizeof(num), 0);
+    send(sd, &amp;header-&gt;PktType, sizeof(header-&gt;PktType), 0);
+    num = htonl((uint32_t)header-&gt;SeqNo);
+    send(sd, &amp;num, sizeof(num), 0);
+    num = htonl((uint32_t)header-&gt;PktLength);
+    send(sd, &amp;num, sizeof(num), 0);
+}
+</code></pre>
+<p>This will ensure that your client can safely decode it using the <a href="https://docs.python.org/3/library/struct.html#module-struct" rel="nofollow noreferrer">struct</a> module:</p>
+<pre><code>buf = s.recv(13)  # packed data is 13 bytes long
+id_, pkt_type, seq_no, pkt_length = struct.unpack('&gt;IBII', buf)
+</code></pre>
+<p>If you cannot modify the C code to fix the serialization indeterminacy, then you will have to read the data from the stream and figure out where the C compiler is inserting padding and manually build <a href="https://docs.python.org/3/library/struct.html#module-struct" rel="nofollow noreferrer">struct</a> format strings to match using the padding byte format character to ignore padding values.</p>
+<p>I usually write a decoder class in Python that reads a complete value from the socket.  In your case it would look something like:</p>
+<pre><code>class PacketReader(object):
+    def __init__(self, sd):
+        self._socket = sd
+
+    def read_packet(self):
+        id_, pkt_type, seq_no, pkt_length = self._read_header()
+        data_bufs = [self._read_data_buf() for _ in range(0, 100)]
+        message, info = self._read_trl()
+        return {'id': id_, 'pkt_type': pkt_type, 'seq_no': seq_no,
+                'data_bufs': data_bufs, 'message': message,
+                'info': info}
+
+    def _read_header(self):
+        """
+        Read and unpack a ``hdr`` structure.
+
+        :returns: a :class:`tuple` of the header data values
+            in order - *Id*, *PktType*, *SeqNo*, and *PktLength*
+
+        The header is assumed to be packed as 13 bytes with
+        integers in network byte order.
+
+        """
+        buf = self._socket.read(13)
+        # &gt;   Multibyte values in network order
+        # I   Id as 32-bit unsigned integer value
+        # B   PktType as 8-bit unsigned integer value
+        # I   SeqNo as 32-bit unsigned integer value
+        # I   PktLength as 32-bit unsigned integer value
+        return struct.unpack('&gt;IBII', buf)
+
+    def _read_data_buf(self):
+        """
+        Read and unpack a single ``data`` structure.
+
+        :returns: a :class:`tuple` of data values in order -
+            *value*, *result*, *count*, and *value*
+
+        The data structure is assumed to be packed as 28 bytes
+        with integers in network byte order and doubles encoded
+        as IEEE 754 binary64 in network byte order.
+
+        """
+        buf = self._socket.read(28)  # assumes double is binary64
+        # &gt;   Multibyte values in network order
+        # 10s value bytes
+        # d   result encoded as IEEE 754 binary64 value
+        # q   count encoded as a 64-bit signed integer
+        # H   valueid as a 16-bit unsigned integer value
+        return struct.unpack('&gt;10sdqH', buf)
+
+    def _read_trl(self):
+        """
+        Read and unpack a ``trl`` structure.
+
+        :returns: a :class:`tuple` of trl values in order -
+            *Message* as byte string, *info*
+
+        The structure is assumed to be packed as 24 bytes with
+        integers in network byte order.
+
+        """
+        buf = self.socket.read(24)
+        # &gt;   Multibyte values in network order
+        # 16s message bytes
+        # q   info encoded as a 64-bit signed value
+        return struct.unpack('&gt;16sq', buf)
+</code></pre>
+<p>Mind you that this is untested and probably contains syntax errors but that is how I would approach the problem.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <a href="https://docs.python.org/2/library/struct.html" rel="nofollow noreferrer"><code>struct</code></a> library has all you need to do this.</p>
+</div>
+<span class="comment-copy">Are you receiving a string of bytes by a socket?</span>
+<span class="comment-copy">@egaio yes.I am receiving string of bytes.</span>
+<span class="comment-copy">@Shawley thanks for the guidance. Can you just kindly elaborate about  <code>&gt;10sdIIH</code> and <code>&gt;16sII</code>  ?</span>
+<span class="comment-copy">@Soumajit - I added a handful of comments &amp; docstrings.  I also converted to using <code>q</code> for 64-bit signed values.  I mistakenly thought that it was only available in native mode.  See note (2) of <a href="https://docs.python.org/3/library/struct.html#format-characters" rel="nofollow noreferrer">docs.python.org/3/library/struct.html#format-characters</a></span>
+<span class="comment-copy">@Shawley thanks a lot once again.</span>
+<span class="comment-copy">@equaio thanks for the advice. I was not sure of the format specifiers for the structure of structure inside the <code>unpack</code></span>

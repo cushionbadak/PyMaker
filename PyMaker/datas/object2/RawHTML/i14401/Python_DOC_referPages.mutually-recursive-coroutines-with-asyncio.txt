@@ -1,0 +1,160 @@
+<div class="post-text" itemprop="text">
+<p>I had the hypothesis that if I wrote mutually recursive coroutines with asyncio, they would not hit the maximum recursion depth exception, since the event loop was calling them (and act like a trampoline). This, however, is not the case when I write them like this:</p>
+<pre><code>import asyncio
+
+@asyncio.coroutine
+def a(n):
+    print("A: {}".format(n))
+    if n &gt; 1000: return n
+    else: yield from b(n+1)
+
+@asyncio.coroutine
+def b(n):
+    print("B: {}".format(n))
+    yield from a(n+1)
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(a(0))
+</code></pre>
+<p>When this runs, I get <code>RuntimeError: maximum recursion depth exceeded while calling a Python object</code>.</p>
+<p>Is there a way to keep the stack from growing in recursive coroutines with asyncio?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>To keep the stack from growing, you have to allow each coroutine to actually exit after it schedules the next recursive call, which means you have to avoid using <code>yield from</code>. Instead, you use <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.async" rel="noreferrer"><code>asyncio.async</code></a> (or <code>asyncio.ensure_future</code> if using Python 3.4.4+) to schedule the next coroutine with the event loop, and use <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.Future.add_done_callback" rel="noreferrer"><code>Future.add_done_callback</code></a> to schedule a callback to run once the recursive call returns. Each coroutine then returns an <code>asyncio.Future</code> object, which has its result set inside the callback that's run when the recursive call it scheduled completes.</p>
+<p>It's probably easiest to understand if you actually see the code:</p>
+<pre><code>import asyncio
+
+@asyncio.coroutine
+def a(n):
+    fut = asyncio.Future()  # We're going to return this right away to our caller
+    def set_result(out):  # This gets called when the next recursive call completes
+        fut.set_result(out.result()) # Pull the result from the inner call and return it up the stack.
+    print("A: {}".format(n))
+    if n &gt; 1000: 
+        return n
+    else: 
+        in_fut = asyncio.async(b(n+1))  # This returns an asyncio.Task
+        in_fut.add_done_callback(set_result) # schedule set_result when the Task is done.
+    return fut
+
+@asyncio.coroutine
+def b(n):
+    fut = asyncio.Future()
+    def set_result(out):
+        fut.set_result(out.result())
+    print("B: {}".format(n))
+    in_fut = asyncio.async(a(n+1))
+    in_fut.add_done_callback(set_result)
+    return fut
+
+loop = asyncio.get_event_loop()
+print("Out is {}".format(loop.run_until_complete(a(0))))
+
+
+Output:
+A: 0
+B: 1
+A: 2
+B: 3
+A: 4
+B: 5
+...
+A: 994
+B: 995
+A: 996
+B: 997
+A: 998
+B: 999
+A: 1000
+B: 1001
+A: 1002
+Out is 1002
+</code></pre>
+<p>Now, your example code doesn't actually return <code>n</code> all the way back up the stack, so you could make something functionally equivalent that's a bit simpler:</p>
+<pre><code>import asyncio
+
+@asyncio.coroutine
+def a(n):
+    print("A: {}".format(n))
+    if n &gt; 1000: loop.stop(); return n
+    else: asyncio.async(b(n+1))
+
+@asyncio.coroutine
+def b(n):
+    print("B: {}".format(n))
+    asyncio.async(a(n+1))
+
+loop = asyncio.get_event_loop()
+asyncio.async(a(0))
+loop.run_forever()
+</code></pre>
+<p>But I suspect you really meant to return <code>n</code> all the way back up.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I changed the code to <code>async</code>, <code>await</code> and measured time. I really like how much more readable it is.</p>
+<p>Future:
+    </p>
+<pre><code>import asyncio
+
+@asyncio.coroutine
+def a(n):
+    fut = asyncio.Future()
+    def set_result(out):
+        fut.set_result(out.result())
+    if n &gt; 1000: 
+        return n
+    else: 
+        in_fut = asyncio.async(b(n+1))
+        in_fut.add_done_callback(set_result)
+    return fut
+
+@asyncio.coroutine
+def b(n):
+    fut = asyncio.Future()
+    def set_result(out):
+        fut.set_result(out.result())
+    in_fut = asyncio.async(a(n+1))
+    in_fut.add_done_callback(set_result)
+    return fut
+
+import timeit
+print(min(timeit.repeat("""
+loop = asyncio.get_event_loop()
+loop.run_until_complete(a(0))
+""", "from __main__ import a, b, asyncio", number=10)))
+</code></pre>
+<p>Result:</p>
+<pre><code>% time python stack_ori.py 
+0.6602963969999109
+python stack_ori.py  2,06s user 0,01s system 99% cpu 2,071 total
+</code></pre>
+<p>Async, await:
+    </p>
+<pre><code>import asyncio
+
+async def a(n):
+    if n &gt; 1000:
+        return n
+    else:
+        ret = await asyncio.ensure_future(b(n + 1))
+    return ret
+
+async def b(n):
+    ret = await asyncio.ensure_future(a(n + 1))
+    return ret
+
+import timeit
+print(min(timeit.repeat("""
+loop = asyncio.get_event_loop()
+loop.run_until_complete(a(0))
+""", "from __main__ import a, b, asyncio", number=10)))
+</code></pre>
+<p>Result:</p>
+<pre><code>% time  python stack.py
+0.45157229300002655
+python stack.py  1,42s user 0,02s system 99% cpu 1,451 total
+</code></pre>
+</div>
+<span class="comment-copy">each time you 'yield from' you are hooking into the next call. Have you tried using a queue instead? That way you can hand off the information and dequeue into the next coroutine without linking them into each other.</span>
+<span class="comment-copy">Great answer - exactly what I was looking for. Thanks!</span>
+<span class="comment-copy">@dano, Out of curiosity. In your first code, if a and b are infinite mutual coroutines that never return, this will explode memory with Future objects. correct? What abount the second?</span>

@@ -1,0 +1,152 @@
+<div class="post-text" itemprop="text">
+<p>I have a simple poller class (code snippet below) which retrieves files from a number of folders based on a regex.
+I attempt to catch OSError exceptions and ignore them as files could be moved out/deleted/permissions etc... 
+During some testing (in which i created/deleted a large nr of files) i noticed that when sorting the generator, 
+the exceptions that were raised in the generator function (_get) were re-raised(?), and i had to use an additional try except 
+block to get around this.</p>
+<p>Any idea why this is happening? All comments/improvements appreciated!</p>
+<p>Thanks
+Timmah</p>
+<pre><code>def __init__(self, **kwargs):
+    self._sortkey = kwargs.get('sortkey', os.path.getmtime)
+
+def _get(self, maxitems=0):
+    def customfilter(f):
+        if self._exclude is not None and self._exclude.search(f): return False
+        if self._regex is not None:
+            return self._regex.search(f)
+
+        return True
+
+    count = 0
+    for p in self.paths:
+        if not os.path.isdir(p): raise PollException("'%s' is not a valid path." % (p), p)
+        if maxitems and count &gt;= maxitems: break
+        try:
+            for f in [os.path.join(p, f) for f in filter(customfilter, os.listdir(p))]:
+                if maxitems and count &gt;= maxitems: break
+
+                if not self._validate(f): continue
+
+                count += 1
+                yield f
+        except OSError:
+            '''
+            There will be instances where we wont have permission on the file/directory or
+            when a file is moved/deleted before it was yielded.
+            '''
+            continue
+
+def get(self, maxitems=0):
+    try:
+        if self._sortkey is not None:
+            files = sorted(self._get(maxitems), key=self._sortkey, reverse=self._sortreverse)**
+        else:
+            files = self._get(maxitems)
+    except OSError:
+        '''
+        self._sortkey uses os.path function to sort so exceptions can happen again
+        '''
+        return
+
+    for f in files:
+        yield f
+
+if __name__ == '__main__':
+    while True:
+        for f in poll(paths=['/tmp'], regex="^.*\.CSV").get(10):
+            print f
+</code></pre>
+<p>EDIT: Thanks to @ShadowRanger for pointing out the os.path function that was passed as sortkey param.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Posting an answer for posterity: Per <a href="/questions/34090416/python-generator-to-list-exception-re-raised/34091702#comment55933510_34090416">psychic intuition</a> (and <a href="/questions/34090416/python-generator-to-list-exception-re-raised/34091702#comment55933676_34090416">confirmation in the comments</a>), <code>self._sortkey</code> was trying to <code>stat</code> the files being sorted. While having read permission on a directory is sufficient to get the filenames contained within it, if you lack read permission on those files, you won't be able to <code>stat</code> them.</p>
+<p>Since <code>sorted</code> is executing the <code>key</code> function outside the generator scope, nothing in the generator is raising the exception, and therefore it can't catch it. You'd need to pre-filter/pre-compute the <code>stat</code> values for each file (and drop files that can't be <code>stat</code>-ed), sort on that, then drop the (no longer relevant) <code>stat</code> data. For example:</p>
+<pre><code>from operator import itemgetter
+
+def with_key(filenames, key):
+    '''Generates computed_key, filename pairs
+
+    Silently filters out files where the key function raises OSError
+    '''
+    for f in filenames:
+        try:
+            yield key(f), f
+        except OSError:
+            pass
+
+# ... skipping to the `sorted` call in get ...
+# Replace the existing sorted call with:
+# map(itemgetter(1), strips the key, yielding only the file name
+files = map(itemgetter(1),
+            sorted(
+                   # Use with_key to filter and decorate filenames with sortkey
+                   with_key(self._get(maxitems), self._sortkey),
+                   # Use key=itemgetter(0) so only sortkey is considered for
+                   # sorting (making sort stable, instead of performing fallback
+                   # comparison between filenames when key is the same)
+                   key=itemgetter(0), reverse=self._sortreverse))
+</code></pre>
+<p>It's basically performing the <a href="https://en.wikipedia.org/wiki/Schwartzian_transform" rel="nofollow">Schwartzian Transform</a> (aka "Decorate-Sort-Undecorate") manually. Normally, Python's <code>key</code> argument for <code>sorted</code>/<code>list.sort</code> hides this complexity from you, but in this case, thanks to the possibility of exceptions, the need to drop the item if one occurs and the desire to minimize race conditions by using <a href="https://en.wikipedia.org/wiki/EAFP" rel="nofollow">EAFP</a> patterns), you have to do the work yourself.</p>
+<h2>Alternate solution with Python 3.5 (or 2.6-2.7 and 3.2-3.4 using the third party <code>scandir</code> package):</h2>
+<p>You could avoid this issue (and on Windows, include unreadable files in your output so long as the directory was readable and on a Windows-like file system that caches file metadata in the directory entry) if you so desired, with far less complexity and likely better performance. <code>os.scandir</code> (or pre-3.5, <code>scandir.scandir</code>) on Windows gets you the <code>stat</code> information cached in the directory entry "for free" (you only pay the RTT cost once per few thousands entries in a directory, not once per file), and on Linux the first call to <code>DirEntry.stat</code> caches the <code>stat</code> data, so doing it in <code>_get</code> means you can catch and handle <code>OSError</code> there, populating the cache so during sorting, <code>self._sortkey</code> can use the cached data with no risk of <code>OSError</code>. So you could do:</p>
+<pre><code>try:
+    from os import scandir
+except ImportError:
+    from scandir import scandir
+
+# Prestat will ensure OSErrors raised in _get, not in caller using DirEntry
+def _get(self, maxitems=0, prestat=True, follow_symlinks=True):
+    def customfilter(f):
+        if self._exclude is not None and self._exclude.search(f):
+            return False
+        return self._regex is None or self._regex.search(f)
+
+    count = 0
+    for p in self.paths:
+        if not os.path.isdir(p): raise PollException("'%s' is not a valid path." % (p,), p)
+        if maxitems and count &gt;= maxitems: break
+        try:
+            # Use scandir over listdir, and since we get DirEntrys, we
+            # don't need to explicitly use os.path.join to make full paths
+            # and we can use genexpr for validation instead
+            for dirent in (de for de in scandir(p) if customfilter(de.name) and self._validate(de.path)):
+                # On Windows, stat() is cheap noop (returns precomputed data)
+                # except symlink w/follow_symlinks=True (where it stats and caches)
+                # On Linux, this will force a stat now, and cache the result
+                # so OSErrors will only be raised here, not during sorting
+                if prestat:
+                    dirent.stat(follow_symlinks=follow_symlinks)
+
+                if maxitems and count &gt;= maxitems: break
+
+                count += 1
+                yield dirent
+        except OSError:
+            '''
+            There will be instances where we wont have permission on the file/directory or
+            when a file is moved/deleted before it was yielded.
+            '''
+            continue
+
+def get(self, maxitems=0):
+    # Prestat if we have a sortkey (assuming it may use stat data)
+    files = self._get(maxitems, prestat=self._sortkey is not None)
+    if self._sortkey is not None:
+        # self._sortkey must now operate on a os.DirEntry
+        # but no more need to wrap in try/except OSError
+        files = sorted(files, key=self._sortkey, reverse=self._sortreverse)
+
+    # To preserve observable public behaviors, return path, not DirEntry
+    for dirent in files:
+        yield dirent.path
+</code></pre>
+<p>This requires a small change in usage; <code>self._sortkey</code> must operate on an <a href="https://docs.python.org/3/library/os.html#os.DirEntry" rel="nofollow"><code>os.DirEntry</code> instance</a>, not a file path. So instead of <code>self._sortkey = kwargs.get('sortkey', os.path.getmtime)</code>, you might have <code>self._sortkey = kwargs.get('sortkey', lambda de: de.stat().st_mtime)</code>.</p>
+<p>But it avoids the complexity of manual Schwartzian Transforms (because access violations can only occur in <code>_get</code>'s <code>try</code>/<code>except</code> as long as you don't change <code>prestat</code>, so no OSErrors occur during <code>key</code> computation). It will also likely run faster, by lazily iterating the directory instead of constructing a complete <code>list</code> before iterating (admittedly a small benefit unless the directory is huge) and removing the need to use a <code>stat</code> system call at all for most directory entries on Windows.</p>
+</div>
+<span class="comment-copy">Why do you put a continue sentence on the except inside _get()? What happen if you put a pass instead?</span>
+<span class="comment-copy">I have a list of paths i cycle through, if one fails continue to the next?</span>
+<span class="comment-copy">@Timmah: What is the definition of <code>self._sortkey</code>? That is code that executes outside the generator scope, and I'm betting you probably try to read or <code>stat</code> the file there; if you have read permission on the directory and not the file, you'd get the file name, no problem, but if you tried to read or <code>stat</code> the file to determine the sort key, you'd raise a new <code>OSError</code> in <code>sorted</code> when it computed a key for each item in the input, outside the scope of the generator function.</span>
+<span class="comment-copy">Aaaaaaaaaaargh!!! self._sortkey = kwargs.get('sortkey', os.path.getmtime), totally overlooked it.</span>
+<span class="comment-copy">Beer time, thanks @ShadowRanger!</span>
+<span class="comment-copy">Thanks again for all the input! Will have a look at scandir package!</span>

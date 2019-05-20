@@ -1,0 +1,278 @@
+<div class="post-text" itemprop="text">
+<p>I'm having difficulty figuring out at what point I can pass the <code>BNG_FFIArray</code> returned by my Rust program back to it, in order to free the memory that it's allocated.</p>
+<p>My ctypes setup is as follows:</p>
+<pre><code>class BNG_FFITuple(Structure):
+    _fields_ = [("a", c_uint32),
+                ("b", c_uint32)]
+
+class BNG_FFIArray(Structure):
+    _fields_ = [("data", c_void_p),
+                ("len", c_size_t)]
+
+    # Allow implicit conversions from a sequence of 32-bit unsigned
+    # integers.
+    @classmethod
+    def from_param(cls, seq):
+        return seq if isinstance(seq, cls) else cls(seq)
+
+    def __init__(self, seq, data_type = c_float):
+        array_type = data_type * len(seq)
+        raw_seq = array_type(*seq)
+        self.data = cast(raw_seq, c_void_p)
+        self.len = len(seq)
+
+# A conversion function that cleans up the result value to make it
+# nicer to consume.
+def bng_void_array_to_tuple_list(array, _func, _args):
+    res = cast(array.data, POINTER(BNG_FFITuple * array.len))[0]
+    return res
+
+convert_bng = lib.convert_vec_c
+convert_bng.argtypes = (BNG_FFIArray, BNG_FFIArray)
+convert_bng.restype = BNG_FFIArray
+convert_bng.errcheck = bng_void_array_to_tuple_list
+
+# this is the FFI function I'd like to call. It takes a BNG_FFIArray as its argument
+drop_array = lib.drop_array 
+drop_array.argtypes = (BNG_FFIArray,)
+
+
+def convertbng(lons, lats):
+    """ just a wrapper """
+    return [(i.a, i.b) for i in iter(convert_bng(lons, lats))]
+
+# pass values into the FFI rust function
+convertbng([-0.32824866], [51.44533267])
+</code></pre>
+<p>This is all working correctly, but I'm not sure at what point I'm supposed to return the data initially allocated by my call to <code>lib.convert_to_bng</code> back across the FFI boundary in order to free its associated memory, by calling <code>drop_array</code>.</p>
+<p>Here's my Rust struct and function.</p>
+<pre><code>#[repr(C)]
+pub struct Array {
+    data: *const c_void,
+    len: libc::size_t,
+}
+
+#[no_mangle]
+pub extern "C" fn drop_array(arr: Array) {
+    unsafe { Vec::from_raw_parts(arr.data as *mut u8, arr.len, arr.len) };
+}
+
+impl Array {
+    unsafe fn as_f32_slice(&amp;self) -&gt; &amp;[f32] {
+        assert!(!self.data.is_null());
+        slice::from_raw_parts(self.data as *const f32, self.len as usize)
+    }
+    unsafe fn as_i32_slice(&amp;self) -&gt; &amp;[i32] {
+        assert!(!self.data.is_null());
+        slice::from_raw_parts(self.data as *const i32, self.len as usize)
+    }
+
+    fn from_vec&lt;T&gt;(mut vec: Vec&lt;T&gt;) -&gt; Array {
+        // Important to make length and capacity match
+        // A better solution is to track both length and capacity
+        vec.shrink_to_fit();
+
+        let array = Array {
+            data: vec.as_ptr() as *const libc::c_void,
+            len: vec.len() as libc::size_t,
+        };
+
+        // Leak the memory, and now the raw pointer is the owner
+        mem::forget(vec);
+
+        array
+    }
+}
+
+
+#[no_mangle]
+pub extern "C" fn convert_vec_c(lon: Array, lat: Array) -&gt; Array {
+    // we're receiving floats
+    let lon = unsafe { lon.as_f32_slice() };
+    let lat = unsafe { lat.as_f32_slice() };
+    // copy values and combine
+    let orig = lon.iter()
+                  .cloned()
+                  .zip(lat.iter()
+                          .cloned());
+    // carry out the conversion
+    let result = orig.map(|elem| convert_bng(elem.0 as f64, elem.1 as f64));
+    // convert back to vector of unsigned integer Tuples
+    let nvec = result.map(|ints| {
+                         IntTuple {
+                             a: ints.0 as u32,
+                             b: ints.1 as u32,
+                         }
+                     })
+                     .collect();
+    Array::from_vec(nvec)
+}
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>There are two ways to manage resources in Python, both of which involve creating an object that either:</p>
+<ul>
+<li>has a finalizer, <a href="https://docs.python.org/3/reference/datamodel.html#object.__del__">the <code>__del__</code> method</a></li>
+<li>or acts as a <a href="https://docs.python.org/3/library/stdtypes.html#typecontextmanager">context manager</a> for the <code>with</code> statement</li>
+</ul>
+<p>Both of these involve having a manager object that controls/provides access to the resource, which will run any clean-up code necessary when the object is no longer needed. For this case, I think the first one works best, but I'll demonstrate both.</p>
+<p>For my examples, I'll use this Rust code,, where <code>Data</code> is a stand-in for any resource that needs managing (e.g. your <code>Array</code> type):</p>
+<pre><code>// ffi_example.rs
+#![crate_type = "dylib"]
+
+pub struct Data {
+    x: i32
+}
+
+#[no_mangle]
+pub extern fn data_create(x: i32) -&gt; *mut Data {
+    println!("Rust: creating: x = {}", x);
+    Box::into_raw(Box::new(Data { x: x }))
+}
+
+// example function for interacting with the pointer
+#[no_mangle]
+pub unsafe extern fn data_get(p: *mut Data) -&gt; i32 {
+    (*p).x
+}
+
+#[no_mangle]
+pub unsafe extern fn data_destroy(p: *mut Data) {
+    let data = Box::from_raw(p);
+    println!("Rust: destroying: x = {}", data.x);
+}
+</code></pre>
+<p>Which can be compiled with, say, <code>rustc ffi_example.rs</code> to create <code>libffi_example.so</code> (or similar, depending on platform). This is the start of the Python code I'm using for the two cases (the <code>CDLL</code> call may need to be adjusted):</p>
+<pre><code>import sys
+import ctypes as c
+
+class RawData(c.Structure):
+    pass
+
+lib = c.CDLL('./libffi_example.so')
+
+create = lib.data_create
+create.argtypes = [c.c_int]
+create.restype = c.POINTER(RawData)
+
+get = lib.data_get
+get.arg_types = [c.POINTER(RawData)]
+get.restype = c.c_int
+
+destroy = lib.data_destroy
+destroy.argtypes = [c.POINTER(RawData)]
+destroy.restype = None
+</code></pre>
+<p>(Note that by interfacing via pointers, I don't have to tell Python any info about the internals of <code>RawData</code>.)</p>
+<p>You can check everything's working by adding the following, for instance, to the end:</p>
+<pre><code>p = create(10)
+print('Python: got %s (at 0x%x)' % (get(p), c.addressof(p.contents)))
+sys.stdout.flush()
+destroy(p)
+</code></pre>
+<p>which prints something like</p>
+<pre><code>Rust: creating: x = 10 (at 0x138b7c0)
+Python: got 10 (at 0x138b7c0)
+Rust: destroying: x = 10 (at 0x138b7c0)
+</code></pre>
+<p>(The <code>flush</code> is to ensure the <code>print</code>s from the two languages appear in the right order, since they have different buffers.) </p>
+<h2><code>__del__</code></h2>
+<p>To use <code>__del__</code> just make an Python object (not a <code>ctypes.Structure</code>) that serves as the interface to the Rust one, like</p>
+<pre><code>class Data:
+    def __init__(self, x):
+         self._pointer = create(x)
+
+    def get(self):
+         return int(get(self._pointer))
+
+    def __del__(self):
+         destroy(self._pointer)
+</code></pre>
+<p>This can then be used as a normal object:</p>
+<pre><code>obj = Data(123)
+print('Python: %s' % obj.get())
+sys.stdout.flush()
+
+obj2 = obj # two pointers to the same `Data`
+
+obj = Data(456) # overwrite one
+print('Python: %s, %s' % (obj.get(), obj2.get()))
+sys.stdout.flush()
+
+obj2 = None # just clear the second reference
+print('Python: end')
+sys.stdout.flush()
+</code></pre>
+<p>This will print:</p>
+<pre><code>Rust: creating: x = 123 (at 0x28aa510)
+Python: 123
+Rust: creating: x = 456 (at 0x28aa6e0)
+Python: 456, 123
+Rust: destroying: x = 123 (at 0x28aa510)
+Python: end
+Rust: destroying: x = 456 (at 0x28aa6e0)
+</code></pre>
+<p>That is, Python can tell when object definitely no longer have any references (e.g. when the two handles <code>obj</code> and <code>obj2</code> are both overwritten for <code>123</code>, or when the program ends, for <code>456</code>).</p>
+<h2>Context managers</h2>
+<p>If the resource is heavily scoped (which it probably isn't, in this case), it may make sense to instead use a context manager, which will allow something like:</p>
+<pre><code>print('Python: before')
+sys.stdout.flush()
+
+with Data(789) as obj:
+    print('Python: %s' % obj.get())
+    sys.stdout.flush()
+# obj's internals destroyed here
+
+print('Python: after')
+sys.stdout.flush()
+</code></pre>
+<p>This is somewhat error-prone because a handle to an object can be kept outside the <code>with</code> statement, so it has to check for this or else it may access deallocated memory. For instance,</p>
+<pre><code>with Data(1234) as obj:
+    pass
+# obj's internals destroyed here
+
+print(obj.get()) # oops...
+</code></pre>
+<p>Anyway, implementation:</p>
+<pre><code>class Data:
+    def __init__(self, x):
+        self._x = x
+        self._valid = False
+    def __enter__(self):
+        self._pointer = create(self._x)
+        self._valid = False
+        return self
+    def __exit__(self):
+        assert self._valid
+        destroy(self._pointer)
+        self._valid = False
+        return False
+
+    def get(self):
+        if not self._valid:
+            raise ValueError('getting from a destroyed Data')
+        return int(get(self._pointer))
+</code></pre>
+<p>The first example above gives output like:</p>
+<pre><code>Python: before
+Rust: creating: x = 789 (at 0x1650530)
+Python: 789
+Rust: destroying: x = 789 (at 0x1650530)
+Python: after
+</code></pre>
+<p>And the second gives:</p>
+<pre><code>Rust: creating: x = 1234 (at 0x113d450)
+Rust: destroying: x = 1234 (at 0x113d450)
+Traceback (most recent call last):
+  File "ffi.py", line 82, in &lt;module&gt;
+    print(obj.get()) # oops...
+  File "ffi.py", line 63, in get
+    raise ValueError('getting from a destroyed Data')
+ValueError: getting from a destroyed Data
+</code></pre>
+<p>This approach does have the advantage of makes the region of code where the resource is valid/allocated clearer, effectively a manual form of the RAII/scope-based resource management of Rust.</p>
+</div>
+<span class="comment-copy">At the risk of an insulting non-answer, you <i>have</i> to free memory after you are done with it, otherwise you risk accessing memory in an unknown state. This generally means you free it immediately after you are done using it, as that's the first place you are sure you aren't using it. Is there something more detailed you are looking for?</span>
+<span class="comment-copy">@shepmaster I understand your comment – the main problem is that I've made it difficult for myself, partly as a result of ctypes odd (unpythonic-feeling) way of doing things. Passing <code>array</code> back to rust after I cast and assign it to res in bng_void_array_to_tuple_list seems to work, but what I really need to do is restructure my code to conform to your and @huon's examples.</span>
+<span class="comment-copy">this is incredibly useful, thanks. However, your example demonstrates a simple, single return type (i32) in data_get, whereas my return type (Array) is a ctypes (and thus, C) representation of a Vector, which means I <i>have</i> to define it on the python side, so ctypes knows how to dereference it (the class derived from Structure has to be given to restype), no?</span>
+<span class="comment-copy">You're already defining the appropriate <code>Structure</code> type: they should just work. Another way is to have the Rust side return pointers like my example does.</span>

@@ -1,0 +1,136 @@
+<div class="post-text" itemprop="text">
+<p>I was just very confused by some code that I wrote. I was surprised to discover that:</p>
+<pre><code>with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    results = list(executor.map(f, iterable))
+</code></pre>
+<p>and </p>
+<pre><code>with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    results = list(map(lambda x: executor.submit(f, x), iterable))
+</code></pre>
+<p>produce different results. The first one produces a list of whatever type <code>f</code> returns, the second produces a list of <code>concurrent.futures.Future</code> objects that then need to be evaluated with their <code>result()</code> method in order to get the value that <code>f</code> returned. </p>
+<p>My main concern is that this means that <code>executor.map</code> can't take advantage of <code>concurrent.futures.as_completed</code>, which seems like an extremely convenient way to evaluate the results of some long-running calls to a database that I'm making as they become available. </p>
+<p>I'm not at all clear on how <code>concurrent.futures.ThreadPoolExecutor</code> objects work -- naively, I would prefer the (somewhat more verbose):</p>
+<pre><code>with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    result_futures = list(map(lambda x: executor.submit(f, x), iterable))
+    results = [f.result() for f in futures.as_completed(result_futures)]
+</code></pre>
+<p>over the more concise <code>executor.map</code> in order to take advantage of a possible gain in performance. Am I wrong to do so?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem is that you transform the result of <code>ThreadPoolExecutor.map</code> to a list. If you don't do this and instead iterate over the resulting generator directly, the results are still yielded in the right order but the loop continues before all results are ready. You can test this with this example:</p>
+<pre><code>import time
+import concurrent.futures
+
+e = concurrent.futures.ThreadPoolExecutor(4)
+s = range(10)
+for i in e.map(time.sleep, s):
+    print(i)
+</code></pre>
+<p>That the order is kept may be because it's sometimes important that you get results in the same order you give them to map. And results are probably not wrapped in future objects because in some situations it may take just too long to do another map over the list to get all results if you need them. And after all in most cases it's very likely that the next value is ready before the loop processed the first value. This is demonstrated in this example:</p>
+<pre><code>import concurrent.futures
+
+executor = concurrent.futures.ThreadPoolExecutor() # Or ProcessPoolExecutor
+data = some_huge_list()
+results = executor.map(crunch_number, data)
+finals = []
+
+for value in results:
+    finals.append(do_some_stuff(value))
+</code></pre>
+<p>In this example it may be likely that <code>do_some_stuff</code> takes longer than <code>crunch_number</code> and if this is really the case it's really not a big loss of performace while you still keep the easy usage of map.</p>
+<p>Also since the worker threads(/processes) start processing at the beginning of the list and work their way to the end to the list you submitted the results should be finished in the order they're already yielded by the iterator. Which means in most cases <code>executor.map</code> is just fine, but in some cases, for example if it doesn't matter in which order you process the values and the function you passed to <code>map</code> takes very different times to run, the <code>future.as_completed</code> may be faster.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Below is an example of submit vs. map.  They both accept the jobs immediately (submitted|mapped - start).  They take the same time to complete, 11 seconds (last result time - start).  However, submit gives results as soon as any thread in the ThreadPoolExecutor maxThreads=2 completes.  map gives results in the order they are submitted.</p>
+<pre><code>import time
+import concurrent.futures
+
+def worker(i):
+    time.sleep(i)
+    return i,time.time()
+
+e = concurrent.futures.ThreadPoolExecutor(2)
+arrIn = range(1,7)[::-1]
+print arrIn
+
+f = []
+print 'start submit',time.time()
+for i in arrIn:
+    f.append(e.submit(worker,i))
+print 'submitted',time.time()
+for r in concurrent.futures.as_completed(f):
+    print r.result(),time.time()
+print
+
+f = []
+print 'start map',time.time()
+f = e.map(worker,arrIn)
+print 'mapped',time.time()
+for r in f:
+    print r,time.time()    
+</code></pre>
+<p>Output:</p>
+<pre><code>[6, 5, 4, 3, 2, 1]
+start submit 1543473934.47
+submitted 1543473934.47
+(5, 1543473939.473743) 1543473939.47
+(6, 1543473940.471591) 1543473940.47
+(3, 1543473943.473639) 1543473943.47
+(4, 1543473943.474192) 1543473943.47
+(1, 1543473944.474617) 1543473944.47
+(2, 1543473945.477609) 1543473945.48
+
+start map 1543473945.48
+mapped 1543473945.48
+(6, 1543473951.483908) 1543473951.48
+(5, 1543473950.484109) 1543473951.48
+(4, 1543473954.48858) 1543473954.49
+(3, 1543473954.488384) 1543473954.49
+(2, 1543473956.493789) 1543473956.49
+(1, 1543473955.493888) 1543473956.49
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>In addition to the explanation in the answers here, it can be helpful to go right to the source.  It reaffirms the statement from another answer here that:</p>
+<ul>
+<li><code>.map()</code> gives results in the order they are submitted, while</li>
+<li>iterating over a list of <code>Future</code> objects with <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.as_completed" rel="nofollow noreferrer"><code>concurrent.futures.as_completed()</code></a> won't guarantee this ordering, because this is the nature of <code>as_completed()</code></li>
+</ul>
+<hr/>
+<p><code>.map()</code> is defined in the base class, <a href="https://github.com/python/cpython/blob/3.7/Lib/concurrent/futures/_base.py" rel="nofollow noreferrer"><code>concurrent.futures._base.Executor</code></a>:</p>
+<pre><code>class Executor(object):
+    def submit(self, fn, *args, **kwargs):
+        raise NotImplementedError()
+
+    def map(self, fn, *iterables, timeout=None, chunksize=1):
+        if timeout is not None:
+            end_time = timeout + time.monotonic()
+
+        fs = [self.submit(fn, *args) for args in zip(*iterables)]  # &lt;!!!!!!!!
+
+        def result_iterator():
+            try:
+                # reverse to keep finishing order
+                fs.reverse()  # &lt;!!!!!!!!
+                while fs:
+                    # Careful not to keep a reference to the popped future
+                    if timeout is None:
+                        yield fs.pop().result()  # &lt;!!!!!!!!
+                    else:
+                        yield fs.pop().result(end_time - time.monotonic())
+            finally:
+                for future in fs:
+                    future.cancel()
+        return result_iterator()
+</code></pre>
+<p>As you mention, there is also <code>.submit()</code>, which left to be defined in the child classes, namely <code>ProcessPoolExecutor</code> and <a href="https://github.com/python/cpython/blob/3.7/Lib/concurrent/futures/thread.py" rel="nofollow noreferrer"><code>ThreadPoolExecutor</code></a>, and returns a <code>_base.Future</code> instance that you need to call <code>.result()</code> on to actually make do anything.</p>
+<p>The important lines from <code>.map()</code> boil down to:</p>
+<pre><code>fs = [self.submit(fn, *args) for args in zip(*iterables)]
+fs.reverse()
+while fs:
+    yield fs.pop().result()
+</code></pre>
+<p>The <code>.reverse()</code> plus <code>.pop()</code> is a means to get the first-submitted result (from <code>iterables</code>) to be yielded first, the second-submitted result to be yielded second, and so on.  The elements of the resulting iterator are not <code>Future</code>s; they're the actual results themselves.</p>
+</div>
+<span class="comment-copy">Yes, I'm not concerned about the return order here, I'm more interested in getting things done as quickly as possible. My worry is that, when the order of results doesn't matter, <code>executor.map</code> will perform more poorly than using <code>futures.as_completed</code> on a generator made by mapping <code>executor.submit</code> on the appropriate iterable. Do you know if that's the case?</span>
+<span class="comment-copy">I think my answer is just unclear. "right order" means in this case that the values are most likely finished in the order they were in the list you submitted to <code>map</code>. For most computations you wanna do with map this holds. Because the same function often (not always) takes the roughly the same time to run. However if you have a function with very different runtimes it may be faster to use <code>future.as_completed</code>.</span>

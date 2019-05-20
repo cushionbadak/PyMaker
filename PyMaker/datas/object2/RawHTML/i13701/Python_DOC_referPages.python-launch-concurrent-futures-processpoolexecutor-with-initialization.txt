@@ -1,0 +1,81 @@
+<div class="post-text" itemprop="text">
+<p>I'm planning to use <code>concurrent.futures.ProcessPoolExecutor</code> to parallelize execution of functions. According to the <a href="https://docs.python.org/3/library/concurrent.futures.html" rel="noreferrer">documentation</a>, its <code>executor</code> object can only accept a simple function in <code>map</code>. My actual situation involves initialization (loading of data) prior to execution of the 'to-be-parallelized' function. How do I arrange that?</p>
+<p>The 'to-be-parallelized' function is called in an iteration for many times. I don't want it to be re-initialized each time.</p>
+<p>In other words, there's an <code>init</code> function that produces some output to this tbp function. Each child should have its own copy of that output, because the function depended on that.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It sounds like you're looking for an equivalent to the <code>initializer</code>/<code>initargs</code> options that <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.Pool" rel="noreferrer"><code>multiprocessing.Pool</code></a> takes. Currently, that behavior doesn't exist for <code>concurrent.futures.ProcessPoolExecutor</code>, though there is a <a href="http://bugs.python.org/issue21423" rel="noreferrer">patch waiting for review</a> that adds that behavior.</p>
+<p>So, you can either use <code>multiprocessing.Pool</code> (which might be fine for your usecase), wait for that patch to get merged and released (you might be waiting a while :)), or roll your own solution. Turns out, it's not too hard to write a wrapper function for map that takes an <code>initializer</code>, but only calls it one per process:</p>
+<pre><code>from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+
+inited = False
+initresult = None
+
+def initwrapper(initfunc, initargs, f, x):
+    # This will be called in the child. inited
+    # Will be False the first time its called, but then
+    # remain True every other time its called in a given
+    # worker process.
+    global inited, initresult
+    if not inited:
+        inited = True
+        initresult = initfunc(*initargs)
+    return f(x)
+
+def do_init(a,b):
+    print('ran init {} {}'.format(a,b))
+    return os.getpid() # Just to demonstrate it will be unique per process
+
+def f(x):
+    print("Hey there {}".format(x))
+    print('initresult is {}'.format(initresult))
+    return x+1
+
+def initmap(executor, initializer, initargs, f, it):
+    return executor.map(partial(initwrapper, initializer, initargs, f), it)
+
+
+if __name__ == "__main__":
+    with ProcessPoolExecutor(4) as executor:
+        out = initmap(executor, do_init, (5,6), f, range(10))
+    print(list(out))
+</code></pre>
+<p>Output:</p>
+<pre><code>ran init 5 6
+Hey there 0
+initresult is 4568
+ran init 5 6
+Hey there 1
+initresult is 4569
+ran init 5 6
+Hey there 2
+initresult is 4570
+Hey there 3
+initresult is 4569
+Hey there 4
+initresult is 4568
+ran init 5 6
+Hey there 5
+initresult is 4571
+Hey there 6
+initresult is 4570
+Hey there 7
+initresult is 4569
+Hey there 8
+initresult is 4568
+Hey there 9
+initresult is 4570
+[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+</code></pre>
+</div>
+<span class="comment-copy">Can you create an example that shows what the initialization actually is? Is there a reason you can't just create a wrapper around the function you want to parallelize that does the initialization, then calls the function?</span>
+<span class="comment-copy">Well, think of initialization as close to <code>json.load</code>, the 'to-be-parallelized' function is called in an iteration for many times. I don't want it to be re-initialized each time.</span>
+<span class="comment-copy">Ah, ok. And initialization needs to run in the child processes, not the parent?</span>
+<span class="comment-copy">FWIW, there's a <a href="http://bugs.python.org/issue21423" rel="nofollow noreferrer">patch waiting for review</a> that I think would do exactly what you want here.</span>
+<span class="comment-copy">Thanks for the info.</span>
+<span class="comment-copy">It might be the problem with wording of my question. But in my case, the function <code>f(x)</code> need to have access to the returned result from <code>initfunc</code>. And each child should have its own copy. I'm not seeing it possible in this implementation.</span>
+<span class="comment-copy">@HeShiming I've edited my answer to demonstrate you can share the result of <code>initfunc</code> with each child function in a way that would be easy to translate to <code>multiprocessing.Pool</code> w/ the <code>initializer</code> kwarg.</span>
+<span class="comment-copy">But umm... <code>initresult</code> is global. In my case, each child will have to have a separate copy. And I'm not sure if it's picklable, it's not really...</span>
+<span class="comment-copy">@HeShiming It's global <i>per child process</i>. Look at the output in my answer, there are four different values for <code>initresult</code> printed, one for each process in the pool. <code>initwrapper</code> only runs in the child processes, so it doesn't need to be picklable.</span>
+<span class="comment-copy">@HeShiming Yes, it's a bit confusing at first glance. The trick is that <code>initwrapper</code>, and therefor <code>do_init</code>, is only executed inside of the child processes (meaning inside the call to <code>executor.map</code>). At that point, all global variables become unique to each child. The <code>ProcessPoolExecutor</code> object keeps each child process alive for the entire life of the <code>Executor</code> (basically just using a <code>while &lt;is_pool_alive&gt;</code>: loop), so that once you initialize the global in the child process, it will be re-used for every single call to <code>f</code>.</span>

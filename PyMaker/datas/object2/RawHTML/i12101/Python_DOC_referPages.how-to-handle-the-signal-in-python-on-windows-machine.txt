@@ -1,0 +1,179 @@
+<div class="post-text" itemprop="text">
+<p>I am trying the code pasted below on Windows, but instead of handling signal, it is killing the process.
+However, the same code is working in Ubuntu.</p>
+<pre><code>import os, sys
+import time
+import signal
+def func(signum, frame):
+    print 'You raised a SigInt! Signal handler called with signal', signum
+
+signal.signal(signal.SIGINT, func)
+while True:
+    print "Running...",os.getpid()
+    time.sleep(2)
+    os.kill(os.getpid(),signal.SIGINT)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Python's <a href="https://docs.python.org/2/library/os.html#os.kill"><code>os.kill</code></a> wraps two unrelated APIs on Windows. It calls <a href="https://msdn.microsoft.com/en-us/library/ms683155"><code>GenerateConsoleCtrlEvent</code></a> when the <code>sig</code> parameter is <code>CTRL_C_EVENT</code> or <code>CTRL_BREAK_EVENT</code>. In this case the <code>pid</code> parameter is a process group ID. If the latter call fails, and for all other <code>sig</code> values, it calls <a href="https://msdn.microsoft.com/en-us/library/ms684320"><code>OpenProcess</code></a> and then <a href="https://msdn.microsoft.com/en-us/library/ms686714"><code>TerminateProcess</code></a>. In this case the <code>pid</code> parameter is a process ID, and the <code>sig</code> value is passed as the exit code. Terminating a Windows process is akin to sending <code>SIGKILL</code> to a POSIX process. Generally this should be avoided since it doesn't allow the process to exit cleanly.</p>
+<p>Note that the docs for <code>os.kill</code> mistakenly claim that "kill() additionally takes process handles to be killed", which was never true. It calls <code>OpenProcess</code> to get a process handle.</p>
+<p>The decision to use WinAPI <code>CTRL_C_EVENT</code> and <code>CTRL_BREAK_EVENT</code>, instead of <code>SIGINT</code> and <code>SIGBREAK</code>, is unfortunate for cross-platform code. It's also not defined what <code>GenerateConsoleCtrlEvent</code> does when passed a process ID that's not a process group ID. Using this function in an API that takes a process ID is dubious at best, and potentially very wrong. </p>
+<p>For your particular needs you can write an adapter function that makes <code>os.kill</code> a bit more friendly for cross-platform code. For example:</p>
+<pre><code>import os
+import sys
+import time
+import signal
+
+if sys.platform != 'win32':
+    kill = os.kill
+    sleep = time.sleep
+else: 
+    # adapt the conflated API on Windows.
+    import threading
+
+    sigmap = {signal.SIGINT: signal.CTRL_C_EVENT,
+              signal.SIGBREAK: signal.CTRL_BREAK_EVENT}
+
+    def kill(pid, signum):
+        if signum in sigmap and pid == os.getpid():
+            # we don't know if the current process is a
+            # process group leader, so just broadcast
+            # to all processes attached to this console.
+            pid = 0
+        thread = threading.current_thread()
+        handler = signal.getsignal(signum)
+        # work around the synchronization problem when calling
+        # kill from the main thread.
+        if (signum in sigmap and
+            thread.name == 'MainThread' and
+            callable(handler) and
+            pid == 0):
+            event = threading.Event()
+            def handler_set_event(signum, frame):
+                event.set()
+                return handler(signum, frame)
+            signal.signal(signum, handler_set_event)                
+            try:
+                os.kill(pid, sigmap[signum])
+                # busy wait because we can't block in the main
+                # thread, else the signal handler can't execute.
+                while not event.is_set():
+                    pass
+            finally:
+                signal.signal(signum, handler)
+        else:
+            os.kill(pid, sigmap.get(signum, signum))
+
+    if sys.version_info[0] &gt; 2:
+        sleep = time.sleep
+    else:
+        import errno
+
+        # If the signal handler doesn't raise an exception,
+        # time.sleep in Python 2 raises an EINTR IOError, but
+        # Python 3 just resumes the sleep.
+
+        def sleep(interval):
+            '''sleep that ignores EINTR in 2.x on Windows'''
+            while True:
+                try:
+                    t = time.time()
+                    time.sleep(interval)
+                except IOError as e:
+                    if e.errno != errno.EINTR:
+                        raise
+                interval -= time.time() - t
+                if interval &lt;= 0:
+                    break
+
+def func(signum, frame):
+    # note: don't print in a signal handler.
+    global g_sigint
+    g_sigint = True
+    #raise KeyboardInterrupt
+
+signal.signal(signal.SIGINT, func)
+
+g_kill = False
+while True:
+    g_sigint = False
+    g_kill = not g_kill
+    print('Running [%d]' % os.getpid())
+    sleep(2)
+    if g_kill:
+        kill(os.getpid(), signal.SIGINT)
+    if g_sigint:
+        print('SIGINT')
+    else:
+        print('No SIGINT')
+</code></pre>
+<h2>Discussion</h2>
+<p>Windows doesn't implement signals at the system level [*]. Microsoft's C runtime implements the six signals that are required by standard C: <code>SIGINT</code>, <code>SIGABRT</code>, <code>SIGTERM</code>, <code>SIGSEGV</code>, <code>SIGILL</code>, and <code>SIGFPE</code>. </p>
+<p><code>SIGABRT</code> and <code>SIGTERM</code> are implemented just for the current process. You can call the handler via C <a href="https://msdn.microsoft.com/en-us/library/dwwzkt4c.aspx"><code>raise</code></a>. For example (in Python 3.5):</p>
+<pre><code>&gt;&gt;&gt; import signal, ctypes
+&gt;&gt;&gt; ucrtbase = ctypes.CDLL('ucrtbase')
+&gt;&gt;&gt; c_raise = ucrtbase['raise']
+&gt;&gt;&gt; foo = lambda *a: print('foo')
+&gt;&gt;&gt; signal.signal(signal.SIGTERM, foo)
+&lt;Handlers.SIG_DFL: 0&gt;
+&gt;&gt;&gt; c_raise(signal.SIGTERM)
+foo
+0
+</code></pre>
+<p><code>SIGTERM</code> is useless. </p>
+<p>You also can't do much with <code>SIGABRT</code> using the signal module because the <a href="https://msdn.microsoft.com/en-us/library/k089yyh0.aspx"><code>abort</code></a> function kills the process once the handler returns, which happens immediately when using the signal module's internal handler (it trips a flag for the registered Python callable to be called in the main thread). For Python 3 you can instead use the <a href="https://docs.python.org/3/library/faulthandler.html">faulthandler</a> module. Or call the CRT's <a href="https://msdn.microsoft.com/en-us/library/xdkz3x12.aspx"><code>signal</code></a> function via ctypes to set a ctypes callback as the handler.</p>
+<p>The CRT implements <code>SIGSEGV</code>, <code>SIGILL</code>, and <code>SIGFPE</code> by setting a Windows <a href="https://msdn.microsoft.com/en-us/library/ms680657">structured exception handler</a> for the corresponding Windows exceptions:</p>
+<pre><code>STATUS_ACCESS_VIOLATION          SIGSEGV
+STATUS_ILLEGAL_INSTRUCTION       SIGILL
+STATUS_PRIVILEGED_INSTRUCTION    SIGILL
+STATUS_FLOAT_DENORMAL_OPERAND    SIGFPE
+STATUS_FLOAT_DIVIDE_BY_ZERO      SIGFPE
+STATUS_FLOAT_INEXACT_RESULT      SIGFPE
+STATUS_FLOAT_INVALID_OPERATION   SIGFPE
+STATUS_FLOAT_OVERFLOW            SIGFPE
+STATUS_FLOAT_STACK_CHECK         SIGFPE
+STATUS_FLOAT_UNDERFLOW           SIGFPE
+STATUS_FLOAT_MULTIPLE_FAULTS     SIGFPE
+STATUS_FLOAT_MULTIPLE_TRAPS      SIGFPE
+</code></pre>
+<p>The CRT's implementation of these signals is incompatible with Python's signal handling. The exception filter calls the registered handler and then returns <a href="https://msdn.microsoft.com/en-us/library/ms679328"><code>EXCEPTION_CONTINUE_EXECUTION</code></a>. However, Python's handler only trips a flag for the interpreter to call the registered callable sometime later in the main thread. Thus the errant code that triggered the exception will continue to trigger in an endless loop. In Python 3 you can use the faulthandler module for these exception-based signals. </p>
+<p>That leaves <code>SIGINT</code>, to which Windows adds the non-standard <code>SIGBREAK</code>. Both console and non-console processes can <code>raise</code> these signals, but only a console process can receive them from another process. The CRT implements this by registering a console control event handler via <a href="https://msdn.microsoft.com/en-us/library/ms686016"><code>SetConsoleCtrlHandler</code></a>. </p>
+<p>The console sends a control event by creating a new thread in an attached process that begins executing at <code>CtrlRoutine</code> in kernel32.dll or kernelbase.dll (undocumented). That the handler doesn't execute on the main thread can lead to synchronization problems (e.g. in the REPL or with <code>input</code>). Also, a control event won't interrupt the main thread if it's blocked while waiting on a synchronization object or waiting for synchronous I/O to complete. Care needs to be taken to avoid blocking in the main thread if it should be interruptible by <code>SIGINT</code>. Python 3 attempts to work around this by using a Windows event object, which can also be used in waits that should be interruptible by <code>SIGINT</code>.</p>
+<p>When the console sends the process a <code>CTRL_C_EVENT</code> or <code>CTRL_BREAK_EVENT</code>, the CRT's handler calls the registered <code>SIGINT</code> or <code>SIGBREAK</code> handler, respectively. The <code>SIGBREAK</code> handler is also called for the <code>CTRL_CLOSE_EVENT</code> that the console sends when its window is closed. Python defaults to handling <code>SIGINT</code> by rasing a <code>KeyboardInterrupt</code> in the main thread. However, <code>SIGBREAK</code> is initially the default <code>CTRL_BREAK_EVENT</code> handler, which calls <code>ExitProcess(STATUS_CONTROL_C_EXIT)</code>.</p>
+<p>You can send a control event to all processes attached to the current console via <code>GenerateConsoleCtrlEvent</code>. This can target a subset of processes that belong to a process group, or target group 0 to send the event to all processes attached to the current console. </p>
+<p>Process groups aren't a well-documented aspect of the Windows API. There's no public API to query the group of a process, but every process in a Windows session belongs to a process group, even if it's just the wininit.exe group (services session) or winlogon.exe group (interactive session). A new group is created by passing the creation flag <code>CREATE_NEW_PROCESS_GROUP</code> when creating a new process. The group ID is the process ID of the created process. To my knowledge, the console is the only system that uses the process group, and that's just for <code>GenerateConsoleCtrlEvent</code>. </p>
+<p>What the console does when the target ID isn't a process group ID is undefined and should not be relied on. If both the process and its parent process are attached to the console, then sending it a control event basically acts like the target is group 0. If the parent process isn't attached to the current console, then <code>GenerateConsoleCtrlEvent</code> fails, and <code>os.kill</code> calls <code>TerminateProcess</code>. Weirdly, if you target the "System" process (PID 4) and its child process smss.exe (session manager), the call succeeds but nothing happens except that the target is mistakenly added to the list of attached processes (i.e. <a href="https://msdn.microsoft.com/en-us/library/ms683170"><code>GetConsoleProcessList</code></a>). It's probably because the parent process is the "Idle" process, which, since it's PID 0, is implicitly accepted as the broadcast PGID. The parent process rule also applies to non-console processes. Targeting a non-console child process does nothing -- except mistakenly corrupt the console process list by adding the unattached process. I hope it's clear that you should only send a control event to either group 0 or to a <em>known</em> process group that you created via <code>CREATE_NEW_PROCESS_GROUP</code>.</p>
+<p>Don't rely on being able to send <code>CTRL_C_EVENT</code> to anything but group 0, since it's initially disabled in a new process group. It's not impossible to send this event to a new group, but the target process first has to enable <code>CTRL_C_EVENT</code> by calling <code>SetConsoleCtrlHandler(NULL, FALSE)</code>.</p>
+<p><code>CTRL_BREAK_EVENT</code> is all you can depend on since it can't be disabled. Sending this event is a simple way to gracefully kill a child process that was started with <code>CREATE_NEW_PROCESS_GROUP</code>, assuming it has a Windows <code>CTRL_BREAK_EVENT</code> or C <code>SIGBREAK</code> handler. If not, the default handler will terminate the process, setting the exit code to <code>STATUS_CONTROL_C_EXIT</code>. For example:</p>
+<pre><code>&gt;&gt;&gt; import os, signal, subprocess
+&gt;&gt;&gt; p = subprocess.Popen('python.exe',
+...         stdin=subprocess.PIPE,
+...         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+&gt;&gt;&gt; os.kill(p.pid, signal.CTRL_BREAK_EVENT)
+&gt;&gt;&gt; STATUS_CONTROL_C_EXIT = 0xC000013A
+&gt;&gt;&gt; p.wait() == STATUS_CONTROL_C_EXIT
+True
+</code></pre>
+<p>Note that <code>CTRL_BREAK_EVENT</code> wasn't sent to the current process, because the example targets the process group of the child process (including all of its child processes that are attached to the console, and so on). If the example had used group 0, the current process would have been killed as well since I didn't define a <code>SIGBREAK</code> handler. Let's try that, but with a handler set:</p>
+<pre><code>&gt;&gt;&gt; ctrl_break = lambda *a: print('^BREAK')
+&gt;&gt;&gt; signal.signal(signal.SIGBREAK, ctrl_break)
+&lt;Handlers.SIG_DFL: 0&gt;
+&gt;&gt;&gt; os.kill(0, signal.CTRL_BREAK_EVENT)
+^BREAK
+</code></pre>
+<hr/>
+<p>[*]</p>
+<p>Windows has <a href="https://msdn.microsoft.com/en-us/library/ms681951">asynchronous procedure calls</a> (APC) to queue a target function to a thread. See the article <a href="http://www.drdobbs.com/inside-nts-asynchronous-procedure-call/184416590">Inside NT's Asynchronous Procedure Call</a> for an in-depth analysis of Windows APCs, especially to clarify the role of kernel-mode APCs. You can queue a user-mode APC to a thread via <a href="https://msdn.microsoft.com/en-us/library/ms684954"><code>QueueUserAPC</code></a>. They also get queued by <a href="https://msdn.microsoft.com/en-us/library/aa365468"><code>ReadFileEx</code></a> and <a href="https://msdn.microsoft.com/en-us/library/aa365748"><code>WriteFileEx</code></a> for the I/O completion routine. </p>
+<p>A user-mode APC executes when the thread enters an alertable wait (e.g. <a href="https://msdn.microsoft.com/en-us/library/ms687028"><code>WaitForSingleObjectEx</code></a> or <a href="https://msdn.microsoft.com/en-us/library/ms686307"><code>SleepEx</code></a> with <code>bAlertable</code> as <code>TRUE</code>). Kernel-mode APCs, on the other hand, get dispatched immediately (when the IRQL is below <code>APC_LEVEL</code>). They're typically used by the I/O manager to complete asynchronous I/O Request Packets in the context of the thread that issued the request (e.g. copying data from the IRP to a user-mode buffer). See <a href="https://msdn.microsoft.com/en-us/library/ff565592">Waits and APCs</a> for a table that shows how APCs affect alertable and non-alertable waits. Note that kernel-mode APCs don't interrupt a wait, but instead are executed internally by the wait routine.</p>
+<p>Windows could implement POSIX-like signals using APCs, but in practice it uses other means for the same ends. For example: </p>
+<ul>
+<li><a href="https://msdn.microsoft.com/en-us/library/ms680657">Structured Exception Handling</a>, e.g. <a href="https://msdn.microsoft.com/en-us/library/ms680144"><code>__try</code>, <code>__except</code>, <code>__finally</code>, <code>__leave</code></a>, <a href="https://msdn.microsoft.com/en-us/library/ms680552"><code>RaiseException</code></a>, <a href="https://msdn.microsoft.com/en-us/library/ms679274"><code>AddVectoredExceptionHandler</code></a>.</li>
+<li><p><a href="https://msdn.microsoft.com/en-us/library/ff548068">Kernel Dispatcher Objects</a> (i.e. <a href="https://msdn.microsoft.com/en-us/library/ms686364">Synchronization Objects</a>), e.g. <a href="https://msdn.microsoft.com/en-us/library/ms686211"><code>SetEvent</code></a>, <a href="https://msdn.microsoft.com/en-us/library/ms686289"><code>SetWaitableTimer</code></a>.</p></li>
+<li><p>Window Messages, e.g. <a href="https://msdn.microsoft.com/en-us/library/ms644950"><code>SendMessage</code></a> (to a window procedure), <a href="https://msdn.microsoft.com/en-us/library/ms644944"><code>PostMessage</code></a> (to a thread's message queue to be dispatched to a window procedure), <a href="https://msdn.microsoft.com/en-us/library/ms644946"><code>PostThreadMessage</code></a> (to a thread's message queue), <a href="https://msdn.microsoft.com/en-us/library/ms632617"><code>WM_CLOSE</code></a>, <a href="https://msdn.microsoft.com/en-us/library/ms644902"><code>WM_TIMER</code></a>. </p></li>
+</ul>
+<p>Window messages can be sent and posted to all threads that share the calling <a href="https://msdn.microsoft.com/en-us/library/ms686744">thread's desktop</a> and that are at the same or lower integrity level. Sending  a window message puts it in a system queue to call the window procedure when the thread calls <a href="https://msdn.microsoft.com/en-us/library/ms644943"><code>PeekMessage</code></a> or <a href="https://msdn.microsoft.com/en-us/library/ms644936"><code>GetMessage</code></a>. Posting a message adds it to the thread's message queue, which has a default quota of 10,000 messages. A thread with a message queue should have a message loop to process the queue via <code>GetMessage</code> and <a href="https://msdn.microsoft.com/en-us/library/ms644934"><code>DispatchMessage</code></a>. Threads in a console-only process typically do not have a message queue. However, the console host process, conhost.exe, obviously does. When the close button is clicked, or when the primary process of a console is killed via the task manager or <a href="https://technet.microsoft.com/en-us/library/cc725602">taskkill.exe</a>, a <code>WM_CLOSE</code> message is posted to the message queue of the console window's thread. The console in turns sends a <code>CTRL_CLOSE_EVENT</code> to all of its attached processes. If a process handles the event, it's given 5 seconds to exit gracefully before it's forcefully terminated.</p>
+</div>
+<span class="comment-copy">Why this answer doesn't have more +1</span>
+<span class="comment-copy">So basically: <code>if sys.platform == 'win32': abandon_all_hope_ye_who_enter_here()</code>.</span>
+<span class="comment-copy">Using <code>signal.CTRL_BREAK_EVENT</code> to stop a Python process prevents calling the <code>atexit</code> handlers so I wouldn't call this a graceful shutdown. But thanks for this great summary, it is really helpful.</span>
+<span class="comment-copy">@schlamar, perhaps you missed the part about creating the child process with the flag <code>CREATE_NEW_PROCESS_GROUP</code> and having the child set a handler for <code>signal.SIGBREAK</code>. This works for an intentional signal from the parent. Unfortunately it doesn't handle the case when the console window is closed, due to the way Python's C signal handler simply sets a flag indicating the signal and returns immediately (signal handlers are only called in the main thread). To handle this case, I should revise this answer to provide a ctypes example that sets a console control handler.</span>

@@ -1,0 +1,112 @@
+<div class="post-text" itemprop="text">
+<p>There are essentially three ways to use the with statement:</p>
+<p>Use an existing context manager:</p>
+<pre><code>with manager:
+    pass
+</code></pre>
+<p>Create a context manager and bind its result to a variable:</p>
+<pre><code>with Manager() as result:
+    pass
+</code></pre>
+<p>Create an context manager and discard its return value:</p>
+<pre><code>with Manager():
+    pass
+</code></pre>
+<p>If we have place a function <code>get_manager()</code> inside the three with blocks above, is there any implementation that can return the enclosing context manager, or at least their <code>__exit__</code> function? </p>
+<p>It's obviously easy in the first case, but I can't think of a way to make it work in the other two. I doubt it's possible to get the entire context manager, since the value stack is popped immediately after the <code>SETUP_WITH</code> opcode. However, since the <code>__exit__</code> function is stored on the block stack by <a href="http://docs.python.org/2/library/dis.html#opcode-SETUP_WITH" rel="noreferrer"><code>SETUP_WITH</code></a>, is there some way to access it?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Unfortunately, as discussed in the comments, this is not possible in all cases. When a context manager is created, the <a href="http://hg.python.org/cpython/file/75c0b65591fd/Python/ceval.c#l2541" rel="noreferrer">following code is run</a> (in cPython 2.7, at least. I can't comment on other implementations):</p>
+<pre><code>    case SETUP_WITH:
+    {
+        static PyObject *exit, *enter;
+        w = TOP();
+        x = special_lookup(w, "__exit__", &amp;exit);
+        if (!x)
+            break;
+        SET_TOP(x);
+        /* more code follows... */
+    }
+</code></pre>
+<p>The <code>__exit__</code> method is pushed onto a stack with the <code>SET_TOP</code> macro, which is <a href="http://hg.python.org/cpython/file/75c0b65591fd/Python/ceval.c#l826" rel="noreferrer">defined as</a>: </p>
+<pre><code>#define SET_TOP(v)        (stack_pointer[-1] = (v))
+</code></pre>
+<p>The stack pointer, in turn, is set to the top of the frame's value stack at the start of <a href="http://hg.python.org/cpython/file/75c0b65591fd/Python/ceval.c#l937" rel="noreferrer">frame eval</a>:</p>
+<pre><code>stack_pointer = f-&gt;f_stacktop;
+</code></pre>
+<p>Where f is a frame object defined in <a href="http://hg.python.org/cpython/file/75c0b65591fd/Include/frameobject.h" rel="noreferrer">frameobject.h</a>. Unfortunately for us, this is where the trail stops. The python accessible frame object is defined with the <a href="http://hg.python.org/cpython/file/75c0b65591fd/Objects/frameobject.c#l17" rel="noreferrer">following methods only</a>:</p>
+<pre><code>static PyMemberDef frame_memberlist[] = {
+    {"f_back",          T_OBJECT,       OFF(f_back),    RO},
+    {"f_code",          T_OBJECT,       OFF(f_code),    RO},
+    {"f_builtins",      T_OBJECT,       OFF(f_builtins),RO},
+    {"f_globals",       T_OBJECT,       OFF(f_globals), RO},
+    {"f_lasti",         T_INT,          OFF(f_lasti),   RO},
+    {NULL}      /* Sentinel */
+};
+</code></pre>
+<p>Which, unfortunaltey, does not include the <code>f_valuestack</code> that we would need. This makes sense, since <code>f_valuestack</code> is of the type <code>PyObject **</code>, which would need to be wrapped in an object to be accessible from python any way.</p>
+<p>TL;DR: The <code>__exit__</code> method we're looking for is only located in one place, the value stack of a frame object, and cPython doesn't make the value stack accessible to python code.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If the context manager is a class and only ever has a single instance, then you could find it on the heap:</p>
+<pre><code>import gc
+
+class ConMan(object):
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        print "enter %s" % self.name
+
+    def found(self):
+        print "You found %s!" % self.name
+
+    def __exit__(self, *args):
+        print "exit %s" % self.name
+
+
+def find_single(typ):
+    single = None
+    for obj in gc.get_objects():
+        if isinstance(obj, typ):
+            if single is not None:
+                raise ValueError("Found more than one")
+            single = obj
+    return single
+
+
+
+def foo():
+    conman = find_single(ConMan)
+    conman.found()
+
+with ConMan('the-context-manager'):
+    foo()
+</code></pre>
+<p><em>(Disclaimer: Don't do this)</em></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The difference between this case and similar-appearing cases like <code>super</code> is that here there is no enclosing frame to look at. A <code>with</code> statement is not a new scope. <code>sys._getframe(0)</code> (or, if you're putting the code into a function, <code>sys._getframe(1)</code>) will work just fine, but it'll return you the exact same frame you have before and after the <code>with</code> statement.</p>
+<p>The only way you could do it would be by inspecting the bytecode. But even that won't help. For example, try this:</p>
+<pre><code>from contextlib import contextmanager
+
+@contextmanager
+def silly():
+    yield
+
+with silly():
+    fr = sys._getframe(0)
+
+dis.dis(fr.f_code)
+</code></pre>
+<p>Obviously, as <a href="http://docs.python.org/3/library/dis.html#opcode-SETUP_WITH" rel="nofollow"><code>SETUP_WITH</code></a> explains, the method does get looked up and pushed onto the stack for <a href="http://docs.python.org/3/library/dis.html#opcode-WITH_CLEANUP" rel="nofollow"><code>WITH_CLEANUP</code></a> to use later. So, even after <code>POP_TOP</code> removes the return value of <code>silly()</code>, its <code>__exit__</code> is still on the stack.</p>
+<p>But there's no way to get at that from Python. Unless you want to start munging the bytecode, or digging apart the stack with <code>ctypes</code> or something, it might as well not exist.</p>
+</div>
+<span class="comment-copy">Are you just curious about this, or do you have an actual use case you want to solve with this?</span>
+<span class="comment-copy">I do have an actual use case, but it's pretty involved. What it boils down to is that I need to be able to run the <code>__exit__</code> function without control leaving the enclosed block. I know that might sound like a terrible idea, but let's just go with it.</span>
+<span class="comment-copy">That really sounds like a bad idea because when the enclosed block then ends, the exit function would be called again. For many context managers this could likely cause some weird effects. Is there anything that prevents you from just passing the context itself further?</span>
+<span class="comment-copy">Yes, like I said, I know it sounds bad. In my case, doesn't always leave the enclosing scope, and I don't write the code that creates the context manager. Thanks for taking the time to help find the root of my question! This really is necessary, so let's hope someone has an answer.</span>
+<span class="comment-copy">Even if you have no control over the context manager, surely you have control over the <code>with</code> block. So, why not just use #2 instead of #3? Then you have the thing returned from <code>__enter__</code>. And, if the context manager is buggy and that return value is not useful, why not write one extra line of code and use #1 instead?</span>
+<span class="comment-copy">Extra disclaimer: No, really, <b>don't</b> do this.  It is O(n) in the number of objects on the heap, which is potentially huge.  Translation: This has the potential to be extremely slow.  That's not even accounting for the possibility of finding random uncollected garbage and other junk you don't want.</span>
+<span class="comment-copy">Thanks for the answer, but this is just repeating what I said in my question.</span>
+<span class="comment-copy">@Narcolei: No it isn't. Your answer seems to assume that there's some kind of scope you could get at, and you want to know how. There is no such scope. Blocks are not scopes in Python, or really <i>anything</i> once you get past the compiler stage; all the interpreter does is push a callable on the stack and call it. There's no hidden information buried anywhere for you to access.</span>

@@ -1,0 +1,86 @@
+<div class="post-text" itemprop="text">
+<p>It's somewhat common knowledge that Python functions can have a maximum of 256 arguments.  What I'm curious to know is if this limit applies to <code>*args</code> and <code>**kwargs</code> when they're unrolled in the following manner:</p>
+<pre><code>items = [1,2,3,4,5,6]
+
+def do_something(*items):
+    pass
+</code></pre>
+<p>I ask because, hypothetically, there might be cases where a list larger than 256 items gets unrolled as a set of <code>*args</code> or <code>**kwargs</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>WFM</p>
+<pre><code>&gt;&gt;&gt; fstr = 'def f(%s): pass' % (', '.join(['arg%d' % i for i in range(5000)]))
+&gt;&gt;&gt; exec(fstr)
+&gt;&gt;&gt; f
+&lt;function f at 0x829bae4&gt;
+</code></pre>
+<p><strong>Update:</strong> as Brian noticed, the limit is on the calling side:</p>
+<pre><code>&gt;&gt;&gt; exec 'f(' + ','.join(str(i) for i in range(5000)) + ')'
+
+Traceback (most recent call last):
+  File "&lt;pyshell#63&gt;", line 1, in &lt;module&gt;
+    exec 'f(' + ','.join(str(i) for i in range(5000)) + ')'
+  File "&lt;string&gt;", line 1
+SyntaxError: more than 255 arguments (&lt;string&gt;, line 1)
+</code></pre>
+<p>on the other hand this works:</p>
+<pre><code>&gt;&gt;&gt; f(*range(5000))
+&gt;&gt;&gt; 
+</code></pre>
+<p><strong>Conclusion:</strong> no, it does not apply to unrolled arguments.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The limit is due to how the compiled bytecode treats calling a function with position arguments and/or keyword arguments.</p>
+<p>The bytecode op of concern is <code>CALL_FUNCTION</code> which carries an <code>op_arg</code> that is 4 bytes in length, but on the two least significant bytes are used. Of those, the most significant byte represent the number of keyword arguments on the stack and the least significant byte the number of positional arguments on the stack. Therefore, you can have at most <code>0xFF == 255</code> keyword arguments or <code>0xFF == 255</code> positional arguments. </p>
+<p>This limit does not apply to <code>*args</code> and <code>**kwargs</code> because calls with that grammar use the bytecode ops <code>CALL_FUNCTION_VAR</code>, <code>CALL_FUNCTION_KW</code>, and <code>CALL_FUNCTION_VAR_KW</code> depending on the signature. For these opcodes, the stack consists of an iterable for the <code>*args</code> and a <code>dict</code> for the <code>**kwargs</code>. These items get passed directly to the receiver which unrolls them as needed.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>In versions before Python 3.7, CPython has a limit of 255 explicitly passed arguments in a call:</p>
+<pre><code>&gt;&gt;&gt; def f(*args, **kwargs): pass
+...
+&gt;&gt;&gt; exec("f({})".format(', '.join(map(str, range(256)))))
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+  File "&lt;string&gt;", line 1
+SyntaxError: more than 255 arguments
+</code></pre>
+<p>This limitation is in place because until Python 3.5, the <a href="https://docs.python.org/3.5/library/dis.html#opcode-CALL_FUNCTION" rel="noreferrer"><code>CALL_FUNCTION</code> opcode</a> overloaded the opcode argument to encode both the number of positional and keyword arguments on the stack, each encoded in a single byte. </p>
+<p>This limitation is removed in the upcoming Python 3.7 release, see <a href="https://bugs.python.org/issue27213" rel="noreferrer">issue #27213</a> and <a href="https://bugs.python.org/issue12844" rel="noreferrer">issue #12844</a>; #27213 reworked the <code>CALL_FUNCTION*</code> family of opcodes for performance and simplicity (part of 3.6), freeing up the opcode argument to only encode a single argument count, and #12844 removed the compile-time check that prevented code with more arguments from being compiled.</p>
+<p>In 3.7, with the <a href="https://docs.python.org/3/library/dis.html#opcode-EXTENDED_ARG" rel="noreferrer"><code>EXTENDED_ARG()</code> opcode</a>, there is now <em>no limit at all</em> on how many arguments you can pass in using explicit arguments, save how many can be fitted onto the stack (so bound now by your memory):</p>
+<pre><code>&gt;&gt;&gt; import sys
+&gt;&gt;&gt; sys.version_info
+sys.version_info(major=3, minor=7, micro=0, releaselevel='alpha', serial=2)
+&gt;&gt;&gt; def f(*args, **kwargs): pass
+...
+&gt;&gt;&gt; exec("f({})".format(', '.join(map(str, range(256)))))
+&gt;&gt;&gt; exec("f({})".format(', '.join(map(str, range(2 ** 16)))))
+</code></pre>
+<p>Do note that lists, tuples and dictionaries are limited to <a href="https://docs.python.org/3/library/sys.html#sys.maxsize" rel="noreferrer"><code>sys.maxsize</code></a> elements, so if the called function uses <code>*args</code> and/or <code>**kwargs</code> catch-all parameters then those <em>are</em> limited. </p>
+<p>For the <code>*args</code> and <code>**kwargs</code> call syntax (expanding arguments) there are no limits other than the same <code>sys.maxint</code> size limits on Python standard types. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This appears to be a restriction in compiling the source, so will probably exist only for arguments being passed directly, not in *args or **kwargs.</p>
+<p>The relevant code can be found in <a href="http://svn.python.org/view/python/trunk/Python/ast.c?view=markup" rel="noreferrer">ast.c</a>:</p>
+<pre><code>if (nargs + nkeywords + ngens &gt; 255) {
+  ast_error(n, "more than 255 arguments");
+  return NULL;
+}
+</code></pre>
+<p>But note that this is in ast_for_call, and so only applys to the calling side. ie <code>f(a,b,c,d,e...)</code>, rather than the definition, though it will count both positional <code>(a,b,c,d)</code> and <code>keyword (a=1, b=2, c=3)</code> style parameters .  Actual <code>*args</code> and <code>**kwargs</code> parameters look like they should only count as one argument for these purposes on the calling side.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>for **kwargs, If I remember well, this is a dictionary. It therefore has about no limits.</p>
+<p>for *args, I am not so sure, but I think it is a tuple or a list, so it also has about no limits.</p>
+<p>By no limits, I mean except maybe the memory limit.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I tried for a list of 4000 items, and it worked. So I'm guessing it will work for larger values as well.</p>
+</div>
+<span class="comment-copy">It looks like the limit is on the calling side.  Try exec 'f(' + ','.join(str(i) for i in range(5000)) + ')'</span>
+<span class="comment-copy">"WFM"? WTF?....</span>
+<span class="comment-copy">@Stefan: <i>Works For Me</i></span>
+<span class="comment-copy">Is this a CPython implementation restriction, or is it part of Python itself?</span>
+<span class="comment-copy">It's an implementation detail of the CPython bytecode.</span>
+<span class="comment-copy">… indeed. The limitation will be released with CPython 3.7.</span>
+<span class="comment-copy">Nice refresh answer providing new information and context</span>
+<span class="comment-copy">Yes *args is a tuple.</span>

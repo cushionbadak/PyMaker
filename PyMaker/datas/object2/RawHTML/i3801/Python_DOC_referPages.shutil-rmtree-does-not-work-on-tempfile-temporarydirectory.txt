@@ -1,0 +1,100 @@
+<div class="post-text" itemprop="text">
+<p>Consider this test</p>
+<pre><code>import shutil, tempfile
+from os import path
+import unittest
+
+from pathlib import Path
+
+class TestExample(unittest.TestCase):
+    def setUp(self):
+        # Create a temporary directory
+        self.test_dir = tempfile.TemporaryDirectory()
+        self.test_dir2 = tempfile.mkdtemp()
+
+    def tearDown(self):
+        # Remove the directory after the  test
+        shutil.rmtree(self.test_dir2) 
+        shutil.rmtree(self.test_dir.name) #throws error
+
+    def test_something(self):
+        self.assertTrue(Path(self.test_dir.name).is_dir())
+        self.assertTrue(Path(self.test_dir2).is_dir())
+
+if __name__ == '__main__':
+    unittest.main()
+</code></pre>
+<p>In <code>tearDown</code> however an error is raised</p>
+<pre><code>FileNotFoundError: [Errno 2] No such file or directory: '/tmp/tmpxz7ts7a7'
+</code></pre>
+<p>which refers to <code>self.test_dir.name</code>.</p>
+<p>According to <a href="https://github.com/python/cpython/blob/1df877caad584135263ef94d83a28251e162e643/Lib/tempfile.py#L779" rel="nofollow noreferrer">the source code for <code>tempfile</code></a>, both elements are the same.</p>
+<pre><code>    def __init__(self, suffix=None, prefix=None, dir=None):
+        self.name = mkdtemp(suffix, prefix, dir)
+        self._finalizer = _weakref.finalize(
+            self, self._cleanup, self.name,
+            warn_message="Implicitly cleaning up {!r}".format(self))
+</code></pre>
+<p>And I'm not using it within a context, so <code>__exit__()</code> shouldn't be called as far as I understand.</p>
+<p>What is happening?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Don't cleanup these with <code>shutil</code>.  The <code>tempfile.TemporaryDirectory</code> class provides a <code>cleanup()</code> method, just call that if you want to opt-in to an explicit cleanup.</p>
+<p>The reason you get the crash with your code is that the <code>TemporaryDirectory</code> class is designed to clean up after itself once it goes out of scope (ref count to zero).  However, since you've already removed the directory from your filesystem manually, the tear down fails when the instance subsequently tries to delete itself.  The "No such file or directory" error is from <code>TemporaryDirectory</code>'s own tear down, it's not from your <code>shutil.rmtree</code> line!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It's not context related:</p>
+<pre><code>import tempfile,os
+
+t = tempfile.TemporaryDirectory()
+s = t.name
+print(os.path.isdir(s))
+# os.rmdir(s) called here triggers error on the next line
+t = None
+print(os.path.isdir(s))
+</code></pre>
+<p>it prints</p>
+<pre><code>True
+False
+</code></pre>
+<p>So as soon as the reference of <code>t</code> is set to <code>None</code> the object is garbage collected and the directory is removed, as the <a href="https://docs.python.org/3/library/tempfile.html#tempfile.TemporaryDirectory" rel="nofollow noreferrer">documentation</a> states:</p>
+<blockquote>
+<p>On completion of the context <strong>or destruction of the temporary directory object</strong> the newly created temporary directory and all its contents are removed from the filesystem.</p>
+</blockquote>
+<p>Uncommenting <code>os.rmdir(s)</code> in the snippet below throws exception when object is finalized:</p>
+<pre><code>Exception ignored in: &lt;finalize object at 0x20b20f0; dead&gt;
+Traceback (most recent call last):
+  File "L:\Python34\lib\weakref.py", line 519, in __call__
+    return info.func(*info.args, **(info.kwargs or {}))
+  File "L:\Python34\lib\tempfile.py", line 698, in _cleanup
+    _shutil.rmtree(name)
+  File "L:\Python34\lib\shutil.py", line 482, in rmtree
+    return _rmtree_unsafe(path, onerror)
+  File "L:\Python34\lib\shutil.py", line 364, in _rmtree_unsafe
+    onerror(os.listdir, path, sys.exc_info())
+  File "L:\Python34\lib\shutil.py", line 362, in _rmtree_unsafe
+    names = os.listdir(path)
+</code></pre>
+<p>So your call probably succeeds, but you get the exception at the finalization of the object (just afterwards)</p>
+<p>Calling <code>cleanup()</code> object method instead of <code>rmtree</code> solves the issue, because the object internal state is updated for <em>not</em> to try to remove the directory when finalized (if you ask me, the object <em>should</em> test if directory exists before trying to clean it up, but even that doesn't always work since it's not an atomic operation)</p>
+<p>So replace</p>
+<pre><code>shutil.rmtree(self.test_dir.name)
+</code></pre>
+<p>by</p>
+<pre><code>self.test_dir.cleanup()
+</code></pre>
+<p>or by nothing at all, let the object clean the directory on deletion.</p>
+</div>
+<span class="comment-copy">please don't change the tag for <code>tempfile</code>, which is the python module being used. <code>temporary-files</code> can be misleading.</span>
+<span class="comment-copy">I tried out at my end and it is working perfectly fine :/</span>
+<span class="comment-copy">A <code>TemporaryDirectory</code> is automatically deleted when the corresponding object is garbage collected. That said, I have no idea why it's being garbage collected <i>before</i> the <code>tearDown</code> function has finished executing.</span>
+<span class="comment-copy">are you sure it's <code>shutil.rmtree(self.test_dir.name)</code> and not the finalizer for <code>self.test_dir</code> ? have you tried <i>not</i> to clean it up, isn't it cleaned up when exiting context/when it's garbage collected? "On completion of the context or destruction of the temporary directory object the newly created temporary directory and all its contents are removed from the filesystem."</span>
+<span class="comment-copy">I don't understand the bit <code>TemporaryDirectory class is designed to clean up after itself once it goes out of scope (ref count to zero)</code>. Does the self cleaning occur after or before <code>tearDown</code> is called? does that mean that a <code>UnitTestCase</code> is a huge <code>try/finally</code> block inside some <code>context</code>?</span>
+<span class="comment-copy">It occurs after <code>tearDown</code> is called, because the test class itself holds a reference to the <code>TemporaryDirectory</code> instance (via <code>self.test_dir</code>).  Only once the test (i.e. the "<code>self</code>") is deleted, can the temp dir be finalized.  Yes, the execution of a <code>unittest.TestCase</code> is more or less a huge try/finally block setup by the test runner.</span>
+<span class="comment-copy">this is a good example of why looking at the full stack trace is important- too many people just look at the error and assume they know where its coming from</span>
+<span class="comment-copy">I don't understand why the <code>cleanup()</code> method of <code>self.test_dir</code> gets called at the end of <code>tearDown</code>. I guess that's a different question.  Both current answers explain the problem right, so I guess I will pick an answer tomorrow, if you don't mind.</span>
+<span class="comment-copy">@bluesmonk  Because <code>TemporaryDirectory()</code> sets up a <a href="https://docs.python.org/3/library/weakref.html#weakref.finalize" rel="nofollow noreferrer">weakref finalizer</a> in <code>__init__</code>, which calls <code>cleanup()</code> when the object gets garbage collected.  The object is collected once there are no references to it remaining, i.e. once the test is done.</span>
+<span class="comment-copy">So if I get the order right, after <code>tearDown</code> is finished, temp_dir calls its <code>__exit__</code> method that runs <code>cleanup()</code>, failing because during the <code>tearDown</code> call, that folder was removed using <code>shutil.rmtree()</code></span>
+<span class="comment-copy">yeah, probably what happens. What is stupid is that the object calls <code>rmtree</code> without checking that the base directory exsts or not...</span>
+<span class="comment-copy">Opinions differ on whether this is "stupid", or actually a sensible design decision. It prevents you from using the class incorrectly, without ever noticing that context is automatically managed with weakref (besides, the "unmanaged" version is <code>tempfile.mkdtemp</code>).</span>
+<span class="comment-copy">probably designed like this to avoid race conditions: testing if a directory exists and delete it afterwards isn't a guarantee because it could be deleted in the meanwhile. The alternative would have been to catch the exception, but then distinguish the "cannot delete because file is locked" from "cannot delete because the file isn't there". Point made.</span>

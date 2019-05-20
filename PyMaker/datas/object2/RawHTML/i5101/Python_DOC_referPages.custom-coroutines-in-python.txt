@@ -1,0 +1,148 @@
+<div class="post-text" itemprop="text">
+<p>I would like to implement and run custom Python coroutines (without using asyncio) to have a better "under the hood" understanding of asynchronous mechanisms.</p>
+<p>I was expected to be able to use concurrency to start a second task when the first task is waiting, doing nothing.</p>
+<p>Here the synchronous implementation of a stacker (which is an arbitrary use case).</p>
+<pre><code>def log(*msg):
+    print(int(time() - start), ':', *msg)
+
+def stack(stack, item):
+    sleep(1)
+    stack.append(item)
+
+start = time()
+words = []
+stack(words, 'hello')
+log(words)
+stack(words, 'world')
+log(words)
+</code></pre>
+<p>Here the output, as I was expected:</p>
+<pre><code>1 : ['hello']
+2 : ['hello', 'world']
+</code></pre>
+<p>Then an attempt of the asynchronous implementation of the same stacker.</p>
+<pre><code>def coroutine(func):
+    def starter(*args, **kwargs):
+        gen = func(*args, **kwargs)
+        next(gen)
+        return gen
+    return starter
+
+@coroutine
+def a_sleep(count):
+    while True:
+        yield
+        sleep(count)
+
+@coroutine
+def a_stack(stack):
+    while True:
+        item = yield
+        yield from a_sleep(1)
+        stack.append(item)
+
+start = time()
+words = []
+a_stack(words).send('hello')
+log(words)
+a_stack(words).send('world')
+log(words)
+
+# Wait all tasks to finish
+sleep(4)
+log(words)
+</code></pre>
+<p>Expected output:</p>
+<pre><code>0 : []
+1 : ['hello', 'world']
+5 : ['hello', 'world']
+</code></pre>
+<p>Real output:</p>
+<pre><code>1 : []
+2 : []
+6 : []
+</code></pre>
+<p>I figure I missed something important. I hope my approach is relevant.</p>
+<p>With additional logs, I have noticed that the a_stack function never execute the append part.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your problem is that your generators are paused at the <code>yield</code> expression in the <code>a_sleep()</code> function (via the <code>yield from a_sleep(1)</code>) delegation. The generator there is also <em>infinite</em> and so will never return. You can never advance your generators far enough to reach the <code>stack.append(item)</code> calls.</p>
+<p>I think you misunderstood what <code>yield from</code> does here. <code>yield from</code> moves control of the generator to another generator; that other generator <em>has to complete iteration</em> before the <code>yield from</code> expression completes and returns:</p>
+<pre><code>&gt;&gt;&gt; @coroutine
+... def a_sleep(count):
+...     while True:
+...         yield 'sleeping'  # to illustrate where we are stuck
+...         sleep(count)
+...
+&gt;&gt;&gt; words = []
+&gt;&gt;&gt; g = a_stack(words)
+&gt;&gt;&gt; g.send('hello')
+'sleeping'
+&gt;&gt;&gt; g.send('hello')
+'sleeping'
+&gt;&gt;&gt; g.send('hello')
+'sleeping'
+</code></pre>
+<p>Instead of using <code>sleep()</code> and an infinite loop, record the time, and loop until the time has passed:</p>
+<pre><code>&gt;&gt;&gt; @coroutine
+... def a_sleep(count):
+...     start = time()
+...     while int(time() - start) &lt; count:
+...         yield 'sleeping'
+...
+&gt;&gt;&gt; g = a_stack(words)
+&gt;&gt;&gt; g.send('hello')
+'sleeping'
+&gt;&gt;&gt; g.send('hello')
+'sleeping'
+&gt;&gt;&gt; g.send('hello')
+&gt;&gt;&gt; words
+['hello']
+</code></pre>
+<p>You'll have to keep iterating over your generators (in a loop, perhaps?) to have them alternate execution.</p>
+<p>The <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.sleep" rel="nofollow noreferrer"><code>asyncio.sleep()</code> function</a> is of course much more efficient than that; it uses a <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.Future" rel="nofollow noreferrer"><code>Future()</code> object</a> that attaches to the <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.AbstractEventLoop.call_later" rel="nofollow noreferrer"><code>AbstactEventLoop.call_later()</code> functionality</a> offered by the event loop. The loop lets the future object know when the time is up, at which point the future is marked 'ready' and the coroutine that produced it is continued again.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The line:</p>
+<pre><code>a_stack(words).send('hello')
+</code></pre>
+<p>does two things:</p>
+<ol>
+<li>create and run a new generator</li>
+<li>send the string <code>hello</code> into the generator</li>
+</ol>
+<p>The created generator waits for item to arrive, and then, <em>once resumed</em>, does something with the item. And that is the problem, you never resume the generator, you throw it away and create a new one, and proceed to use in the same manner. To fix it, your sending code should do something like:</p>
+<pre><code>coro = a_stack(words)
+coro.send('hello')
+log(words)
+coro.send('world')
+log(words)
+</code></pre>
+<p>But there is another problem. Before actually appending to the stack, <code>a_stack</code> defers its execution to another iterator, which <em>never stops yielding</em>. One  way to code <code>a_sleep</code> that fixes the problem is:</p>
+<pre><code>@coroutine
+def a_sleep(count):
+    t0 = time()
+    while time() - t0 &lt; count:
+        yield 'notyet'
+</code></pre>
+<p>Then you need either a scheduler or at least a more resilient version of <code>send</code>, which can actually deal with a task deferring its execution. A simple (and very inefficient) one could looks like this:</p>
+<pre><code>def sync_send(c, v):
+    while True:
+        ret = c.send(v)
+        if ret != 'notyet':
+            return ret
+</code></pre>
+<p>After replacing <code>coro.send('hello')</code> with <code>sync_send(coro, 'hello')</code>, the expected output is displayed.</p>
+<p>A real scheduler would never busy-loop; it would be instructed by <code>sleep</code> and by other potentially blocking calls, such as reads from files or sockets, which IO/timing events it must wait for. After the appropriate event arrived, it would wake up the correct task. This is the core of what <code>asyncio</code> does.</p>
+<p>To learn more about how generators and <code>yield from</code> are used as a core abstraction for asynchronous programming, I recommend the excellent lecture <a href="https://www.youtube.com/watch?v=MCs5OvhV9S4" rel="nofollow noreferrer">Python Concurrency From the Ground</a> by Dave Beazley. In the lecture Dave implements a coroutine scheduler in front of live audience, showing the design of his <a href="https://github.com/dabeaz/curio" rel="nofollow noreferrer">curio</a> library.</p>
+</div>
+<span class="comment-copy"><code>sleep(1)</code> does not yield to other coroutines. It stops the thread entirely.</span>
+<span class="comment-copy">You also have no event loop managing your tasks. The asyncio loop is the key component here, switching between tasks as futures are produced for tasks waiting. You are simply calling <code>send()</code> on two generators, in sequence.</span>
+<span class="comment-copy">I wonder how it was possible to do that before asyncio, without using asyncio.sleep, asyncio.get_event_loop, etc.</span>
+<span class="comment-copy">You'll have to create an event loop, at the very least, to keep advancing your generators continually to multiplex them. And avoid infinite generators if you expect to run more code following them, they'll not return.</span>
+<span class="comment-copy">@MartijnPieters The restriction against infinite generator applies only to <i>leaf</i> generators, such as <code>a_sleep</code>. There's nothing wrong with other infinite generators; they're used all over the place in asyncio. (For example, <code>while True: cmd = await reader.readline(); response = execute(cmd); writer.write(response)</code> is an oft-seen pattern with stream-based communication.)</span>
+<span class="comment-copy">If I understood correctly, the while True in my a_sleep made my generator infinite. If I remove it, my function become strictly equivalent to a normal sleep. How can I implement a sleep which will not blocking my thread? Using threading?</span>
+<span class="comment-copy">@srjjio: I added an example already, just loop until enough time has passed?</span>
+<span class="comment-copy">Now I finally see what I was missing and why the loop is essential! Thank you @Martijn</span>
+<span class="comment-copy">Thank you for your answer, which really helps me too, and also deserves to be marked as accepted. I am going to take a look on your link.</span>
+<span class="comment-copy">@srjjio I didn't see that Martijn already answered while I was writing mine. It's remarkable how similar our solutions ended up being.</span>

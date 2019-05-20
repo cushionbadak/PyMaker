@@ -1,0 +1,74 @@
+<div class="post-text" itemprop="text">
+<p>I have a service running on a Linux box that creates a <del>named pipe</del> character device-special file, and I want to write a Python3 program that communicates with the service by writing text commands and reading text replies from the <del>pipe</del> device.  I don't have source code for the service.</p>
+<p>I can use <code>os.open(named_pipe_pathname, os.O_RDWR)</code>, and I can use <code>os.read(...)</code> and <code>os.write(...)</code> to read and write it, but that's a pain because I have to write my own code to convert between bytes and strings, I have to write my own <code>readline(...)</code> function, etc.</p>
+<p>I would much rather use a Python3 <code>io</code> object to read and write the <del>pipe</del> device, but every way I can think to create one returns the same error:</p>
+<pre><code>io.UnsupportedOperation: File or stream is not seekable.
+</code></pre>
+<p>For example, I get that message if I try <code>open(pathname, "r+")</code>, and I get that same message if I try <code>fd=os.open(...)</code> followed by <code>os.fdopen(fd, "r+", ...)</code>.</p>
+<p>Q: What is the preferred way for a Python3 program to write and read text to and from a <del>named pipe</del> character device?</p>
+<hr/>
+<p>Edit:</p>
+<p>Oops! I assumed that I was dealing with a named pipe because documentation for the service describes it as a "pipe" and, because it doesn't appear in the file system until the user-mode service runs.  But, the Linux <code>file</code> utility says it is in fact, a character device special file.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem occurs because attempting to use <code>io.open</code> in read-write mode implicitly tries to wrap the underlying file in <code>io.BufferedRandom</code> (which is then wrapped in <code>io.TextIOWrapper</code> if in text mode), which assumes the underlying file is not only read/write, but random access, and it takes liberties (seeking implicitly) based on this. There is a separate class, <code>io.BufferedRWPair</code>, intended for use with read/write pipes (the docstring specifically mentions it being used for sockets and two way pipes). </p>
+<p>You can mimic the effects of <code>io.open</code> by manually wrapping layer by layer to produce the same end result. Specifically, for a text mode wrapper, you'd do something like:</p>
+<pre><code>rawf = io.FileIO(named_pipe_pathname, mode="rb+")
+with io.TextIOWrapper(io.BufferedRWPair(rawf, rawf), encoding='utf-8', write_through=True) as txtf:
+    del rawf   # Remove separate reference to rawf; txtf manages lifetime now
+    # Example use that works (but is terrible form, since communicating with
+    # oneself without threading, select module, etc., is highly likely to deadlock)
+    # It works for this super-simple case; presumably you have some parallel real code
+    txtf.write("abcé\n")
+    txtf.flush()
+    print(txtf.readline(), flush=True)
+</code></pre>
+<p>I believe this will close <code>rawf</code> twice when <code>txtf</code> is closed, but luckily, double-close is harmless here (the second <code>close</code> does nothing, realizing it's already closed).</p>
+</div>
+<div class="post-text" itemprop="text">
+<h3>Solution</h3>
+<p>You can use <a href="https://pexpect.readthedocs.io/en/stable/overview.html#" rel="nofollow noreferrer"><code>pexpect</code></a>. Here is an example using two python modules:</p>
+<p><strong>caller.py</strong></p>
+<pre><code>import pexpect
+
+proc = pexpect.spawn('python3 backwards.py')
+proc.expect(' &gt; ')
+
+while True:
+
+    n = proc.sendline(input('Feed me - '))
+    proc.expect(' &gt; ')
+    print(proc.before[n+1:].decode())
+</code></pre>
+<p><strong>backwards.py</strong></p>
+<pre><code>x = ''
+
+while True:
+    x = input(x[::-1] + ' &gt; ')
+</code></pre>
+<h3>Explanation</h3>
+<p><code>caller.py</code> is using a "Pseudo-TTY device" to talk to <code>backwards.py</code>. We are providing input with <code>sendline</code> and capturing input with <code>expect</code> (and the <code>before</code> attribute).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It looks like you need to create separate handles for reading and for writing: to open read/write just requires a seek method. I couldn't figure out how to timeout reading, so it's nice to add an opener (see the docstring for <code>io.open</code>) that opens the reader in non-blocking mode. I set up a simple echo service on a named pipe called <code>/tmp/test_pipe</code>:</p>
+<pre><code>In [1]: import io
+In [2]: import os
+In [3]: nonblockingOpener = lambda name, flags:os.open(name, flags|os.O_NONBLOCK)
+In [4]: reader = io.open('/tmp/test_pipe', 'r', opener = nonblockingOpener)
+In [5]: writer = io.open('/tmp/test_pipe', 'w')
+In [6]: writer.write('Hi have a line\n')
+In [7]: writer.flush()
+In [8]: reader.readline()
+Out[8]: 'You said: Hi have a line\n'
+In [9]: reader.readline()
+''
+</code></pre>
+</div>
+<span class="comment-copy">Have you considered <a href="https://pexpect.readthedocs.io/en/stable/overview.html" rel="nofollow noreferrer"><code>pexpect</code></a>?</span>
+<span class="comment-copy">@Alex, Thank you.  It looks like maybe I could use the <code>pexpect.fdpexpect.fdspawn</code> class.  I'll have to look deeper.  Maybe your comment should be an answer.</span>
+<span class="comment-copy">Shouldn't you use <i>two</i> named pipes for this? A named pipe only has one read end and one write end. Trying to send messages bidirectionally on a named pipe seems like a bad idea.</span>
+<span class="comment-copy">Apparently they're bidirectional on some systems, but not on Linux.</span>
+<span class="comment-copy">There's a <a href="https://docs.python.org/3/library/io.html#io.BufferedRWPair" rel="nofollow noreferrer">big warning</a> against doing this in the docs: "Warning: BufferedRWPair does not attempt to synchronize accesses to its underlying raw streams. You should not pass it the same object as reader and writer; use BufferedRandom instead." BufferedRandom is unsuitable, though, as you explain. If the warning in the docs does not apply for this use case, can you explain why in your answer?</span>
+<span class="comment-copy">@user2357112: I can't find any guarantees; fundamentally what it's saying is that it doesn't do anything to keep the file pointers in sync, so if you had an actual random access stateful file object and wrapped it in <code>BufferedRWPair</code>, the operations in one direction would interfere with operations in the other direction, and more importantly, thanks to the buffering, the ordering of operations might not make sense. When the underlying object is a named pipe, there's no possibility of ambiguously ordered reads changing the "position" of a write, or vice versa, so I <i>think</i> it's safe.</span>
+<span class="comment-copy">Example where a regular file would be weird would be <code>write</code>ing <code>b'abc'</code>, then <code>read</code>ing 3 bytes, then <code>write</code>ing <code>'def'</code> to a small file. If you'd opened it with <code>BufferedRWPair</code>, and didn't <code>flush</code> explicitly before closing, there's a decent chance the <code>write</code>s would all get buffered, the <code>read</code> would buffer the whole contents of the file, and the <code>write</code>s would end up at the end of the file (making it longer). <code>BufferedRandom</code> would synchronize the <code>read</code>s with the <code>write</code>s, so you'd actually <code>write</code> to bytes 0-2 and 6-8, reading the original bytes 3-5 as expected.</span>
+<span class="comment-copy">By contrast, modulo deadlock concerns, a named pipe doesn't have that problem; the read and write sides are effectively independent (it always passes through the OS from write side to read side, and there is no file pointer on either side). So ignoring the possibility of deadlock (which has to be handled by <code>select</code> or <code>threading</code> related nonsense with explicit <code>flush</code>ing), the behavior for the named pipe is well defined, even when using the same handle; <code>b'abcdef'</code> is written in order, and <code>b'abc'</code> is read, assuming no other readers and writers are involved.</span>

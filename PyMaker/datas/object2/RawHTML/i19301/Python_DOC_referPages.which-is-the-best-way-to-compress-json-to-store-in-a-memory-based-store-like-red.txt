@@ -1,0 +1,136 @@
+<div class="post-text" itemprop="text">
+<p>Requirement :
+Python objects with 2-3 levels of nesting containing basic datypes like integers,strings, lists, and dicts.
+( no dates etc), needs to be stored as json in redis against a key.
+What are the best methods available for compressing json as a string for low memory footprint.
+The target objects are not very large, having 1000 small elements on average, 
+or about 15000 characters when converted to JSON.</p>
+<p>eg.</p>
+<pre><code>&gt;&gt;&gt; my_dict
+{'details': {'1': {'age': 13, 'name': 'dhruv'}, '2': {'age': 15, 'name': 'Matt'}}, 'members': ['1', '2']}
+&gt;&gt;&gt; json.dumps(my_dict)
+'{"details": {"1": {"age": 13, "name": "dhruv"}, "2": {"age": 15, "name": "Matt"}}, "members": ["1", "2"]}'
+### SOME BASIC COMPACTION ###
+&gt;&gt;&gt; json.dumps(my_dict, separators=(',',':'))
+'{"details":{"1":{"age":13,"name":"dhruv"},"2":{"age":15,"name":"Matt"}},"members":["1","2"]}'
+</code></pre>
+<p>1/ Are there any other better ways to compress json to save memory in redis ( also ensuring light weight decoding afterwards ).</p>
+<p>2/ How good a candidate would be msgpack [http://msgpack.org/] ?</p>
+<p>3/ Shall I consider options like pickle as well ?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>We just use <code>gzip</code> as a compressor.</p>
+<pre><code>import gzip
+import cStringIO
+
+def decompressStringToFile(value, outputFile):
+  """
+  decompress the given string value (which must be valid compressed gzip
+  data) and write the result in the given open file.
+  """
+  stream = cStringIO.StringIO(value)
+  decompressor = gzip.GzipFile(fileobj=stream, mode='r')
+  while True:  # until EOF
+    chunk = decompressor.read(8192)
+    if not chunk:
+      decompressor.close()
+      outputFile.close()
+      return 
+    outputFile.write(chunk)
+
+def compressFileToString(inputFile):
+  """
+  read the given open file, compress the data and return it as string.
+  """
+  stream = cStringIO.StringIO()
+  compressor = gzip.GzipFile(fileobj=stream, mode='w')
+  while True:  # until EOF
+    chunk = inputFile.read(8192)
+    if not chunk:  # EOF?
+      compressor.close()
+      return stream.getvalue()
+    compressor.write(chunk)
+</code></pre>
+<p>In our usecase we store the result as files, as you can imagine.  To use just in-memory strings, you can use a <code>cStringIO.StringIO()</code> object as a replacement for the file as well.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Based on @Alfe's <a href="https://stackoverflow.com/a/15529390/4794841">answer</a> above here is a version that keeps the contents in memory (for network I/O tasks). I also made a few changes to support Python 3.</p>
+<pre><code>import gzip
+from io import StringIO, BytesIO
+
+def decompressBytesToString(inputBytes):
+  """
+  decompress the given byte array (which must be valid 
+  compressed gzip data) and return the decoded text (utf-8).
+  """
+  bio = BytesIO()
+  stream = BytesIO(inputBytes)
+  decompressor = gzip.GzipFile(fileobj=stream, mode='r')
+  while True:  # until EOF
+    chunk = decompressor.read(8192)
+    if not chunk:
+      decompressor.close()
+      bio.seek(0)
+      return bio.read().decode("utf-8")
+    bio.write(chunk)
+  return None
+
+def compressStringToBytes(inputString):
+  """
+  read the given string, encode it in utf-8,
+  compress the data and return it as a byte array.
+  """
+  bio = BytesIO()
+  bio.write(inputString.encode("utf-8"))
+  bio.seek(0)
+  stream = BytesIO()
+  compressor = gzip.GzipFile(fileobj=stream, mode='w')
+  while True:  # until EOF
+    chunk = bio.read(8192)
+    if not chunk:  # EOF?
+      compressor.close()
+      return stream.getvalue()
+    compressor.write(chunk)
+</code></pre>
+<p>To test the compression try:</p>
+<pre><code>inputString="asdf" * 1000
+len(inputString)
+len(compressStringToBytes(inputString))
+decompressBytesToString(compressStringToBytes(inputString))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you want it to be fast, <a href="https://github.com/lz4/lz4" rel="nofollow noreferrer">try lz4</a>. 
+If you want it to compress better, <a href="https://docs.python.org/3/library/lzma.html" rel="nofollow noreferrer">go for lzma</a>.</p>
+<blockquote>
+<p>Are there any other better ways to compress json to save memory in
+  redis(also ensuring light weight decoding afterwards)?</p>
+<p>How good a candidate would be msgpack [<a href="http://msgpack.org/]" rel="nofollow noreferrer">http://msgpack.org/]</a>?</p>
+</blockquote>
+<p>Msgpack is relatively fast and has a smaller memory footprint. But <a href="https://pypi.python.org/pypi/ujson" rel="nofollow noreferrer">ujson</a> is generally faster for me. 
+You should compare them on your data, measure the compression and decompression rates and the compression ratio.</p>
+<blockquote>
+<p>Shall I consider options like pickle as well?</p>
+</blockquote>
+<p>Consider both pickle(cPickle in partucular) and marshal. They are fast. But remember that they are not secure or scalable and you pay for the speed with the added responsibility.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>One easy "post process" way is to build a "short key name" map and run the generated json through that before storage, and again (reversed) before de-serializing to an object. For example:</p>
+<pre><code>Before: {"details":{"1":{"age":13,"name":"dhruv"},"2":{"age":15,"name":"Matt"}},"members":["1","2"]}
+Map: details:d, age:a, name:n, members:m
+Result: {"d":{"1":{"a":13,"n":"dhruv"},"2":{"a":15,"n":"Matt"}},"m":["1","2"]}
+</code></pre>
+<p>Just go through the json and replace key-&gt;value on the way to the database, and value-&gt;key on the way to the application.</p>
+<p>You can also gzip for extra goodness (won't be a string after that though).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Another possibility would be to use MongoDB's storage format, <a href="http://bsonspec.org/" rel="nofollow">BSON</a>.</p>
+<p>You can find two python implementations in the implementation page on that site.</p>
+<p>edit: why not just save the dictionary, and convert to json on retrieval?</p>
+</div>
+<span class="comment-copy">what are the requirements of your application? do you need performance? reliability, consistency, etc? would you consider alternatives to redis?</span>
+<span class="comment-copy">I do not think BSON can be added as a value for a key in redis.</span>
+<span class="comment-copy">@DhruvPathak see my edit</span>
+<span class="comment-copy">@DhruvPathak sure it can, why wouldn't it? Redis has no opinion on what you store in a key.</span>
+<span class="comment-copy">@JonatanHedborg thanks for the correction. I did not pay attention to the point that redis strings are binary safe.</span>
+<span class="comment-copy">However, BSON isn't really more compact than JSON (as stated on their site), so it's not really an option.</span>

@@ -1,0 +1,196 @@
+<div class="post-text" itemprop="text">
+<p>What is the correct way to access the log4j logger of Spark using pyspark on an executor?</p>
+<p>It's easy to do so in the driver but I cannot seem to understand how to access the logging functionalities on the executor so that I can log locally and let YARN collect the local logs.</p>
+<p>Is there any way to access the local logger?</p>
+<p>The standard logging procedure is not enough because I cannot access the spark context from the executor.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You cannot use local log4j logger on executors. Python workers spawned by executors jvms has no "callback" connection to the java, they just receive commands. But there is a way to log from executors using standard python logging and capture them by YARN. </p>
+<p>On you HDFS place python module file that configures logging once per python worker and proxies logging functions (name it <code>logger.py</code>):</p>
+<pre><code>import os
+import logging
+import sys
+
+class YarnLogger:
+    @staticmethod
+    def setup_logger():
+        if not 'LOG_DIRS' in os.environ:
+            sys.stderr.write('Missing LOG_DIRS environment variable, pyspark logging disabled')
+            return 
+
+        file = os.environ['LOG_DIRS'].split(',')[0] + '/pyspark.log'
+        logging.basicConfig(filename=file, level=logging.INFO, 
+                format='%(asctime)s.%(msecs)03d %(levelname)s %(module)s - %(funcName)s: %(message)s')
+
+    def __getattr__(self, key):
+        return getattr(logging, key)
+
+YarnLogger.setup_logger()
+</code></pre>
+<p>Then import this module inside your application:</p>
+<pre><code>spark.sparkContext.addPyFile('hdfs:///path/to/logger.py')
+import logger
+logger = logger.YarnLogger()
+</code></pre>
+<p>And you can use in inside your pyspark functions like normal logging library:</p>
+<pre><code>def map_sth(s):
+    logger.info("Mapping " + str(s))
+    return s
+
+spark.range(10).rdd.map(map_sth).count()
+</code></pre>
+<p>The <code>pyspark.log</code> will be visible on resource manager and will be collected on application finish, so you can access these logs later with <code>yarn logs -applicationId ....</code>.
+<a href="https://i.stack.imgur.com/4R2XU.png" rel="noreferrer"><img alt="enter image description here" src="https://i.stack.imgur.com/4R2XU.png"/></a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Note that Mariusz's answer returns a <em>proxy</em> to the logging module. This works (upvoted) when your logging demands are very basic. Once you're interested in doing things like configuring multiple logger instances or using multiple handlers, it will be lacking. E.g. if you have a larger set of code that you only want to run when debugging, one of the <a href="https://stackoverflow.com/questions/21377020/python-how-to-do-lazy-debug-logging">solutions</a> would be to check a logger instance's <a href="https://docs.python.org/3/library/logging.html?highlight=logging#logging.Logger.isEnabledFor" rel="nofollow noreferrer"><code>isEnabledFor</code></a> method, like so:</p>
+<pre><code>logger = logging.getLogger(__name__)
+if logger.isEnabledFor(logging.DEBUG):
+    # do some heavy calculations and call `logger.debug` (or any other logging method, really)
+</code></pre>
+<p>This would fail when the method is called on the logging module, like in Mariusz's answer, because the logging module does not have such an attribute.</p>
+<p>One way to solve this would be to create a <code>spark_logging.py</code> module in which you configure the logging and return a new instance of <code>Logger</code>. The code below shows an example of this, which configures logging using <code>dictConfig</code>. It also adds a filter so that the number of repetitions from all the worker nodes is greatly reduced when using the root logger (filter example is from Christopher Dunn (<a href="https://code.activestate.com/recipes/412552-using-the-logging-module/" rel="nofollow noreferrer">ref</a>)).</p>
+<pre><code># spark_logging.py
+import logging
+import logging.config
+import os
+import tempfile
+from logging import *  # gives access to logging.DEBUG etc by aliasing this module for the standard logging module
+
+
+class Unique(logging.Filter):
+    """Messages are allowed through just once.
+    The 'message' includes substitutions, but is not formatted by the
+    handler. If it were, then practically all messages would be unique!
+    """
+    def __init__(self, name=""):
+        logging.Filter.__init__(self, name)
+        self.reset()
+
+    def reset(self):
+        """Act as if nothing has happened."""
+        self.__logged = {}
+
+    def filter(self, rec):
+        """logging.Filter.filter performs an extra filter on the name."""
+        return logging.Filter.filter(self, rec) and self.__is_first_time(rec)
+
+    def __is_first_time(self, rec):
+        """Emit a message only once."""
+        msg = rec.msg %(rec.args)
+        if msg in self.__logged:
+            self.__logged[msg] += 1
+            return False
+        else:
+            self.__logged[msg] = 1
+            return True
+
+
+def getLogger(name, logfile="pyspark.log"):
+    """Replaces getLogger from logging to ensure each worker configures
+    logging locally."""
+
+    try:
+        logfile = os.path.join(os.environ['LOG_DIRS'].split(',')[0], logfile)
+    except (KeyError, IndexError):
+        tmpdir = tempfile.gettempdir()
+        logfile = os.path.join(tmpdir, logfile)
+        rootlogger = logging.getLogger("")
+        rootlogger.addFilter(Unique())
+        rootlogger.warning(
+            "LOG_DIRS not in environment variables or is empty. Will log to {}."
+            .format(logfile))
+
+    # Alternatively, load log settings from YAML or use JSON.
+    log_settings = {
+        'version': 1,
+        'disable_existing_loggers': False,
+        'handlers': {
+            'file': {
+                'class': 'logging.FileHandler',
+                'level': 'DEBUG',
+                'formatter': 'detailed',
+                'filename': logfile
+            },
+            'default': {
+                'level': 'INFO',
+                'class': 'logging.StreamHandler',
+            },
+        },
+        'formatters': {
+            'detailed': {
+                'format': ("%(asctime)s.%(msecs)03d %(levelname)s %(module)s - "
+                           "%(funcName)s: %(message)s"),
+            },
+        },
+        'loggers': {
+            'driver': {
+                'level': 'INFO',
+                'handlers': ['file', ]
+            },
+            'executor': {
+                'level': 'DEBUG',
+                'handlers': ['file', ]
+            },
+        }
+    }
+
+    logging.config.dictConfig(log_settings)
+    return logging.getLogger(name)
+</code></pre>
+<p>You could then import this module and alias it for <code>logging</code> itself:</p>
+<pre><code>from pyspark.sql import SparkSession
+
+spark = SparkSession \
+    .builder \
+    .appName("Test logging") \
+    .getOrCreate()
+
+try:
+    spark.sparkContext.addPyFile('s3://YOUR_BUCKET/spark_logging.py')
+except:
+    # Probably running this locally. Make sure to have spark_logging in the PYTHONPATH
+    pass
+finally:
+    import spark_logging as logging
+
+def map_sth(s):
+    log3 = logging.getLogger("executor")
+    log3.info("Logging from executor")
+
+    if log3.isEnabledFor(logging.DEBUG):
+        log3.debug("This statement is only logged when DEBUG is configured.")
+
+    return s
+
+def main():
+    log2 = logging.getLogger("driver")
+    log2.info("Logging from within module function on driver")
+    spark.range(100).rdd.map(map_sth).count()
+
+if __name__ == "__main__":
+    log1 = logging.getLogger("driver")
+    log1.info("logging from module level")
+    main()
+</code></pre>
+<p>Like with <a href="https://stackoverflow.com/a/40839220/2476444">Mariusz's answer</a>, logs will be accessible using the resource manager (or dumped in your temp-folder when <code>LOG_DIRS</code> is not in your environment variables).
+The error handling done at the top of this script is added so that you could run this script locally. </p>
+<p>This approach allows more freedom: you could have the executors log to one file and all kinds of aggregation counts on the drive in another file.</p>
+<p>Note that there is slightly more work to be done in this case, compared to using a class as a proxy for the built-in logging module, as each time you request a logger on the executor instances, it will have to be configured. That likely won't be your main time-hog when doing big data analytics though. ;-) </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I have yet another approach to solve logging issue in PySpark. Idea is as follows:</p>
+<ul>
+<li>Use remote log management service (For example Loggly, CloudWatch on AWS, Application Insights on Azure etc)</li>
+<li>Configure logging module in both master node and worker nodes using same configuration to send logs to above sevices</li>
+</ul>
+<p>This is good approach if you are already using cloud services as many of them also have log collection/management services.</p>
+<p>I have a simple wordcount example on Github to demonstrate this approach <a href="https://github.com/chhantyal/wordcount" rel="nofollow noreferrer">https://github.com/chhantyal/wordcount</a></p>
+<p>This Spark app sends logs to Loggly using standard <code>logging</code> module from driver (master node) as well as executors (worker nodes).</p>
+</div>
+<span class="comment-copy">Thank you very much. In the meanwhile I had found more answers validating what you said. Our current approach to logging is somewhat similar to what you did. This is a good confirmation we are on a good track, even if this solution lacks all the flexibility of log4j.</span>
+<span class="comment-copy">This is not working for me.</span>
+<span class="comment-copy">@feroze what version of spark and YARN are you using?</span>
+<span class="comment-copy">In case anyone's not sure you can access <code>pyspark.log</code> alone by doing <code>yarn logs -applicationId &lt;app_id&gt; -log_files pyspark.log</code></span>
+<span class="comment-copy">If you want to write it directly into the "console", you can replace the file by <code>stream=sys.stdout</code></span>
+<span class="comment-copy">Hi @Oliver W., Many thanks for this. In case of using spark on EMR of AWS, what LOG_DIRS variable should contain to see the pyspark.log file through the resource manager?</span>

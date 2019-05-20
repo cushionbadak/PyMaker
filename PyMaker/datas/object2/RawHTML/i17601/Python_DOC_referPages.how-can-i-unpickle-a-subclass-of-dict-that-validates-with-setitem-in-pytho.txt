@@ -1,0 +1,245 @@
+<div class="post-text" itemprop="text">
+<p>I'm using python3.3. It's possible this problem doesn't exist in 2.x's pickle protocol, but I haven't actually verified.</p>
+<p>Suppose I've created a <code>dict</code> subclass that counts every time a key is updated. Something like this:</p>
+<pre><code>class Foo(dict):
+    def __init__(self):
+        self.counter = 0
+
+    def __setitem__(self, key, value):
+        print(key, value, self.__dict__)
+        if key == 'bar':
+            self.counter += 1
+        super(Foo, self).__setitem__(key, value)
+</code></pre>
+<p>You might use it like this:</p>
+<pre><code>&gt;&gt;&gt; f = Foo()
+&gt;&gt;&gt; assert f.counter == 0
+&gt;&gt;&gt; f['bar'] = 'baz'
+... logging output...        
+&gt;&gt;&gt; assert f.counter == 1
+</code></pre>
+<p>Now let's pickle and unpickle it:</p>
+<pre><code>&gt;&gt;&gt; import pickle
+&gt;&gt;&gt; f_str = pickle.dumps(f)
+&gt;&gt;&gt; f_new = pickle.loads(f_str)
+bar baz {}
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+  File "test.py", line 133, in __setitem__
+    self.counter += 1
+AttributeError: 'Foo' object has no attribute 'counter'
+</code></pre>
+<p>I think the <code>print()</code> in <code>__setitem__</code> shows the problem: <code>pickle.loads</code> attempts to write the dictionary's keys <em>before</em> it writes the object's attributes... at least I think that's what's happening. It's pretty easy to verify if you remove the <code>self.counter</code> reference in <code>Foo.__setitem__()</code>:</p>
+<pre><code>&gt;&gt;&gt; f_mod = ModifiedFoo()
+&gt;&gt;&gt; f_mod['bar'] = 'baz'
+&gt;&gt;&gt; f_mod_str = pickle.dumps(f_mod)
+&gt;&gt;&gt; f_mod_new = pickle.loads(f_mod_str)
+bar baz {}
+&gt;&gt;&gt; assert f_mod_new.counter == 0
+&gt;&gt;&gt;
+</code></pre>
+<p>Is this just a byproduct of the pickle protocol? I've tried variations on <code>__setstate__</code> to let it unpickle correctly, but as far as I can tell, it hits the <code>__setitem__</code> error before <code>__setstate__</code> is even called. Is there any way I can modify this object to allow unpickling?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As stated by <code>pickle</code> documentation:</p>
+<blockquote>
+<p>When a pickled class instance is unpickled, its <code>__init__()</code> method is
+  normally <em>not</em> invoked.</p>
+</blockquote>
+<p>In your case you <em>do</em> want to invoke <code>__init__</code>. However since your class is a new-style class you cannot use <code>__getinitargs__</code> (which isn't supported in python3 anyway). You could try to write your custom <code>__getstate__</code> and <code>__setstate__</code> methods:</p>
+<pre><code>class Foo(dict):
+    def __init__(self):
+        self.counter = 0
+    def __getstate__(self):
+        return (self.counter, dict(self))
+    def __setstate__(self, state):
+        self.counter, data = state
+        self.update(data)  # will *not* call __setitem__
+
+    def __setitem__(self, key, value):
+        self.counter += 1
+        super(Foo, self).__setitem__(key, value)
+</code></pre>
+<p>However this <em>still</em> doesn't work, because since you are subclassing <code>dict</code> and <code>dict</code> has a special handler for pickling, the <code>__getstate__</code> method <em>is</em> called, however the <code>__setstate__</code> method <em>is not</em>.</p>
+<p>You can work around this defining the <code>__reduce__</code> method:</p>
+<pre><code>class Foo(dict):
+    def __init__(self):
+        self.counter = 0
+    def __getstate__(self):
+        return (self.counter, dict(self))
+    def __setstate__(self, state):
+        self.counter, data = state
+        self.update(data)
+    def __reduce__(self):
+        return (Foo, (), self.__getstate__())
+
+    def __setitem__(self, key, value):
+        self.counter += 1
+        super(Foo, self).__setitem__(key, value)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You are subclassing <code>dict</code>, and the pickle protocol will use the dedicated <code>dict</code> handler to store the keys and values in the resulting pickle data, using a <em>different</em> set of opcodes to restore these to your object again.</p>
+<p>As a result, <code>__setstate__</code> is going only going to be called <em>after</em> restoring the dictionary keys, and the state contains only the <code>counter</code> attribute.</p>
+<p>There are two work-arounds here:</p>
+<ol>
+<li><p>Make your <code>counter</code> code resilient in the face of <code>__init__</code> not being called:</p>
+<pre><code>class Foo(dict):
+    counter = 0
+
+    def __setitem__(self, key, value):
+        print(key, value, self.__dict__)
+        if key == 'bar':
+            self.counter += 1
+        super(Foo, self).__setitem__(key, value)
+</code></pre>
+<p>Here <code>counter</code> is a class attribute and thus always present. You could also use:</p>
+<pre><code>self.counter = getattr(self, 'counter', 0) + 1
+</code></pre>
+<p>to ensure there is a default value for the missing attribute.</p></li>
+<li><p>Provide a <code>__newargs__</code> method; it can return an empty tuple, but specifying it ensures that <code>__new__</code> is called when unpickling, which in turn could call <code>__init__</code>:</p>
+<pre><code>class Foo(dict):
+    def __new__(cls, *args, **kw):
+        f = super().__new__(cls, *args, **kw)
+        f.__init__()
+        return f
+
+    def __init__(self):
+        self.counter = 0
+
+    def __setitem__(self, key, value):
+        print(key, value, self.__dict__)
+        if key == 'bar':
+            self.counter += 1
+        super(Foo, self).__setitem__(key, value)
+
+    def __getnewargs__(self):
+        # Call __new__ (and thus __init__) on unpickling.
+        return ()
+</code></pre>
+<p>Note that after <code>__init__</code> is called, the unpickler still will set all the keys, <em>then</em> restore <code>__dict__</code>. <code>self.counter</code> will reflect the correct value in the end.</p></li>
+</ol>
+<p>Demos:</p>
+<p>1st approach:</p>
+<pre><code>&gt;&gt;&gt; import pickle
+&gt;&gt;&gt; class Foo(dict):
+...     counter = 0
+...     def __setitem__(self, key, value):
+...         print(key, value, self.__dict__)
+...         if key == 'bar':
+...             self.counter += 1
+...         super(Foo, self).__setitem__(key, value)
+... 
+&gt;&gt;&gt; f = Foo()
+&gt;&gt;&gt; f['bar'] = 'baz'
+bar baz {}
+&gt;&gt;&gt; f.counter
+1
+&gt;&gt;&gt; f['bar'] = 'foo'
+bar foo {'counter': 1}
+&gt;&gt;&gt; f.counter
+2
+&gt;&gt;&gt; f_str = pickle.dumps(f)
+&gt;&gt;&gt; new_f = pickle.loads(f_str)
+bar foo {}
+&gt;&gt;&gt; new_f.counter
+2
+&gt;&gt;&gt; new_f.items()
+dict_items([('bar', 'foo')])
+</code></pre>
+<p>2nd approach:</p>
+<pre><code>&gt;&gt;&gt; import pickle
+&gt;&gt;&gt; class Foo(dict):
+...     def __new__(cls, *args, **kw):
+...         f = super().__new__(cls, *args, **kw)
+...         f.__init__()
+...         return f
+...     def __init__(self):
+...         self.counter = 0
+...     def __setitem__(self, key, value):
+...         print(key, value, self.__dict__)
+...         if key == 'bar':
+...             self.counter += 1
+...         super(Foo, self).__setitem__(key, value)
+...     def __getnewargs__(self):
+...         return ()
+... 
+
+&gt;&gt;&gt; f = Foo()
+&gt;&gt;&gt; f['bar'] = 'baz'
+bar baz {'counter': 0}
+&gt;&gt;&gt; f.counter
+1
+&gt;&gt;&gt; f['bar'] = 'foo'
+bar foo {'counter': 1}
+&gt;&gt;&gt; f.counter
+2
+&gt;&gt;&gt; f_str = pickle.dumps(f)
+&gt;&gt;&gt; new_f = pickle.loads(f_str)
+bar foo {}
+&gt;&gt;&gt; new_f.counter
+2
+&gt;&gt;&gt; new_f.items()
+dict_items([('bar', 'foo')])
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can add pickle support to your dictionary subclass by adding a<a href="http://docs.python.org/3/library/pickle.html?highlight=__reduce__#object.__reduce__" rel="nofollow"><code>__reduce__()</code></a>method which will be used to get arguments to pass to a user defined function to reconstitute the object when it's unpickled. </p>
+<p>Although, since your class is a<code>dict</code>subclass,  not wasn't quite as trivial to implement as I originally thought, but it's fairly simple once I figured out what needed to be done. Here's what I came up with -- note that the <code>_Foo_unpickle_helper()</code>function can't be a regular, class, or static method of<code>Foo</code>, so that's why it was defined at the module level:</p>
+<pre><code>class Foo(dict):
+    def __init__(self):
+        self.counter = 0
+
+    def __setitem__(self, key, value):
+        print(key, value, self.__dict__)
+        if key == 'bar':
+            self.counter += 1
+        super(Foo, self).__setitem__(key, value)
+
+    def __reduce__(self):
+        return _Foo_unpickle_helper, (self.counter, iter(self.items()))
+
+def _Foo_unpickle_helper(counter, items):
+    """ Reconstitute a Foo instance from the arguments. """
+    foo = Foo()
+    foo.counter = counter
+    foo.update(items)  # apparently doesn't call __setitem__()...
+    return foo
+
+f = Foo()
+f['bar'] = 'baz'
+f['bar'] = 'baz'
+print('f: {}'.format(f))
+print('f.counter: {}'.format(f.counter))
+
+import pickle
+f_str = pickle.dumps(f)
+print('----------')
+f_new = pickle.loads(f_str)
+print('f_new: {}'.format(f_new))
+print('f_new.counter: {}'.format(f_new.counter))
+</code></pre>
+<p>Output:</p>
+<pre class="lang-none prettyprint-override"><code>bar baz {'counter': 0}
+bar baz {'counter': 1}
+f: {'bar': 'baz'}
+f.counter: 2
+----------
+f_new: {'bar': 'baz'}
+f_new.counter: 2
+</code></pre>
+</div>
+<span class="comment-copy">I was having problems getting pickle to work correctly with <code>__setstate__</code> and <code>__getstate__</code> before too.  I don't remember the details of what I tracked down, but I ended up using <code>copy_reg.pickle</code> to register handlers for the object type, and that worked better for me.  Maybe you should take a look at the <code>copy_reg</code> module.</span>
+<span class="comment-copy">Ah, you are subclassing <code>dict</code>! That's where <code>__setstate__</code> is bypassed, because a <i>different</i> opcode is used to restore the contents of a dictionary.</span>
+<span class="comment-copy">Yet, if <code>__setstate__</code> is defined it should be called when building the class.</span>
+<span class="comment-copy">Those docs state it works for old-style classes, where this is a new style class, as far as I'm aware? I had tried <a href="http://docs.python.org/3.3/library/pickle.html#object.__getnewargs__" rel="nofollow noreferrer"><code>__getnewargs__()</code></a> but wasn't able to get traction. I was possibly misusing it. It looks like <code>__getinitargs__</code> doesn't exist in python3's docs.</span>
+<span class="comment-copy">@Christopher Yes, my answer isn't correct. Since you are subclassing <code>dict</code>, which has some special handling during pickling, what you want to achieve doesn't seem trivial. You'd better write a custom pickler/unpickler and register them via the <code>copy_reg</code> module.</span>
+<span class="comment-copy">@Christopher Never mind. Seems to be easy enough to define a <code>__reduce__</code> that works.</span>
+<span class="comment-copy">My preferred solution of the three, but I upvoted all of them as they're all valid, creative approaches to the same problem.</span>
+<span class="comment-copy">Note that the second solution doesn't preserve <code>counter</code>. After unpickling you'll always have <code>counter == len(foo)</code> which need not be true before the pickling.</span>
+<span class="comment-copy">@Bakuriu: No, it <i>does</i> preserve <code>counter</code>, because <code>counter</code> attribute will be set <i>after</i> the keys are set.</span>
+<span class="comment-copy">In any case I just tried and adding <code>__getnewargs__</code> does <i>not</i> call <code>__init__</code>. I still get an <code>AttributeError</code>.</span>
+<span class="comment-copy">@Bakuriu: This is Python 3; I tested it in 3.3.2, and this <i>works</i>.</span>
+<span class="comment-copy">It doesn't seem that the presence of <code>__getnewargs__</code> affects whether or not <code>__new__</code> is called, at least in python 3.6. I just posted a <a href="https://bugs.python.org/issue29597" rel="nofollow noreferrer">documentation issue</a> about it.</span>
+<span class="comment-copy">This won't restore the counter if you <i>replace</i> the value of a key; <code>f['bar'] = 'baz'; f['bar'] = 'foo'</code> would leave the counter set to <code>2</code>, but your code restores it to <code>1</code>.</span>
+<span class="comment-copy">@Martijn: Good catch, thanks -- addressed by latest update.</span>

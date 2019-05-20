@@ -1,0 +1,156 @@
+<div class="post-text" itemprop="text">
+<p>I have a non-GUI PyQt application that I want to performs some clean-up tasks and print a message after quitting the event loop. </p>
+<pre><code>def main(name):
+    signal( SIGTERM, onQuit )
+    signal( SIGINT, onQuit )
+
+    logging.basicConfig( level=LOG_LEVEL, format=LOG_FMT.format(name) )
+
+    try:
+        app = QtCore.QCoreApplication(sys.argv)
+        QtDBus.QDBusConnection.sessionBus().registerService( "{}.{}.{}".format( DBUS_SERVICE,
+                                                                                name,
+                                                                                "CommandRelay" ) )
+        relay = CommandRelay(name)
+    except Exception:
+        log.error( "Failed to create CommandRelay. process exiting." )
+        raise
+    try:
+        app.exec_()
+    except Exception:
+        log.error( "Fatal exception occurred while running relay. Exiting." )
+        raise
+    finally:
+        relay.destroy()
+        log.info( "Exiting process now." )
+</code></pre>
+<p>This application runs as a subprocess to a larger application. When it receives a <code>SIGTERM</code> signal, it quits the application.</p>
+<pre><code>def onQuit( signum, stackframe ):
+    """ Handle terminate signal """
+    try:
+        log.info( "Terminate signal received." )
+        QtCore.QCoreApplication.quit()
+    except Exception:
+        log.exception( "Exception occured while terminating" )
+        sys.exit(1)
+    sys.exit(0)
+</code></pre>
+<p>According to the documentation for <a href="http://doc.qt.io/qt-5/qcoreapplication.html#quit" rel="nofollow"><code>QCoreApplication.quit()</code></a>, the program should then return control to just after the call to <code>exec_()</code>. But instead, it seems to exit immediately.</p>
+<p>Platform is Opensuse 13.2 x86_64.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your issue probably is that Python handles signals while it's running Python code - basically something like:</p>
+<ul>
+<li>Did a signal occur?
+
+<ul>
+<li>If so, call signal handler</li>
+</ul></li>
+<li>Execute next execution</li>
+</ul>
+<p>However, while your application is in the Qt mainloop, it's inside C++ code, so Python never has a chance to react to the signal.</p>
+<p>I know of two solutions for the problem:</p>
+<h1>Polling for signals</h1>
+<p>This simply executes a little bit of Python code all few seconds using a <a href="http://doc.qt.io/qt-5/qtimer.html" rel="nofollow">QTimer</a>:</p>
+<pre><code>timer = QTimer()
+timer.timeout.connect(lambda: None)
+timer.start(1000)
+</code></pre>
+<p>The drawback is that it takes up to 1s to react to signals, and you're "pointlessly" running some code once per second - waking up the CPU all the time might be a problem for e.g. power consumption too, but I don't have any evidence to back up this claim, it's more of a guess.</p>
+<p>It's however the only solution which works on Windows.</p>
+<h1>Polling for signals using a wakeup filedescriptor</h1>
+<p>This uses a <a href="http://doc.qt.io/qt-5/qsocketnotifier.html" rel="nofollow">QSocketNotifier</a> with a pipe and and <a href="https://docs.python.org/3/library/signal.html#signal.set_wakeup_fd" rel="nofollow">signal.set_wakeup_fd</a> to listen to signals.</p>
+<h1>Combining the approaches</h1>
+<p>The complete code I have in my application to handle signals looks something like this:</p>
+<pre><code>class SignalHandler(QObject):
+
+    """Handler responsible for handling OS signals (SIGINT, SIGTERM, etc.).
+
+    Attributes:
+        _activated: Whether activate() was called.
+        _notifier: A QSocketNotifier used for signals on Unix.
+        _timer: A QTimer used to poll for signals on Windows.
+        _orig_handlers: A {signal: handler} dict of original signal handlers.
+        _orig_wakeup_fd: The original wakeup filedescriptor.
+    """
+
+    def __init__(self, *, app, quitter, parent=None):
+        super().__init__(parent)
+        self._notifier = None
+        self._timer = usertypes.Timer(self, 'python_hacks')
+        self._orig_handlers = {}
+        self._activated = False
+        self._orig_wakeup_fd = None
+
+    def activate(self):
+        """Set up signal handlers.
+
+        On Windows this uses a QTimer to periodically hand control over to
+        Python so it can handle signals.
+
+        On Unix, it uses a QSocketNotifier with os.set_wakeup_fd to get
+        notified.
+        """
+        self._orig_handlers[signal.SIGINT] = signal.signal(
+            signal.SIGINT, self.interrupt)
+        self._orig_handlers[signal.SIGTERM] = signal.signal(
+            signal.SIGTERM, self.interrupt)
+
+        if os.name == 'posix' and hasattr(signal, 'set_wakeup_fd'):
+            # pylint: disable=import-error,no-member,useless-suppression
+            import fcntl
+            read_fd, write_fd = os.pipe()
+            for fd in (read_fd, write_fd):
+                flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            self._notifier = QSocketNotifier(
+                read_fd, QSocketNotifier.Read, self)
+            self._notifier.activated.connect(self.handle_signal_wakeup)
+            self._orig_wakeup_fd = signal.set_wakeup_fd(write_fd)
+        else:
+            self._timer.start(1000)
+            self._timer.timeout.connect(lambda: None)
+        self._activated = True
+
+    def deactivate(self):
+        """Deactivate all signal handlers."""
+        if not self._activated:
+            return
+        if self._notifier is not None:
+            self._notifier.setEnabled(False)
+            rfd = self._notifier.socket()
+            wfd = signal.set_wakeup_fd(self._orig_wakeup_fd)
+            os.close(rfd)
+            os.close(wfd)
+        for sig, handler in self._orig_handlers.items():
+            signal.signal(sig, handler)
+        self._timer.stop()
+        self._activated = False
+
+    @pyqtSlot()
+    def handle_signal_wakeup(self):
+        """Handle a newly arrived signal.
+
+        This gets called via self._notifier when there's a signal.
+
+        Python will get control here, so the signal will get handled.
+        """
+        logging.debug("Handling signal wakeup!")
+        self._notifier.setEnabled(False)
+        read_fd = self._notifier.socket()
+        try:
+            os.read(read_fd, 1)
+        except OSError:
+            logging.exception("Failed to read wakeup fd.")
+        self._notifier.setEnabled(True)
+
+    def interrupt(self, signum, _frame):
+        """Handler for signals to gracefully shutdown (SIGINT/SIGTERM)."""
+        # [...]
+</code></pre>
+</div>
+<span class="comment-copy">It might be helpful to state what platform you are on. It's possible that different platforms have different behaviour.</span>
+<span class="comment-copy">Sorry, I may have been unclear on this point. The application does received the SIGTERM signal and handle it, using the polling method as you describe above. The handler calls quit(), and the application exits. However, the code following the call to exec_() is never executed.</span>
+<span class="comment-copy">What happens if you remove <code>sys.exit(0)</code> afterwards? The main loop probably doesn't exit immediately (i.e. when you call quit), but some time afterwards when control is back in the Qt mainloop.</span>
+<span class="comment-copy">That actually works. With a Tornado event loop, the SystemExit exception is handled so that the finally block executes before exiting. For some reason it works differently with a Qt event loop.</span>
+<span class="comment-copy">I'd like to mark your answer as correct, but the answer is actually in your comment.</span>

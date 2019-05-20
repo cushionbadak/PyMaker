@@ -1,0 +1,121 @@
+<div class="post-text" itemprop="text">
+<p><strong>tl;dr -- In a PySide application, an object whose method throws an exception will remain alive even when all other references have been deleted. Why? And what, if anything, should one do about this?</strong></p>
+<p>In the course of building a simple CRUDish app using a Model-View-Presenter architecture with a PySide GUI, I discovered some curious behavior. In my case:</p>
+<ul>
+<li>The interface is divided into multiple Views -- i.e., each tab page displaying a different aspect of data might be its own class of View</li>
+<li>Views are instantiated first, and in their initialization, they instantiate their own Presenter, keeping a normal reference to it</li>
+<li>A Presenter receives a reference to the View it drives, but stores this as a weak reference (<code>weakref.ref</code>) to avoid circularity</li>
+<li>No other strong references to a Presenter exist. (Presenters can communicate indirectly with the <code>pypubsub</code> messaging library, but this also stores only weak references to listeners, and is not a factor in the MCVE below.)</li>
+<li>Thus, in normal operation, when a View is deleted (e.g., when a tab is closed), its Presenter is subsequently deleted as its reference count becomes 0</li>
+</ul>
+<p>However, a Presenter of which a method has thrown an exception does not get deleted as expected. The application continues to function, because PySide employs <a href="https://stackoverflow.com/questions/14493081/pyqt-event-handlers-snarf-exceptions">some magic</a> to catch exceptions. The Presenter in question continues to receive and respond to any View events bound to it. But when the View is deleted, the exception-throwing Presenter remains alive until the whole application is closed. An MCVE (<a href="http://pastebin.com/CvVFnjAJ" rel="nofollow noreferrer">link for readability</a>):</p>
+<pre><code>import logging
+import sys
+import weakref
+
+from PySide import QtGui
+
+
+class InnerPresenter:
+    def __init__(self, view):
+        self._view = weakref.ref(view)
+        self.logger = logging.getLogger('InnerPresenter')
+        self.logger.debug('Initializing InnerPresenter (id:%s)' % id(self))
+
+    def __del__(self):
+        self.logger.debug('Deleting InnerPresenter (id:%s)' % id(self))
+
+    @property
+    def view(self):
+        return self._view()
+
+    def on_alert(self):
+        self.view.show_alert()
+
+    def on_raise_exception(self):
+        raise Exception('From InnerPresenter (id:%s)' % id(self))
+
+
+class OuterView(QtGui.QMainWindow):
+    def __init__(self, *args, **kwargs):
+        super(OuterView, self).__init__(*args, **kwargs)
+        self.logger = logging.getLogger('OuterView')
+        # Menus
+        menu_bar = self.menuBar()
+        test_menu = menu_bar.addMenu('&amp;Test')
+        self.open_action = QtGui.QAction('&amp;Open inner', self, triggered=self.on_open, enabled=True)
+        test_menu.addAction(self.open_action)
+        self.close_action = QtGui.QAction('&amp;Close inner', self, triggered=self.on_close, enabled=False)
+        test_menu.addAction(self.close_action)
+
+    def closeEvent(self, event, *args, **kwargs):
+        self.logger.debug('Exiting application')
+        event.accept()
+
+    def on_open(self):
+        self.setCentralWidget(InnerView(self))
+        self.open_action.setEnabled(False)
+        self.close_action.setEnabled(True)
+
+    def on_close(self):
+        self.setCentralWidget(None)
+        self.open_action.setEnabled(True)
+        self.close_action.setEnabled(False)
+
+
+class InnerView(QtGui.QWidget):
+    def __init__(self, *args, **kwargs):
+        super(InnerView, self).__init__(*args, **kwargs)
+        self.logger = logging.getLogger('InnerView')
+        self.logger.debug('Initializing InnerView (id:%s)' % id(self))
+        self.presenter = InnerPresenter(self)
+        # Layout
+        layout = QtGui.QHBoxLayout(self)
+        alert_button = QtGui.QPushButton('Alert!', self, clicked=self.presenter.on_alert)
+        layout.addWidget(alert_button)
+        raise_button = QtGui.QPushButton('Raise exception!', self, clicked=self.presenter.on_raise_exception)
+        layout.addWidget(raise_button)
+        self.setLayout(layout)
+
+    def __del__(self):
+        super(InnerView, self).__del__()
+        self.logger.debug('Deleting InnerView (id:%s)' % id(self))
+
+    def show_alert(self):
+        QtGui.QMessageBox(text='Here is an alert').exec_()
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.DEBUG)
+    app = QtGui.QApplication(sys.argv)
+    view = OuterView()
+    view.show()
+    sys.exit(app.exec_())
+</code></pre>
+<p>Open and close the inner view, and you'll see both view and presenter are deleted as expected. Open the inner view, click the button to trigger an exception on the presenter, then close the inner view. The view will be deleted, but the presenter won't until the application exits.</p>
+<p><strong>Why?</strong> Presumably whatever it is that catches all exceptions on behalf of PySide is storing a reference to the object that threw it. Why would it need to do that?</p>
+<p><strong>How</strong> should I proceed (aside from writing code that never causes exceptions, of course)? I have enough sense not to rely on <code>__del__</code> for resource management. I get that I have no right to expect anything subsequent to a caught-but-not-really-handled exception to go ideally but this just strikes me as unnecessarily ugly. How should I approach this in general?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem is <code>sys.last_tracback</code> and <code>sys.last_value</code>.</p>
+<p>When a traceback is raised interactively, and this seems to be what is emulated, the last exception and its traceback are stores in <code>sys.last_value</code> and <code>sys.last_traceback</code> respectively.</p>
+<p>Doing</p>
+<pre><code>del sys.last_value
+del sys.last_traceback
+
+# for consistency, see
+# https://docs.python.org/3/library/sys.html#sys.last_type
+del sys.last_type
+</code></pre>
+<p>will free the memory.</p>
+<p>It's worth noting that at most <em>one</em> exception and traceback pair can get cached. This means that, because you're sane and don't rely on <code>del</code>, there isn't a massive amount of damage to be done.</p>
+<p>But if you want to reclaim the memory, just delete those values.  </p>
+</div>
+<span class="comment-copy">Kudos for writing such a thorough question. :)</span>
+<span class="comment-copy">@grayshirt I'm running on Ubuntu using Python 2.7, so it seems Windows and Linux behave different here.</span>
+<span class="comment-copy">@grayshirt Also of note: Using PyQt4 instead of PySide, I see the same behavior you described on seeing on Windows.</span>
+<span class="comment-copy">I <i>can</i> reproduce this on my side (I had to install PySide, hence the delay). I suggest you utilize <code>gc.get_referrers</code> to find out what's holding those pesky references.</span>
+<span class="comment-copy">Well, it's a <code>&lt;frame object at 0x7fc89c018ac8&gt;</code> that's holding the reference. I think exceptions own frame objects, so it could be that the exception is getting cached.</span>
+<span class="comment-copy">Enlightening -- I was wrong to presume this was PySide's fault; it's just Python.  Still poses an issue for my app. Long story short, after throwing an exception, a Presenter can continue to live after its View has been closed and deleted. Without a natural death, it continues to receive <code>pypubsub</code> messages asking it to update its View, which no longer exists. Simple solution: test if the View exists before updating it. Avoids further exceptions but it's just gross to me for a Presenter to outlive its View. I can't see any good place to delete the values you describe above. Any suggestions?</span>
+<span class="comment-copy">I'm not really sure. Normally things that have no references to them shouldn't do anything, but I understand it's significantly harder in your case. But you shouldn't require any ordering on destruction; Python doesn't guarantee <code>__del__</code> will <i>ever</i> get called, nor the object <i>ever</i> deleted.</span>
+<span class="comment-copy">On top of that, as we noticed in the comments above, for whatever reason on Ubuntu, PySide isn't destroying the View objects (and their Presenters in turn), exception or no. Seems like the options are to make peace with this or go learn C++. Thanks again for your help.</span>

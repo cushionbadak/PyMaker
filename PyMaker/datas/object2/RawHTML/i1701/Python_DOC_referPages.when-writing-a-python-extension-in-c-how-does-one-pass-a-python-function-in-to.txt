@@ -1,0 +1,228 @@
+<div class="post-text" itemprop="text">
+<p>First off, apologies for the confusing title. </p>
+<p>What I am trying to achieve is the following: Suppose I have some function <code>foo</code> which takes a function and an integer as input. e.g. </p>
+<pre><code>int foo(int(*func)(), int i) {
+    int n = func() + i;
+    return n;
+}
+</code></pre>
+<p>Now, I'd like to wrap this function in a python extension module. So I start writing my interface:</p>
+<pre><code>#include &lt;Python.h&gt;
+
+extern "C" {
+    static PyObject* foo(PyObject* self, PyObject* args);
+}
+
+static PyMethodDef myMethods[] = {
+    {"foo", foo, METH_VARARGS, "Runs foo"},
+    {NULL, NULL, 0, NULL}
+}
+
+// Define the module
+static struct PyModuleDef myModule = {
+    PyModuleDef_HEAD_INIT,
+    "myModule",
+    "A Module",
+    -1,
+    myMethods
+};
+
+// Initialize the module
+PyMODINIT_FUNC PyInit_BSPy(void) {
+    return PyModule_Create(&amp;myModule);
+}
+
+//Include the function
+static PyObject* foo(PyObject* self, PyObject* args){
+    // Declare variable/function pointer
+    int(*bar)(void);
+    unsigned int n;
+
+    // Parse the input tuple
+    if (!PyArg_ParseTuple(args, ..., &amp;bar, &amp;n)) {
+        return NULL;
+    }
+}
+</code></pre>
+<p>Now, when it comes time to parse the input tuple, I get confused, as I'm not really sure how to parse it. The idea is rather simple: I need to be able to call <code>foo(bar(), n)</code> in python. But I could use some help on how to realize this.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>First off, when you have a Python "extension method", implemented in C, and that function receives a Python callable as an argument, here is how you receive the argument, and how you call the callable:</p>
+<pre><code>/* this code uses only C features */
+static PyObject *
+foo(PyObject *self, PyObject *args)
+{
+    PyObject *cb;    
+
+    // Receive a single argument which can be any Python object
+    // note: the object's reference count is NOT increased (but it's pinned by
+    // the argument tuple).
+    if (!PyArg_ParseTuple(args, "O", &amp;cb)) {
+        return 0;
+    }
+    // determine whether the object is in fact callable
+    if (!PyCallable_Check(cb)) {
+        PyErr_SetString(PyExc_TypeError, "foo: a callable is required");
+        return 0;
+    }
+    // call it (no arguments supplied)
+    // there are a whole bunch of other PyObject_Call* functions for when you want
+    // to supply arguments
+    PyObject *rv = PyObject_CallObject(cb, 0);
+    // if calling it returned 0, must return 0 to propagate the exception
+    if (!rv) return 0;
+    // otherwise, discard the object returned and return None
+    Py_CLEAR(rv);
+    Py_RETURN_NONE;
+}
+</code></pre>
+<p>The problem with using logic like this to wrap <code>bsp_init</code> is that the pointer to the Python callable is a <em>data</em> pointer.  If you passed that pointer directly to <code>bsp_init</code>, <code>bsp_init</code> would attempt to invoke data as machine code and it would crash.  If <code>bsp_init</code> passed through a data pointer to the function that it calls, you could work around this with a "glue" procedure:</p>
+<pre><code>/* this code also uses only C features */
+struct bsp_init_glue_args {
+   PyObject *cb;
+   PyObject *rv;
+};
+static void
+bsp_init_glue(void *data)
+{
+   struct bsp_init_glue_args *args = data;
+   args-&gt;rv = PyObject_CallObject(args-&gt;cb, 0);
+}
+
+static PyObject *
+foo(PyObject *self, PyObject *args)
+{
+    bsp_init_glue_args ba;
+    if (!PyArg_ParseTuple(args, "O", &amp;ba.cb)) {
+        return 0;
+    }
+    if (!PyCallable_Check(ba.cb)) {
+        PyErr_SetString(PyExc_TypeError, "foo: a callable is required");
+        return 0;
+    }
+    bsp_init(bsp_init_glue, (void *)&amp;ba, ...);
+    if (ba-&gt;rv == 0) return 0;
+    Py_CLEAR(ba-&gt;rv);
+    Py_RETURN_NONE;
+}
+</code></pre>
+<p>Unfortunately, <code>bsp_init</code> does not have this signature, so you cannot do this.  But the alternative interface <code>BSPLib::Classic::Init</code> takes a <code>std::function&lt;void()&gt;</code>, which is an object-oriented wrapper around the pattern above, so you can do this instead:</p>
+<pre><code>/* this code requires C++11 */
+static PyObject *
+foo(PyObject *self, PyObject *args)
+{
+    PyObject *cb;
+    PyObject *rv = 0;
+    if (!PyArg_ParseTuple(args, "O", &amp;cb)) {
+        return 0;
+    }
+    if (!PyCallable_Check(cb)) {
+        PyErr_SetString(PyExc_TypeError, "foo: a callable is required");
+        return 0;
+    }
+
+    std::function&lt;void()&gt; closure = [&amp;]() {
+       rv = PyObject_CallObject(cb, 0);
+    };
+    BSPLib::Classic::Init(closure, ...);
+
+    if (rv == 0) return 0;
+    Py_CLEAR(rv);
+    Py_RETURN_NONE;
+}
+</code></pre>
+<p>The magic here is all in the <code>[&amp;]() { ... }</code> notation, which is syntactic sugar for defining and creating an instance of a local class that "captures" the variables <code>cb</code> and <code>rv</code> so that the code inside the curly braces, which will be compiled as a separate function, can communicate with <code>foo</code> proper.  This is a C++11 feature called "lambdas", which is a jargon term going all the way back to the earliest days of theoretical CS and immortalized by Lisp.  <a href="https://www.cprogramming.com/c++11/c++11-lambda-closures.html" rel="nofollow noreferrer">Here is a tutorial</a>, but I am not sure how good it is because I already know the concept inside and out.</p>
+<p>It is not possible to do this in plain C, but it isn't possible to call <code>BSPLib::Classic::Init</code> from plain C either (because you can't define a <code>std::function</code> object at all in plain C ... well, not without reverse engineering the C++ standard library and ABI, anyway) so that's okay.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The Python callable passed in will be a Python object which matches the Callable protocol.  Therefore, in order to pass it to your C function, you'll have to create another C function as a proxy which matches the required signature of your function pointer.</p>
+<p>As an example:</p>
+<pre><code>static PyObject* foo_cb_callable;
+static int py_foo_callback(void) {
+    PyObject* retval;
+    int result;
+
+    // Call the python function/object saved below
+    retval = PyObject_CallObject(foo_cb_callable, NULL);
+
+    // Convert the returned object to an int if possible
+    if (retval &amp;&amp; PyInt_Check(retval))
+        result = (int)PyInt_AsLong(retval);
+    else
+        result = -1;
+    Py_XDECREF(retval);
+    return result;
+}
+
+// NOTE: I renamed this to avoid conflicting with your "foo"
+// function to be called externally.
+static PyObject* py_foo(PyObject* self, PyObject* args) {
+    unsigned int n;
+    int result;
+
+    // Parse the input tuple
+    if (!PyArg_ParseTuple(args, "OI", &amp;foo_cb_callable, &amp;n)) {
+        return NULL;
+    }
+    // Ensure the first parameter is a callable (e.g. function)
+    if (!PyCallable_Check(foo_cb_callable)) {
+        return NULL;
+    }
+
+    // Call foo with our custom wrapper
+    result = foo(&amp;py_foo_callback, n);
+    return Py_BuildValue("i", result);
+}
+</code></pre>
+<p>Note that I used a global callback object pointer in the example, since your original function pointer didn't have a place for custom user data.  If you add a generic user parameter to the <code>func</code> callback, the <code>wrap_foo_callback</code> could be passed to it that way instead of making a global variable.  For example:</p>
+<pre><code>int foo(int(*func)(void*), void* user_data, int i) {
+    int n = func(user_data) + i;
+    return n;
+}
+
+// ...
+
+static int py_foo_callback(void* callback) {
+    PyObject* retval;
+    int result;
+
+    // Call the python function/object saved below
+    retval = PyObject_CallObject((PyObject*)callback, NULL);
+
+    // Convert the returned object to an int if possible
+    if (retval &amp;&amp; PyInt_Check(retval))
+        result = (int)PyInt_AsLong(retval);
+    else
+        result = -1;
+    Py_XDECREF(retval);
+    return result;
+}
+
+static PyObject* py_foo(PyObject* self, PyObject* args) {
+    PyObject* callback;
+    unsigned int n;
+    int result;
+
+    // Parse the input tuple
+    if (!PyArg_ParseTuple(args, "OI", &amp;callback, &amp;n)) {
+        return NULL;
+    }
+    // Ensure the first parameter is a callable (e.g. function)
+    if (!PyCallable_Check(callback)) {
+        return NULL;
+    }
+
+    // Call foo with our custom wrapper
+    result = foo(&amp;py_foo_callback, callback, n);
+    return Py_BuildValue("i", result);
+}
+</code></pre>
+</div>
+<span class="comment-copy">I'm not sure this is reasonably possible.  Python doesn't have the same concept of pointers that C does.  Can you wrap your Python call in a C function and then pass that C function as a parameter to your <code>foo</code> function?</span>
+<span class="comment-copy">Is the signature of the C function that you are trying to wrap <i>exactly</i> <code>int foo(int(*func)(void), int i)</code>?  The thing you're trying to do will be much easier if it is really something like <code>int foo(int (*func)(void *data), int i, void *data)</code> where <code>func</code> will be called with whatever you supply as <code>data</code> as its argument.</span>
+<span class="comment-copy">Aha, an alternative that takes C++ <code>std::function</code>!  That makes it doable.  I'll write an answer.</span>
+<span class="comment-copy">Since apparently you are targeting CPython, are you not concerned about its <a href="https://wiki.python.org/moin/GlobalInterpreterLock" rel="nofollow noreferrer">Global Interpreter Lock</a>, which limits the parallelism achievable within a single Python instance?</span>
+<span class="comment-copy">Given that this is a parallel processing use case, you may need to deal with <a href="https://docs.python.org/3/c-api/init.html#non-python-created-threads" rel="nofollow noreferrer">the interface for calling Python functions from threads not created by Python</a>.</span>
+<span class="comment-copy">Thanks for this answer! It took me a while to comprehend what was going on, but seems really cool. I'm not able to verify whether it works yet, since I ran in to a bug, but will update and accept once I can!</span>
+<span class="comment-copy">Turns out this is totally an answer to the question I was asking! Sadly, as @user2357112 noted in the main comment thread, it seems like this method results in multiple threads trying to execute Python, which is causing problems. I may have a way around this, but I'm not sure. Either way, this answer was extremely helpful!</span>
+<span class="comment-copy">@MitchellFaas Depending what you're trying to do, Python's "multiple interpreters" mechanism may be helpful.  I don't know anything about BSPLib though, so I can't be sure.</span>

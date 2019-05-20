@@ -1,0 +1,94 @@
+<div class="post-text" itemprop="text">
+<p>asyncio has <a href="https://docs.python.org/3/library/asyncio-stream.html#asyncio.StreamReader.readline" rel="noreferrer"><code>StreamReader.readline()</code></a>, allowing something like:</p>
+<pre><code>while True:
+    line = await reader.readline()
+    ...
+</code></pre>
+<p>(I don't see <code>async for</code> available in asyncio but that would be the obvious evolution)</p>
+<p>How do I achieve the equivalent with trio?</p>
+<p>I don't see any high level support for this directly in trio 0.9. All I see is <a href="https://trio.readthedocs.io/en/latest/reference-io.html#trio.abc.ReceiveStream.receive_some" rel="noreferrer"><code>ReceiveStream.receive_some()</code></a> which returns arbitrary sized binary chunks; it seems non-trivial to me to decode and convert this to something line-wise. Is there a standard library function or snippet I can use? I found the io stdlib module which looks promising, but I don't see any way to provide a "feed" method.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You're right, there's no highlevel support for this included in Trio currently. There should be <em>something</em>, though I'm not 100% sure what it should look like. I opened <a href="https://github.com/python-trio/trio/issues/796" rel="nofollow noreferrer">an issue</a> to discuss it.</p>
+<p>In the mean time, your implementation looks reasonable.</p>
+<p>If you want to make it even more robust, you might (1) use a <code>bytearray</code> instead of <code>bytes</code> for your buffer, to make appending and deleting amortized O(n) instead of O(n^2), (2) put a limit on the maximum line length, so evil peers can't force you to waste infinite memory buffering infinitely long lines, (3) resume each call to <code>find</code> at the place where the last one left off instead of restarting from the beginning each time, again to avoid O(n^2) behavior. None of this is super important if you're only dealing with reasonable line-lengths and well-behaved peers, but it doesn't hurt, either.</p>
+<p>Here's a tweaked version of your code that tries to incorporate those three ideas:</p>
+<pre><code>class LineReader:
+    def __init__(self, stream, max_line_length=16384):
+        self.stream = stream
+        self._line_generator = self.generate_lines(max_line_length)
+
+    @staticmethod
+    def generate_lines(max_line_length):
+        buf = bytearray()
+        find_start = 0
+        while True:
+            newline_idx = buf.find(b'\n', find_start)
+            if newline_idx &lt; 0:
+                # no b'\n' found in buf
+                if len(buf) &gt; max_line_length:
+                    raise ValueError("line too long")
+                # next time, start the search where this one left off
+                find_start = len(buf)
+                more_data = yield
+            else:
+                # b'\n' found in buf so return the line and move up buf
+                line = buf[:newline_idx+1]
+                # Update the buffer in place, to take advantage of bytearray's
+                # optimized delete-from-beginning feature.
+                del buf[:newline_idx+1]
+                # next time, start the search from the beginning
+                find_start = 0
+                more_data = yield line
+
+            if more_data is not None:
+                buf += bytes(more_data)
+
+    async def readline(self):
+        line = next(self._line_generator)
+        while line is None:
+            more_data = await self.stream.receive_some(1024)
+            if not more_data:
+                return b''  # this is the EOF indication expected by my caller
+            line = self._line_generator.send(more_data)
+        return line
+</code></pre>
+<p>(Feel free to use under whatever license you like.)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I ended up writing this. Not properly tested (bugfixes welcome), but it seems to work:</p>
+<pre><code>class LineReader:
+    def __init__(self, stream):
+        self.stream = stream
+        self._line_generator = self.generate_lines()
+
+    @staticmethod
+    def generate_lines():
+        buf = bytes()
+        while True:
+            newline_idx = buf.find(b'\n')
+            if newline_idx &lt; 0:
+                # no b'\n' found in buf
+                more_data = yield
+            else:
+                # b'\n' found in buf so return the line and move up buf
+                line = buf[:newline_idx+1]
+                buf = buf[newline_idx+1:]
+                more_data = yield line
+
+            if more_data is not None:
+                buf += bytes(more_data)
+
+    async def readline(self):
+        line = next(self._line_generator)
+        while line is None:
+            more_data = await self.stream.receive_some(1024)
+            if not more_data:
+                return b''  # this is the EOF indication expected by my caller
+            line = self._line_generator.send(more_data)
+        return line
+</code></pre>
+<p>Then I can wrap the <code>ReceiveStream</code> with a <code>LineReader</code> and use its <code>readline</code> method. Adding <code>__aiter__()</code> and <code>__anext()__</code> would then be trivial, but I don't need it in my case (I'm porting something to trio that doesn't use <code>async for</code> anyway).</p>
+<p>The other flaw with this is that it assumes UTF-8 or a similar encoding where <code>b'\n'</code> newlines exist in the encoded bytes object unmodified.</p>
+<p>It'd be nice to rely on library functions to handle this though; other answers appreciated.</p>
+</div>

@@ -1,0 +1,177 @@
+<div class="post-text" itemprop="text">
+<p>I want to use Python to copy a local file up to several remote hosts in parallel. I'm trying to do that with <code>asyncio</code> and Paramiko, since I'm already using these libraries for other purposes in my program.</p>
+<p>I'm using <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.BaseEventLoop.run_in_executor" rel="nofollow"><code>BaseEventLoop.run_in_executor()</code></a> and the default <code>ThreadPoolExecutor</code>, which is effectively a new interface to the old <code>threading</code> library, along with Paramiko's SFTP feature to do the copying.</p>
+<p>Here's a simplified example of how.</p>
+<pre><code>import sys
+import asyncio
+import paramiko
+import functools
+
+
+def copy_file_node(
+        *,
+        user: str,
+        host: str,
+        identity_file: str,
+        local_path: str,
+        remote_path: str):
+    ssh_client = paramiko.client.SSHClient()
+    ssh_client.load_system_host_keys()
+    ssh_client.set_missing_host_key_policy(paramiko.client.AutoAddPolicy())
+
+    ssh_client.connect(
+        username=user,
+        hostname=host,
+        key_filename=identity_file,
+        timeout=3)
+
+    with ssh_client:
+        with ssh_client.open_sftp() as sftp:
+            print("[{h}] Copying file...".format(h=host))
+            sftp.put(localpath=local_path, remotepath=remote_path)
+            print("[{h}] Copy complete.".format(h=host))
+
+
+loop = asyncio.get_event_loop()
+
+tasks = []
+
+# NOTE: You'll have to update the values being passed in to
+#      `functools.partial(copy_file_node, ...)`
+#       to get this working on on your machine.
+for host in ['10.0.0.1', '10.0.0.2']:
+    task = loop.run_in_executor(
+        None,
+        functools.partial(
+            copy_file_node,
+            user='user',
+            host=host,
+            identity_file='/path/to/identity_file',
+            local_path='/path/to/local/file',
+            remote_path='/path/to/remote/file'))
+    tasks.append(task)
+
+try:
+    loop.run_until_complete(asyncio.gather(*tasks))
+except Exception as e:
+    print("At least one node raised an error:", e, file=sys.stderr)
+    sys.exit(1)
+
+loop.close()
+</code></pre>
+<p>The problem I'm seeing is that the file gets copied up serially to the hosts instead of in parallel. So if the copy takes 5 seconds for a single host, it takes 10 seconds for two hosts, and so on.</p>
+<p>I've tried various other approaches, including ditching SFTP and piping the file to <code>dd</code> on each of the remote hosts via <a href="http://docs.paramiko.org/en/1.15/api/client.html#paramiko.client.SSHClient.exec_command" rel="nofollow"><code>exec_command()</code></a>, but the copies always happen serially.</p>
+<p>I'm probably misunderstanding some basic idea here. What's keeping the different threads from copying the file in parallel?</p>
+<p>From my testing, it appears that the holdup happens on the remote write, not on reading the local file. But why would that be, since we are attempting network I/O against independent remote hosts?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><strong>There is nothing wrong with your usage of asyncio.</strong></p>
+<p>To prove it, let's try a simplified version of your script - no <a href="http://www.paramiko.org/" rel="nofollow">paramiko</a>, just pure Python.</p>
+<pre><code>import asyncio, functools, sys, time
+
+START_TIME = time.monotonic()
+
+def log(msg):
+    print('{:&gt;7.3f} {}'.format(time.monotonic() - START_TIME, msg))
+
+def dummy(thread_id):
+    log('Thread {} started'.format(thread_id))
+    time.sleep(1)
+    log('Thread {} finished'.format(thread_id))
+
+loop = asyncio.get_event_loop()
+tasks = []
+for i in range(0, int(sys.argv[1])):
+    task = loop.run_in_executor(None, functools.partial(dummy, thread_id=i))
+    tasks.append(task)
+loop.run_until_complete(asyncio.gather(*tasks))
+loop.close()
+</code></pre>
+<p>With two threads, this will print:</p>
+<pre><code>$ python3 async.py 2
+  0.001 Thread 0 started
+  0.002 Thread 1 started       &lt;-- 2 tasks are executed concurrently
+  1.003 Thread 0 finished
+  1.003 Thread 1 finished      &lt;-- Total time is 1 second
+</code></pre>
+<p>This concurrency scales up to 5 threads:</p>
+<pre><code>$ python3 async.py 5
+  0.001 Thread 0 started
+  ...
+  0.003 Thread 4 started       &lt;-- 5 tasks are executed concurrently
+  1.002 Thread 0 finished
+  ...
+  1.005 Thread 4 finished      &lt;-- Total time is still 1 second
+</code></pre>
+<p>If we add one more thread, we hit the thread pool limit:</p>
+<pre><code>$ python3 async.py 6
+  0.001 Thread 0 started
+  0.001 Thread 1 started
+  0.002 Thread 2 started
+  0.003 Thread 3 started
+  0.003 Thread 4 started       &lt;-- 5 tasks are executed concurrently
+  1.002 Thread 0 finished
+  1.003 Thread 5 started       &lt;-- 6th task is executed after 1 second
+  1.003 Thread 1 finished
+  1.004 Thread 2 finished
+  1.004 Thread 3 finished
+  1.004 Thread 4 finished      &lt;-- 5 task are completed after 1 second
+  2.005 Thread 5 finished      &lt;-- 6th task is completed after 2 seconds
+</code></pre>
+<p>Everything goes as expected, and overall time grows by 1 second for every 5 items. Magic number 5 is documented in <a href="https://docs.python.org/3/library/concurrent.futures.html#threadpoolexecutor" rel="nofollow">ThreadPoolExecutor</a> docs:</p>
+<blockquote>
+<p><em>Changed in version 3.5</em>: If <em>max_workers</em> is <code>None</code> or not given, it will default to the number of processors on the machine, multiplied by <code>5</code>, assuming that ThreadPoolExecutor is often used to overlap I/O instead of CPU work and the number of workers should be higher than the number of workers for ProcessPoolExecutor.</p>
+</blockquote>
+<p><strong>How can a third-party library block my ThreadPoolExecutor?</strong></p>
+<ul>
+<li><p>Library uses some kind of global lock. It means that library does not support multi-threading. Try using ProcessPoolExecutor, but with caution: library may contain other anti-patterns, such as using the same hardcoded temporary file name.</p></li>
+<li><p>Function executes for a long time and doesn't release GIL. It may indicate a bug in C extension code, but the most popular reason to holding the GIL is doing some CPU-intensive computations. Again, you can try ProcessPoolExecutor, as it isn't affected by GIL.</p></li>
+</ul>
+<p>None of these is expected to happen with a library like paramiko.</p>
+<p><strong>How can a third-party library block my ProcessPoolExecutor?</strong></p>
+<p>It usually can't. Your tasks are executed in separate processes. If you see that two tasks in ProcessPoolExecutor take twice as much time, suspect resource bottleneck (such as consuming 100% of the network bandwidth).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'm not sure this is the best way to approach it, but it works for me</p>
+<pre><code>#start
+from multiprocessing import Process
+
+#omitted
+
+tasks = []
+for host in hosts:
+    p = Process(
+        None,
+        functools.partial(
+          copy_file_node,
+          user=user,
+          host=host,
+          identity_file=identity_file,
+          local_path=local_path,
+          remote_path=remote_path))
+
+    tasks.append(p)
+
+[t.start() for t in tasks]
+[t.join() for t in tasks]
+</code></pre>
+<p>based on comment, added a datestamp and captured the output from multiprocessing and got this:</p>
+<pre><code>2015-10-24 03:06:08.749683[vagrant1] Copying file...
+2015-10-24 03:06:08.751826[basement] Copying file...
+2015-10-24 03:06:08.757040[upstairs] Copying file...
+2015-10-24 03:06:16.222416[vagrant1] Copy complete.
+2015-10-24 03:06:18.094373[upstairs] Copy complete.
+2015-10-24 03:06:22.478711[basement] Copy complete.
+</code></pre>
+</div>
+<span class="comment-copy">Maybe <code>paramiko</code> is using some lock internally. Did you try <code>ProcessPoolExecutor</code>?</span>
+<span class="comment-copy">I replaced <code>copy_file_node()</code> with some dummy code and it worked fine so I thought it was <code>paramiko</code> that prevented concurrency. If it's the case, <code>ProcessPoolExecutor</code> should solve the problem. Can you post the <code>ProcessPoolExecutor</code> version of your code?</span>
+<span class="comment-copy">@NickChammas Are you sure network bandwidth is not a bottleneck?</span>
+<span class="comment-copy">@NickChammas Try to copy that file to two hosts manually via scp at the same time and see how long it will take.</span>
+<span class="comment-copy">@alexanderlukanin13 - Actually, maybe you are right about the bandwidth. If try 2 separate <code>scp</code> processes one always finishes in ~23 seconds while the other takes ~38 seconds. Wow. So maybe nothing is wrong except my assumptions about my own environment... :)</span>
+<span class="comment-copy">And, as you helped me see in the comments on the question, the cause behind the apparent serial upload I was seeing was simply my upload bandwidth!</span>
+<span class="comment-copy">I'll give this is try. However, shouldn't this be functionally equivalent to using the <code>ProcessPoolExecutor</code> with <code>asyncio</code>, <a href="https://gist.github.com/nchammas/783632df222277605fde" rel="nofollow noreferrer">like I did here</a>?</span>
+<span class="comment-copy">I'd think so since same basic apis, but without going through the whole source of both, i'd hazard something like "they implement something slightly differently"    Also, since you're using futures, it begs the question of what <i>exact</i> version of python and assorted modules you are using.  The question is tagged 3.x, but futures suggests you're using 2.x with 3.x backports, or an early 3.x, or some other old module.  Its conceivable you're hitting up against strange interaction between module versions / unhandled edge case in the backport. I used python 3.4.3 and recent everything else.</span>
+<span class="comment-copy">I'm using Python 3.5.0 and Paramiko 1.15.3. <code>concurrent.futures</code> is what the <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.BaseEventLoop.run_in_executor" rel="nofollow noreferrer">3.5 docs</a> on <code>asyncio</code> reference when explaining what executors can be provided to <code>run_in_executor()</code>. Anyway, lemme give this a shot and see if there's a difference. When you say it works for you, btw, are you copying a large enough file to 2 remote hosts to notice if they get uploaded serially or in parallel?</span>
+<span class="comment-copy">try adding a datestamp to your output or profiling the threads.  because of the way threaded stuff returns, it isn't necessarily printing the output in the same order that it was created in across multiple threads.   You may actually be getting simultaneous transfers and not know it!</span>
+<span class="comment-copy">If its bandwidth, since you're remotes are in ec2, you could always copy it to one of the ec2 hosts and fan out from there to the other ec2 hosts, or send the file to s3 and pull data into the hosts from there.</span>

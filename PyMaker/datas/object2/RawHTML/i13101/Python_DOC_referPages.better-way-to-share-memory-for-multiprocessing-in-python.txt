@@ -1,0 +1,133 @@
+<div class="post-text" itemprop="text">
+<p>I have been tackling this problem for a week now and it's been getting pretty frustrating because every time I implement a simpler but similar scale example of what I need to do, it turns out multiprocessing will fudge it up. The way it handles shared memory baffles me because it is so limited, it can become useless quite rapidly.</p>
+<p>So the basic description of my problem is that I need to create a process that gets passed in some parameters to open an image and create about 20K patches of size 60x40. These patches are saved into a list 2 at a time and need to be returned to the main thread to then be processed again by 2 other concurrent processes that run on the GPU.</p>
+<p>The process and the workflow and all that are mostly taken care of, what I need now is the part that was supposed to be the easiest is turning out to be the most difficult. I have not been able to save and get the list with 20K patches back to the main thread.</p>
+<p>First problem was because I was saving these patches as PIL images. I then found out all data added to a Queue object has to be pickled.
+Second problem was I then converted the patches to an array of 60x40 each and saved them to a list. And now that still doesn't work? Apparently Queues have a limited amount of data they can save otherwise when you call queue_obj.get() the program hangs. </p>
+<p>I have tried many other things, and every new thing I try does not work, so I would like to know if anyone has other recommendations of a library I can use to share objects without all the fuzz?</p>
+<p>Here is a sample implementation of kind of what I'm looking at. Keep in mind this works perfectly fine, but the full implementation doesn't. And I do have the code print informational messages to see that the data being saved has the exact same shape and everything, but for some reason it doesn't work. In the full implementation the independent process completes successfully but freezes at q.get().</p>
+<pre><code>from PIL import Image
+from multiprocessing import Queue, Process
+import StringIO
+import numpy
+
+img = Image.open("/path/to/image.jpg")
+q = Queue()
+q2 = Queue()
+#
+#
+# MAX Individual Queue limit for 60x40 images in BW is 31,466.
+# Multiple individual Queues can be filled to the max limit of 31,466.
+# A single Queue can only take up to 31,466, even if split up in different puts.
+def rz(patch, qn1, qn2):
+    totalPatchCount = 20000
+    channels = 1
+    patch = patch.resize((60,40), Image.ANTIALIAS)
+    patch = patch.convert('L')
+    # ImgArray = numpy.asarray(im, dtype=numpy.float32)
+    list_im_arr = []
+    # ----Create a 4D Array
+    # returnImageArray = numpy.zeros(shape=(totalPatchCount, channels, 40, 60))
+    imgArray = numpy.asarray(patch, dtype=numpy.float32)
+    imgArray = imgArray[numpy.newaxis, ...]
+    # ----End 4D array
+    # list_im_arr2 = []
+    for i in xrange(totalPatchCount):
+        # returnImageArray[i] = imgArray
+        list_im_arr.append(imgArray)
+    qn1.put(list_im_arr)
+    qn1.cancel_join_thread()
+    # qn2.cancel_join_thread()
+    print "PROGRAM Done"
+
+# rz(img,q,q2)
+# l = q.get()
+
+#
+p = Process(target=rz,args=(img, q, q2,))
+p.start()
+p.join()
+#
+# # l = []
+# # for i in xrange(1000): l.append(q.get())
+#
+imdata = q.get()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Queue is for communication between processes. In your case, you don't really have this kind of communication. You can simply let the process return result, and use the <code>.get()</code> method to collect them. (Remember to add <code>if __name__ == "main":</code>, see <a href="https://docs.python.org/3.4/library/multiprocessing.html#multiprocessing-programming" rel="nofollow noreferrer">programming guideline</a>)</p>
+<pre><code>from PIL import Image
+from multiprocessing import Pool, Lock
+import numpy
+
+img = Image.open("/path/to/image.jpg")
+
+def rz():
+    totalPatchCount = 20000
+    imgArray = numpy.asarray(patch, dtype=numpy.float32)
+    list_im_arr = [imgArray] * totalPatchCount  # A more elegant way than a for loop
+    return list_im_arr
+
+if __name__ == '__main__':  
+    # patch = img....  Your code to get generate patch here
+    patch = patch.resize((60,40), Image.ANTIALIAS)
+    patch = patch.convert('L')
+
+    pool = Pool(2)
+    imdata = [pool.apply_async(rz).get() for x in range(2)]
+    pool.close()
+    pool.join()
+</code></pre>
+<p>Now, according to first answer of this <a href="https://stackoverflow.com/questions/1816958/cant-pickle-type-instancemethod-when-using-pythons-multiprocessing-pool-ma">post</a>, multiprocessing only pass objects that's picklable. Pickling is probably unavoidable in multiprocessing because processes don't share memory. They simply don't live in the same universe. (They do inherit memory when they're first spawned, but they can not reach out of their own universe). PIL image object itself is not picklable. You can make it picklable by extracting only the image data stored in it, like this <a href="https://stackoverflow.com/questions/10118068/pickleable-image-object">post</a> suggested. </p>
+<p>Since your problem is mostly I/O bound, you can also try multi-threading. It might be even faster for your purpose. Threads share everything so no pickling is required. If you're using python 3, <code>ThreadPoolExecutor</code> is a wonderful tool. For Python 2, you can use ThreadPool. To achieve higher efficiency, you'll have to rearrange how you do things, you want to break-up the process and let different threads do the job. </p>
+<pre><code>from PIL import Image
+from multiprocessing.pool import ThreadPool
+from multiprocessing import Lock
+import numpy
+
+img = Image.open("/path/to/image.jpg")
+lock = Lock():
+totalPatchCount = 20000
+
+def rz(x):
+    patch = ...
+    return patch
+
+pool = ThreadPool(8)
+imdata = [pool.map(rz, range(totalPatchCount)) for i in range(2)]
+pool.close()
+pool.join()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You say "Apparently Queues have a limited amount of data they can save otherwise when you call queue_obj.get() the program hangs."</p>
+<p>You're right and wrong there. There is a limited amount of information the <code>Queue</code> will hold without being drained. The problem is that when you do:</p>
+<pre><code>qn1.put(list_im_arr)
+qn1.cancel_join_thread()
+</code></pre>
+<p>it schedules the communication to the underlying pipe (handled by a thread). The <code>qn1.cancel_join_thread()</code> then says <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Queue.cancel_join_thread" rel="nofollow">"but it's cool if we exit without the scheduled <code>put</code> completing"</a>, and of course, a few microseconds later, the worker function exits and the <code>Process</code> exits (without waiting for the thread that is populating the pipe to actually do so; at best it might have sent the initial bytes of the object, but anything that doesn't fit in <code>PIPE_BUF</code> almost certainly gets dropped; you'd need some amazing race conditions to occur to get anything at all, let alone the whole of a large object). So later, when you do:</p>
+<pre><code>imdata = q.get()
+</code></pre>
+<p>nothing has actually been sent by the (now exited) <code>Process</code>. When you call <code>q.get()</code> it's waiting for data that never actually got transmitted.</p>
+<p>The other answer is correct that in the case of computing and conveying a single value, <code>Queue</code>s are overkill. But if you're going to use them, you need to use them properly. The fix would be to:</p>
+<ol>
+<li>Remove the call to <code>qn1.cancel_join_thread()</code> so the <code>Process</code> doesn't exit until the data has been transmitted across the pipe.</li>
+<li>Rearrange your calls to avoid deadlock</li>
+</ol>
+<p>Rearranging is just this:</p>
+<pre><code>p = Process(target=rz,args=(img, q, q2,))
+p.start()
+
+imdata = q.get()
+p.join()
+</code></pre>
+<p>moving <code>p.join()</code> after <code>q.get()</code>; if you try to <code>join</code> first, your main process will be waiting for the child to exit, and the child will be waiting for the queue to be consumed before it will exit (this might actually work if the <code>Queue</code>'s pipe is drained by a thread in the main process, but it's best not to count on implementation details like that; this form is correct regardless of implementation details, as long as <code>put</code>s and <code>get</code>s are matched).</p>
+</div>
+<span class="comment-copy">Do you mean to break an image into many patches (tile) and save them as list of arrays and that you want to use multiple threads to speed up this process?</span>
+<span class="comment-copy">Each image is broken into many patches and saved as a single list of 20K patches per image. This part is all done in one process, i dont need to split up the data, i just need to get that specificlist created back to the main thread. So the multiple processes would create multiple lists of 20K patches each, and send them back to the main program to now process 2 of these lists at a time on my 2 GPUs.</span>
+<span class="comment-copy">you're only passing one argument in pool.apply_asyn(rz, args=(x,)), but rz takes two, is this correct? Also I tried this and got an error that the data can't be pickled. So even if you get data through a pool.get() method it still has to be pickled?</span>
+<span class="comment-copy">No, that's not correct. I made a few mistakes in a rush. I've updated my code. Nothing should be pickled in my code. Can you post the line that actually give you the error?</span>
+<span class="comment-copy">This is what I'm getting:  ` <code>AttributeError                            Traceback (most recent call last) &lt;ipython-input-17-e145d27c1373&gt; in &lt;module&gt;()      18 imdata = []      19  ---&gt; 20 with Pool(processes=2) as pool:      21     for x in range(2):      22         res = pool.apply_asyn(rz, args=(patch, x))  AttributeError: __exit__</code></span>
+<span class="comment-copy">My bad, it's a typo. It should be <code>apply_async</code>  not <code>apply_asyn</code> . I've corrected it. Also, you should run this as a script, not in interactive mode.</span>
+<span class="comment-copy">that was my mistake too, i had already corrected the spelling, but sent you an old output. I'm still getting the same error running as a script. <code>Traceback (most recent call last):   File "multiprocess_helper.py", line 363, in &lt;module&gt;     with Pool(processes=2) as pool: AttributeError: __exit__ </code></span>
+<span class="comment-copy">Yes I've tried it both with and without the qn1.cancel_join_thread(), but I would always call p.join() to wait for the process to complete before exiting. Thanks for the awesome explanation, I'm still trying to get the suggested code to work. I'll let you know how it goes.</span>

@@ -1,0 +1,53 @@
+<div class="post-text" itemprop="text">
+<p>I am invoking a Python tool called <a href="https://spark.apache.org/docs/latest/ec2-scripts.html" rel="nofollow">spark-ec2</a> from a Bash script.</p>
+<p>As part of its work, spark-ec2 makes several calls to the system's <code>ssh</code> command via use of the <code>subprocess</code> module.</p>
+<p><a href="https://github.com/apache/spark/blob/d5f1b9650b6e46cf6a9d61f01cda0df0cda5b1c9/ec2/spark_ec2.py#L788-L794" rel="nofollow">Here's an example</a>:</p>
+<pre class="lang-python prettyprint-override"><code>s = subprocess.Popen(
+    ssh_command(opts) + ['-t', '-t', '-o', 'ConnectTimeout=3',
+                         '%s@%s' % (opts.user, host), stringify_command('true')],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT  # we pipe stderr through stdout to preserve output order
+)
+cmd_output = s.communicate()[0]  # [1] is stderr, which we redirected to stdout
+</code></pre>
+<p>For some reason, spark-ec2 is hanging on that line where <code>communicate()</code> is called. I have no idea why.</p>
+<p>For the record, here is an excerpt that shows how I'm invoking spark-ec2:</p>
+<pre class="lang-bash prettyprint-override"><code># excerpt from script-that-calls-spark-ec2.sh
+
+# snipped: load AWS keys and do other setup stuff
+
+timeout 30m spark-ec2 launch "$CLUSTER_NAME" ...
+
+# snipped: if timeout, report and exit
+</code></pre>
+<p>What's killing me is that when I call spark-ec2 alone it works fine, and when I copy and paste commands from this Bash script and run them interactively they work fine.</p>
+<p>It's only when I execute the whole script like this</p>
+<pre class="lang-bash prettyprint-override"><code>$ ./script-that-calls-spark-ec2.sh
+</code></pre>
+<p>that spark-ec2 hangs on that <code>communicate()</code> step. This is driving me nuts.</p>
+<p>What's going on?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is one of those things that, once I figured it out, made me say "Wow..." out loud in a mixture of amazement and disgust.</p>
+<p>In this case, spark-ec2 isn't hanging because of some deadlock related to the use of <code>subprocess.PIPE</code>, as might've been the case if spark-ec2 had used <a href="https://docs.python.org/2/library/subprocess.html#subprocess.Popen.wait" rel="nofollow"><code>Popen.wait()</code> instead of <code>Popen.communicate()</code></a>.</p>
+<p>The problem, as hinted to by the fact that spark-ec2 only hangs when the whole Bash script is invoked at once, is caused by something that behaves in subtly different ways depending on whether it's being called interactively or not.</p>
+<p>In this case the culprit is the GNU coreutils utility <code>timeout</code>, and an option it offers called <code>--foreground</code>.</p>
+<p>From the <code>timeout</code> man page:</p>
+<pre class="lang-none prettyprint-override"><code>   --foreground
+
+          when not running timeout directly from a shell prompt,
+
+          allow  COMMAND  to  read  from  the TTY and get TTY signals; in this
+          mode, children of COMMAND will not be timed out
+</code></pre>
+<p>Without this option, Python's <code>communicate()</code> cannot read the output of the SSH command being invoked by <code>subprocess.Popen()</code>.</p>
+<p>This probably has something to do with SSH allocating TTYs via the <code>-t</code> switches, but honestly I don't fully understand it.</p>
+<p>What I <em>can</em> say, though, is that modifying the Bash script to use the <code>--foreground</code> option like this</p>
+<pre class="lang-bash prettyprint-override"><code>timeout --foreground 30m spark-ec2 launch "$CLUSTER_NAME" ...
+</code></pre>
+<p>makes everything work as expected.</p>
+<p>Now, if I were you, I would consider converting that Bash script into something else that won't drive you nuts...</p>
+</div>
+<span class="comment-copy">For those wondering what I'm going to do from a longer-term maintenance and sanity perspective, I'm thinking of converting this Bash script into Python and using the new <code>subprocess.communicate()</code> in Python 3 which <a href="https://docs.python.org/3/library/subprocess.html#subprocess.Popen.communicate" rel="nofollow noreferrer">directly supports a timeout</a>. Python 2 also offer this new capability in an external library called <a href="https://pypi.python.org/pypi/subprocess32/" rel="nofollow noreferrer">subprocess32</a>, which is just a backport of the Python 3 subprocess module.</span>
+<span class="comment-copy">You can see where the --foreground option was added at <a href="http://git.sv.gnu.org/gitweb/?p=coreutils.git;a=commitdiff;h=4496c94" rel="nofollow noreferrer">git.sv.gnu.org/gitweb/?p=coreutils.git;a=commitdiff;h=4496c94</a> where the difference is that the timeout command doesn't create a new group when run with --foreground. It might be worth investigating the -f option of ssh too</span>
+<span class="comment-copy">@pixelbeat - Neat find! Looks like the relevant comment is: "Don't create a separate background program group, so that the managed @var{command} can use the foreground TTY normally." Oh, and good point about <code>ssh -f</code>. That might be an alternate fix, sending ssh to the background.</span>

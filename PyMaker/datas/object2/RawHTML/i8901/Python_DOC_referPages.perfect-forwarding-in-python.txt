@@ -1,0 +1,285 @@
+<div class="post-text" itemprop="text">
+<p>I am a maintainer of a Python project that makes heavy use of inheritance.  There's an anti-pattern that has caused us a couple of issues and makes reading difficult, and I am looking for a good way to fix it.</p>
+<p>The problem is forwarding very long argument lists from derived classes to base classes - mostly but not always in constructors. </p>
+<p>Consider this artificial example:</p>
+<pre><code>class Base(object):
+    def __init__(self, a=1, b=2, c=3, d=4, e=5, f=6, g=7):
+       self.a = a
+       # etc
+
+class DerivedA(Base):
+    def __init__(self, a=1, b=2, c=300, d=4, e=5, f=6, g=700, z=0):
+        super().__init__(a=a, b=b, c=c, d=d, e=e, f=f, g=g)
+        self.z = z
+
+class DerivedB(Base):
+    def __init__(self, z=0, c=300, g=700, **kwds):
+        super().__init__(c=c, g=g, **kwds)
+        self.z = z
+</code></pre>
+<p>At this time, everything looks like <code>DerivedA</code> - long argument lists, all of which are passed to the base class explicitly.</p>
+<p>Unfortunately, we've had a couple of issues over the last couple of years, involving forgetting to pass an argument and getting the default, and from not noticing that one default parameter in one derived class was different from the default default.</p>
+<p>It also makes the code needlessly bulky and therefore hard-to-read.</p>
+<p><code>DerivedB</code> is better and fixes those problems, but has the new problem that the Python help/sphinx HTML documentation for the method in the derived class is misleading as a lot of the important parameters are hidden in the <code>**kwds</code>. </p>
+<p>Is there some way to "forward" the correct signature - or at least the documentation of the correct signature - from the base class method to the derived class method?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I haven't found a way to perfectly create a function with the same signature, but I think the downsides of my implementation aren't too serious. The solution I've come up with is a function decorator.</p>
+<h1>Usage example:</h1>
+<pre><code>class Base(object):
+    def __init__(self, a=1, b=2, c=3, d=4, e=5, f=6, g=7):
+       self.a = a
+       # etc
+
+class DerivedA(Base):
+    @copysig(Base.__init__)
+    def __init__(self, args, kwargs, z=0):
+        super().__init__(*args, **kwargs)
+        self.z = z
+</code></pre>
+<p>All named inherited parameters will be passed to the function through the <code>kwargs</code> dict. The <code>args</code> parameter is only used to pass varargs to the function. If the parent function has no varargs, <code>args</code> will always be an empty tuple.</p>
+<h1>Known problems and limitations:</h1>
+<ul>
+<li><strong>Doesn't work in python2!</strong> (Why are you still using python 2?)</li>
+<li>Not all attributes of the decorated function are perfectly preserved. For example, <code>function.__code__.co_filename</code> will be set to <code>"&lt;string&gt;"</code>.</li>
+<li><p>If the decorated functions throws an exception, there will be an additional function call visible in the exception traceback, for example:</p>
+<p><code>&gt;&gt;&gt; f2()
+Traceback (most recent call last):
+  File "", line 1, in 
+  File "", line 3, in f2
+  File "untitled.py", line 178, in f2
+    raise ValueError()
+ValueError</code></p></li>
+<li>If a method is decorated, the first parameter <em>must</em> be called "self".</li>
+</ul>
+<h1>Implementation</h1>
+<pre><code>import inspect
+
+def copysig(from_func, *args_to_remove):
+    def wrap(func):
+        #add and remove parameters
+        oldsig= inspect.signature(from_func)
+        oldsig= _remove_args(oldsig, args_to_remove)
+        newsig= _add_args(oldsig, func)
+
+        #write some code for a function that we can exec
+        #the function will have the correct signature and forward its arguments to the real function
+        code= '''
+def {name}{signature}:
+    {func}({args})
+'''.format(name=func.__name__,
+            signature=newsig,
+            func='_'+func.__name__,
+            args=_forward_args(oldsig, newsig))
+        globs= {'_'+func.__name__: func}
+        exec(code, globs)
+        newfunc= globs[func.__name__]
+
+        #copy as many attributes as possible
+        newfunc.__doc__= func.__doc__
+        newfunc.__module__= func.__module__
+        #~ newfunc.__closure__= func.__closure__
+        #~ newfunc.__code__.co_filename= func.__code__.co_filename
+        #~ newfunc.__code__.co_firstlineno= func.__code__.co_firstlineno
+        return newfunc
+    return wrap
+
+def _collectargs(sig):
+    """
+    Writes code that gathers all parameters into "self" (if present), "args" and "kwargs"
+    """
+    arglist= list(sig.parameters.values())
+
+    #check if the first parameter is "self"
+    selfarg= ''
+    if arglist:
+        arg= arglist[0]
+        if arg.name=='self':
+            selfarg= 'self, '
+            del arglist[0]
+
+    #all named parameters will be passed as kwargs. args is only used for varargs.
+    args= 'tuple(), '
+    kwargs= ''
+    kwarg= ''
+    for arg in arglist:
+        if arg.kind in (arg.POSITIONAL_ONLY,arg.POSITIONAL_OR_KEYWORD,arg.KEYWORD_ONLY):
+            kwargs+= '("{0}",{0}), '.format(arg.name)
+        elif arg.kind==arg.VAR_POSITIONAL:
+            #~ assert not args
+            args= arg.name+', '
+        elif arg.kind==arg.VAR_KEYWORD:
+            assert not kwarg
+            kwarg= 'list({}.items())+'.format(arg.name)
+        else:
+            assert False, arg.kind
+    kwargs= 'dict({}[{}])'.format(kwarg, kwargs[:-2])
+
+    return '{}{}{}'.format(selfarg, args, kwargs)
+
+def _forward_args(args_to_collect, sig):
+    collect= _collectargs(args_to_collect)
+
+    collected= {arg.name for arg in args_to_collect.parameters.values()}
+    args= ''
+    for arg in sig.parameters.values():
+        if arg.name in collected:
+            continue
+
+        if arg.kind==arg.VAR_POSITIONAL:
+            args+= '*{}, '.format(arg.name)
+        elif arg.kind==arg.VAR_KEYWORD:
+            args+= '**{}, '.format(arg.name)
+        else:
+            args+= '{0}={0}, '.format(arg.name)
+    args= args[:-2]
+
+    code= '{}, {}'.format(collect, args) if args else collect
+    return code
+
+def _remove_args(signature, args_to_remove):
+    """
+    Removes named parameters from a signature.
+    """
+    args_to_remove= set(args_to_remove)
+    varargs_removed= False
+    args= []
+    for arg in signature.parameters.values():
+        if arg.name in args_to_remove:
+            if arg.kind==arg.VAR_POSITIONAL:
+                varargs_removed= True
+            continue
+
+        if varargs_removed and arg.kind==arg.KEYWORD_ONLY:#if varargs have been removed, there are no more keyword-only parameters
+            arg= arg.replace(kind=arg.POSITIONAL_OR_KEYWORD)
+
+        args.append(arg)
+
+    return signature.replace(parameters=args)
+
+def _add_args(sig, func):
+    """
+    Merges a signature and a function into a signature that accepts ALL the parameters.
+    """
+    funcsig= inspect.signature(func)
+
+    #find out where we want to insert the new parameters
+    #parameters with a default value will be inserted before *args (if any)
+    #if parameters with a default value exist, parameters with no default value will be inserted as keyword-only AFTER *args
+    vararg= None
+    kwarg= None
+    insert_index_default= None
+    insert_index_nodefault= None
+    default_found= False
+    args= list(sig.parameters.values())
+    for index,arg in enumerate(args):
+        if arg.kind==arg.VAR_POSITIONAL:
+            vararg= arg
+            insert_index_default= index
+            if default_found:
+                insert_index_nodefault= index+1
+            else:
+                insert_index_nodefault= index
+        elif arg.kind==arg.VAR_KEYWORD:
+            kwarg= arg
+            if insert_index_default is None:
+                insert_index_default= insert_index_nodefault= index
+        else:
+            if arg.default!=arg.empty:
+                default_found= True
+
+    if insert_index_default is None:
+        insert_index_default= insert_index_nodefault= len(args)
+
+    #find the new parameters
+    #skip the first two parameters (args and kwargs)
+    newargs= list(funcsig.parameters.values())
+    if not newargs:
+        raise Exception('The decorated function must accept at least 2 parameters')
+    #if the first parameter is called "self", ignore the first 3 parameters
+    if newargs[0].name=='self':
+        del newargs[0]
+    if len(newargs)&lt;2:
+        raise Exception('The decorated function must accept at least 2 parameters')
+    newargs= newargs[2:]
+
+    #add the new parameters
+    if newargs:
+        new_vararg= None
+        for arg in newargs:
+            if arg.kind==arg.VAR_POSITIONAL:
+                if vararg is None:
+                    new_vararg= arg
+                else:
+                    raise Exception('Cannot add varargs to a function that already has varargs')
+            elif arg.kind==arg.VAR_KEYWORD:
+                if kwarg is None:
+                    args.append(arg)
+                else:
+                    raise Exception('Cannot add kwargs to a function that already has kwargs')
+            else:
+                #we can insert it as a positional parameter if it has a default value OR no other parameter has a default value
+                if arg.default!=arg.empty or not default_found:
+                    #do NOT change the parameter kind here. Leave it as it was, so that the order of varargs and keyword-only parameters is preserved.
+                    args.insert(insert_index_default, arg)
+                    insert_index_nodefault+= 1
+                    insert_index_default+= 1
+                else:
+                    arg= arg.replace(kind=arg.KEYWORD_ONLY)
+                    args.insert(insert_index_nodefault, arg)
+                    if insert_index_default==insert_index_nodefault:
+                        insert_index_default+= 1
+                    insert_index_nodefault+= 1
+
+        #if varargs need to be added, insert them before keyword-only arguments
+        if new_vararg is not None:
+            for i,arg in enumerate(args):
+                if arg.kind not in (arg.POSITIONAL_ONLY,arg.POSITIONAL_OR_KEYWORD):
+                    break
+            else:
+                i+= 1
+            args.insert(i, new_vararg)
+
+    return inspect.Signature(args, return_annotation=funcsig.return_annotation)
+</code></pre>
+<h2>Short explanation:</h2>
+<p>The decorator creates a string of the form</p>
+<pre><code>def functionname(arg1, arg2, ...):
+    real_function((arg1, arg2), {'arg3':arg3, 'arg4':arg4}, z=z)
+</code></pre>
+<p>then <a href="https://docs.python.org/3/library/functions.html#exec" rel="nofollow noreferrer"><code>exec</code></a>s it and returns the dynamically created function.</p>
+<h2>Additional features:</h2>
+<p>If you don't want to "inherit" parameters x and y, use</p>
+<pre><code>@copysig(parentfunc, 'x', 'y')
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Consider using <a href="https://pypi.python.org/pypi/attrs" rel="nofollow noreferrer">attrs module</a>:</p>
+<pre><code>import attr
+
+@attr.s
+class Base(object):
+    a = attr.ib(1)
+    b = attr.ib(2)
+    c = attr.ib(3)
+    d = attr.ib(4)
+    e = attr.ib(5)
+    f = attr.ib(6)
+    g = attr.ib(7)
+
+@attr.s
+class DerivedA(Base):
+    z = attr.ib(0)
+
+der_a = DerivedA()
+print(der_a.a, der_a.z)
+</code></pre>
+</div>
+<span class="comment-copy">This is great stuff!  I upvoted you and if you update it to pass the inherited parameters, I'll mark it correct - and if you release it as an open source project somewhere, I'll mark it correct <i>again</i>.  ;-)</span>
+<span class="comment-copy">@TomSwirly Code updated, the decorated function now receives <b>all</b> (named) parameters as <code>kwargs</code>. The <code>args</code> parameter is still mandatory, but only used for inherited varargs.</span>
+<span class="comment-copy">Thanks, done!  I would have marked it as correct anyway but wanted to get that extra from you.  The <code>eval</code> makes me feel a little dirty :-D but I don't see how to get around it.</span>
+<span class="comment-copy">Just so I have it for my other project, I put it into a repo here: <a href="https://github.com/rec/copysig/tree/master" rel="nofollow noreferrer">github.com/rec/copysig/tree/master</a>  Ping me and I'll amend that commit to be from you and give you ownership of the project!</span>
+<span class="comment-copy">For manipulating sigs, have you considered boltons.funcutils? Not to detract from this answer, but that is a maintained, tested, installable package. To forward arguments you just use **locals() give or take the arguments that you want to add or remove. The fight to kill boilerplate continues!</span>
+<span class="comment-copy">Oh, this is very interesting.  While this doesn't exactly solve the problem as posed above, I'm wondering if this is a better solution to the practical problem I abstracted the original post from.  I gave you an upvote for this excellent idea!</span>
+<span class="comment-copy">This was my intention :) Thanks for upvote! :)</span>
+<span class="comment-copy">This is the approach I used in package autosig, which helps building related signatures (does't help with the forwarding though). An example application is package altair_recipes, file signatures.py in particular</span>

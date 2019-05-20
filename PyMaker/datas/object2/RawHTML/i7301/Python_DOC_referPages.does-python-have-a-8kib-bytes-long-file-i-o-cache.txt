@@ -1,0 +1,72 @@
+<div class="post-text" itemprop="text">
+<p>I'm investigating file I/O performance in Python 3.6.0. Given this script which consists of 3 tests:</p>
+<pre><code>#!python3
+
+import random, string, time
+
+strs = ''.join(random.choice(string.ascii_lowercase) for i in range(1000000))
+strb = bytes(strs, 'latin-1')
+
+inf = open('bench.txt', 'w+b')
+inf.write(strb)
+
+for t in range(3):
+    inf.seek(0)
+    inf.read(8191)
+
+for t in range(3):
+    inf.seek(0)
+    inf.read(8192)
+
+for t in range(3):
+    inf.seek(0)
+    inf.read(8193)
+
+inf.close()
+</code></pre>
+<p>Procmon sees the following operations happening (hashtag lines are my comments):</p>
+<pre><code>  # Initial write
+Offset: 0, Length: 1.000.000
+  # The 3 8191-long reads only produce one syscall due to caching:
+Offset: 0, Length: 8.192
+  # However, if the read length is exactly 8192, python doesn't take advantage:
+Offset: 0, Length: 8.192
+Offset: 0, Length: 8.192
+Offset: 0, Length: 8.192
+  # Due to caching, the first syscall of the first read of the last loop is missing.
+Offset: 8.192, Length: 8.192
+Offset: 0, Length: 8.192
+Offset: 8.192, Length: 8.192
+Offset: 0, Length: 8.192
+Offset: 8.192, Length: 8.192
+ # Afterwards, 2 syscalls per read are produced on the 8193-long reads.
+</code></pre>
+<p>First off, it is clear that python will read files in chunks which are multiples of 8KiB.</p>
+<p>I'm suspecting that python implements a cache buffer that stores the last read 8KiB block and will simply return it and crop it if you are trying to read only in that same 8KiB extent multiple times consecutively.</p>
+<p>Can somebody confirm that it is actually the case that python implements this mechanism?</p>
+<p>If that's the case, this means that python cannot detect a change to that block made by an external application if you don't somehow manually invalidate the cache. Is that correct? Perhaps there is a way to disable this mechanism?</p>
+<p>Optionally, why is it that exactly 8192 bytes reads cannot benefit from the cache?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Yes, the default buffer size is 8k. See <a href="https://docs.python.org/3/library/io.html#io.DEFAULT_BUFFER_SIZE" rel="noreferrer"><code>io.DEFAULT_BUFFER_SIZE</code></a>:</p>
+<blockquote>
+<p><code>io.DEFAULT_BUFFER_SIZE</code><br/>
+  An <code>int</code> containing the default buffer size used by the module’s buffered I/O classes. <code>open()</code> uses the file’s <code>blksize</code> (as obtained by <code>os.stat()</code>) if possible.</p>
+</blockquote>
+<p>and</p>
+<pre><code>&gt;&gt;&gt; import io
+&gt;&gt;&gt; io.DEFAULT_BUFFER_SIZE
+8192
+</code></pre>
+<p>and the <a href="https://github.com/python/cpython/blob/v3.6.1/Modules/_io/_iomodule.h#L78" rel="noreferrer">module source code</a>:</p>
+<pre class="lang-c prettyprint-override"><code>#define DEFAULT_BUFFER_SIZE (8 * 1024)  /* bytes */
+</code></pre>
+<p>If you use the <a href="https://docs.python.org/3/library/io.html#io.BufferedIOBase" rel="noreferrer"><code>BufferedIOBase</code> interface</a> or a wrapper to make changes to the file, the buffer will automatically be updated (opening a file in binary mode produces a <code>BufferedIOBase</code> subclass, one of <a href="https://docs.python.org/3/library/io.html#io.BufferedReader" rel="noreferrer"><code>BufferedReader</code></a>, <a href="https://docs.python.org/3/library/io.html#io.BufferedWriter" rel="noreferrer"><code>BufferedWriter</code></a> or <a href="https://docs.python.org/3/library/io.html#io.BufferedRandom" rel="noreferrer"><code>BufferedRandom</code></a>).</p>
+<p>For your second case, your <code>seek()</code> call flushes that buffer because you seeked outside of the 'current' block range (the current position was at <code>8192</code>, the first byte of the second buffered block, you seeked back to <code>0</code>, which is first byte of the first buffered block). See the <a href="https://github.com/python/cpython/blob/v3.6.1/Modules/_io/bufferedio.c#L1278-L1303" rel="noreferrer">source code of <code>BufferedIOBase.seek()</code> for more details</a></p>
+<p>If you need to edit the underlying file from some other process, using <code>seek()</code> is a great way to ensure that buffer is dropped before trying to read again, <em>or</em> you could just ignore the buffer and go to the underlying <a href="https://docs.python.org/3/library/io.html#io.RawIOBase" rel="noreferrer"><code>RawIOBase</code> implementation</a> via the <a href="https://docs.python.org/3/library/io.html#io.BufferedIOBase.raw" rel="noreferrer"><code>BufferedIOBase.raw</code> attribute</a>.</p>
+</div>
+<span class="comment-copy">What are you <b>really</b> trying to do? If you want to confirm the actual behavior, read the source ™.</span>
+<span class="comment-copy">when you open a file, there is an optional buffer argument, where the default uses the operating systems default buffering mode, however you can specify that it should be unbuffered.</span>
+<span class="comment-copy">Currently <code>st_blksize</code> isn't supported on Windows. Starting with Windows 8 the equivalent information is available as <code>PhysicalBytesPerSectorForPerformance</code> in the <code>FileStorageInfo</code> via <code>GetFileInformationByHandleEx</code>.</span>
+<span class="comment-copy">@eryksun: not sure why you are telling me ;-) That'd be something for the Python code devs to ponder, isn't it?</span>
+<span class="comment-copy">The quoted docs state that "<code>open()</code> uses the file’s <code>blksize</code> (as obtained by <code>os.stat()</code>) if possible". My comment provides the reason that this optimization is not currently possible on Windows, as well as the way a program could manually implement it via ctypes, cffi, Cython, PyWin32, etc in Windows 8+.</span>

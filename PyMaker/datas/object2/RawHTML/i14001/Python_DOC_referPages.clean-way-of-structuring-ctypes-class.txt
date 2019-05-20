@@ -1,0 +1,306 @@
+<div class="post-text" itemprop="text">
+<p>I've defined a <code>ctypes</code> class and an associated convenience function like so:</p>
+<pre><code>class BNG_FFITuple(Structure):
+    _fields_ = [("a", c_uint32),
+                ("b", c_uint32)]
+
+
+class BNG_FFIArray(Structure):
+    _fields_ = [("data", c_void_p),
+                ("len", c_size_t)]
+
+    # Allow implicit conversions from a sequence of 32-bit unsigned ints
+    @classmethod
+    def from_param(cls, seq):
+        return seq if isinstance(seq, cls) else cls(seq)
+
+    def __init__(self, seq, data_type = c_float):
+        array_type = data_type * len(seq)
+        raw_seq = array_type(*seq)
+        self.data = cast(raw_seq, c_void_p)
+        self.len = len(seq)
+
+
+def bng_void_array_to_tuple_list(array, _func, _args):
+    res = cast(array.data, POINTER(BNG_FFITuple * array.len))[0]
+    return res
+
+convert = lib.convert_to_bng
+convert.argtypes = (BNG_FFIArray, BNG_FFIArray)
+convert.restype = BNG_FFIArray
+convert.errcheck = bng_void_array_to_tuple_list
+drop_array = lib.drop_array 
+drop_array.argtypes = (POINTER(BNG_FFIArray),)
+</code></pre>
+<p>I then define a simple convenience function:</p>
+<pre><code>def f(a, b):
+    return [(i.a, i.b) for i in iter(convert(a, b))]
+</code></pre>
+<p>Most of this works perfectly, but I have two issues:</p>
+<ul>
+<li>It's not flexible enough; I'd like to be able to instantiate a <code>BNG_FFITuple</code> using <code>c_float</code> instead of <code>c_uint32</code> (so the fields are <code>c_float</code>), and vice versa, so the <code>BNG_FFIArray</code> <code>data_type</code> is <code>c_uint32</code>. I'm not clear on how to do this, though.</li>
+<li>I'd like to free the memory which is now owned by Python, by sending a <code>POINTER(BNG_FFIArray)</code> back to my dylib (see <code>drop_array</code> – I've already defined a function in my dylib), but I'm not sure at what point I should call it.</li>
+</ul>
+<p>Is there a way of encapsulating all this in a neater, more Pythonic way, which is also safer? I'm concerned that without the memory cleanup being defined in a robust way (on <code>__exit__</code>? <code>__del__</code>?) That anything that goes wrong will lead to unfreed memory </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since you have some control over the rust side, the cleanest thing to do would be to pre-allocate the result array from Python before the call, and pass everything in a single structure.</p>
+<p>The code below assumes this modification, but also designates the place where you would do the deallocation if you cannot do this.</p>
+<p>Note that if you do this sort of encapsulation, you do NOT need to specify things like the parameters and result processing for the library function, because you're only calling the actual function from a single place, and always with exactly the same kinds of parameters.</p>
+<p>I don't know rust (and even my C is a bit rusty), but the code below assumes you redefine your rust to match the equivalent of something like this:</p>
+<pre><code>typedef struct FFIParams {
+    int32 source_ints;
+    int32 len;
+    void * a;
+    void * b;
+    void * result;
+} FFIParams;
+
+void convert_to_bng(FFIParams *p) {
+}
+</code></pre>
+<p>Here is the Python.  One final note -- this is not thread-safe, due to the reuse of the parameter structure.  That's easy enough to fix if needed.</p>
+<pre><code>from ctypes import c_uint32, c_float, c_size_t, c_void_p
+from ctypes import Structure, POINTER, pointer, cast
+from itertools import izip, islice
+
+_test_standalone = __name__ == '__main__'
+
+if _test_standalone:
+    class lib(object):
+        @staticmethod
+        def convert_to_bng(ptr_params):
+            params = ptr_params.contents
+            source_ints = params.source_ints
+            types = c_uint32, c_float
+            if not source_ints:
+                types = reversed(types)
+            length = params.len
+            src_type, dst_type = types
+            src_type = POINTER(length * src_type)
+            dst_type = POINTER(length * 2 * dst_type)
+            a = cast(params.a, src_type).contents
+            b = cast(params.b, src_type).contents
+            result = cast(params.result, dst_type).contents
+
+            # Assumes we are converting int to float or back...
+            func = float if source_ints else int
+            result[0::2] = map(func, a)
+            result[1::2] = map(func, b)
+
+class _BNG_FFIParams(Structure):
+    _fields_ = [("source_ints", c_uint32),
+                ("len", c_size_t),
+                ("a", c_void_p),
+                ("b", c_void_p),
+                ("result", c_void_p)]
+
+class _BNG_FFI(object):
+
+    int_type = c_uint32
+    float_type = c_float
+    _array_type = type(10 * int_type)
+
+    # This assumes we want the result to be opposite type.
+    # Maybe I misunderstood this -- easily fixable if so.
+    _result_type = {int_type: float_type, float_type: int_type}
+
+    def __init__(self):
+        my_params = _BNG_FFIParams()
+        self._params = my_params
+        self._pointer = POINTER(_BNG_FFIParams)(my_params)
+        self._converter = lib.convert_to_bng
+
+
+    def _getarray(self, seq, data_type):
+        # Optimization for pre-allocated correct array type
+        if type(type(seq)) == self._array_type and seq._type_ is data_type:
+            print("Optimized!")
+            return seq
+        return (data_type * len(seq))(*seq)
+
+    def __call__(self, a, b, data_type=float_type):
+        length = len(a)
+        if length != len(b):
+            raise ValueError("Input lengths must be same")
+
+        a, b = (self._getarray(x, data_type) for x in (a, b))
+
+        # This has the salutary side-effect of insuring we were
+        # passed a valid type
+        result = (length * 2 * self._result_type[data_type])()
+
+        params = self._params
+        params.source_ints = data_type is self.int_type
+        params.len = length
+        params.a = cast(pointer(a), c_void_p)
+        params.b = cast(pointer(b), c_void_p)
+        params.result = cast(pointer(result), c_void_p)
+        self._converter(self._pointer)
+
+        evens = islice(result, 0, None, 2)
+        odds = islice(result, 1, None, 2)
+        result = list(izip(evens, odds))
+
+        # If you have to have the converter allocate memory,
+        # deallocate it here...
+
+        return result
+
+convert = _BNG_FFI()
+
+if _test_standalone:
+    print(convert([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], c_float))
+    print(convert([1, 2, 3], [4, 5, 6], c_uint32))
+    print(convert([1, 2, 3], (c_uint32 * 3)(4, 5, 6), c_uint32))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here is a modified version of the code that allocates the return array in the called DLL.  Since that would be harder to test with pure Python, and since I don't know rust, I built a cheesy C library for the actual test:</p>
+<pre><code>#include &lt;stdlib.h&gt;
+#include &lt;stdio.h&gt;
+
+typedef struct FFIParams {
+    int source_ints;
+    int len;
+    void * a;
+    void * b;
+} FFIParams, *FFIParamsPtr;
+
+typedef int * intptr;
+typedef float * floatptr;
+
+void * to_float(FFIParamsPtr p) {
+    floatptr result;
+    intptr a = p-&gt;a;
+    intptr b = p-&gt;b;
+    int i;
+    int size = sizeof(result[0]) * 2 * p-&gt;len;
+    result = malloc(size);
+    printf("Allocated %x bytes at %x\n", size, (unsigned int)result);
+    for (i = 0; i &lt; p-&gt;len; i++) {
+        result[i*2+0] = (float)(a[i]);
+        result[i*2+1] = (float)(b[i]);
+    }
+    return result;
+}
+
+void * to_int(FFIParamsPtr p) {
+    intptr result;
+    floatptr a = p-&gt;a;
+    floatptr b = p-&gt;b;
+    int i;
+    int size = sizeof(result[0]) * 2 * p-&gt;len;
+    result = malloc(size);
+    printf("Allocated %x bytes at %x\n", size, (unsigned int)result);
+    for (i = 0; i &lt; p-&gt;len; i++) {
+        result[i*2+0] = (int)(a[i]);
+        result[i*2+1] = (int)(b[i]);
+    }
+    return result;
+}
+
+void * convert_to_bng(FFIParamsPtr p) {
+    if (p-&gt;source_ints)
+        return to_float(p);
+    return to_int(p);
+}
+
+void free_bng_mem(void * data) {
+    printf("Deallocating memory at %x\n", (unsigned int)data);
+    free(data);
+}
+</code></pre>
+<p>Here is the Python code that calls it:</p>
+<pre><code>from ctypes import c_uint32, c_float, c_size_t, c_void_p
+from ctypes import Structure, POINTER, pointer, cast, cdll
+from itertools import izip, islice
+
+
+class _BNG_FFIParams(Structure):
+    _fields_ = [("source_ints", c_uint32),
+                ("len", c_size_t),
+                ("a", c_void_p),
+                ("b", c_void_p)]
+
+class _BNG_FFI(object):
+
+    int_type = c_uint32
+    float_type = c_float
+    _array_type = type(10 * int_type)
+    _lib = cdll.LoadLibrary('./testlib.so')
+    _converter = _lib.convert_to_bng
+    _converter.restype = c_void_p
+    _deallocate = _lib.free_bng_mem
+
+    _result_type = {int_type: float_type,
+                    float_type: int_type}
+
+    def __init__(self):
+        my_params = _BNG_FFIParams()
+        self._params = my_params
+        self._pointer = POINTER(_BNG_FFIParams)(my_params)
+
+
+    def _getarray(self, seq, data_type):
+        # Optimization for pre-allocated correct array type
+        if type(type(seq)) == self._array_type and seq._type_ is data_type:
+            print("Optimized!")
+            return seq
+        return (data_type * len(seq))(*seq)
+
+    def __call__(self, a, b, data_type=float_type):
+        length = len(a)
+        if length != len(b):
+            raise ValueError("Input lengths must be same")
+
+        a, b = (self._getarray(x, data_type) for x in (a, b))
+
+        # This has the salutary side-effect of insuring we were
+        # passed a valid type
+        result_type = POINTER(length * 2 * self._result_type[data_type])
+
+        params = self._params
+        params.source_ints = data_type is self.int_type
+        params.len = length
+        params.a = cast(pointer(a), c_void_p)
+        params.b = cast(pointer(b), c_void_p)
+
+        resptr = self._converter(self._pointer)
+        result = cast(resptr, result_type).contents
+
+        evens = islice(result, 0, None, 2)
+        odds = islice(result, 1, None, 2)
+        result = list(izip(evens, odds))
+
+        self._deallocate(resptr)
+
+        return result
+
+convert = _BNG_FFI()
+
+if __name__ == '__main__':
+    print(convert([1.0, 2.0, 3.0], [4.0, 5.0, 6.0], c_float))
+    print(convert([1, 2, 3], [4, 5, 6], c_uint32))
+    print(convert([1, 2, 3], (c_uint32 * 3)(4, 5, 6), c_uint32))
+</code></pre>
+<p>And here is the result when I executed it:</p>
+<pre><code>Allocated 18 bytes at 9088468
+Deallocating memory at 9088468
+[(1L, 4L), (2L, 5L), (3L, 6L)]
+Allocated 18 bytes at 908a6b8
+Deallocating memory at 908a6b8
+[(1.0, 4.0), (2.0, 5.0), (3.0, 6.0)]
+Optimized!
+Allocated 18 bytes at 90e1ae0
+Deallocating memory at 90e1ae0
+[(1.0, 4.0), (2.0, 5.0), (3.0, 6.0)]
+</code></pre>
+<p>This happens to be a 32 bit Ubuntu 14.04 system. I used Python 2.7, and I built the library with <code>gcc --shared ffitest.c -o testlib.so -Wall</code></p>
+</div>
+<span class="comment-copy">Do you need the <code>BNG_FFITuple</code> as an FFI argument, or is it just for use in Python? If it's just used in Python you'd be better served by <a href="https://docs.python.org/3/library/collections.html#collections.namedtuple" rel="nofollow noreferrer">collections.namedtuple</a>. Just define a separate <code>errcheck</code> function for <code>int</code> and <code>float</code> conversions. You can free the array in <code>BNG_FFIArray.__del__</code>, but use a class reference to <code>lib.drop_array</code> as <code>BNG_FFIArray._drop_array</code> to avoid problems with module teardown setting <code>lib</code> to <code>None</code> before the object's <code>__del__</code> finalizer ha been called.</span>
+<span class="comment-copy">I'm not sure I understand; my dylib functions expect a struct with <code>data</code> and <code>len</code> fields with the appropriate types, but it doesn't have to be called anything specific.</span>
+<span class="comment-copy">You convert the result to a <code>BNG_FFITuple</code> array in <code>bng_void_array_to_tuple_list</code>. Do you ever pass the <code>BNG_FFITuple</code> back to your library? If not, there's no reason to use a ctypes struct for that instead of converting the result to a regular Python <code>tuple</code> or <code>namedtuple</code>. Once converted the <code>BNG_FFIArray</code> is the only reference to the array, so it's fine to use its <code>__del__</code> finalizer to call <code>drop_array</code>.</span>
+<span class="comment-copy">Ah, OK. No, it's a one-way trip; never gets used after <code>bng_void_array_to_tuple_list</code>.</span>
+<span class="comment-copy">Are you restricted to having your library allocate and return memory, or could you calculate the size of the return array and pass a pointer to it from Python as well (so that Python owns all the memory)?</span>
+<span class="comment-copy">This example is simple enough you wouldn't really need a structure -- you could just pass 4 parameters directly.  But your original question had a structure, and I decided to leave it in as an example for more complicated cases.  If you want to pass more than one parameter, just do it -- ctypes doesn't <i>require</i> you to define the valid types in each position, it just <i>allows</i> it, which is really useful when you are exposing a c function to higher level code, but not so useful when you are wrapping it and only calling it from one place.</span>

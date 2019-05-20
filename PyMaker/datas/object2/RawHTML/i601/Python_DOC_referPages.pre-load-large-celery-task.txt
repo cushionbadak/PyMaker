@@ -1,0 +1,70 @@
+<div class="post-text" itemprop="text">
+<p>I'm writing a small Flask application and am having it connect to Rserve using pyRserve. I want every session to initiate and then maintain its own Rserve connection. </p>
+<p>Something like this:</p>
+<pre><code>session['my_connection'] = pyRserve.connect()
+</code></pre>
+<p>doesn't work because the connection object is not JSON serializable. On the other hand, something like this:</p>
+<pre><code>flask.g.my_connection = pyRserve.connect()
+</code></pre>
+<p>doesn't work because it does not persist between requests. To add to the difficulty, it doesn't seem as though pyRserve provides any identifier for a connection, so I can't store a connection ID in the session and use that to retrieve the right connection before each request.</p>
+<p>Is there a way to accomplish having a unique connection per session?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The following applies to any global Python data that you don't want to recreate for each request, not just rserve, and not just data that is unique to each user.</p>
+<p>We need some common location to create an rserve connection for each user.  The simplest way to do this is to run a <a href="https://docs.python.org/3/library/multiprocessing.html#managers" rel="noreferrer"><code>multiprocessing.Manager</code></a> as a separate process.</p>
+<pre><code>import atexit
+from multiprocessing import Lock
+from multiprocessing.managers import BaseManager
+import pyRserve
+
+connections = {}
+lock = Lock()
+
+
+def get_connection(user_id):
+    with lock:
+        if user_id not in connections:
+            connections[user_id] = pyRserve.connect()
+
+        return connections[user_id]
+
+
+@atexit.register
+def close_connections():
+    for connection in connections.values():
+        connection.close()
+
+
+manager = BaseManager(('', 37844), b'password')
+manager.register('get_connection', get_connection)
+server = manager.get_server()
+server.serve_forever()
+</code></pre>
+<p>Run it before starting your application, so that the manager will be available:</p>
+<pre><code>python rserve_manager.py
+</code></pre>
+<hr/>
+<p>We can access this manager from the app during requests using a simple function.  This assumes you've got a value for "user_id" in the session (which is what Flask-Login would do, for example).  This ends up making the rserve connection unique per user, not per session.</p>
+<pre><code>from multiprocessing.managers import BaseManager
+from flask import g, session
+
+def get_rserve():
+    if not hasattr(g, 'rserve'):
+        manager = BaseManager(('', 37844), b'password')
+        manager.register('get_connection')
+        manager.connect()
+        g.rserve = manager.get_connection(session['user_id'])
+
+    return g.rserve
+</code></pre>
+<p>Access it inside a view:</p>
+<pre><code>result = get_rserve().eval('3 + 5')
+</code></pre>
+<hr/>
+<p>This should get you started, although there's plenty that can be improved, such as not hard-coding the address and password, and not throwing away the connections to the manager.  This was written with Python 3, but <em>should</em> work with Python 2.</p>
+</div>
+<span class="comment-copy">Why do you need to use the same connection for a session?</span>
+<span class="comment-copy">Because I need objects in the R namespace to persist for the same user during a session (but not be visible / accessible to other users). For instance, a user may load some data and fit a model - I want to be able to access that model (without refitting it) on other pages (ie. after other Flask requests have been made).</span>
+<span class="comment-copy">I see. I'm not certain I truly need a re-usable connection per user. My only requirement is that a user's R connection/session be able to access R objects created using previous requests by that user. I suppose a workable solution might be to have an R connection save the current R workspace to the server, save the ID of that workspace as a cookie, and upon a new request, have a new R connections read that workspace back...</span>
+<span class="comment-copy">Take a look at DeployR (<a href="http://deployr.revolutionanalytics.com/" rel="nofollow noreferrer">deployr.revolutionanalytics.com</a>) - it adds APIs and additional functionality on top of Rserve that makes it easy to manage this type of requirement.</span>
+<span class="comment-copy">@Andrie I considered this - although looks like there are only client libraries for Java, Javascript, and .NET. I'm restricted to python...</span>

@@ -1,0 +1,116 @@
+<div class="post-text" itemprop="text">
+<p>From the <code>asyncio</code> <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.as_completed" rel="noreferrer">docs</a>:</p>
+<blockquote>
+<p><code>asyncio.as_completed(aws, *, loop=None, timeout=None)</code></p>
+<p>Run awaitable objects in the aws set concurrently. <strong>Return an iterator
+  of Future objects.</strong> Each Future object returned represents the earliest
+  result from the set of the remaining awaitables.</p>
+</blockquote>
+<p>I would assume each of these <code>Future</code> objects has the methods described in <a href="https://docs.python.org/3/library/asyncio-future.html#asyncio.Future" rel="noreferrer"><code>asyncio.Future</code></a>: <code>.cancelled()</code>, <code>.exception()</code>, and <code>.result()</code>.  But it appears that the yielded elements are just coroutines, not <code>Future</code> objects.  What am I missing?</p>
+<p>This seems to defeat the description of <code>.as_completed()</code>.  How is the coroutine "completed" if I need to <code>await</code> it?</p>
+<pre><code>&gt;&gt;&gt; import asyncio
+&gt;&gt;&gt; import aiohttp
+&gt;&gt;&gt; 
+&gt;&gt;&gt; async def get(session, url):
+...     async with session.request('GET', url) as resp:
+...         t = await resp.text()
+...         return t
+... 
+&gt;&gt;&gt; async def bulk_as_completed(urls):
+...     async with aiohttp.ClientSession() as session:
+...         aws = [get(session, url) for url in urls]
+...         for future in asyncio.as_completed(aws):
+...             for i in ('cancelled', 'exception', 'result'):
+...                 print(hasattr(future, i))
+...             print(type(future))
+...             try:
+...                 result = await future
+...             except:
+...                 pass
+...             else:
+...                 print(type(result))
+...                 print()
+... 
+&gt;&gt;&gt; 
+&gt;&gt;&gt; urls = (
+...     'https://docs.python.org/3/library/asyncio-task.html',
+...     'https://docs.python.org/3/library/select.html',
+...     'https://docs.python.org/3/library/this-page-will-404.html',
+... )
+&gt;&gt;&gt; 
+&gt;&gt;&gt; asyncio.run(bulk_as_completed(urls))
+False
+False
+False
+&lt;class 'coroutine'&gt;
+&lt;class 'str'&gt;
+
+False
+False
+False
+&lt;class 'coroutine'&gt;
+&lt;class 'str'&gt;
+
+False
+False
+False
+&lt;class 'coroutine'&gt;
+&lt;class 'str'&gt;
+</code></pre>
+<hr/>
+<p>Ultimately, the reason I care about this is because I'd like to <strong>let exceptions bubble up as they do in <code>asyncio.gather(..., return_exceptions=True)</code>.</strong>  Consider adding on one bogus URL that will raise when <code>session.request()</code> is called:</p>
+<pre><code>urls = (
+    'https://docs.python.org/3/library/asyncio-task.html',
+    'https://docs.python.org/3/library/select.html',
+    'https://docs.python.org/3/library/this-page-will-404.html',
+
+    # This URL will raise on session.request().  How can I propagate
+    # that exception to the iterator of results?
+    'https://asdfasdfasdf-does-not-exist-asdfasdfasdf.com'
+)
+</code></pre>
+<p>What I would <em>like</em> to be able to do is something like this (using the methods of a Future object, but these aren't Future objects at all, which is the problem):</p>
+<pre><code>async def bulk_as_completed(urls):
+    async with aiohttp.ClientSession() as session:
+        aws = [get(session, url) for url in urls]
+        for future in asyncio.as_completed(aws):
+            if future.cancelled():
+                res = futures.CancelledError()
+            else:
+                exc = future.exception()
+                if exc is not None:
+                    res = exc
+                else:
+                    res = future.result()
+            # ...
+            # [Do something with `res`]
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>What I would like to be able to do is something like this [...]</p>
+</blockquote>
+<p>Perhaps not as convenient, but you should be able to extract the exception with code like this:</p>
+<pre><code>async def bulk_as_completed(urls):
+    async with aiohttp.ClientSession() as session:
+        aws = [get(session, url) for url in urls]
+        for future in asyncio.as_completed(aws):
+            try:
+                res = await future
+            except Exception as e:
+                res = e
+            # ...
+            # [Do something with `res`]
+</code></pre>
+<blockquote>
+<p>This [yielding coroutines rather than futures] seems to defeat the description of <code>.as_completed()</code>. How is the coroutine "completed" if I need to await it?</p>
+</blockquote>
+<p>It's not. When <code>asyncio.as_completed</code> was first implemented, asynchronous iterators didn't exist. Without asynchronous iteration there was no way to return the futures as they complete, so <code>as_completed</code> sort of faked it by yielding (immediately) dummy awaitables which one has to await to get the actual result.</p>
+<p>Even if <code>as_completed</code> yielded actual futures, it wouldn't help with your use case because those futures wouldn't complete without someone awaiting them. To provide the expected semantics of <code>as_completed</code> yielding <em>completed</em> futures, <code>as_completed</code> needs to implement asynchronous iteration, whose equivalent of <code>__next__</code> can await.</p>
+<p>The surprising behavior of <code>as_completed</code> has been brought up before, and I have already filed <a href="https://bugs.python.org/issue33533" rel="nofollow noreferrer">an issue</a> to fix it by providing async iteration. Once it is implemented, your original code will work with just the <code>for</code> changed to <code>async for</code>.</p>
+</div>
+<span class="comment-copy">This question is really strange as it seems the doc is wrong at all: <a href="https://github.com/python/cpython/blob/dce345c51abd5081679a487315fb47efddc54cdb/Lib/asyncio/tasks.py#L526" rel="nofollow noreferrer">github.com/python/cpython/blob/…</a>. According to source code, it does not return a Future.</span>
+<span class="comment-copy">Yes @Sraw, it looks like the docstring itself says coroutines, while the docs say Futures.  I wonder if this changed in a certain minor version of Python 3.x</span>
+<span class="comment-copy">This is exactly what I ended up doing and then did not edit my question.  But thank you, especially for the explanation.</span>
+<span class="comment-copy">The only difference, it seems, is that there is no concept of <code>.cancelled()</code> when the iterator contains coroutines rather than Futures.  But I suppose that's null and void and the behavior is what it is.</span>
+<span class="comment-copy">@BradSolomon The current <code>as_completed</code> could easily yield futures by wrapping the coroutines into tasks. But that wouldn't buy anything because the futures wouldn't be <i>completed</i>, you'd still have to await them - and handle exeptions, etc.</span>

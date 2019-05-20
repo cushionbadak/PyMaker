@@ -1,0 +1,148 @@
+<div class="post-text" itemprop="text">
+<p>UPDATE:</p>
+<p><a href="https://stackoverflow.com/a/16262657/336527" title="This answer">This answer</a> states that what I'm trying to do is impossible as of April 2013. This, however, seems to contradict what Alex Martelli says in <a href="http://shop.oreilly.com/product/0636920027072.do" rel="nofollow noreferrer">Python Cookbook</a> (p. 624, 3rd ed.):</p>
+<blockquote>
+<p>Upon return, PyGILState_Ensure() always guarantees that the calling
+  thread has exclusive access to the Python interpreter. This is true
+  even if the calling C code is running a different thread that is
+  unknown to the interpreter.</p>
+</blockquote>
+<p><a href="https://docs.python.org/3.4/c-api/init.html#c.PyGILState_Ensure" rel="nofollow noreferrer">The docs</a> also seem to suggest GIL can be acquired, which would give me hope (except I don't think I can call <code>PyGILState_Ensure()</code> from pure python code, and if I create a C extension to call it, I'm not sure how to embed my <code>memory_daemon()</code> in that).</p>
+<p>Perhaps I'm misreading either the answer or Python Cookbook and the docs.</p>
+<p>ORIGINAL QUESTION:</p>
+<p>I want a given thread (from <code>threading</code> module) to prevent any other thread from running while a certain segment of its code is executing. What's the easiest way to achieve it? </p>
+<p>Obviously, it would be great to minimize code changes in the other threads, to avoid using C and direct OS calls, and to make it cross-platform for windows and linux. But realistically, I'll be happy to just have any solution whatsoever for my actual environment (see below).</p>
+<p>Environment:</p>
+<ul>
+<li>CPython</li>
+<li>python 3.4 (but can upgrade to 3.5 if it helps)</li>
+<li>Ubuntu 14.04</li>
+</ul>
+<p>Use case:</p>
+<p>For debugging purposes, I calculate memory used by all the objects (as reported by <code>gc.get_objects()</code>), and print some summary report to <code>sys.stderr</code>. I do this in a separate thread, because I want this summary delivered asynchronously from other threads; I put <code>time.sleep(10)</code> at the end of the <code>while True</code> loop that does the actual memory usage calculation. However, the memory reporting thread takes a while to complete each report, and I don't want all the other threads to move ahead before the memory calculation is finished (otherwise, the memory snapshot will be really hard to interpret).</p>
+<p>Example (to clarify the question):</p>
+<pre><code>import threading as th
+import time
+
+def report_memory_consumption():
+  # go through `gc.get_objects()`, check their size and print a summary
+  # takes ~5 min to run
+
+def memory_daemon():
+  while True:
+    # all other threads should not do anything until this call is complete
+    report_memory_consumption()
+    # sleep for 10 sec, then update memory summary
+    # this sleep is the only time when other threads should be executed
+    time.sleep(10)
+
+
+def f1():
+  # do something, including calling many other functions
+  # takes ~3 min to run
+
+def f2():
+  # do something, including calling many other functions
+  # takes ~3 min to run
+
+
+def main():
+  t_mem = th.Thread(target = memory_daemon)
+  t1 = th.Thread(target = f1)
+  t2 = th.Thread(target = f2)
+  t_mem.start()
+  t1.start()
+  t2.start()
+
+# requirement: no other thread is running while t_mem is not sleeping
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The Python Cookbook is correct. You have exclusive access to the Python interpreter at the point when <code>PyGILState_Ensure()</code> returns. Exclusive access means that you can safely call all CPython functions. And it means the current C thread is also the current active Python thread. If the current C thread did not have a corresponding Python thread before, <code>PyGILState_Ensure()</code> will have created one for you automatically.</p>
+<p>That is the state right after <code>PyGILState_Ensure()</code>. And you also have the GIL acquired at that point.</p>
+<p>However, when you call other CPython functions now, such as <code>PyEval_EvalCode()</code> or any other, they can implicitly make that the GIL gets released meanwhile. For example, that is the case if implicitly the Python statement <code>time.sleep(0.1)</code> gets called somewhere as a result. And while the GIL is released from this thread, other Python threads can run.</p>
+<p>You only have the guarantee that when <code>PyEval_EvalCode()</code> (or whatever other CPython function you called) returns, you will again have the same state as before - i.e. you are on the same active Python thread and you again have the GIL.</p>
+<hr/>
+<p>About your original question: There currently is no way to achieve this, i.e. to call Python code and avoid that the GIL gets released as a result somewhere meanwhile. And this is a good thing, otherwise you could easily be end up in deadlocks, e.g. if you don't allow some other thread to release some lock which it currently holds.</p>
+<p>About how to implement your use case: The only real way to do that is in C. You would call <code>PyGILState_Ensure()</code> to get the GIL. And at that point, you must only call those CPython functions which cannot have the side effect of calling other Python code. Be very careful. Even <code>PyObj_DecRef()</code> could call <code>__del__</code>. The best thing would be to avoid calling any CPython functions and manually traversing the CPython objects. Note that you probably don't have to do it as complicated as you outlined it: There is the underlying CPython memory allocator and I think you can just get the information from there.</p>
+<p>Read <a href="https://docs.python.org/3.5/c-api/memory.html" rel="nofollow">here</a> about the memory management in CPython.</p>
+<p>Related code is in <a href="https://github.com/python/cpython/blob/master/Include/pymem.h" rel="nofollow">pymem.h</a>, <a href="https://github.com/python/cpython/blob/master/Objects/obmalloc.c" rel="nofollow">obmalloc.c</a> and <a href="https://github.com/python/cpython/blob/master/Python/pyarena.c" rel="nofollow">pyarena.c</a>. See the function <code>_PyObject_DebugMallocStats()</code>, although that might not be compiled into your CPython.</p>
+<p>There is also the <a href="https://docs.python.org/3/library/tracemalloc.html" rel="nofollow">tracemalloc module</a> which however will add some overhead. Maybe its underlying C code (file <a href="https://github.com/python/cpython/blob/master/Modules/_tracemalloc.c" rel="nofollow">_tracemalloc.c</a>) is helpful however to understand the internals a bit better.</p>
+<hr/>
+<p>About <code>sys.setswitchinterval(1000)</code>: That is related only for going through the Python bytecode and handling it. That is basically the main loop of CPython in <code>PyEval_EvalFrameEx</code> in the file <a href="https://github.com/python/cpython/blob/master/Python/ceval.c" rel="nofollow">ceval.c</a>. There you'll find such part:</p>
+<pre><code>if (_Py_atomic_load_relaxed(&amp;gil_drop_request))
+    ...
+</code></pre>
+<p>All the logic with the switch interval is covered in the file <a href="https://github.com/python/cpython/blob/master/Python/ceval_gil.h" rel="nofollow">ceval_gil.h</a>.</p>
+<p>Setting a high switch interval just means that the main loop in <code>PyEval_EvalFrameEx</code> will not be interrupted for a longer time. That does not mean that there aren't other possibilities that the GIL could get released meanwhile and that another thread could run.</p>
+<p><code>PyEval_EvalFrameEx</code> will execute the Python bytecode. Let's assume that this calls <code>time.sleep(1)</code>. That will call the native C implementation of the function. You'll find that in <code>time_sleep()</code> in the file <a href="https://github.com/python/cpython/blob/master/Modules/timemodule.c" rel="nofollow">timemodule.c</a>. If you follow that code, you'll find this:</p>
+<pre><code>Py_BEGIN_ALLOW_THREADS
+err = select(0, (fd_set *)0, (fd_set *)0, (fd_set *)0, &amp;timeout);
+Py_END_ALLOW_THREADS
+</code></pre>
+<p>Thus, the GIL gets released meanwhile. Now, any other thread which is waiting for the GIL could pick it up and run other Python code.</p>
+<p>Theoretically, you could think, if you set a high switch interval and never call any Python code which in turn could release the GIL at some point, you would be safe. Note that this is almost impossible, though. E.g. the GC will get called from time to time and any <code>__del__</code> of some objects could have various side effects.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You should use threading locks to execute code synchronously between threads. The answer given is somewhat correct but I would use reentrant locals to check again to see if you indeed have the lock. </p>
+<p>Do not use variables as described in another answer to check for lock possession. The variables can get corrupted between multiple threads. Reentrant locks were meant to solve this problem.</p>
+<p>Also what's incorrect in that code is that lock is released assuming the code between doesn't throw exception. so always do in <code>with</code> context or <code>try-catch-finally</code>.</p>
+<p>Here is an excellent <a href="http://effbot.org/zone/thread-synchronization.htm" rel="nofollow">article</a> explaining synchronization in Python and threading <a href="https://docs.python.org/3.4/library/threading.html" rel="nofollow">docs</a>.</p>
+<p><strong>Edit: Answering OP's update on embedding Python in C</strong></p>
+<p>You misunderstood what he said in the cookbook. <code>PyGILState_Ensure</code> returns the GIL if a GIL is available in the <strong>current python interpreter</strong> but not C threads which is unknown to the python interpreter.</p>
+<p>You can't force to get GIL from other threads in the current interpreter. Imagine if you were able to, then basically you will cannibalize all other threads.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Python is <em>always</em> executing <em>one thread at a time</em> because of the Global Interpreter Lock. It doesn't do so when <code>multiprocessing</code> is involved. You can see <a href="https://stackoverflow.com/a/29105799/4354477">this answer</a> to learn more about the GIL in CPython.</p>
+<p>Note, that's pseudocode as I don't know how you're creating threads/using them/which code you're executing in threads.</p>
+<pre><code>import threading, time
+
+l=threading.Lock()
+locked=False
+
+def worker():
+    l.acquire()
+    locked=True
+    #do something
+    l.release()
+
+def test():
+    while locked:
+        time.sleep(10)
+    #do something
+
+threads = []
+t = threading.Thread(target=worker)
+threads.append(t)
+t = threading.Thread(target=test)
+threads.append(t)
+for th in threads:
+    th.start()
+for th in threads:
+    th.join()
+</code></pre>
+<p>Certainly, it may be written better and can be optimized.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As a stop-gap solution (for obvious reasons), the following worked for me:</p>
+<pre><code>def report_memory_consumption():
+  sys.setswitchinterval(1000) # longer than the expected run time
+  # go through `gc.get_objects()`, check their size and print a summary
+  # takes ~5 min to run
+  sys.setswitchinterval(0.005) # the default value
+</code></pre>
+<p>If anyone has a better answer, please post it.</p>
+</div>
+<span class="comment-copy">I believe, Python can execute only <i>one thread at a time</i> because of the GIL.</span>
+<span class="comment-copy">Thanks this is very helpful. Can you comment on whether my answer works (with certain caveats)?</span>
+<span class="comment-copy">@max: I extended my answer.</span>
+<span class="comment-copy">Thanks. Is there any way to collect the data on how many thread switches happened while my program was running?</span>
+<span class="comment-copy">@max: No. You would have to modify CPython. But that will be hard. Easier would be to implement the memory counting in C and just don't release the GIL while you do the calculation. I will extend my answer with some more information about that.</span>
+<span class="comment-copy">See my edit to clarify the question. A simple <code>Lock</code> or <code>RLock</code> won't do the trick, since the other thread needs to be stopped whenever the "controlling thread" stops sleeping, regardless of where the "instruction pointer" happens to be in that other thread. (And of course, I can't insert a <code>Lock</code> check at every line of code in the other thread.)</span>
+<span class="comment-copy">Gotcha. So what begs the question is whether the execution should suspend immediately or should it finish its unit of execution before checking if it should suspend or run. If it is the latter, it's easier by simply looping <code>while should_run:</code> and then put code inside that loop. You can then update that flag in a listener that listens to messages from main thread on whether you should continue or suspend.</span>
+<span class="comment-copy">Yes, the <code>while should_run</code> construct would work for code that yields to being represented as a loop; unfortunately, my code is just a long sequence of operations. I would have to essentially sprinkle checks of <code>should_run</code> throughout the code, making this a rather cumbersome task, and creating a maintenance nightmare.</span>
+<span class="comment-copy">This may be the case, but it doesn't prevent Python from releasing the GIL and switching threads during the critical section.</span>
+<span class="comment-copy">So, we have to use some C or C++ to lock/release the GIL, that's not what we can do with pure Python.</span>
+<span class="comment-copy">@ForceBru Hmm.. I asked for the easiest way to solve this, but if there's no way to do it in pure python, a solution in C is still better than no solution at all! :)</span>
+<span class="comment-copy">@max, you can use some <a href="https://docs.python.org/3/library/threading.html" rel="nofollow noreferrer">locks</a> to do this. For example, make some threads pause while a certain lock is locked and make them resume their work when it's released.</span>
+<span class="comment-copy">@ForceBru but how? I don't know where in the other threads the execution happens to be occurring when the interpreter chooses to switch to any of them, and I don't know how to check a lock in <i>every</i> line of code in a thread (I think it's impossible?)</span>

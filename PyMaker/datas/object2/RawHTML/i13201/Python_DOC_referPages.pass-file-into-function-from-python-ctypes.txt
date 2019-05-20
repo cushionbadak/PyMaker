@@ -1,0 +1,98 @@
+<div class="post-text" itemprop="text">
+<p>I have a library function (written in C) that generates text by writing the output to <code>FILE *</code>.  I want to wrap this in Python (2.7.x) with code that creates a temp file or pipe, passes it into the function, reads the result from the file, and returns it as a Python string.</p>
+<p>Here's a simplified example to illustrate what I'm after:</p>
+<pre><code>/* Library function */
+void write_numbers(FILE * f, int arg1, int arg2)
+{
+   fprintf(f, "%d %d\n", arg1, arg2);
+}
+</code></pre>
+<p>Python wrapper:</p>
+<pre><code>from ctypes import *
+mylib = CDLL('mylib.so')
+
+
+def write_numbers( a, b ):
+   rd, wr = os.pipe()
+
+   write_fp = MAGIC_HERE(wr)
+   mylib.write_numbers(write_fp, a, b)
+   os.close(wr)
+
+   read_file = os.fdopen(rd)
+   res = read_file.read()
+   read_file.close()
+
+   return res
+
+#Should result in '1 2\n' being printed.
+print write_numbers(1,2)
+</code></pre>
+<p>I'm wondering what my best bet is for <code>MAGIC_HERE()</code>. </p>
+<p>I'm tempted to just use <code>ctypes</code> and create a <code>libc.fdopen()</code> wrapper that returns a Python c_void_t, then pass that into the library function.  I'm seems like that should be safe in theory--just wondering if there are issues with that approach or an existing Python-ism to solve this problem.</p>
+<p>Also, this will go in a long-running process (lets just assume "forever"), so any leaked file descriptors are going to be problematic.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>First, do note that <code>FILE*</code> is an stdio-specific entity. It doesn't exist at system level. The things that exist at system level are descriptors (retrieved with <a href="https://docs.python.org/2/library/stdtypes.html?highlight=fileno#file.fileno" rel="nofollow noreferrer"><code>file.fileno()</code></a>) in UNIX (<code>os.pipe()</code> returns plain descriptors already) and handles (retrieved with <a href="https://docs.python.org/2/library/msvcrt.html?highlight=msvcrt#msvcrt.get_osfhandle" rel="nofollow noreferrer"><code>msvcrt.get_osfhandle()</code></a>) in Windows. <strong>Thus it's a poor choice as an inter-library exchange format if there can be more than one C runtime in action.</strong> You'll be in trouble if your library is compiled against another C runtime than your copy of Python: 1) binary layouts of the structure may differ (e.g. due to alignment or additional members for debugging purposes or even different type sizes); 2) in Windows, file descriptors that the structure links to are C-specific entities as well, and their table is maintained by a C runtime internally<sup><a href="https://stackoverflow.com/questions/33310675/pass-file-into-function-from-python-ctypes/33311066#comment54499370_33311066">1</a></sup>.</p>
+<p>Moreover, in Python 3, I/O was overhauled in order to untangle it from <code>stdio</code>. So, <code>FILE*</code> is alien to that Python flavor (and likely, most non-C flavors, too).</p>
+<p>Now, what you need is to</p>
+<ul>
+<li>somehow guess which C runtime you need, and</li>
+<li>call its <a href="http://linux.die.net/man/3/fdopen" rel="nofollow noreferrer"><code>fdopen()</code></a> (or equivalent).</li>
+</ul>
+<p>(One of Python's mottoes <em>is</em> "make the right thing easy and the wrong thing hard", after all)</p>
+<hr/>
+<p>The cleanest method is to use the precise instance that the library is linked to (do pray that it's linked with it dynamically or there'll be no exported symbol to call)</p>
+<p>For the 1st item, I couldn't find any Python modules that can analyze loaded dynamic modules' metadata to find out which DLLs/so's it have been linked with (just a name or even name+version isn't enough, you know, due to possible multiple instances of the library on the system). Though it's definitely possible since the information about its format is widely available.</p>
+<p>For the 2nd item, it's a trivial <code>ctypes.cdll('path').fdopen</code> (<code>_fdopen</code> for MSVCRT).</p>
+<hr/>
+<p>Second, you can do a small helper module that would be compiled against the same (or guaranteed compatible) runtime as the library and would do the conversion from the aforementioned descriptor/handle for you. This is effectively a workaround to editing the library proper.</p>
+<hr/>
+<p>Finally, there's the simplest (and the dirtiest) method using Python's C runtime instance (so all the above warnings apply in full) through Python C API available via <a href="https://docs.python.org/2/library/ctypes.html?highlight=pythonapi" rel="nofollow noreferrer"><code>ctypes.pythonapi</code></a>. It takes advantage of</p>
+<ul>
+<li>the fact that Python 2's file-like objects are wrappers over <code>stdio</code>'s <code>FILE*</code> (Python 3's are not)</li>
+<li><a href="https://docs.python.org/2/c-api/file.html?highlight=pyfile_asfile#c.PyFile_AsFile" rel="nofollow noreferrer"><code>PyFile_AsFile</code></a> API that returns the wrapped <code>FILE*</code> (note that <a href="https://docs.python.org/3/c-api/file.html?highlight=pyfile_asfile#c.PyFile_AsFile" rel="nofollow noreferrer">it's missing from Python 3</a>)
+
+<ul>
+<li>for a standalone <code>fd</code>, you need to construct a file-like object first (so that there would be a <code>FILE*</code> to return ;) )</li>
+</ul></li>
+<li><p>the fact that <a href="https://docs.python.org/2/library/functions.html?highlight=id#id" rel="nofollow noreferrer"><code>id()</code></a> of an object is its memory address (CPython-specific)<sup><a href="https://stackoverflow.com/questions/33310675/pass-file-into-function-from-python-ctypes/33311066#comment54426705_33311066">2</a></sup></p>
+<pre><code>&gt;&gt;&gt; open("test.txt")
+&lt;open file 'test.txt', mode 'r' at 0x017F8F40&gt;
+&gt;&gt;&gt; f=_
+&gt;&gt;&gt; f.fileno()
+3
+&gt;&gt;&gt; ctypes.pythonapi
+&lt;PyDLL 'python dll', handle 1e000000 at 12808b0&gt;
+&gt;&gt;&gt; api=_
+&gt;&gt;&gt; api.PyFile_AsFile
+&lt;_FuncPtr object at 0x018557B0&gt;
+&gt;&gt;&gt; api.PyFile_AsFile.restype=ctypes.c_void_p   #as per ctypes docs,
+                                         # pythonapi assumes all fns
+                                         # to return int by default
+&gt;&gt;&gt; api.PyFile_AsFile.argtypes=(ctypes.c_void_p,) # as of 2.7.10, long integers are
+                #silently truncated to ints, see http://bugs.python.org/issue24747
+&gt;&gt;&gt; api.PyFile_AsFile(id(f))
+2019259400
+</code></pre></li>
+</ul>
+<p>Do keep in mind that with <strong><code>fd</code>s and C pointers, you need to ensure proper object lifetimes by hand!</strong></p>
+<ul>
+<li>file-like objects returned by <code>os.fdopen()</code> do close the descriptor on <code>.close()</code>
+<ul>
+<li>so duplicate descriptors with <code>os.dup()</code> if you need them after a file object is closed/garbage collected</li>
+</ul></li>
+<li>while working with the C structure, adjust the corresponding object's reference count with <a href="https://docs.python.org/2/c-api/file.html?highlight=pyfile_asfile#c.PyFile_IncUseCount" rel="nofollow noreferrer"><code>PyFile_IncUseCount()</code></a>/<a href="https://docs.python.org/2/c-api/file.html?highlight=pyfile_asfile#c.PyFile_DecUseCount" rel="nofollow noreferrer"><code>PyFile_DecUseCount()</code></a>.</li>
+<li>ensure no other I/O on the descriptors/file objects since it would screw up the data (e.g. ever since calling <code>iter(f)</code>/<code>for l in f</code>, internal caching is done that's independent from <code>stdio</code>'s caching)</li>
+</ul>
+</div>
+<span class="comment-copy"><code>os.popen()</code> is incorrect. It requires at least one argument, the command line to invoke and get pipes to. Besides, it's deprecated in favour of <code>subprocess</code>, as <a href="https://docs.python.org/2/library/os.html?highlight=os.popen#os.popen" rel="nofollow noreferrer">the docs</a> say.</span>
+<span class="comment-copy">Sorry, I meant <code>os.pipe()</code>.  Updated.</span>
+<span class="comment-copy">Unless you're also planning to run this on Windows, which has the problem of potentially mismatched C runtime libraries, then I don't think you'll have any problem calling <code>libc.fdopen</code> and passing the resulting <code>FILE</code> pointer. But instead of using <code>c_void_p</code>, I'd create an opaque <code>class FILE(Structure): pass</code> and set <code>libc.fdopen.restype = POINTER(FILE)</code>. This won't be converted to an integer result. OTOH, <code>c_void_p</code> as the <code>restype</code> gets converted to an integer,  so you'd have to make sure that <code>mylib.write_numbers.argtypes</code> is also set to prevent truncating a 64-bit pointer value.</span>
+<span class="comment-copy">Did you consider using <a href="http://pubs.opengroup.org/onlinepubs/9699919799/functions/fmemopen.html" rel="nofollow noreferrer"><code>fmemopen</code></a>? If the amount of data that will ever be written by a single <code>write_numbers</code> call is bounded b a reasonably small fixed constant, it could provide a good alternative to using a pipe.</span>
+<span class="comment-copy">@BrianMcFarland You don't have to (and I'm not sure you even can) read the <code>FILE *</code> back in. But you can simply read the <code>char[]</code> array that you passed to <code>fmemopen</code>.</span>
+<span class="comment-copy">If you're worried about the library using a different C runtime (mostly a Windows problem), then using <code>PyFile_AsFile</code> solves nothing, and limits the code to Python 2 for no good reason. Why bring Cython into the discussion? That's a random segue.</span>
+<span class="comment-copy">Also, never pass <code>id(f)</code> as a pointer. You want <code>py_object(f)</code> to pass a Python object -- as <code>PyObject *</code> for CPython. Using <code>id</code> to get a base address is specific to CPython, and passing Python integers as <i>arguments</i> also defaults to being converted as 32-bit C int values, which will truncate a 64-bit pointer value.</span>
+<span class="comment-copy">I'd like to see some backing for "truncating pointers to integers". Python does have a notion of long integers, you know, and there's completely no reason to truncate a <code>c_void_p</code>.</span>
+<span class="comment-copy">What's your aversion to setting <code>api.PyFile_AsFile.argtypes=(ctypes.py_object,)</code> and calling as <code>api.PyFile_AsFile(f)</code>? It's simpler, and also the intended usage.</span>
+<span class="comment-copy">@ivan_pozdeev - As a fairly experienced C programmer, this is the first I've heard the notion that using a <code>FILE *</code> as part of a public API is a bad idea.  Not saying you're wrong--I'm rarely writing libraries meant for public use.  But are you really saying the use of a file number is superior?  <code>FILE *</code> is part of the C standard.  File descriptors that come from <code>open</code>, e.g. are not.  So you're saying while <code>stdio.h</code> is far more portable, it's bad to use for public APIs?  Have you ever seen this cause a problem in practice?  Read a blog post on it?  Or is this purely speculative?</span>

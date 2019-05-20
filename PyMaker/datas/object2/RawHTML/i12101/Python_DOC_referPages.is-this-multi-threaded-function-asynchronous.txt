@@ -1,0 +1,128 @@
+<div class="post-text" itemprop="text">
+<p>I'm afraid I'm still a bit confused (despite checking other threads) whether:</p>
+<ul>
+<li>all asynchronous code is multi-threaded</li>
+<li>all multi-threaded functions are asynchronous</li>
+</ul>
+<p>My initial guess is no to both and that proper asynchronous code should be able to run in one thread - however it can be improved by adding threads for example like so:</p>
+<p><a href="https://i.stack.imgur.com/jaafm.png" rel="nofollow noreferrer"><img alt="enter image description here" src="https://i.stack.imgur.com/jaafm.png"/></a></p>
+<p>So I constructed this toy example:</p>
+<pre><code>from threading import *
+from queue import Queue
+import time
+
+def do_something_with_io_lag(in_work):
+    out = in_work
+    # Imagine we do some work that involves sending
+    # something over the internet and processing the output
+    # once it arrives
+    time.sleep(0.5) # simulate IO lag
+    print("Hello, bee number: ",
+          str(current_thread().name).replace("Thread-",""))
+
+class WorkerBee(Thread):
+    def __init__(self, q):
+        Thread.__init__(self)
+        self.q = q
+
+    def run(self):
+        while True:
+            # Get some work from the queue
+            work_todo = self.q.get()
+            # This function will simiulate I/O lag
+            do_something_with_io_lag(work_todo)
+            # Remove task from the queue
+            self.q.task_done()
+
+if __name__ == '__main__':
+    def time_me(nmbr):
+        number_of_worker_bees = nmbr
+        worktodo = ['some input for work'] * 50
+
+        # Create a queue
+        q = Queue()
+        # Fill with work
+        [q.put(onework) for onework in worktodo]
+        # Launch processes
+        for _ in range(number_of_worker_bees):
+            t = WorkerBee(q)
+            t.start()
+        # Block until queue is empty
+        q.join()
+
+    # Run this code in serial mode (just one worker)
+    %time time_me(nmbr=1)
+    # Wall time: 25 s
+    # Basically 50 requests * 0.5 seconds IO lag
+    # For me everything gets processed by bee number: 59
+
+    # Run this code using multi-tasking (launch 50 workers)
+    %time time_me(nmbr=50)
+    # Wall time: 507 ms
+    # Basically the 0.5 second IO lag + 0.07 seconds it took to launch them
+    # Now everything gets processed by different bees
+</code></pre>
+<p><strong>Is it asynchronous?</strong></p>
+<p>To me this code does not seem asynchronous because it is Figure 3 in my example diagram. The I/O call blocks the thread (although we don't feel it because they are blocked in parallel).</p>
+<p>However, if this is the case I am confused why requests-futures is considered asynchronous since it is a wrapper around ThreadPoolExecutor:</p>
+<pre><code>with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+    future_to_url = {executor.submit(load_url, url, 10): url for url in     get_urls()}
+    for future in concurrent.futures.as_completed(future_to_url):
+        url = future_to_url[future]
+        try:
+            data = future.result()
+</code></pre>
+<p><strong>Can this function on just one thread?</strong></p>
+<p>Especially when compared to <a href="https://docs.python.org/3/library/asyncio.html" rel="nofollow noreferrer">asyncio</a>, which means it can run single-threaded</p>
+<blockquote>
+<p>There are only two ways to have a program on a single processor do
+  “more than one thing at a time.” Multi-threaded programming is the
+  simplest and most popular way to do it, but there is another very
+  different technique, that lets you have nearly all the advantages of
+  multi-threading, without actually using multiple threads. It’s really
+  only practical if your program is largely I/O bound. If your program
+  is processor bound, then pre-emptive scheduled threads are probably
+  what you really need. Network servers are rarely processor bound,
+  however.</p>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<p>First of all, one note: <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Future" rel="nofollow noreferrer"><code>concurrent.futures.Future</code></a> is not the same as <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.Future" rel="nofollow noreferrer"><code>asyncio.Future</code></a>. Basically it's just an abstraction - an object, that allows you to refer to job result (or exception, which is also a result) in your program after you assigned a job, but before it is completed. It's similar to assigning common function's result to some variable.</p>
+<p><strong>Multithreading</strong>: Regarding your example, when using multiple threads you can say that your code is "asynchronous" as several operations are performed in different threads at the same time without waiting for each other to complete, and you can see it in the timing results. And you're right, your function due to <code>sleep</code> is blocking, it blocks the worker thread for the specified amount of time, but when you use several threads those threads are blocked in parallel. So if you would have one job with <code>sleep</code> and the other one without and run multiple threads, the one without <code>sleep</code> would perform calculations while the other would sleep. When you use single thread, the jobs are performed in in a serial manner one after the other, so when one job sleeps the other jobs wait for it, actually they just don't exist until it's their turn. All this is pretty much proven by your time tests. The thing happened with <code>print</code> has to do with "thread safety", i.e. print uses standard output, which is a single shared resource. So when your multiple threads tried to print at the same time the switching happened inside and you got your strange output. (This also show "asynchronicity" of your multithreaded example.) To prevent such errors there are locking mechanisms, e.g. locks, semaphores, etc.</p>
+<p><strong>Asyncio</strong>: To better understand the purpose <em>note the "IO" part, it's not 'async computation', but 'async input/output'</em>. When talking about asyncio you usually don't think about threads at first. Asyncio is about event loop and generators (coroutines). The event loop is the arbiter, that governs the execution of coroutines (and their callbacks), that were registered to the loop. Coroutines are implemented as generators, i.e. functions that allow to perform some actions iteratively, saving state at each iteration and 'returning', and on the next call continuing with the saved state. So basically the event loop is <code>while True:</code> loop, that calls all coroutines/generators, assigned to it, one after another, and they provide result or no-result on each such call - this provides possibility for "asynchronicity". (A simplification, as there's scheduling mechanisms, that optimize this behavior.) The event loop in this situation can run in single thread and if coroutines are non-blocking it will give you true "asynchronicity", but if they are blocking then it's basically a linear execution.</p>
+<p>You can achieve the same thing with explicit multithreading, but threads are costly - they require memory to be assigned, switching them takes time, etc. On the other hand asyncio API allows you to abstract from actual implementation and just consider your jobs to be performed asynchronously. It's implementation may be different, it includes calling the OS API and the OS decides what to do, e.g. DMA, additional threads, some specific microcontroller use, etc. The thing is it works well for IO due to lower level mechanisms, hardware stuff. On the other hand, performing computation will require explicit breaking of computation algorithm into pieces to use as asyncio coroutine, so a separate thread might be a better decision, as you can launch the whole computation as one there. (I'm not talking about algorithms that are special to parallel computing). But asyncio event loop might be explicitly set to use separate threads for coroutines, so this will be asyncio with multithreading.</p>
+<p>Regarding your example, if you'll implement your function with <code>sleep</code> as asyncio coroutine, shedule and run 50 of them single threaded, you'll get time similar to the first time test, i.e. around <code>25s</code>, as it is blocking. If you will change it to something like <code>yield from [asyncio.sleep][3](0.5)</code> (which is a coroutine itself), shedule and run 50 of them single threaded, it will be called asynchronously. So while one coroutine will sleep the other will be started, and so on. The jobs will complete in time similar to your second multithreaded test, i.e. close to <code>0.5s</code>. If you will add <code>print</code> here you'll get good output as it will be used by single thread in serial manner, but the output might be in different order then the order of coroutine assignment to the loop, as coroutines could be run in different order. If you will use multiple threads, then the result will obviously be close to the last one anyway.</p>
+<p>Simplification: The difference in multythreading and asyncio is in blocking/non-blocking, so basicly <em>blocking multithreading</em> will somewhat come close to <em>non-blocking asyncio</em>, but there're a lot of differences.</p>
+<ul>
+<li>Multithreading for computations (i.e. CPU bound code)</li>
+<li>Asyncio for input/output (i.e. I/O bound code)</li>
+</ul>
+<p>Regarding your original statement:</p>
+<blockquote>
+<ul>
+<li>all asynchronous code is multi-threaded</li>
+<li>all multi-threaded functions are asynchronous</li>
+</ul>
+</blockquote>
+<p>I hope that I was able to show, that:</p>
+<blockquote>
+<ul>
+<li>asynchronous code might be both single threaded and multi-threaded</li>
+<li>all multi-threaded functions could be called "asynchronous"</li>
+</ul>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think the main confusion comes from the meaning of asynchronous. From the Free Online Dictionary of Computing, "A process [...] whose execution can proceed independently" is asynchronous. Now, apply that to what your bees do:</p>
+<ul>
+<li>Retrieve an item from the queue. Only one at a time can do that, while the order in which they get an item is undefined. I wouldn't call that asynchronous.</li>
+<li>Sleep. Each bee does so independently of all others, i.e. the sleep duration runs on all, otherwise the time wouldn't go down with multiple bees. I'd call that asynchronous.</li>
+<li>Call <code>print()</code>. While the calls are independent, at some point the data is funneled into the same output target, and at that point a sequence is enforced. I wouldn't call that asynchronous. Note however that the two arguments to <code>print()</code> and also the trailing newline are handled independently, which is why they can be interleaved.</li>
+<li>Lastly, the call to <code>q.join()</code>. Here of course the calling thread is blocked until the queue is empty, so some kind of synchronization is enforced and wanted. I don't see why this "seems to break" for you.</li>
+</ul>
+</div>
+<span class="comment-copy">Code isn't asynchronous, code execution is. Functions aren't multi-threaded, function calls are. In that light, your question is wrong/unclear.</span>
+<span class="comment-copy">@Nitika. Thanks so much for this detailed response! I was hoping you could check out my edited first post as I have included a diagram to illustrate why I am having difficulty seeing that all multi-threaded functions are asychronous</span>
+<span class="comment-copy">@mptevsion, You diagram is pretty accurate, just note the fact that on the diagram for asyncio the Tasks might run in any order for both single and multithreaded scenario, so it might be Task1, Task3, Task2 or anything, because they are sheduled first and then executed, that depends on implementation and particular Tasks (e.g. they all open a connection and Task 3 receives connection response right away, while Task 1 and Task 2 are still waiting).</span>
+<span class="comment-copy">@mptevsion, Regarding your concerns about multitheading, you show by your self that Task 1, Task 2, Task 3 run in parallel and therefore asynchronously from each other. Imagine if they take different time to complete, then they will finish at different time points. If your concernt is in the word 'blocking', then there're 3 threads and while 1 blocks - it blocks only itself, other ones do their job. It just happens that in your example they are totaly identical, which is rare in real life - while doing the same job it takes different amount of time for each thread for different input data.</span>
+<span class="comment-copy">Take a note on @Ulrich Eckhardt's comment - it's execution that is async, not the tasks themself. Task 1 is not async to itself in any scenario, but for both multithreading and asyncio Task 1 is async in relation to Task 2, and same for Task 3. Also, for multithreading there's usually a 'master' process, that governs other threads, called 'workers' and does something with their results. ANY asynchronisity or multiple threads have a point of synchronisation, e.g. acquiring tasks or returning results for future combined processing, but it doesn't make computation of those pieces synchronous.</span>

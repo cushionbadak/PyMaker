@@ -1,0 +1,235 @@
+<div class="post-text" itemprop="text">
+<p>I've seen several posts about this, so I know it is fairly straightforward to do, but I seem to be coming up short.  I'm not sure if I need to create a worker pool, or use the Queue class.  Basically, I want to be able to create several processes that each act autonomously (which is why they inherit from the Agent superclass).  </p>
+<p>At random ticks of my main loop I want to update each Agent.  I'm using <code>time.sleep</code> with different values in the main loop and the Agent's run loop to simulate different processor speeds.</p>
+<p>Here is my Agent superclass:</p>
+<pre><code># Generic class to handle mpc of each agent
+class Agent(mpc.Process):
+  # initialize agent parameters
+  def __init__(self,):
+    # init mpc
+    mpc.Process.__init__(self)
+    self.exit = mpc.Event()
+
+  # an agent's main loop...generally should be overridden
+  def run(self):
+    while not self.exit.is_set():
+      pass
+    print "You exited!"
+
+  # safely shutdown an agent
+  def shutdown(self):
+    print "Shutdown initiated"
+    self.exit.set()
+
+  # safely communicate values to this agent
+  def communicate(self,value):
+    print value
+</code></pre>
+<p>A specific agent's subclass (simulating an HVAC system):</p>
+<pre><code>class HVAC(Agent):
+  def __init__(self, dt=70, dh=50.0):
+    super(Agent, self).__init__()
+    self.exit = mpc.Event()
+
+    self.__pref_heating     = True
+    self.__pref_cooling     = True
+    self.__desired_temperature = dt
+    self.__desired_humidity    = dh
+
+    self.__meas_temperature = 0
+    self.__meas_humidity    = 0.0
+    self.__hvac_status      = "" # heating, cooling, off
+
+    self.start()
+
+  def run(self): # handle AC or heater on 
+    while not self.exit.is_set():
+      ctemp = self.measureTemp()
+      chum  = self.measureHumidity()
+
+      if (ctemp &lt; self.__desired_temperature):
+        self.__hvac_status = 'heating'
+        self.__meas_temperature += 1
+
+      elif (ctemp &gt; self.__desired_temperature):
+        self.__hvac_status = 'cooling'
+        self.__meas_temperature += 1
+
+      else:
+        self.__hvac_status = 'off'
+      print self.__hvac_status, self.__meas_temperature
+
+
+      time.sleep(0.5)
+
+
+    print "HVAC EXITED"
+
+  def measureTemp(self):
+    return self.__meas_temperature
+  def measureHumidity(self):
+    return self.__meas_humidity
+
+  def communicate(self,updates):
+    self.__meas_temperature = updates['temp']
+    self.__meas_humidity    = updates['humidity']
+    print "Measured [%d] [%f]" % (self.__meas_temperature,self.__meas_humidity)
+</code></pre>
+<p>And my main loop:</p>
+<pre><code>if __name__ == "__main__":
+  print "Initializing subsystems"
+  agents = {}
+  agents['HVAC'] = HVAC()
+
+  # Run simulation
+  timestep = 0
+  while timestep &lt; args.timesteps:
+    print "Timestep %d" % timestep
+
+    if timestep % 10 == 0:
+      curr_temp = random.randrange(68,72)
+      curr_humidity = random.uniform(40.0,60.0)
+      agents['HVAC'].communicate({'temp':curr_temp, 'humidity':curr_humidity})
+
+    time.sleep(1)
+    timestep += 1
+
+  agents['HVAC'].shutdown()
+  print "HVAC process state: %d" % agents['HVAC'].is_alive()
+</code></pre>
+<p>So the issue is that, whenever I run <code>agents['HVAC'].communicate(x)</code> within the main loop, I can see the value being passed into the <code>HVAC</code> subclass in its <code>run</code> loop (so it prints the received value correctly).  However, the value never is successfully stored.</p>
+<p>So typical output looks like this:</p>
+<pre><code>Initializing subsystems
+Timestep 0
+Measured [68] [56.948675]
+heating 1
+heating 2
+Timestep 1
+heating 3
+heating 4
+Timestep 2
+heating 5
+heating 6
+</code></pre>
+<p>When in reality, as soon as Measured [68] appears, the internal stored value should be updated to output 68 (not heating 1, heating 2, etc.).  So effectively, the HVAC's self.__meas_temperature is not being properly updated.  </p>
+<hr/>
+<p>Edit: After a bit of research, I realized that I didn't necessarily understand what is happening behind the scenes.  Each subprocess operates with its own virtual chunk of memory and is completely abstracted away from any data being shared this way, so passing the value in isn't going to work.  My new issue is that I'm not necessarily sure how to share a global value with multiple processes.   </p>
+<p>I was looking at the Queue or JoinableQueue packages, but I'm not necessarily sure how to pass a Queue into the type of superclass setup that I have (especially with the <code>mpc.Process.__init__(self)</code> call).</p>
+<p>A side concern would be if I can have multiple agents reading values out of the queue without pulling it out of the queue?  For instance, if I wanted to share a <code>temperature</code> value with multiple agents, would a Queue work for this?  </p>
+<p><a href="https://stackoverflow.com/questions/8463008/python-multiprocessing-pipe-vs-queue">Pipe v Queue</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's a suggested solution assuming that you want the following:</p>
+<ul>
+<li>a centralized manager / main process which controls lifetimes of the workers</li>
+<li>worker processes to do something self-contained and then report results to the manager and other processes</li>
+</ul>
+<p>Before I show it though, for the record I want to say that in general unless you are CPU bound <code>multiprocessing</code> is not really the right fit, mainly because of the added complexity, and you'd probably be better of using a different high-level asynchronous framework. Also, you should use python 3, it's so much better!</p>
+<p>That said, <a href="https://docs.python.org/2/library/multiprocessing.html#managers" rel="nofollow noreferrer"><code>multiprocessing.Manager</code></a>, makes this pretty easy to do using <code>multiprocessing</code>. I've done this in python 3 but I don't think anything shouldn't "just work" in python 2, but I haven't checked.</p>
+<pre><code>from ctypes import c_bool
+from multiprocessing import Manager, Process, Array, Value
+from pprint import pprint
+from time import sleep, time
+
+
+class Agent(Process):
+
+    def __init__(self, name, shared_dictionary, delay=0.5):
+        """My take on your Agent.
+
+        Key difference is that I've commonized the run-loop and used
+        a shared value to signal when to stop, to demonstrate it.
+        """
+        super(Agent, self).__init__()
+        self.name = name
+
+        # This is going to be how we communicate between processes.
+        self.shared_dictionary = shared_dictionary
+
+        # Create a silo for us to use.
+        shared_dictionary[name] = []
+        self.should_stop = Value(c_bool, False)
+
+        # Primarily for testing purposes, and for simulating 
+        # slower agents.
+        self.delay = delay
+
+    def get_next_results(self):
+        # In the real world I'd use abc.ABCMeta as the metaclass to do 
+        # this properly.
+        raise RuntimeError('Subclasses must implement this')
+
+    def run(self):
+        ii = 0
+        while not self.should_stop.value:
+            ii += 1
+            # debugging / monitoring
+            print('%s %s run loop execution %d' % (
+                type(self).__name__, self.name, ii))
+
+            next_results = self.get_next_results()
+
+            # Add the results, along with a timestamp.
+            self.shared_dictionary[self.name] += [(time(), next_results)]
+            sleep(self.delay)
+
+    def stop(self):
+        self.should_stop.value = True
+        print('%s %s stopped' % (type(self).__name__, self.name))
+
+
+class HVACAgent(Agent):
+    def get_next_results(self):
+        # This is where you do your work, but for the sake of
+        # the example just return a constant dictionary.
+        return {'temperature': 5, 'pressure': 7, 'humidity': 9}
+
+
+class DumbReadingAgent(Agent):
+    """A dumb agent to demonstrate workers reading other worker values."""
+
+    def get_next_results(self):
+        # get hvac 1 results:
+        hvac1_results = self.shared_dictionary.get('hvac 1')
+        if hvac1_results is None:
+            return None
+
+        return hvac1_results[-1][1]['temperature']
+
+# Script starts.
+results = {}
+
+# The "with" ensures we terminate the manager at the end.
+with Manager() as manager:
+
+    # the manager is a subprocess in its own right. We can ask
+    # it to manage a dictionary (or other python types) for us
+    # to be shared among the other children.
+    shared_info = manager.dict()
+
+    hvac_agent1 = HVACAgent('hvac 1', shared_info)
+    hvac_agent2 = HVACAgent('hvac 2', shared_info, delay=0.1)
+    dumb_agent = DumbReadingAgent('dumb hvac1 reader', shared_info)
+
+    agents = (hvac_agent1, hvac_agent2, dumb_agent)
+
+    list(map(lambda a: a.start(), agents))
+
+    sleep(1)
+
+    list(map(lambda a: a.stop(), agents))
+    list(map(lambda a: a.join(), agents))
+
+    # Not quite sure what happens to the shared dictionary after
+    # the manager dies, so for safety make a local copy.
+    results = dict(shared_info)
+
+pprint(results)
+</code></pre>
+</div>
+<span class="comment-copy">This is a very broad question. As far as I can make out you're basically asking "what ways are there of sharing data between multiprocesses?" (have you read <a href="https://docs.python.org/3/library/multiprocessing.html" rel="nofollow noreferrer">the docs</a>?), and then "which one should I use for my application?". Can you narrow it down a bit, i.e. give a specific desired behaviour? Else I think people might leave general purpose answers that may not actually be very helpful for you.</span>
+<span class="comment-copy">Actually that's what the edit was supposed to cover.  Based on my exact implementation I need a way to share data...I don't know if a Queue or JoinableQueue or something else is best, but I can't seem to figure out how to share data if I am using mpc.Process.__init__(self)</span>
+<span class="comment-copy">*With multiple consumers all reading the same variable(s)</span>
+<span class="comment-copy">Nice post!  Runs fine in 2.7 (I've just historically used 2 because of all the code that is in 2 vs 3).  I will probably break the run loop out separately because each of these agents are supposed to be running fully autonomously, so they'll have very distinct run loops.  But I do like the idea of a shared dictionary...it kind of reminds me of a nice clean Singleton instance with the ability to modify it.  Question though...if <code>hvac_agent1</code> decides to modify <code>shared_info</code> at the same time as <code>hvac_agent2</code>, is there a race condition issue?</span>
+<span class="comment-copy">The docs aren't exactly clear, although they kind of imply it's fine, but I also tested it with 3 agents continually updating their entry in the dictionary with no pause over 5 seconds (so each agent was adding an entry every 3-4ms), and there was no loss of data, so I think that provided they're only writing to their entry in the dictionary, there is no race condition. Obviously if agent 1 writes to <code>shared_info['key']</code> at the same time that agent 2 writes to it, then only one of them is going to win!</span>
+<span class="comment-copy">Awesome, this is exactly what I was looking for then.  Thanks!</span>

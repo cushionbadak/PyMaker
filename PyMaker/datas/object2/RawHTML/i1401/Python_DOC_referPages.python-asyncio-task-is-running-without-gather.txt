@@ -1,0 +1,120 @@
+<div class="post-text" itemprop="text">
+<p>I was trying to reproduce &amp; better understand the TaskPool example in <a href="https://medium.com/@cgarciae/making-an-infinite-number-of-requests-with-python-aiohttp-pypeln-3a552b97dc95" rel="nofollow noreferrer">this</a> blog post by Cristian Garcia, and I ran into a very interesting result.</p>
+<p>Here are the two scripts that I used. I swapped out an actual network request with a random sleep call </p>
+<pre><code>#task_pool.py
+import asyncio
+
+class TaskPool(object):
+
+    def __init__(self, workers):
+        self._semaphore = asyncio.Semaphore(workers)
+        self._tasks = set()
+
+    async def put(self, coro):
+        await self._semaphore.acquire()
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._on_task_done)
+
+    def _on_task_done(self, task):
+        self._tasks.remove(task)
+        self._semaphore.release()
+
+    async def join(self):
+        await asyncio.gather(*self._tasks)
+
+    async def __aenter__(self):
+        return self
+
+    def __aexit__(self, exc_type, exc, tb):
+        print("aexit triggered")
+        return self.join()
+</code></pre>
+<p>And </p>
+<pre><code># main.py
+import asyncio
+import sys
+from task_pool import TaskPool
+import random
+limit = 3
+
+async def fetch(i):
+    timereq = random.randrange(5)
+    print("request: {} start, delay: {}".format(i, timereq))
+    await asyncio.sleep(timereq)
+    print("request: {} end".format(i))
+    return (timereq,i)
+
+async def _main(total_requests):
+    async with TaskPool(limit) as tasks:
+        for i in range(total_requests):
+            await tasks.put(fetch(i))
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(_main(int(sys.argv[1])))
+</code></pre>
+<p>The command <code>main.py 10</code> on python 3.7.1 yields the following result.</p>
+<pre><code>request: 0 start, delay: 3
+request: 1 start, delay: 3
+request: 2 start, delay: 3
+request: 0 end
+request: 1 end
+request: 2 end
+request: 3 start, delay: 4
+request: 4 start, delay: 1
+request: 5 start, delay: 0
+request: 5 end
+request: 6 start, delay: 1
+request: 4 end
+request: 6 end
+request: 7 start, delay: 1
+request: 8 start, delay: 4
+request: 7 end
+aexit triggered
+request: 9 start, delay: 1
+request: 9 end
+request: 3 end
+request: 8 end
+</code></pre>
+<p>I have a few questions based on this result.</p>
+<ol>
+<li>I would not have expected the tasks to run until the context manager exited and triggered <code>__aexit__</code>, because that is the only trigger for <code>asyncio.gather</code>. However the print statements strongly suggest that the <code>fetch</code> jobs are occuring even before the <code>aexit</code>. What's happening, exactly? Are the tasks running? If so, what started them? </li>
+<li>Related to (1). Why is the context manager exiting before all the jobs have returned?</li>
+<li>The <code>fetch</code> job is supposed to return a tuple. How can I access this value? For a web-based application, I imagine the developer may want to do operations on the data returned by the website.</li>
+</ol>
+<p>Any help is greatly appreciated!</p>
+</div>
+<div class="post-text" itemprop="text">
+<ol>
+<li><p>A task starts as soon as <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task" rel="nofollow noreferrer"><code>create_task</code></a> is called.</p>
+<p>Straight from the documentation, first line:</p>
+<blockquote>
+<p>Wrap the coro coroutine into a Task and schedule its execution.</p>
+</blockquote></li>
+<li><p>it should not, but. Look at the code in your question:</p>
+<pre><code>def __aexit__(self, exc_type, exc, tb):
+    print("aexit triggered")
+    return self.join()
+</code></pre>
+<p>There are three issues:</p>
+<ul>
+<li><p>This is a regular synchronous function. Change it to <code>async def</code> and add the mandatory <code>await</code> for invoking <code>self.join()</code>. Here you don't call <code>join</code> you just create the task but never run it. Your python surely complains about you never awaiting a task. <strong>Those warnings must never be ignored</strong> because they mean something is going very wrong in your program.</p>
+<p><strong>[edit:]</strong> as user4815162342 pointed out below, the construction you wrote will actually work, though probably not for the intended reasons — it works because the coroutine function returned by calling <code>self.join()</code> without awaiting it will be returned and used as if it was aexit's own. You don't want this, make it async and await.</p></li>
+<li><p>Once this is fixed, <code>__aexit__</code> will print "aexit triggered" and <em>then</em> calls <code>join</code>, which waits for tasks to complete. Therefore messages from tasks not yet completed will appear after the "aexit triggered" message.</p></li>
+<li>The return value of <code>__aexit__</code> is ignored, unless the exit happens because an exception was raised. In that case, <code>return True</code> will swallow the exception. Drop the <code>return</code>
+<br/><br/></li>
+</ul>
+<p>So that part, fixed:</p>
+<pre><code>async def __aexit__(self, exc_type, exc, tb):
+    print("aexit triggered")
+    await self.join()
+    print("aexit completed")
+</code></pre></li>
+<li><p>Your <code>TaskPool</code> must make the result of tasks available. It is yours to design, python will not do any magic under the hood. From what you have, a simple way would be for <code>join</code> to store the result of <code>gather</code> as an attribute of the task pool.</p></li>
+</ol>
+</div>
+<span class="comment-copy">Note that in the OP's code <code>return self.join()</code> was actually necessary <i>in combination</i> with <code>__aexit__</code> being a regular function. This worked correctly (though perhaps unintentionally), just like it is correct for a non-generator function to instantiate and return a generator - and there is no functional difference between that function and an actual generator. This is why the OP likely didn't get warnings (regarding that part of code). The rest of your explanation is still spot-on.</span>
+<span class="comment-copy">@user4815162342&gt; excellent catch. It indeed ended up running <code>join</code> as an synchronous exit handler. This proves once again that asyncio is significantly less developer-friendly than the rest of python.</span>
+<span class="comment-copy">I understand why it feels unfriendly, but being able to return a coroutine from a sync function is sometimes a useful feature. Perhaps one needs to choose between different coroutines/futures depending on a condition, or maybe one needs to do some preparation in sync-land before returning the coroutine. See <a href="https://stackoverflow.com/a/53472079/1600898">this answer</a> for an exammple of it being <i>necessary</i> to have a coroutine defined by an ordinary function that returns an instantiated <code>async def</code>. And the code is written at the coroutine level without ever dropping to generators.</span>
+<span class="comment-copy">@user4815162342 I understand why it is useful given how asyncio is implemented, I do manipulate them sometimes (though I tend to encapsulate that in a class or function). I still think that's not the best designed part of python. :)</span>
+<span class="comment-copy">@CuriousDan&gt; it is stored somewhere: that somewhere is on the Future itself, so you have to keep a reference to it. For 2) the point is calling an <code>async def</code> function creates and returns a coroutine object. That object won't be run unless <code>await</code>ed or scheduled explicitly. In the version you posted, <code>aexit</code> did return a coroutine object (created by calling <code>self.join()</code>), that's why it didn't break.</span>

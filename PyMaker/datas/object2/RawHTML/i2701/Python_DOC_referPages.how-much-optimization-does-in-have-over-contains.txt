@@ -1,0 +1,94 @@
+<div class="post-text" itemprop="text">
+<p>So in the itertools recipe section, they have a snipped of code that looks like:</p>
+<pre><code>seen = set()
+seen_add = seen.add
+</code></pre>
+<p>I was wondering whether a similar idea might bridge some of the performance gap between <code>in</code> and <code>__contains__</code>. For instance, with the following code:</p>
+<pre><code>seen = set()
+seen_add = seen.add
+in_seen = seen.__contains__
+for item in iterable:
+    in_seen(item)
+</code></pre>
+<p>vs</p>
+<pre><code>seen = set()
+seen_add = seen.add
+in_seen = seen.__contains__  # make identical in beginning
+for item in iterable:
+    item in seen
+</code></pre>
+<p>So if I'm reading the output from dis correctly, the question comes down to "is <code>x in y</code> faster than <code>func(x)</code>?"</p>
+<p>Edit: to those saying it doesn't matter, I'm not using this as an optimization. I'm trying to understand the language better by picking this element apart.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>We're talking a couple dozen nanoseconds at most, so usually it doesn't matter. And, even when it does, things are more complicated than they first appear.</p>
+<hr/>
+<p>Pre-binding <code>seen.__contains__</code> as <code>seen_contains</code> will speed things up over calling <code>seen.__contains__</code>, but not as much as just using (the more obvious and idiomatic) <code>in seen</code> instead.</p>
+<p>So, why is this different than <code>seen_adds</code>?</p>
+<p>In the case of <code>seen.add()</code>, you're explicitly creating and calling a bound method, and there's no way around that. So, creating the bound method once, instead of each time… is still usually not worth it, but in those rare cases when you need to save the nanoseconds, it's a win.</p>
+<p>In the case of <code>in seen</code>, you're not explicitly creating a bound method, you're just evaluating an operator. In CPython, if <code>seen</code> is an instance of a Python class, that will <em>implicitly</em> create a bound method—but if it's an instance of a builtin class, it will just directly look up the method in the C slot and call that. So, while you save time by creating the bound method once instead of over and over, it's still not as much as the time you waste calling the C function through a bound method instead of calling it directly.</p>
+<p>Of course in a different Python implementation—or just with a different type that wasn't a builtin—things might be different.</p>
+<hr/>
+<p>If this actually matters (which it usually won't), you should of course test it with the platform, Python implementation, and type that you care about. </p>
+<p>But, purely as an example, I'll test it with 64-bit python.org CPython 3.7 on my MacBook Pro with <code>set</code>:</p>
+<pre><code>In [778]: s = {1, 2, 3}
+In [779]: sc = s.__contains__
+In [780]: %timeit 4 in s
+33.9 ns ± 0.444 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+In [781]: %timeit s.__contains__(4)
+69.3 ns ± 0.936 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+In [782]: %timeit sc(4)
+47.6 ns ± 0.866 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+</code></pre>
+<p>As expected, <code>sc</code> gets back some of our wasted time, but not all of it.</p>
+<p>But with a pure-Python type:</p>
+<pre><code>In [787]: class Set:
+     ...:     def __contains__(self, n):
+     ...:         return 1 &lt;= n &lt; 4
+In [788]: s = Set()
+In [789]: sc = s.__contains__
+In [790]: %timeit 4 in s
+129 ns ± 5.69 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+In [791]: %timeit s.__contains__(4)
+124 ns ± 1.14 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+In [792]: %timeit sc(4)
+108 ns ± 1.19 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+</code></pre>
+<p>… <code>4 in s</code> is slightly <em>slower</em> than <code>s.__contains__(4)</code> (because it's basically just a wrapper around calling exactly that), and creating the bound method makes it even faster.</p>
+<p>So, we got completely opposite results with two different types that represent the same value.</p>
+<p>And again, the biggest difference in any of these cases is still only 35ns.</p>
+<hr/>
+<p>As a side note, pre-binding the method helps a little more with locals than globals. (Local variable lookup is significantly faster than attribute lookup; global variable lookup is only a tiny bit faster than an attribute lookup.) That's harder to demonstrate in a one-liner, but you should test that yourself if that's your actual intended use.</p>
+<hr/>
+<p>And remember, all of that is just with CPython. </p>
+<p>When I run the exact same code in PyPy 3.5.3/5.10.1, I get 6.39/6.29/6.31ns for <code>set</code> and 1.52/1.51/1.50ns for <code>Set</code>.</p>
+<p>Notice that almost all of the details turned out exactly the other way around: <code>__contains__</code> is faster than <code>in</code> for <code>set</code>, pre-binding it actually slows things down rather than speeding them up, and the non-builtin <code>Set</code> is 4x faster rather than 3x slower. Why? I can make some guesses, but whenever I try to dive into PyPy's JIT for reliable answers I come out three days later having learned nothing more than that Armin Rigo is an 18th-level wizard.</p>
+<p>(Also notice that just switching Python interpreters made an order of magnitude more difference than any micro-optimization we could do within the language.)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>in</code> does seem to be faster.  At a guess, <code>COMPARE_OP</code> is more efficent than <code>CALL_FUNCTION</code> because it knows how many arguments it has.</p>
+<pre><code>haugh@~$ python3 -m timeit -s "l = {1}" "2 in l"
+10000000 loops, best of 3: 0.029 usec per loop
+
+haugh@~$ python3 -m timeit -s "l = {1}" "l.__contains__(2)"
+10000000 loops, best of 3: 0.0612 usec per loop
+
+haugh@~$ python3 -m timeit -s "l = {1}; isin=l.__contains__" "isin(2)"
+10000000 loops, best of 3: 0.0301 usec per loop
+</code></pre>
+</div>
+<span class="comment-copy">Have you measured this?</span>
+<span class="comment-copy">Sounds like micro-optimization.  Who cares?</span>
+<span class="comment-copy">I mostly care out of curiosity. It's not like I would actually care about this in code, but I think it's interesting to analyze this sort of thing.</span>
+<span class="comment-copy"><code>in</code> calls <code>__contains__</code>. in <code>seen_add</code>'s case method lookup time is saved. I remember that once I applied this approach for several methods on a heavily executed piece of code, and got a <i>~5%</i> performance increase.</span>
+<span class="comment-copy">If this makes significant difference in your application, Python probably isn't the right language. Python is valuable specifically because developers don't need to spend a lot of time worrying about this kind of detail. It's not a highly performant language, but should be used in cases where that's an acceptable trade-off compared to development time.</span>
+<span class="comment-copy">@gabeappleton The <code>%timeit</code> magic is just one of many reasons to use <a href="http://ipython.org/" rel="nofollow noreferrer">IPython/Jupyter</a> in place of the default interactive REPL.</span>
+<span class="comment-copy">@wim Sure it is. I go out of my way to not only explain, but even demonstrate that the results depend on such things. And the unrealistic data set doesn’t matter at all; neither the hashing in the first data structure not the chained comparison in the second would be significantly different with a million elements instead of 3.</span>
+<span class="comment-copy">In this case, it's in the python documentation itself: <a href="https://docs.python.org/3/library/itertools.html#itertools-recipes" rel="nofollow noreferrer">docs.python.org/3/library/itertools.html#itertools-recipes</a>  (search unique_everseen)</span>
+<span class="comment-copy">funny, I started to read the answer, and I knew who the author was. Nice as usual</span>
+<span class="comment-copy">@wim I do want to stop people from using these tricks without thinking. But I think an answer that shows how you get the opposite results with two similar-looking values even in the same Python implementation, and details all of the complexities you need to think about if you want to even consider micro-optimizing, is a better much antidote than not answering.</span>
+<span class="comment-copy">That doesn't really answer the question. There are extra attribute lookups there. The whole point is to compare them all things being equal.</span>
+<span class="comment-copy">@gabeappleton What extra attribute lookups?</span>
+<span class="comment-copy">The data structure shouldn't matter @wim, because it is used in all examples. what is being compared is the <code>__contains__</code> call method, directy or using the <code>in</code> operator keyword</span>
+<span class="comment-copy">@nosklo  that might not change the <i>absolute</i> difference but it can change the <i>relative</i> difference.</span>
+<span class="comment-copy">@PatrickHaugh looking up an attribute of an object will always be slower than looking up a variable. For instance, <code>seen.__contains__</code> generates <code>LOAD_FAST (seen); LOAD_ATTR (add)</code>, whereas <code>in_seen</code> would just be <code>LOAD_FAST (in_seen)</code></span>

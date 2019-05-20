@@ -1,0 +1,171 @@
+<div class="post-text" itemprop="text">
+<p>An application I use for graphics has an embedded Python interpreter  -  It works exactly the same as any other Python interpreter except there are a few special objects.</p>
+<p>Basically I am trying to use Python to download a bunch of images and make other Network and disk I/O. If I do this without multithreading, my application will freeze (i.e. videos quit playing) until the downloads are finished.  </p>
+<p>To get around this I am trying to use multi-threading. However, I can not touch any of the main process.</p>
+<p>I have written this code. The only parts unique to the program are commented. <code>me.store</code> / <code>me.fetch</code> is basically a way of getting a global variable. <code>op('files')</code> refers to a global table.</p>
+<p>These are two things, "in the main process" that can only be touched in a thread safe way. I am not sure if my code does this.</p>
+<p>I would apprecaite any input as to why or (why not) this code is thread-safe and how I can get around access the global variables in a thread safe way.</p>
+<p>One thing I am worried about is how the <code>counter</code> is fetched multiple times by many threads.  Since it is only updated after the file is written, could this cause a race-condition where the different threads access the counter with the same value (and then don't store the incremented value correctly). Or, what happens to the counter if the disk write fails.</p>
+<pre><code>from urllib import request
+import threading, queue, os
+
+url = 'http://users.dialogfeed.com/en/snippet/dialogfeed-social-wall-twitter-instagram.json?api_key=ac77f8f99310758c70ee9f7a89529023'
+
+imgs = [
+    'http://search.it.online.fr/jpgs/placeholder-hollywood.jpg.jpg',
+    'http://www.lpkfusa.com/Images/placeholder.jpg',
+    'http://bi1x.caltech.edu/2015/_images/embryogenesis_placeholder.jpg'
+]
+
+def get_pic(url):
+    # Fetch image data
+    data = request.urlopen(url).read()
+    # This is the part I am concerned about, what if multiple threads fetch the counter before it is updated below
+    # What happens if the file write fails?
+    counter = me.fetch('count', 0)
+
+    # Download the file
+    with open(str(counter) + '.jpg', 'wb') as outfile:
+        outfile.write(data)
+        file_name = 'file_' + str(counter)
+        path = os.getcwd() + '\\' + str(counter) + '.jpg'
+        me.store('count', counter + 1)
+        return file_name, path
+
+
+def get_url(q, results):
+    url = q.get_nowait()
+    file_name, path = get_pic(url)
+    results.append([file_name, path])
+    q.task_done()
+
+def fetch():
+    # Clear the table
+    op('files').clear()
+    results = []
+    url_q = queue.Queue()
+    # Simulate getting a JSON feed
+    print(request.urlopen(url).read().decode('utf-8'))
+
+    for img in imgs:
+        # Add url to queue and start a thread
+        url_q.put(img)
+        t = threading.Thread(target=get_url, args=(url_q, results,))
+        t.start()
+
+    # Wait for threads to finish before updating table
+    url_q.join()
+    for cell in results:
+        op('files').appendRow(cell)
+    return
+
+# Start a thread so that the first http get doesn't block
+thread = threading.Thread(target=fetch) 
+thread.start()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your code doesn't appear to be safe at all. Key points:</p>
+<ul>
+<li>Appending to <code>results</code> is unsafe -- two threads might try to append to the list at the same time.</li>
+<li>Accessing and setting <code>counter</code> is unsafe -- a thread my fetch <code>counter</code> before another thread has set the new <code>counter</code> value.</li>
+<li>Passing a queue of urls is redundant -- just pass a new url to each job.</li>
+</ul>
+<h3>Another way (<a href="https://docs.python.org/3/library/concurrent.futures.html" rel="nofollow"><code>concurrent.futures</code></a>)</h3>
+<p>Since you are using python 3, why not make use of the concurrent.futures module, which makes your task much easier to manage. Below I've written out your code in a way which does not require explicit synchronisation -- all the work is handled by the futures module.</p>
+<pre><code>from urllib import request
+import os
+import threading
+
+from concurrent.futures import ThreadPoolExecutor
+from itertools import count
+
+url = 'http://users.dialogfeed.com/en/snippet/dialogfeed-social-wall-twitter-instagram.json?api_key=ac77f8f99310758c70ee9f7a89529023'
+
+imgs = [
+    'http://search.it.online.fr/jpgs/placeholder-hollywood.jpg.jpg',
+    'http://www.lpkfusa.com/Images/placeholder.jpg',
+    'http://bi1x.caltech.edu/2015/_images/embryogenesis_placeholder.jpg'
+]
+
+def get_pic(url, counter):
+    # Fetch image data
+    data = request.urlopen(url).read()
+
+    # Download the file
+    with open(str(counter) + '.jpg', 'wb') as outfile:
+        outfile.write(data)
+        file_name = 'file_' + str(counter)
+        path = os.getcwd() + '\\' + str(counter) + '.jpg'
+        return file_name, path
+
+def fetch():
+    # Clear the table
+    op('files').clear()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        count_start = me.fetch('count', 0)
+        # reserve these numbers for our tasks
+        me.store('count', count_start + len(imgs))
+        # separate fetching and storing is usually not thread safe
+        # however, if only one thread modifies count (the one running fetch) then 
+        # this will be safe (same goes for the files variable)
+
+        for cell in executor.map(get_pic, imgs, count(count_start)):
+            op('files').appendRow(cell)
+
+
+# Start a thread so that the first http get doesn't block
+thread = threading.Thread(target=fetch) 
+thread.start()
+</code></pre>
+<p>If multiple threads modify count then you should use a lock when modifying count.</p>
+<p>eg.</p>
+<pre><code>lock = threading.Lock()
+
+def fetch():
+    ...
+    with lock:
+        # Do not release the lock between accessing and modifying count.
+        # Other threads wanting to modify count, must use the same lock object (not 
+        # another instance of Lock).
+        count_start = me.fetch('count', 0)
+        me.store('count', count_start + len(imgs))    
+   # use count_start here
+</code></pre>
+<p>The only problem with this if one job fails for some reason then you will get a missing file number. Any raised exception will also interrupt the executor doing the mapping, by re-raising the exception there --so you can then do something if needed.</p>
+<p>You could avoid using a counter by using the <a href="https://docs.python.org/3/library/tempfile.html" rel="nofollow"><code>tempfile</code></a> module to find somewhere to temporarily store a file before moving the file somewhere permanent.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Remember to look at <a href="https://docs.python.org/3/library/multiprocessing.html" rel="nofollow"><code>multiprocessing</code></a> and <a href="https://docs.python.org/3/library/threading.html" rel="nofollow"><code>threading</code></a> if you are new to python multi-threading stuff.</p>
+<p>Your code seems ok, though the code style is not very easy to read. You need to run it to see if it works as your expectation.</p>
+<p><code>with</code> will make sure your lock is released. The acquire() method will be called when the block is entered, and release() will be called when the block is exited.</p>
+<p>If you add more threads, make sure they are not using the same address from queue and no race condition (seems it is done by <code>Queue.get()</code>, but you need to run it to verify). Remember, each threads share the same process so almost everything is shared. You don't want two threads are handling the same <code>address</code></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <code>Lock</code> doesn't do anything at all.  You only have one thread that ever calls <code>download_job</code> - that's the one you assigned to <code>my_thread</code>.  The other one, the main thread, calls <code>offToOn</code> and is finished as soon as it reaches the end of that function.  So there is no second thread that ever tries to acquire the lock, and hence no second thread ever gets blocked.  The table you mention is, apparently, in a file that you explicitly open and close.  If the operating system protects this file against simultaneous access from different programs, you can get away with this; otherwise it is definitely unsafe because you haven't accomplished any thread synchronization.</p>
+<p>Proper synchronization between threads requires that different threads have access to the SAME lock; i.e., one lock is accessed by multiple threads.  Also note that "thread" is not a synonym for "process."  Python supports both.  If you're really supposed to avoid accessing the main <b>process</b>, you have to use the multiprocessing module to launch and manage a second process.</p>
+<p>And this code will never exit, since there is always a thread running in an infinite loop (in <code>threader</code>).</p>
+<p>Accessing a resource in a thread-safe manner requires something like this:</p>
+<pre><code>a_lock = Lock()
+def use_resource():
+    with a_lock:
+        # do something
+</code></pre>
+<p>The lock is created once, outside the function that uses it.  Every access to the resource in the whole application, from whatever thread, must acquire the same lock, either by calling <code>use_resource</code> or some equivalent.</p>
+</div>
+<span class="comment-copy">See my answer.  But it's perfectly safe to run this code, since all it will do is to print a traceback telling you that <code>offToOn()</code> takes four arguments, not zero.  Also for clarity I strongly advise moving all the import statements to the top of the file, outside of any function.</span>
+<span class="comment-copy">Thanks @PaulCornelius , those arguments were from the program and should have been removed.</span>
+<span class="comment-copy">Very nice. As your code notes, even though <code>fetch</code> is run in a different thread, you are staying the storing of the <code>count</code> variable is safe because of how <code>me.store</code> is incremented right after it is fetched correct?</span>
+<span class="comment-copy">However, re: your first points: <a href="http://effbot.org/zone/thread-synchronization.htm" rel="nofollow noreferrer">This link</a> says that appending to a list is safe - can you confirm?  I was using the <code>url_queue</code> so that I could know when all of the threads were done (thus calling <code>url_q.join</code>).</span>
+<span class="comment-copy">The storing of count is safe only if the thread running fetch is the only thread to modify count. Otherwise the thread could be interrupted between accessing and modifying count. If multiple threads modify count then you should use a lock when accessing and modifying count.</span>
+<span class="comment-copy">Appending to a list <i>can</i> be thread safe, but this relies on an implementation detail, not a cast iron guarantee. In CPython the methods of list are implemented in C and this blocks any other thread from running until the C function returns. This is due to another implementation detail (the GIL). Basically you are relying on an implied lock rather than an explicit lock. Your code would be unsafe in interpreters such as Jython and IronPython that do not have the same mechanism, or if you used another list-like class that is implemented at least partially in python or releases the GIL.</span>
+<span class="comment-copy">Why are you talking about multiprocessing in this answer? The only thing to suggest there might be multiprocessing going on is the one line about touching anything "in the main process", which seems to be talking about the program Python is being embedded in rather than anything to do with the <code>multiprocessing</code> module.</span>
+<span class="comment-copy">because he said he is new to python multi-threading, and everyone new to this better to know there are <code>multiprocessing</code> and <code>threading</code></span>
+<span class="comment-copy">I have run this code and it executes fine, however, my understanding is that, even with poorly-managed threads, you wont necessarily know that there is a problem. I have run this code several times and not had an issue but I am not positive it is written well.  Could you recommend how the code could be easier to read?</span>
+<span class="comment-copy">No one can write code without bug. If you code can work, then it works! If someone saying there is a problem, you will know then. Just looking at the code, I cannot tell where may have bug neither. At first, I do suspect there are two bugs, but then I understand your code and they are not bug. I suggest you follow some OOP code style to do it.</span>
+<span class="comment-copy">"it is definitely unsafe because you haven't accomplished any thread synchronization."  This is what I was trying to avoid.  The table is not protected by the operating system and is actually continually accessed by the "main thread" of the graphics program.  What I need to solve is how to be able to update the table (which is basically like a string) in a safe way.</span>
+<span class="comment-copy">And yes, to create that infinite loop I followed an example. How would one exist and / or kill the thread when the downloads have completed?</span>
+<span class="comment-copy">You've described a situation where an existing application is accessing a shared resource (the table) in a manner which is not thread-safe.  You want to add another thread and now access that same resource in a manner that IS thread-safe.  And you can't modify the existing program.  If that's a correct description, it's an absolutely impossible problem.  In order to achieve thread safety, all of the threads (without exception) must access the resource in a thread-safe manner.  The problem, as I understand it, has no solution.</span>
+<span class="comment-copy">To kill a thread properly you can send it another message (i.e., put an object in the queue) with a special value that you can interpret as "kill."  For example, put the integer 0 into the pipe instead of a string (URL).  Test for that inside your loop, and exit when it happens.  That terminates the thread.</span>
+<span class="comment-copy">Edited my answer to sketch a typical solution.</span>

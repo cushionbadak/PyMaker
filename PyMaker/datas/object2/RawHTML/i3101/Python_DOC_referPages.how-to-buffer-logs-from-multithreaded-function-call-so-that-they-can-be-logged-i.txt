@@ -1,0 +1,149 @@
+<div class="post-text" itemprop="text">
+<h2>the problem</h2>
+<p>I'm trying to use the <code>concurrent.futures</code> library to run a function on a list of "things". The code looks something like this.</p>
+<pre><code>import concurrent.futures
+import logging
+
+logger = logging.getLogger(__name__)
+
+def process_thing(thing, count):
+    logger.info(f'starting processing for thing {count}')
+    # Do some io related stuff
+    logger.info(f'finished processing for thing {count}')
+
+def process_things_concurrently(things)
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = []
+        for count, thing in enumerate(things):
+            futures.append(executor.submit(process_thing, thing, count))
+
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
+</code></pre>
+<p>As the code is now, the logging can happen in any order.</p>
+<p>For example:</p>
+<pre><code>starting processing for thing 2
+starting processing for thing 1
+finished processing for thing 2
+finished processing for thing 1
+</code></pre>
+<p>I want to change the code so that the records for a particular call of <code>process_thing()</code> are buffered until the future finishes.</p>
+<p>In other words, all of the records for a particular call stick together. These 'groups' of records are ordered by when the call finished.</p>
+<p>So from the example above the log output above would instead look like</p>
+<pre><code>starting processing for thing 2
+finished processing for thing 2
+starting processing for thing 1
+finished processing for thing 1
+</code></pre>
+<h2>what I've tried</h2>
+<p>I tried making a logger for each call that would have its own custom handler, possibly subclassing <a href="https://docs.python.org/3/library/logging.handlers.html#logging.handlers.BufferingHandler" rel="nofollow noreferrer">BufferingHandler</a>. But eventually there will be lots of "things" and I read that making a lot of loggers is bad.</p>
+<p>I'm open to anything that works! Thanks.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's a little recipe for a <code>DelaydLogger</code> class that puts all calls to <code>logger</code>'s methods into a list instead of actually performing the call, until you finally do a <code>flush</code> where they are all fired up.</p>
+<pre><code>from functools import partial
+
+class DelayedLogger:
+    def __init__(self, logger):
+        self.logger = logger
+        self._call_stack = []  #  list of (method, *args, **kwargs) tuples
+        self._delayed_methods = {
+            name : partial(self._delayed_method_proxy, getattr(logger, name))
+            for name in ["info", "debug", "warning", "error", "critical"]
+        }
+
+    def __getattr__(self, name):
+        """ Proxy getattr to self.logger, except for self._delayed_methods. """
+        return self._delayed_methods.get(name, getattr(self.logger, name))
+
+    def _delayed_method_proxy(self, method, *args, **kwargs):
+        self._call_stack.append((method, args, kwargs))
+
+    def flush(self):
+        """ Flush self._call_stack to the real logger. """
+        for method, args, kwargs in self._call_stack:
+            method(*args, **kwargs)
+        self._call_stack = []
+</code></pre>
+<p>In your example, you could use it like so:            </p>
+<pre><code>import logging
+logger = logging.getLogger(__name__)
+
+def process_thing(thing, count):    
+    dlogger = DelayedLogger(logger)
+    dlogger.info(f'starting processing for thing {count}')
+    # Do some io related stuff
+    dlogger.info(f'finished processing for thing {count}')    
+    dlogger.flush()
+
+process_thing(None, 10)
+</code></pre>
+<p>There may be ways to beautfiy this or make it more compact, but it should get the job done if that's what you really want.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>First I modified @Jeronimo's answer to come up with this</p>
+<pre><code>class DelayedLogger:
+
+    class ThreadLogger:
+        """to be logged from a single thread"""
+
+        def __init__(self, logger):
+            self._call_stack = []  # list of (method, *args, **kwargs) tuples
+            self.logger = logger
+            self._delayed_methods = {
+                name: partial(self._delayed_method_proxy, getattr(logger, name))
+                for name in ["info", "debug", "warning", "error", "critical"]
+            }
+
+        def __getattr__(self, name):
+            """ Proxy getattr to self.logger, except for self._delayed_methods. """
+            return self._delayed_methods.get(name, getattr(self.logger, name))
+
+        def _delayed_method_proxy(self, method, *args, **kwargs):
+            self._call_stack.append((method, args, kwargs))
+
+        def flush(self):
+            """ Flush self._call_stack to the real logger. """
+            for method, args, kwargs in self._call_stack:
+                method(*args, **kwargs)
+            self._call_stack = []
+
+    def __init__(self, logger):
+        self.logger = logger
+        self._thread_loggers: typing.Dict[self.ThreadLogger] = {}
+
+    def new_thread(self, count):
+        """Make a new sub-logger class that writes to the call stack in its slot"""
+        new_logger = self.ThreadLogger(self.logger)
+        self._thread_loggers[count] = new_logger
+        return new_logger
+
+    def get_thread(self, count):
+        return self._thread_loggers[count]
+
+    delayed_logger = DelayedLogger(logger)
+</code></pre>
+<p>Which can be used like this</p>
+<pre><code>delayed_logger = DelayedLogger(logger)
+with concurrent.futures.ThreadPoolExecutor() as executor:
+    futures = []
+    for count, thing in enumerate(things):
+        futures.append(executor.submit(process_thing,
+                                       count,
+                                       thing,
+                                     logger=delayed_logger.new_thread(count)))
+
+    for future in concurrent.futures.as_completed(futures):
+        count = future.result()
+        delayed_logger.get_thread(count).flush()
+</code></pre>
+<p>The problem here is that <code>process_thing()</code> now needs to take the logger as an argument and the logger is limited in scope. If <code>process_thing()</code> calls subroutines then the their logging won't be delayed.</p>
+<p>Probably the solution is just to not try to do this at all. Instead threads can make a log filter or some other way to distinguish their messages.</p>
+</div>
+<span class="comment-copy">Log to a PriorityQueue and structure the logs so they sort correctly?</span>
+<span class="comment-copy">@wwii how do you log to a PriorityQueue as you suggest?</span>
+<span class="comment-copy">Since you don't want any logging-action till it's finished anyway....have you considered making just one LogRecord, that one for "finished" but making it multi-line and including the "starting"-info you need? That would boil down the problem to just a formatting task. It still could look like two separate LogRecords in your output, but it would be logged at once.</span>
+<span class="comment-copy">@Darkonaut that's not a bad idea and definitely simplifies the problem. But as you point out, formatting would be an issue. Also it would make logging more complicated by breaking away from the regular logging interface.</span>
+<span class="comment-copy">This looks great! But I'm concerned that, since <code>dlogger.flush()</code> is called inside of a thread a context switch could occur mid-output. Thus the log would be broken up with the log of another thread.</span>
+<span class="comment-copy">I suppose that <code>process_thing</code> could return the logger, and then <code>flush()</code> could be called outside of the 'worker' thread. I think that would solve the problem.</span>
+<span class="comment-copy">Maybe you could fix that with a <code>threading.Lock</code> inside <code>DelayedLogger</code>, which all the instances use to synchronize each other. The problem remains though with all other calls made to <code>logger</code> which are unaware of this lock. But this depends on your app.</span>

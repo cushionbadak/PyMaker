@@ -1,0 +1,273 @@
+<div class="post-text" itemprop="text">
+<p>Trying to get the SSL certificate from a response in <a href="http://docs.python-requests.org/en/latest/" rel="nofollow noreferrer"><code>requests</code></a>.</p>
+<p>What is a good way to do this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>requests</code> deliberately wraps up low-level stuff like this. Normally, the only thing you want to do is to <a href="http://docs.python-requests.org/en/latest/user/advanced/#ssl-cert-verification" rel="nofollow noreferrer">verify that the certs are valid</a>. To do that, just pass <code>verify=True</code>. If you want to use a non-standard cacert bundle, you can pass that too. For example:</p>
+<pre><code>resp = requests.get('https://example.com', verify=True, cert=['/path/to/my/ca.crt'])
+</code></pre>
+<p>Also, <code>requests</code> is primarily a set of wrappers around other libraries, mostly <a href="https://github.com/shazow/urllib3" rel="nofollow noreferrer"><code>urllib3</code></a> and the stdlib's <a href="http://docs.python.org/3/library/http.client.html" rel="nofollow noreferrer"><code>http.client</code></a> (or, for 2.x, <code>httplib</code>) and <a href="http://docs.python.org/3/library/ssl.html" rel="nofollow noreferrer"><code>ssl</code></a>. </p>
+<p>Sometimes, the answer is just to get at the lower-level objects (e.g., <code>resp.raw</code> is the <code>urllib3.response.HTTPResponse</code>), but in many cases that's impossible. </p>
+<p>And this is one of those cases. The only objects that ever see the certs are an <code>http.client.HTTPSConnection</code> (or a <code>urllib3.connectionpool.VerifiedHTTPSConnection</code>, but that's just a subclass of the former) and an <code>ssl.SSLSocket</code>, and neither of those exist anymore by the time the request returns. (As the name <code>connectionpool</code> implies, the <code>HTTPSConnection</code> object is stored in a pool, and may be reused as soon as it's done; the <code>SSLSocket</code> is a member of the <code>HTTPSConnection</code>.)</p>
+<p>So, you need to patch things so you can copy the data up the chain. It may be as simple as this:</p>
+<pre><code>HTTPResponse = requests.packages.urllib3.response.HTTPResponse
+orig_HTTPResponse__init__ = HTTPResponse.__init__
+def new_HTTPResponse__init__(self, *args, **kwargs):
+    orig_HTTPResponse__init__(self, *args, **kwargs)
+    try:
+        self.peercert = self._connection.sock.getpeercert()
+    except AttributeError:
+        pass
+HTTPResponse.__init__ = new_HTTPResponse__init__
+
+HTTPAdapter = requests.adapters.HTTPAdapter
+orig_HTTPAdapter_build_response = HTTPAdapter.build_response
+def new_HTTPAdapter_build_response(self, request, resp):
+    response = orig_HTTPAdapter_build_response(self, request, resp)
+    try:
+        response.peercert = resp.peercert
+    except AttributeError:
+        pass
+    return response
+HTTPAdapter.build_response = new_HTTPAdapter_build_response
+</code></pre>
+<p>That's untested, so no guarantees; you may need to patch more than that. </p>
+<p>Also, subclassing and overriding would probably be cleaner than monkeypatching (especially since <code>HTTPAdapter</code> was designed to be subclassed).</p>
+<p>Or, even better, forking <code>urllib3</code> and <code>requests</code>, modifying your fork, and (if you think this is legitimately useful) submitting pull requests upstream.</p>
+<p>Anyway, now, from your code, you can do this:</p>
+<pre><code>resp.peercert
+</code></pre>
+<p>This will give you a dict with <code>'subject'</code> and <code>'subjectAltName'</code> keys, as returned by <code>pyopenssl.WrappedSocket.getpeercert</code>. If you instead want more information about the cert, try <a href="https://stackoverflow.com/a/52072170/1709587">Christophe Vandeplas's variant of this answer</a> that lets you get an <code>OpenSSL.crypto.X509</code> object. If you want to get the entire peer certificate chain, see <a href="https://stackoverflow.com/a/47931103/1709587">GoldenStake's answer</a>.</p>
+<p>Of course you may also want to pass along all the information necessary to verify the cert, but that's even easier, because it already passes through the top level.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>To start, <a href="https://stackoverflow.com/a/16904808/2197939">abarnert's answer</a> is very complete. While chasing the proposed <code>connection-close</code> issue of <a href="https://stackoverflow.com/users/5384754/kalkran">Kalkran</a> I actually discovered that the <code>peercert</code> didn't contain detailed information about the SSL Certificate.</p>
+<p>I dug deeper in the connection and socket info and extracted the <code>self.sock.connection.get_peer_certificate()</code> function which contains great functions like:</p>
+<ul>
+<li><code>get_subject()</code> for CN</li>
+<li><code>get_notAfter()</code> and <code>get_notBefore()</code> for expiration dates</li>
+<li><code>get_serial_number()</code> and <code>get_signature_algorithm()</code> for crypto related technical details </li>
+<li>...</li>
+</ul>
+<p>Note that these are only available if you have <code>pyopenssl</code> installed on your system. Under the hood, <code>urllib3</code> uses <code>pyopenssl</code> if it's available and the standard library's <code>ssl</code> module otherwise. The <code>self.sock.connection</code> attribute shown below only exists if <code>self.sock</code> is a <code>urllib3.contrib.pyopenssl.WrappedSocket</code>, not if it's a <code>ssl.SSLSocket</code>. You can install <code>pyopenssl</code> with <code>pip install pyopenssl</code>.</p>
+<p>Once that's done, the code becomes:</p>
+<pre><code>import requests
+
+HTTPResponse = requests.packages.urllib3.response.HTTPResponse
+orig_HTTPResponse__init__ = HTTPResponse.__init__
+def new_HTTPResponse__init__(self, *args, **kwargs):
+    orig_HTTPResponse__init__(self, *args, **kwargs)
+    try:
+        self.peer_certificate = self._connection.peer_certificate
+    except AttributeError:
+        pass
+HTTPResponse.__init__ = new_HTTPResponse__init__
+
+HTTPAdapter = requests.adapters.HTTPAdapter
+orig_HTTPAdapter_build_response = HTTPAdapter.build_response
+def new_HTTPAdapter_build_response(self, request, resp):
+    response = orig_HTTPAdapter_build_response(self, request, resp)
+    try:
+        response.peer_certificate = resp.peer_certificate
+    except AttributeError:
+        pass
+    return response
+HTTPAdapter.build_response = new_HTTPAdapter_build_response
+
+HTTPSConnection = requests.packages.urllib3.connection.HTTPSConnection
+orig_HTTPSConnection_connect = HTTPSConnection.connect
+def new_HTTPSConnection_connect(self):
+    orig_HTTPSConnection_connect(self)
+    try:
+        self.peer_certificate = self.sock.connection.get_peer_certificate()
+    except AttributeError:
+        pass
+HTTPSConnection.connect = new_HTTPSConnection_connect
+</code></pre>
+<p>You will be able to access the result easily:</p>
+<pre><code>r = requests.get('https://yourdomain.tld', timeout=0.1)
+print('Expires on: {}'.format(r.peer_certificate.get_notAfter()))
+print(dir(r.peer_certificate))
+</code></pre>
+<p>If, like me, you want to ignore SSL Certificate warnings just add the following in the top of the file and do not SSL verify:</p>
+<pre><code>from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+r = requests.get('https://yourdomain.tld', timeout=0.1, verify=False)
+print(dir(r.peer_certificate))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This, although not pretty at all, works:</p>
+<pre><code>import requests
+
+req = requests.get('https://httpbin.org')
+pool = req.connection.poolmanager.connection_from_url('https://httpbin.org')
+conn = pool.pool.get()
+# get() removes it from the pool, so put it back in
+pool.pool.put(conn)
+print(conn.sock.getpeercert())
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>To start, <a href="https://stackoverflow.com/a/16904808/2197939">abarnert's answer</a> is very complete</p>
+<p>But I would like to add, that in the case you're looking for the peer cert chain, you would need to patch yet another piece of code</p>
+<pre><code>import requests
+sock_requests = requests.packages.urllib3.contrib.pyopenssl.WrappedSocket
+def new_getpeercertchain(self,*args, **kwargs):
+    x509 = self.connection.get_peer_cert_chain()
+    return x509
+sock_requests.getpeercertchain = new_getpeercertchain
+</code></pre>
+<p>after that you can call it in a very similiar manner as the accepted answer</p>
+<pre><code>HTTPResponse = requests.packages.urllib3.response.HTTPResponse
+orig_HTTPResponse__init__ = HTTPResponse.__init__
+def new_HTTPResponse__init__(self, *args, **kwargs):
+    orig_HTTPResponse__init__(self, *args, **kwargs)
+    try:
+        self.peercertchain = self._connection.sock.getpeercertchain()
+    except AttributeError:
+        pass
+HTTPResponse.__init__ = new_HTTPResponse__init__
+
+HTTPAdapter = requests.adapters.HTTPAdapter
+orig_HTTPAdapter_build_response = HTTPAdapter.build_response
+def new_HTTPAdapter_build_response(self, request, resp):
+    response = orig_HTTPAdapter_build_response(self, request, resp)
+    try:
+        response.peercertchain = resp.peercertchain
+    except AttributeError:
+        pass
+    return response
+HTTPAdapter.build_response = new_HTTPAdapter_build_response
+</code></pre>
+<p>you will get <code>resp.peercertchain</code> which contains a <code>tuple</code> of <a href="https://pyopenssl.org/en/stable/api/crypto.html#x509-objects" rel="nofollow noreferrer"><code>OpenSSL.crypto.X509</code></a> objects</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Thanks for everyone's awesome answers.</p>
+<p>It helped me over engineer an answer to this question:</p>
+<p><a href="https://stackoverflow.com/questions/39356413/how-to-add-a-custom-ca-root-certificate-to-the-ca-store-used-by-python-in-window/52961564#52961564">How to add a custom CA Root certificate to the CA Store used by Python in Windows?</a></p>
+<h1>UPDATE 2019-02-12</h1>
+<blockquote>
+<p>Please take a look at <a href="https://github.com/lifehackjim/cert_human" rel="nofollow noreferrer">Cert Human: SSL Certificates for Humans</a> for an impressive rewrite of my <a href="https://github.com/neozenith/get-ca-py" rel="nofollow noreferrer">https://github.com/neozenith/get-ca-py</a> project by <a href="https://github.com/lifehackjim" rel="nofollow noreferrer">lifehackjim</a>.</p>
+<p>I have archived the original repository now.</p>
+</blockquote>
+<h1>Stand alone snippet</h1>
+<pre><code>#! /usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Get Certificates from a request and dump them.
+"""
+
+import argparse
+import sys
+
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+"""
+Inspired by the answers from this Stackoverflow question:
+https://stackoverflow.com/questions/16903528/how-to-get-response-ssl-certificate-from-requests-in-python
+
+What follows is a series of patching the low level libraries in requests.
+"""
+
+"""
+https://stackoverflow.com/a/47931103/622276
+"""
+
+sock_requests = requests.packages.urllib3.contrib.pyopenssl.WrappedSocket
+
+
+def new_getpeercertchain(self, *args, **kwargs):
+    x509 = self.connection.get_peer_cert_chain()
+    return x509
+
+
+sock_requests.getpeercertchain = new_getpeercertchain
+
+"""
+https://stackoverflow.com/a/16904808/622276
+"""
+
+HTTPResponse = requests.packages.urllib3.response.HTTPResponse
+orig_HTTPResponse__init__ = HTTPResponse.__init__
+
+
+def new_HTTPResponse__init__(self, *args, **kwargs):
+    orig_HTTPResponse__init__(self, *args, **kwargs)
+    try:
+        self.peercertchain = self._connection.sock.getpeercertchain()
+    except AttributeError:
+        pass
+
+
+HTTPResponse.__init__ = new_HTTPResponse__init__
+
+HTTPAdapter = requests.adapters.HTTPAdapter
+orig_HTTPAdapter_build_response = HTTPAdapter.build_response
+
+
+def new_HTTPAdapter_build_response(self, request, resp):
+    response = orig_HTTPAdapter_build_response(self, request, resp)
+    try:
+        response.peercertchain = resp.peercertchain
+    except AttributeError:
+        pass
+    return response
+
+
+HTTPAdapter.build_response = new_HTTPAdapter_build_response
+
+"""
+Attempt to wrap in a somewhat usable CLI
+"""
+
+
+def cli(args):
+    parser = argparse.ArgumentParser(description="Request any URL and dump the certificate chain")
+    parser.add_argument("url", metavar="URL", type=str, nargs=1, help="Valid https URL to be handled by requests")
+
+    verify_parser = parser.add_mutually_exclusive_group(required=False)
+    verify_parser.add_argument("--verify", dest="verify", action="store_true", help="Explicitly set SSL verification")
+    verify_parser.add_argument(
+        "--no-verify", dest="verify", action="store_false", help="Explicitly disable SSL verification"
+    )
+    parser.set_defaults(verify=True)
+
+    return vars(parser.parse_args(args))
+
+
+def dump_pem(cert, outfile="ca-chain.crt"):
+    """Use the CN to dump certificate to PEM format"""
+    PyOpenSSL = requests.packages.urllib3.contrib.pyopenssl
+    pem_data = PyOpenSSL.OpenSSL.crypto.dump_certificate(PyOpenSSL.OpenSSL.crypto.FILETYPE_PEM, cert)
+    issuer = cert.get_issuer().get_components()
+
+    print(pem_data.decode("utf-8"))
+
+    with open(outfile, "a") as output:
+        for part in issuer:
+            output.write(part[0].decode("utf-8"))
+            output.write("=")
+            output.write(part[1].decode("utf-8"))
+            output.write(",\t")
+        output.write("\n")
+        output.write(pem_data.decode("utf-8"))
+
+
+if __name__ == "__main__":
+    cli_args = cli(sys.argv[1:])
+
+    url = cli_args["url"][0]
+    req = requests.get(url, verify=cli_args["verify"])
+    for cert in req.peercertchain:
+        dump_pem(cert)
+</code></pre>
+</div>
+<span class="comment-copy">Wow, this is very complete.  Thanks a lot!  I'll work on it and see how it goes.  Thanks again!</span>
+<span class="comment-copy">Thanks, this really helped. Unfortunately, when the server uses <code>Connection: close</code> and closes the connection immediately after the data is transferred, I still would not get the "peercert". I had to patch <code>requests.packages.urllib3.connection.HTTPSConnection.connect</code> too to first call the original function and then immediately get the <code>self.sock.getpeercert()</code> and then pass it up the chain.</span>
+<span class="comment-copy">Thanks so much for the great addition to the answer! +1.</span>
+<span class="comment-copy">This only works if the connection is still alive, which is not guaranteed. For example, if the other side sends a <code>Connection: close</code>. Or if you've sent out other requests (especially if you're using this in an async or threaded context). Or if <code>urllib3</code> just feels like it for no obvious reason.</span>

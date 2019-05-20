@@ -1,0 +1,60 @@
+<div class="post-text" itemprop="text">
+<p>I am using the <code>multiprocessing</code> python module. I have about 20-25 tasks to run simultaneously. Each task will create a <code>pandas.DataFrame</code> object of ~20k rows. Problem is, all tasks execute well, but when it comes to "joining" the processes, it just stops. I've tried with "small" DataFrames and it works very well. To illustrate my point, I created the code below.</p>
+<pre><code>import pandas
+import multiprocessing as mp
+
+def task(arg, queue):
+    DF = pandas.DataFrame({"hello":range(10)}) # try range(1000) or range(10000)
+    queue.put(DF)
+    print("DF %d stored" %arg)
+
+listArgs = range(20)
+queue = mp.Queue()
+processes = [mp.Process(target=task,args=(arg,queue)) for arg in listArgs]
+
+for p in processes:
+    p.start()
+
+for i,p in enumerate(processes):
+    print("joining %d" %i)
+    p.join()
+
+results = [queue.get() for p in processes]
+</code></pre>
+<p>EDIT:</p>
+<p>With <em>DF = pandas.DataFrame({"hello":range(10)})</em> I have everything correct: "DF 0 stored" up to "DF 19 stored", same with "joining 0" to "joining 19".</p>
+<p>However with <em>DF = pandas.DataFrame({"hello":range(1000)})</em> the issue arises: while it is storing the DF, the joining step stops after "joining 3".</p>
+<p>Thanks for the useful tips :)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This problem is explained in the docs, under <a href="https://docs.python.org/3/library/multiprocessing.html#pipes-and-queues" rel="noreferrer">Pipes and Queues</a>:</p>
+<blockquote>
+<p><strong>Warning:</strong> As mentioned above, if a child process has put items on a queue (and it has not used <code>JoinableQueue.cancel_join_thread</code>), then that process will not terminate until all buffered items have been flushed to the pipe.</p>
+<p>This means that if you try joining that process you may get a deadlock unless you are sure that all items which have been put on the queue have been consumed. Similarly, if the child process is non-daemonic then the parent process may hang on exit when it tries to join all its non-daemonic children.</p>
+<p>Note that a queue created using a manager does not have this issue. See <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing-programming" rel="noreferrer"><em>Programming guidelines</em></a>.</p>
+</blockquote>
+<p>Using a manager would work, but there are a lot of easier ways to solve this:</p>
+<ol>
+<li>Read the data off the queue first, then join the processes, instead of the other way around.</li>
+<li>Manage the <code>Queue</code> manually (e.g., using a <code>JoinableQueue</code> and <code>task_done</code>).</li>
+<li>Just use <code>Pool.map</code> instead of reinventing the wheel. (Yes, much of what <code>Pool</code> does isn't necessary for your use case—but it also isn't going to get in the way, and the nice thing is, you already know it works.)</li>
+</ol>
+<p>I won't show the implementation for #1 because it's so trivial, or for #2 because it's such a pain, but for #3:</p>
+<pre><code>def task(arg):
+    DF = pandas.DataFrame({"hello":range(1000)}) # try range(1000) or range(10000)
+    return DF
+
+with mp.Pool(processes=20) as p:
+    results = p.map(task, range(20), chunksize=1)
+</code></pre>
+<p>(In 2.7, <code>Pool</code> may not work in a <code>with</code> statement; you can install the port of the later version of <code>multiprocessing</code> back to 2.7 off PyPI, or you can just manually create the pool, then <code>close</code> it in a <code>try</code>/<code>finally</code>, just you would handle a file if it didn't work in a <code>with</code> statement...)</p>
+<hr/>
+<p>You may ask yourself, why exactly does it fail at this point, but work with smaller numbers—even just a little bit smaller?</p>
+<p>A pickle of that DataFrame is just over 16K. (The list by itself is a little smaller, but if you try it with 10000 instead of 1000 you should see the same thing without Pandas.)</p>
+<p>So, the first child writes 16K, then blocks until there's room to write the last few hundred bytes. But you're not pulling anything off the pipe (by calling <code>queue.get</code>) until after the <code>join</code>, and you can't <code>join</code> until they exit, which they can't do until you unblock the pipe, so it's a classic deadlock. There's enough room for the first 4 to get through, but no room for 5. Because you have 4 cores, most of the time, the first 4 that get through will be the first 4. But occasionally #4 will beat #3 or something, and then you'll fail to join #3. That would happen more often with an 8-core machine.</p>
+</div>
+<span class="comment-copy">So what does the output look like? Does it say "DF 0 stored" through "DF 19 stored" (in arbitrary order) with a "joining 0" mixed in somewhere? Or something different? (If the problem also happens with only, say, 3 processes, consider doing it that way, so you can just paste the whole output without overwhelming anyone…)</span>
+<span class="comment-copy">Have you had a look at you system recourse utilization while running the code? If it is a memory issue look at this <a href="http://stackoverflow.com/questions/8956832/python-out-of-memory-on-large-csv-file-numpy" title="python out of memory on large csv file numpy">stackoverflow.com/questions/8956832/…</a></span>
+<span class="comment-copy">Also, I don't know whether Pandas can make use of NumPy's multiprocessing shared arrays or not (google numpy-sharedmem), but if it can, that would probably be a lot more efficient than pickling 20 huge frames and passing them over a pipe (which is what <code>Queue</code> does under the covers—and there may be a bug in Pandas' pickler or something that's causing your problem…).</span>
+<span class="comment-copy">Also, have you verified that if you pull out Pandas (maybe just pass a dict of the same size, instead of a DataFrame made from that dict) the problem goes away? Especially if you're using Python 3.2 or earlier, where multiprocessing had some bugs that have since been fixed…</span>
+<span class="comment-copy">@abarnert - he's using python 2.7, so <code>range(1000)</code> will be a list of 1000 ints, likely enough to fill the underlying pipes buffer.</span>

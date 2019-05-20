@@ -1,0 +1,274 @@
+<div class="post-text" itemprop="text">
+<p>Experimenting with some code and doing some microbenchmarks I just found out that using the <code>float</code> function on a string containing an integer number is a factor 2 faster than using <code>int</code> on the same string.</p>
+<pre><code>&gt;&gt;&gt; python -m timeit int('1')
+1000000 loops, best of 3: 0.548 usec per loop
+
+&gt;&gt;&gt; python -m timeit float('1')
+1000000 loops, best of 3: 0.273 usec per loop
+</code></pre>
+<p>It gets even stranger when testing <code>int(float('1'))</code> which runtime is shorter than the bare <code>int('1')</code>.</p>
+<pre><code>&gt;&gt;&gt; python -m timeit int(float('1'))
+1000000 loops, best of 3: 0.457 usec per loop
+</code></pre>
+<p>I tested the code under Windows 7 running cPython 2.7.6 and Linux Mint 16 with cPython 2.7.6. </p>
+<p>I have to add that only Python 2 is affected, Python 3 shows a way smaller (not remarkable) difference between the runtimes.</p>
+<p>I know that the information I get by such microbenchmarks are easy to misuse, but I'm curious why there is such a difference in the functions' runtime.</p>
+<p>I tried to find the implementations of <code>int</code> and <code>float</code> but I can not find it in the sources.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>int</code> has lots of bases.</p>
+<p>*, 0*, 0x*, 0b*, 0o* and it can be long, it takes time to determine the base and other things</p>
+<p>if the base is set, it saves a lot of time</p>
+<pre><code>python -m timeit "int('1',10)"       
+1000000 loops, best of 3: 0.252 usec per loop
+
+python -m timeit "int('1')"   
+1000000 loops, best of 3: 0.594 usec per loop
+</code></pre>
+<p>as @Martijn Pieters metions the code the <code>Object/intobject.c(int_new)</code> and <code>Object/floatobject.c(float_new)</code></p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>int()</code> has to account for more possible types to convert from than <code>float()</code> has to. When you pass a single object to <code>int()</code> and it is not already an integer, then various things are tested for:</p>
+<ol>
+<li>if it is an integer already, use it directly</li>
+<li>if the object implements the <a href="https://docs.python.org/2/reference/datamodel.html#object.__int__" rel="nofollow noreferrer"><code>__int__</code> method</a>, call it and use the result</li>
+<li>if the object is a C-derived subclass of <code>int</code>, reach in and convert the C integer value in the structure to an <code>int()</code> object.</li>
+<li>if the object implements the <a href="https://docs.python.org/2/library/math.html?highlight=__trunc__#math.trunc" rel="nofollow noreferrer"><code>__trunc__</code> method</a>, call it and use the result</li>
+<li>if the object is a string, convert it to an integer with the base set to 10.</li>
+</ol>
+<p>None of these tests are executed when you pass in a base argument, the code then jumps straight to converting a string to an int, with the selected base. That’s because there are no other accepted types, not when there is a base given. </p>
+<p>As a result, when you pass in a base, suddenly creating an integer from a string is a lot faster:</p>
+<pre><code>$ bin/python -m timeit "int('1')"
+1000000 loops, best of 3: 0.469 usec per loop
+$ bin/python -m timeit "int('1', 10)"
+1000000 loops, best of 3: 0.277 usec per loop
+$ bin/python -m timeit "float('1')"
+1000000 loops, best of 3: 0.206 usec per loop
+</code></pre>
+<p>When you pass a string to <code>float()</code>, the first test made is to see if the argument is a string object (and not a subclass), at which point it is being parsed. There’s no need to test other types. </p>
+<p>So the <code>int('1')</code> call makes a few more tests than <code>int('1', 10)</code> or <code>float('1')</code>. Of those tests, tests 1, 2, and 3 are quite fast; they are just pointer checks. But the <em>fourth</em> test uses the C equivalent of <code>getattr(obj, '__trunc__')</code>, which is <em>relatively expensive</em>. This has to test the instance, and the full MRO of the string, and there is no cache, and in the end it raises an <code>AttributeError()</code>, formatting an error message that no-one will ever see. All work that's pretty useless here.</p>
+<p>In Python 3, that <code>getattr()</code> call has been replaced with code that is a lot faster. That's because in Python 3, there is no need to account for old-style classes so the attribute can be looked up directly on the type of the instance (the class, the result of <code>type(instance)</code>), and class attribute lookups across the MRO are cached at this point. No exceptions need to be created. </p>
+<p><code>float()</code> objects implement the <code>__int__</code> method, which is why <code>int(float('1'))</code> is faster; you never hit the <code>__trunc__</code> attribute test at step 4 as step 2 produced the result instead. </p>
+<p>If you wanted to look at the C code, for Python 2, look at the <a href="https://github.com/python/cpython/blob/v2.7.14/Objects/intobject.c#L1060-L1110" rel="nofollow noreferrer"><code>int_new()</code> method</a> first. After parsing the arguments, the code essentially does this:</p>
+<pre class="lang-c prettyprint-override"><code>if (base == -909)  // no base argument given, the default is -909
+    return PyNumber_Int(x);  // parse an integer from x, an arbitrary type. 
+if (PyString_Check(x)) {
+    // do some error handling; there is a base, so parse the string with the base
+    return PyInt_FromString(string, NULL, base);
+}
+</code></pre>
+<p>The no-base case calls the <a href="https://github.com/python/cpython/blob/v2.7.14/Objects/abstract.c#L1610-L1683" rel="nofollow noreferrer"><code>PyNumber_Int()</code> function</a>, which does this:</p>
+<pre class="lang-c prettyprint-override"><code>if (PyInt_CheckExact(o)) {
+    // 1. it's an integer already
+    // ...
+}
+m = o-&gt;ob_type-&gt;tp_as_number;
+if (m &amp;&amp; m-&gt;nb_int) { /* This should include subclasses of int */
+    // 2. it has an __int__ method, return the result
+    // ...
+}
+if (PyInt_Check(o)) { /* An int subclass without nb_int */
+    // 3. it's an int subclass, extract the value
+    // ...
+}
+trunc_func = PyObject_GetAttr(o, trunc_name);
+if (trunc_func) {
+    // 4. it has a __trunc__ method, call it and process the result
+    // ...
+}
+if (PyString_Check(o))
+    // 5. it's a string, lets parse!
+    return int_from_string(PyString_AS_STRING(o),
+                           PyString_GET_SIZE(o));
+</code></pre>
+<p>where <a href="https://github.com/python/cpython/blob/v2.7.14/Objects/abstract.c#L1466-L1483" rel="nofollow noreferrer"><code>int_from_string()</code></a> is essentially a wrapper for <code>PyInt_FromString(string, length, 10)</code>, so parsing the string with base 10.</p>
+<p>In Python 3, <code>intobject</code> was removed, leaving only <code>longobject</code>, renamed to <code>int()</code> on the Python side. In the same vein, <code>unicode</code> has replaced <code>str</code>. So now we look at <a href="https://github.com/python/cpython/blob/v3.6.4/Objects/longobject.c#L4803-L4850" rel="nofollow noreferrer"><code>long_new()</code></a>, and testing for a string is done with <code>PyUnicode_Check()</code> instead of <code>PyString_Check()</code>:</p>
+<pre class="lang-c prettyprint-override"><code>if (obase == NULL)
+    return PyNumber_Long(x);
+
+// bounds checks on the obase argument, storing a conversion in base
+
+if (PyUnicode_Check(x))
+    return PyLong_FromUnicodeObject(x, (int)base);
+</code></pre>
+<p>So again when no base is set, we need to look at <a href="https://github.com/python/cpython/blob/v3.6.4/Objects/abstract.c#L1314-L1404" rel="nofollow noreferrer"><code>PyNumber_Long()</code></a>, which executes:</p>
+<pre class="lang-c prettyprint-override"><code>if (PyLong_CheckExact(o)) {
+    // 1. it's an integer already
+    // ...
+}
+m = o-&gt;ob_type-&gt;tp_as_number;
+if (m &amp;&amp; m-&gt;nb_int) { /* This should include subclasses of int */
+    // 2. it has an __int__ method
+    // ...
+}
+trunc_func = _PyObject_LookupSpecial(o, &amp;PyId___trunc__);
+if (trunc_func) {
+    // 3. it has a __trunc__ method
+    // ...
+}
+if (PyUnicode_Check(o))
+    // 5. it's a string
+    return PyLong_FromUnicodeObject(o, 10);
+</code></pre>
+<p>Note the <code>_PyObject_LookupSpecial()</code> call, this is the <a href="https://docs.python.org/3/reference/datamodel.html#special-method-lookup" rel="nofollow noreferrer">special method lookup</a> implementation; it eventually uses <a href="https://github.com/python/cpython/blob/v3.6.4/Objects/typeobject.c#L2902-L2979" rel="nofollow noreferrer"><code>_PyType_Lookup()</code></a>, which uses a cache; since there is no <code>str.__trunc__</code> method that cache will forever return a null after the first MRO scan. This method also never raises an exception, it just returns either the requested method or a null.</p>
+<p>The way <code>float()</code> handles strings is unchanged between Python 2 and 3, so you only need to look at the <a href="https://github.com/python/cpython/blob/v2.7.14/Objects/floatobject.c#L1811-L1826" rel="nofollow noreferrer">Python 2 <code>float_new()</code> function</a>, which for strings is pretty straightforward:</p>
+<pre class="lang-c prettyprint-override"><code>// test for subclass and retrieve the single x argument
+/* If it's a string, but not a string subclass, use
+   PyFloat_FromString. */
+if (PyString_CheckExact(x))
+    return PyFloat_FromString(x, NULL);
+return PyNumber_Float(x);
+</code></pre>
+<p>So for string objects, we jump straight to parsing, otherwise use <code>PyNumber_Float()</code> to look for actual <code>float</code> objects, or things with a <code>__float__</code> method, or for string subclasses. </p>
+<p>This does reveal a possible optimisation: if <code>int()</code> were to first test for <code>PyString_CheckExact()</code> before all those other type tests it would be just as fast as <code>float()</code> when it comes to strings. <code>PyString_CheckExact()</code> rules out a string subclass that has a <code>__int__</code> or <code>__trunc__</code> method so is a good first test. </p>
+<hr/>
+<p>To address other answers blaming this on base parsing (so looking for a <code>0b</code>, <code>0o</code>, <code>0</code> or <code>0x</code> prefix, case insensitively), the default <code>int()</code> call with a single  string argument <strong>does look for a base</strong>, the base is hardcoded to 10. It is an error to pass in a string with a prefix in that case:</p>
+<pre><code>&gt;&gt;&gt; int('0x1')
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+ValueError: invalid literal for int() with base 10: '0x1'
+</code></pre>
+<p>Base prefix parsing is only done if you explicitly set the second argument to <code>0</code>:</p>
+<pre><code>&gt;&gt;&gt; int('0x1', 0)
+1
+</code></pre>
+<p>Because no testing is done for <code>__trunc__</code> the <code>base=0</code> prefix parsing case is just as fast as setting <code>base</code> explicitly to any other supported value:</p>
+<pre><code>$ python2.7 -m timeit "int('1')"
+1000000 loops, best of 3: 0.472 usec per loop
+$ python2.7 -m timeit "int('1', 10)"
+1000000 loops, best of 3: 0.268 usec per loop
+$ python2.7 bin/python -m timeit "int('1', 0)"
+1000000 loops, best of 3: 0.271 usec per loop
+$ python2.7 bin/python -m timeit "int('0x1', 0)"
+1000000 loops, best of 3: 0.261 usec per loop
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is not a full answer, just some data and observations.</p>
+<hr/>
+<p>Profiling results from x86-64 Arch Linux, Python 2.7.14, on a 3.9GHz Skylake i7-6700k running Linux 4.15.8-1-ARCH.  <code>float</code>: 0.0854 usec per loop.  <code>int</code>: 0.196  usec per loop.  (So about a factor of 2)</p>
+<h2>float</h2>
+<pre><code>$ perf record python2.7 -m timeit 'float("1")'
+10000000 loops, best of 3: 0.0854 usec per loop
+
+Samples: 14K of event 'cycles:uppp', Event count (approx.): 13685905532
+Overhead  Command    Shared Object        Symbol
+  29.73%  python2.7  libpython2.7.so.1.0  [.] PyEval_EvalFrameEx
+   8.54%  python2.7  libpython2.7.so.1.0  [.] _Py_dg_strtod
+   8.30%  python2.7  libpython2.7.so.1.0  [.] vgetargskeywords
+   5.81%  python2.7  libpython2.7.so.1.0  [.] lookdict_string.lto_priv.1492
+   4.79%  python2.7  libpython2.7.so.1.0  [.] PyFloat_FromString
+   4.67%  python2.7  libpython2.7.so.1.0  [.] tupledealloc.lto_priv.335
+   4.16%  python2.7  libpython2.7.so.1.0  [.] float_new.lto_priv.219
+   3.93%  python2.7  libpython2.7.so.1.0  [.] _PyOS_ascii_strtod
+   3.54%  python2.7  libc-2.26.so         [.] __strchr_avx2
+   3.34%  python2.7  libpython2.7.so.1.0  [.] PyOS_string_to_double
+   3.21%  python2.7  libpython2.7.so.1.0  [.] PyTuple_New
+   3.05%  python2.7  libpython2.7.so.1.0  [.] type_call.lto_priv.51
+   2.69%  python2.7  libpython2.7.so.1.0  [.] PyObject_Call
+   2.15%  python2.7  libpython2.7.so.1.0  [.] PyArg_ParseTupleAndKeywords
+   1.88%  python2.7  itertools.so         [.] _init
+   1.78%  python2.7  libpython2.7.so.1.0  [.] _Py_set_387controlword
+   1.19%  python2.7  libpython2.7.so.1.0  [.] _Py_get_387controlword
+   1.10%  python2.7  libpython2.7.so.1.0  [.] vgetargskeywords.cold.59
+   1.07%  python2.7  libpython2.7.so.1.0  [.] PyType_IsSubtype
+   1.07%  python2.7  libc-2.26.so         [.] __memset_avx2_unaligned_erms
+   ...
+</code></pre>
+<p>IDK why the heck Python is messing around with the x87 control word, but yes, the tiny <code>_Py_get_387controlword</code> function really runs <code>fnstcw WORD PTR [rsp+0x6]</code> and then reloads it into <code>eax</code> as an integer return value with <code>movzx</code>, but probably spends more of its time writing and checking the stack canary from <code>-fstack-protector-strong</code>.</p>
+<p>It's weird because <code>_Py_dg_strtod</code> uses SSE2 (<code>cvtsi2sd xmm1,rsi</code>) for FP math, not x87.  (The hot part with this input is mostly integer, but there are <code>mulsd</code> and <code>divsd</code> in there.)  x86-64 code normally only uses x87 for <code>long double</code> (80-bit float).  <code>dg_strtod</code> stands for David Gay's string to double.  <a href="http://www.exploringbinary.com/how-strtod-works-and-sometimes-doesnt/" rel="nofollow noreferrer">Interesting blog post about how it works under the hood</a>.</p>
+<p>Note that this function only takes 9% of the total run time.  The rest is basically interpreter overhead, compared to a C loop that called <code>strtod</code> in a loop and threw away the result.</p>
+<h2>int</h2>
+<pre><code>$ perf record python2.7 -m timeit 'int("1")'
+10000000 loops, best of 3: 0.196 usec per loop
+
+$ perf report -Mintel
+Samples: 32K of event 'cycles:uppp', Event count (approx.): 31257616633
+Overhead  Command    Shared Object        Symbol
+  29.00%  python2.7  libpython2.7.so.1.0  [.] PyString_FromFormatV
+  13.11%  python2.7  libpython2.7.so.1.0  [.] PyEval_EvalFrameEx
+   5.49%  python2.7  libc-2.26.so         [.] __strlen_avx2
+   3.87%  python2.7  libpython2.7.so.1.0  [.] vgetargskeywords
+   3.68%  python2.7  libpython2.7.so.1.0  [.] PyNumber_Int
+   3.10%  python2.7  libpython2.7.so.1.0  [.] PyInt_FromString
+   2.75%  python2.7  libpython2.7.so.1.0  [.] PyErr_Restore
+   2.68%  python2.7  libc-2.26.so         [.] __strchr_avx2
+   2.41%  python2.7  libpython2.7.so.1.0  [.] tupledealloc.lto_priv.335
+   2.10%  python2.7  libpython2.7.so.1.0  [.] PyObject_Call
+   2.00%  python2.7  libpython2.7.so.1.0  [.] PyOS_strtoul
+   1.93%  python2.7  libpython2.7.so.1.0  [.] lookdict_string.lto_priv.1492
+   1.87%  python2.7  libpython2.7.so.1.0  [.] _PyObject_GenericGetAttrWithDict
+   1.73%  python2.7  libpython2.7.so.1.0  [.] PyString_FromStringAndSize
+   1.71%  python2.7  libc-2.26.so         [.] __memmove_avx_unaligned_erms
+   1.67%  python2.7  libpython2.7.so.1.0  [.] PyTuple_New
+   1.63%  python2.7  libpython2.7.so.1.0  [.] PyObject_Malloc
+   1.48%  python2.7  libpython2.7.so.1.0  [.] int_new.lto_priv.68
+   1.45%  python2.7  libpython2.7.so.1.0  [.] PyErr_Format
+   1.45%  python2.7  libpython2.7.so.1.0  [.] PyObject_Realloc
+   1.37%  python2.7  libpython2.7.so.1.0  [.] type_call.lto_priv.51
+   1.30%  python2.7  libpython2.7.so.1.0  [.] PyOS_strtol
+   1.23%  python2.7  libpython2.7.so.1.0  [.] _PyString_Resize
+   1.16%  python2.7  libc-2.26.so         [.] __ctype_b_loc
+   1.11%  python2.7  libpython2.7.so.1.0  [.] _PyType_Lookup
+   1.06%  python2.7  libpython2.7.so.1.0  [.] PyString_AsString
+   1.04%  python2.7  libpython2.7.so.1.0  [.] PyArg_ParseTupleAndKeywords
+   1.02%  python2.7  libpython2.7.so.1.0  [.] PyObject_Free
+   0.93%  python2.7  libpython2.7.so.1.0  [.] PyInt_FromLong
+   0.90%  python2.7  libpython2.7.so.1.0  [.] PyObject_GetAttr
+   0.52%  python2.7  libc-2.26.so         [.] __memset_avx2_unaligned_erms
+   0.52%  python2.7  libpython2.7.so.1.0  [.] vgetargskeywords.cold.59
+   0.48%  python2.7  itertools.so         [.] _init
+   ...
+</code></pre>
+<p>Notice that <code>PyEval_EvalFrameEx</code> takes 13% of the total time for <code>int</code>, vs. 30% of the total for <code>float</code>.  That's about the same absolute time, and <code>PyString_FromFormatV</code> is taking twice as much time.  Plus more functions taking more small chunks of time.</p>
+<p>I haven't figured out what <code>PyInt_FromString</code> does, or what it's spending its time on.  7% of its cycle counts are charged to a <code>movdqu xmm0, [rsi]</code> instruction near the start; i.e. loading a 16-byte arg that was passed by reference (as the 2nd function arg).  This may be getting more counts than it deserves if whatever stored that memory was slow to produce it.  (See <a href="https://stackoverflow.com/questions/48369347/reliability-of-xcode-instruments-disassembly-time-profiling">this Q&amp;A</a> for more about how cycle counts get charge to instructions on out-of-order execution Intel CPUs where lots of different work is in flight every cycle.)  Or maybe it's getting counts from a store-forwarding stall if that memory was written recently with separate narrower stores.</p>
+<p><strong>It's surprising that <code>strlen</code> is taking so much time</strong>.  From looking at the instruction profile within it, it's getting short strings, but not exclusively 1-byte strings.  Looks like a mix of <code>len &lt; 32</code> bytes and <code>64 &lt; len &gt;= 32</code> bytes.  Might be interesting to set a breakpoint in gdb and see what args are common.</p>
+<p>The float version has a <code>strchr</code> (maybe looking for a <code>.</code> decimal point?), but no <code>strlen</code> of anything.  It's surprising that the <code>int</code> version has to redo a <code>strlen</code> inside the loop at all.</p>
+<p>The actual <code>PyOS_strtoul</code> function takes 2% of the total time, run from <a href="https://hg.python.org/cpython/file/2.7/Objects/intobject.c#l351" rel="nofollow noreferrer"><code>PyInt_FromString</code></a> (3% of the total time).  These are "self" times, not including their children, so allocating memory and deciding on the number base is taking more time than parsing the single digit.</p>
+<p>An equivalent loop in C would run ~50x faster (or maybe 20x if we're generous), calling <code>strtoul</code> on a constant string and discarding the result.</p>
+<hr/>
+<h2>int with explicit base</h2>
+<p>For some reason this is as fast as <code>float</code>.</p>
+<pre><code>$ perf record python2.7 -m timeit 'int("1",10)'
+10000000 loops, best of 3: 0.0894 usec per loop
+
+$ perf report -Mintel
+Samples: 14K of event 'cycles:uppp', Event count (approx.): 14289699408
+Overhead  Command    Shared Object        Symbol
+  30.84%  python2.7  libpython2.7.so.1.0  [.] PyEval_EvalFrameEx
+  12.56%  python2.7  libpython2.7.so.1.0  [.] vgetargskeywords
+   6.70%  python2.7  libpython2.7.so.1.0  [.] PyInt_FromString
+   5.19%  python2.7  libpython2.7.so.1.0  [.] tupledealloc.lto_priv.335
+   5.17%  python2.7  libpython2.7.so.1.0  [.] int_new.lto_priv.68
+   4.12%  python2.7  libpython2.7.so.1.0  [.] lookdict_string.lto_priv.1492
+   4.08%  python2.7  libpython2.7.so.1.0  [.] PyOS_strtoul
+   3.78%  python2.7  libc-2.26.so         [.] __strchr_avx2
+   3.29%  python2.7  libpython2.7.so.1.0  [.] type_call.lto_priv.51
+   3.26%  python2.7  libpython2.7.so.1.0  [.] PyTuple_New
+   3.09%  python2.7  libpython2.7.so.1.0  [.] PyOS_strtol
+   3.06%  python2.7  libpython2.7.so.1.0  [.] PyObject_Call
+   2.49%  python2.7  libpython2.7.so.1.0  [.] PyArg_ParseTupleAndKeywords
+   2.01%  python2.7  libpython2.7.so.1.0  [.] PyType_IsSubtype
+   1.65%  python2.7  libc-2.26.so         [.] __strlen_avx2
+   1.52%  python2.7  libpython2.7.so.1.0  [.] object_init.lto_priv.86
+   1.19%  python2.7  libpython2.7.so.1.0  [.] vgetargskeywords.cold.59
+   1.03%  python2.7  libpython2.7.so.1.0  [.] PyInt_AsLong
+   1.00%  python2.7  libpython2.7.so.1.0  [.] PyString_Size
+   0.99%  python2.7  libpython2.7.so.1.0  [.] PyObject_GC_UnTrack
+   0.87%  python2.7  libc-2.26.so         [.] __ctype_b_loc
+   0.85%  python2.7  libc-2.26.so         [.] __memset_avx2_unaligned_erms
+   0.47%  python2.7  itertools.so         [.] _init
+</code></pre>
+<p>The profile by function looks pretty similar to the <code>float</code> version, too.</p>
+</div>
+<span class="comment-copy">Can't replicate difference <code>jakob@devbox:~$ python -m timeit "int("1")" 10000000 loops, best of 3: 0.104 usec per loop</code> <code>jakob@devbox:~$ python -m timeit "float("1")" 10000000 loops, best of 3: 0.106 usec per loop</code></span>
+<span class="comment-copy">@wim because it's a perfectly good opportunity to learn something new? Maybe the knowledge we gain will be too narrow to be applicable to anything else, but that will never stop curious people</span>
+<span class="comment-copy">@JakobBowyer: That's most likely because you messed up the syntax. You nested double quotes without any escaping. I'm not sure what that does, but a quick test seems to indicate that's why you're not seeing it.</span>
+<span class="comment-copy">As for the source code: find it in the <code>Objects/</code> subdirectory of the source tree. Current 2.7 branch mercurial links: <a href="http://hg.python.org/cpython/file/2.7/Objects/floatobject.c" rel="nofollow noreferrer"><code>floatobject.c</code></a> and <a href="http://hg.python.org/cpython/file/2.7/Objects/intobject.c" rel="nofollow noreferrer"><code>intobject.c</code></a>. Look for the <code>float_new</code> and <code>int_new</code> functions.</span>
+<span class="comment-copy">@JakobBowyer: I can reproduce your timings if I use your exact command line <b>which is flawed</b>. You are not escaping the quotes, so you are parsing a <i>literal <code>int</code> value of <code>1</code></i>, not a string!</span>
+<span class="comment-copy">This doesn't explain why <code>int('1')</code> in Python 3 is as fast as <code>float('1')</code>, however.</span>
+<span class="comment-copy">@MartijnPieters yes, this can be trick</span>
+<span class="comment-copy">The base determination is just scanning the first character; if it is <i>not</i> <code>0</code> then <code>base</code> is set to 10. That hardly makes it use double the time. Python 3 has the <i>exact same test</i>, so this cannot be the cause.</span>
+<span class="comment-copy">It seems that all integers are long integers in python 3.3 (it doesn't exist <code>intobject.c</code>). <a href="http://docs.python.org/3.3/c-api/long.html" rel="nofollow noreferrer">docs.python.org/3.3/c-api/long.html</a> vs. <a href="http://docs.python.org/2.7/c-api/long.html" rel="nofollow noreferrer">docs.python.org/2.7/c-api/long.html</a> and <a href="http://docs.python.org/2.7/c-api/int.html" rel="nofollow noreferrer">docs.python.org/2.7/c-api/int.html</a></span>
+<span class="comment-copy">Just to be explicit: this answer is entirely wrong. <code>int("1")</code> never looks for a base, it will always use base 10. You need to explicitly set the second argument to <code>0</code> for Python to even look for a base character in the input string, <b>and this case is faster than the base case of <code>int('1')</code></b>. And there's no support for parsing an int literal with an <code>l</code> at the end, there's no 'long' parsing (<code>str(1L)</code> produces <code>'1'</code>, not <code>'1L'</code>, no need for a reverse there).</span>
+<span class="comment-copy"><code>PyString_FromFormatV</code> is  used indirectly by <code>PyErr_Format</code>, called to format the attribute error raised for the <code>getattr(str, '__trunc__')</code> call. Formatting a string triggers a few <code>strlen</code> calls.</span>

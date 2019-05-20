@@ -1,0 +1,89 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to consume the Exchange <a href="https://docs.microsoft.com/en-us/exchange/client-developer/web-service-reference/getattachment-operation" rel="nofollow noreferrer">GetAttachment</a> webservice using <a href="http://docs.python-requests.org/en/master/" rel="nofollow noreferrer">requests</a>, <a href="https://lxml.de/" rel="nofollow noreferrer">lxml</a> and <a href="https://github.com/aws/base64io-python" rel="nofollow noreferrer">base64io</a>. This service returns a base64-encoded file in a SOAP XML HTTP response. The file content is contained in a single line in a single XML element. <code>GetAttachment</code> is just an example, but the problem is more general.</p>
+<p>I would like to stream the decoded file contents directly to disk without storing the entire contents of the attachment in-memory at any point, since an attachment could be several 100 MB.</p>
+<p>I have tried something like this:</p>
+<pre><code>r = requests.post('https://example.com/EWS/Exchange.asmx', data=..., stream=True)
+with open('foo.txt', 'wb') as f:
+    for action, elem in lxml.etree.iterparse(GzipFile(fileobj=r.raw)):
+    if elem.tag == 't:Content':
+        b64_encoder = Base64IO(BytesIO(elem.text))
+        f.write(b64_encoder.read())
+</code></pre>
+<p>but <code>lxml</code> still stores a copy of the attachment as <code>elem.text</code>. Is there any way I can create a fully streaming XML parser that also streams the content of an element directly from the input stream?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Don't use <code>iterparse</code> in this case. The <code>iterparse()</code> method can only issue element start and end events, so any <em>text</em> in an element is given to you when the closing XML tag has been found.</p>
+<p>Instead, use a <a href="https://docs.python.org/3/library/xml.sax.html#module-xml.sax" rel="noreferrer">SAX parser interface</a>. This is a general standard for XML parsing libraries, to pass on parsed data to a content handler. The <a href="https://docs.python.org/3/library/xml.sax.handler.html#xml.sax.handler.ContentHandler.characters" rel="noreferrer"><code>ContentHandler.characters()</code> callback</a> is passed character data in chunks (assuming that the implementing XML library actually makes use of this possibility). This is a lower level API from the ElementTree API, and and the Python standard library already bundles the Expat parser to drive it.</p>
+<p>So the flow then becomes:</p>
+<ul>
+<li>wrap the incoming request stream in a <code>GzipFile</code> for easy decompression. Or, better still, set <code>response.raw.decode_content = True</code> and leave decompression to the requests library based on the content-encoding the server has set.</li>
+<li>Pass the <code>GzipFile</code> instance or raw stream to the <a href="https://docs.python.org/3/library/xml.sax.reader.html#xml.sax.xmlreader.XMLReader.parse" rel="noreferrer"><code>.parse()</code> method</a> of a parser created with <a href="https://docs.python.org/3/library/xml.sax.html#xml.sax.make_parser" rel="noreferrer"><code>xml.sax.make_parser()</code></a>. The parser then proceeds to read from the stream in chunks. By using <code>make_parser()</code> you first can enable features such as namespace handling (which ensures your code doesn't break if Exchange decides to alter the short prefixes used for each namespace).</li>
+<li>The content handler <code>characters()</code> method is called with chunks of XML data; check for the correct element start event, so you know when to expect base64 data. You can decode that base64 data in <a href="https://stackoverflow.com/a/22734477/100297">chunks of (a multiple of) 4 characters</a> at a time, and write it to a file. I'd not use <code>base64io</code> here, just do your own chunking.</li>
+</ul>
+<p>A simple content handler could be:</p>
+<pre><code>from xml.sax import handler
+from base64 import b64decode
+
+class AttachmentContentHandler(handler.ContentHandler):
+    types_ns = 'http://schemas.microsoft.com/exchange/services/2006/types'
+
+    def __init__(self, filename):
+        self.filename = filename
+
+    def startDocument(self):
+        self._buffer = None
+        self._file = None
+
+    def startElementNS(self, name, *args):
+        if name == (self.types_ns, 'Content'):
+            # we can expect base64 data next
+            self._file = open(self.filename, 'wb')
+            self._buffer = []
+
+    def endElementNS(self, name, *args):
+        if name == (self.types_ns, 'Content'):
+            # all attachment data received, close the file
+            try:
+                if self._buffer:
+                    raise ValueError("Incomplete Base64 data")
+            finally:
+                self._file.close()
+                self._file = self._buffer = None
+
+    def characters(self, data):
+        if self._buffer is None:
+            return
+        self._buffer.append(data)
+        self._decode_buffer()
+
+    def _decode_buffer(self):
+        remainder = ''
+        for data in self._buffer:
+            available = len(remainder) + len(data)
+            overflow = available % 4
+            if remainder:
+                data = (remainder + data)
+                remainder = ''
+            if overflow:
+                remainder, data = data[-overflow:], data[:-overflow]
+            if data:
+                self._file.write(b64decode(data))
+        self._buffer = [remainder] if remainder else []
+</code></pre>
+<p>and you'd use it like this:</p>
+<pre><code>import requests
+from xml.sax import make_parser, handler
+
+parser = make_parser()
+parser.setFeature(handler.feature_namespaces, True)
+parser.setContentHandler(AttachmentContentHandler('foo.txt'))
+
+r = requests.post('https://example.com/EWS/Exchange.asmx', data=..., stream=True)
+r.raw.decode_content = True  # if content-encoding is used, decompress as we read
+parser.parse(r.raw)
+</code></pre>
+<p>This will parse the input XML in chunks of up to 64KB (the default <a href="https://github.com/python/cpython/blob/a02bc719ebc496bc527e9e46de2f2e83f68bfd77/Lib/xml/sax/xmlreader.py#L111" rel="noreferrer"><code>IncrementalParser</code> buffer size</a>), so attachment data is decoded in at most 48KB blocks of raw data.</p>
+<p>I'd probably extend the content handler to take a target directory and then look for <code>&lt;t:Name&gt;</code> elements to extract the filename, then use that to extract the data to the correct filename for each attachment found. You'd also want to verify that you are actually dealing with a <code>GetAttachmentResponse</code> document, and handle error responses.</p>
+</div>
+<span class="comment-copy">Thanks for the elegant solution and pointer to the SAX characters() method! I actually managed to solve it using iterparse(), by wrapping the input stream in a custom, buffering input stream, reacting to the start event and then intercepting my input stream, checking the buffer to find the start token and then consuming the stream until I find the end token, and finally positioning the stream at the start of the end token. The resulting code was really messy. Your solution is much cleaner and easier to understand.</span>
+<span class="comment-copy">@ErikCederstrand: the SAX event-driven interface can lead to somewhat harder to read code, as you now need to maintain a sort of state machine to track what elements have been seen, etc. If expanding on the class to handle multiple attachments, etc. gets out of hand, consider creating separate classes for each state and delegating to a <code>self.state</code> attribute, that should <i>keep</i> this cleaner and easier to understand.</span>

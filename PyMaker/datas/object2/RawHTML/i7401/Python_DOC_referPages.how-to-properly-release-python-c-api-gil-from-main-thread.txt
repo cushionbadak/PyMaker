@@ -1,0 +1,184 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to embed Python in a C++ multithreaded program.
+What I do is calling two statistical functions from the Python C API to perform the <code>Two Sample Kolmogorov-Smirnov Test</code> and the <code>Two Sample Anderson-Darling Test</code> on some data that I collect. So I'm just embedding Python in my code, I'm not extending it or using my own Python functions.</p>
+<p>I recently found out that in order to run a multithreaded program that uses the Python C API you need to handle properly the Global Interpreter Lock (GIL) and when ever you use a Python C API function you need to acquire the GIL and then release it when you're done using the API functions.</p>
+<p>The thing that I still don't understand is how to properly release the GIL from the main thread in order to let the others execute the Python code.</p>
+<p>I tried this (<strong>option 1</strong>):</p>
+<pre><code> int main(int argc, const char * argv[]) {
+
+    int n = 4;
+    std::thread threads[n];
+
+    Py_Initialize();
+    PyEval_InitThreads();
+    PyEval_SaveThread();
+    for (int i = 0; i &lt; n; i++) {
+        threads[i] = std::thread(exec, i);
+    }
+    for (int i = 0; i &lt; n; i++) {
+        threads[i].join();
+    }
+    Py_Finalize();
+    return 0;
+}
+</code></pre>
+<p>But it gives me a <code>segmentation fault</code> when calling <code>Py_Finalize()</code>.</p>
+<p>So I tried this (<strong>option 2</strong>):</p>
+<pre><code>int main(int argc, const char * argv[]) {
+
+    int n = 4;
+    std::thread threads[n];
+
+    Py_Initialize();
+    PyEval_InitThreads();
+    PyThreadState * Py_UNBLOCK_THREADS
+    for (int i = 0; i &lt; n; i++) {
+        threads[i] = std::thread(exec, i);
+    }
+    for (int i = 0; i &lt; n; i++) {
+        threads[i].join();
+    }
+    Py_BLOCK_THREADS    
+    Py_Finalize();
+    return 0;
+}
+</code></pre>
+<p>and this (<strong>option 3</strong>):</p>
+<pre><code>int main(int argc, const char * argv[]) {
+
+    int n = 4;
+    std::thread threads[n];
+
+    Py_Initialize();
+    PyEval_InitThreads();
+    Py_BEGIN_ALLOW_THREADS
+    for (int i = 0; i &lt; n; i++) {
+        threads[i] = std::thread(exec, i);
+    }
+    for (int i = 0; i &lt; n; i++) {
+        threads[i].join();
+    }
+    Py_END_ALLOW_THREADS
+    Py_Finalize();
+    return 0;
+}
+</code></pre>
+<p>With both these last two options the code runs but ends with this error:</p>
+<p><code>Exception ignored in: &lt;module 'threading' from '/usr/local/opt/python3/Frameworks/Python.framework/Versions/3.6/lib/python3.6/threading.py'&gt;
+Traceback (most recent call last):
+  File "/usr/local/opt/python3/Frameworks/Python.framework/Versions/3.6/lib/python3.6/threading.py", line 1289, in _shutdown
+    assert tlock.locked()
+AssertionError:</code></p>
+<p><strong>EDIT:</strong>
+The code that is executed by the spawned threads is this:</p>
+<pre><code>double limited_rand(double lower_bound, double upper_bound) {
+    return lower_bound + (rand() / (RAND_MAX / (upper_bound-lower_bound) ) );
+}
+
+
+double exec_1(std::vector&lt;int&gt; &amp;left_sample, std::vector&lt;int&gt; &amp;right_sample) {
+    PyGILState_STATE gstate = PyGILState_Ensure(); // Acquiring GIL for thread-safe usage Python C API
+
+    PyObject* scipy_stats_module = PyImport_ImportModule("scipy.stats"); // importing "scipy.stats" module
+
+    import_array();
+    npy_intp left_nparray_shape[] = {(npy_intp)left_sample.size()}; // Size of left nparray's first dimension
+    PyObject* left_sample_nparray = PyArray_SimpleNewFromData(1, left_nparray_shape, NPY_INT, &amp;left_sample[0]); // Creating numpy array with 1 dimension, taking "dim" as a dummy, elements are integers, and the data is taken from "sample1" as a int* pointer
+    npy_intp right_nparray_shape[] = {(npy_intp)right_sample.size()}; // Size of right nparray's first dimension
+    PyObject* right_sample_nparray = PyArray_SimpleNewFromData(1, right_nparray_shape, NPY_INT, &amp;right_sample[0]);
+
+    PyObject* ks_2samp = PyObject_GetAttrString(scipy_stats_module, "ks_2samp");
+    Py_DecRef(scipy_stats_module);
+
+    PyObject* ks_2samp_return_val = PyObject_CallFunctionObjArgs(ks_2samp, left_sample_nparray, right_sample_nparray, NULL);
+    Py_DecRef(ks_2samp);
+    Py_DecRef(right_sample_nparray);
+    Py_DecRef(left_sample_nparray);
+
+    double p_value = PyFloat_AsDouble(PyTuple_GetItem(ks_2samp_return_val, 1));
+    Py_DecRef(ks_2samp_return_val);
+
+    PyGILState_Release(gstate); // Releasing GIL
+    return p_value;
+}
+
+
+void initialize_c_2d_int_array(int*&amp; c_array, unsigned long row_length_c_array, std::vector&lt;int&gt; &amp;row1, std::vector&lt;int&gt; &amp;row2) {
+    for (unsigned int i = 0; i &lt; row_length_c_array; i++) {
+        c_array[i] = row1[i];
+        c_array[row_length_c_array + i] = row2[i];
+    }
+}
+double exec_2(std::vector&lt;int&gt; &amp;left_sample, std::vector&lt;int&gt; &amp;right_sample){
+    PyGILState_STATE gstate = PyGILState_Ensure(); // Acquiring GIL for thread-safe usage Python C API
+
+    PyObject* scipy_stats_module = PyImport_ImportModule("scipy.stats"); // importing "scipy.stats" module
+                                                                         //            import_array();
+    unsigned long n_cols = std::min(left_sample.size(), right_sample.size());
+    int* both_samples = (int*) (malloc(2 * n_cols * sizeof(int)));
+    initialize_c_2d_int_array(both_samples, n_cols, left_sample, right_sample);
+    npy_intp dim3[] = {2, (npy_intp) n_cols};
+    PyObject* both_samples_nparray = PyArray_SimpleNewFromData(2, dim3, NPY_INT, both_samples);
+
+    PyObject* anderson_ksamp = PyObject_GetAttrString(scipy_stats_module, "anderson_ksamp");
+    Py_DecRef(scipy_stats_module);
+
+    PyObject* anderson_2samp_return_val = PyObject_CallFunctionObjArgs(anderson_ksamp, both_samples_nparray, NULL);
+    Py_DecRef(anderson_ksamp);
+    Py_DecRef(both_samples_nparray);
+    free(both_samples);
+
+    double p_value = PyFloat_AsDouble(PyTuple_GetItem(anderson_2samp_return_val, 2));
+    Py_DecRef(anderson_2samp_return_val);
+
+    PyGILState_Release(gstate); // Releasing GIL
+
+    return p_value;
+}
+
+
+void exec(int thread_id) {
+    std::vector&lt;int&gt; left_sample;
+    std::vector&lt;int&gt; right_sample;
+
+    int n = 50;
+    for (int j = 0; j &lt; n; j++) {
+
+        int size = 100;
+        for (int i = 0; i &lt; size; i++) {
+            left_sample.push_back(limited_rand(0, 100));
+            right_sample.push_back(limited_rand(0, 100));
+        }
+
+        exec_1(left_sample, right_sample);
+        exec_2(left_sample, right_sample);
+    }
+}
+</code></pre>
+<p>The functions where I use the Python C API are only <strong>exec_1</strong> and <strong>exec_2</strong>, while <strong>exec</strong> has just the job to call the repeatedly on new random data. This is the simplest code I could think of that mimics the behavior of my real code. I've also left out every type of error checking when using the Python APIs for a better readability.</p>
+<p>Without any other choice I'll run my code like <strong>option 2</strong> or <strong>option 3</strong> and forget about the error, but I would really like to understand what's going on. Can you help me?</p>
+<p>P.S. I'm running Python 3.6.1 under a macOS 10.12.5 system using Xcode 8.3.3. If you need more details let me know.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><strong><em>option1</em></strong>: </p>
+<p>I think is giving you a segmentation fault because you called PyEval_SaveThread() (which releases the gil, returns a saved thread state, and sets the current thread state to NULL). </p>
+<p>Py_Finalize will try to free all memory associated with the interpreter, and I guess this included the main thread state. So you can either capture this state with: </p>
+<pre><code> PyEval_InitThreads(); //initialize and aquire the GIL
+ //release the GIL, store thread state, set the current thread state to NULL
+ PyThreadState *mainThreadState = PyEval_SaveThread();
+
+ *main code segment*
+
+ //re-aquire the GIL (re-initialize the current thread state)
+ PyEval_RestoreThread(mainThreadState); 
+
+ Py_Finalize();
+ return 0;
+</code></pre>
+<p>Or you can immediately call <em>PyEval_ReleaseLock()</em> after calling <em>PyEval_InitThreads()</em> since it looks like the main code segment does not use any embedded python. I had a similar problem and that seemed to fix it.</p>
+<p><strong><em>NOTE</em></strong>: Other threads will still need to aquire/release the GIL wherever necessary</p></div>
+<span class="comment-copy">Option 3 is correct. What do those threads do? If they call the interpreter to execute python-code or use the C-api, they need to acquire the GIL individually before doing so.</span>
+<span class="comment-copy">Every thread calls <code>PyGILState_Ensure()</code> before using any API function and then calls <code>PyGILState_Release</code> when it doesn't need to call those functions anymore. But what I don't understand is the error I get at the end of the program's execution. If you want to, I can add the code of the function that is executed by every thread</span>
+<span class="comment-copy">You should do that</span>
+<span class="comment-copy">@user2722968 Added the code</span>
+<span class="comment-copy"><a href="https://docs.python.org/3/c-api/init.html#thread-state-and-the-global-interpreter-lock" rel="nofollow noreferrer">docs.python.org/3/c-api/…</a></span>

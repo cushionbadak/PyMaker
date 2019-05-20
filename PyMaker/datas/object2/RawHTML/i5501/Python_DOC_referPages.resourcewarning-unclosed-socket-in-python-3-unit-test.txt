@@ -1,0 +1,155 @@
+<div class="post-text" itemprop="text">
+<p>I'm modifying some code to be compatible between <code>Python 2</code> and <code>Python 3</code>, but have observed a warning in unit test output.</p>
+<pre><code>/Library/Frameworks/Python.framework/Versions/3.6/lib/python3.6/unittest/case.py:601:
+    ResourceWarning: unclosed socket.socket fd=4,
+    family=AddressFamily.AF_INET, type=SocketKind.SOCK_STREAM, proto=6,
+    laddr=('1.1.2.3', 65087), raddr=('5.8.13.21', 8080)
+</code></pre>
+<p>A little research determined this was also happening from popular libraries like <a href="https://github.com/requests/requests/issues/3912" rel="noreferrer">requests</a> and <a href="https://github.com/boto/boto3/issues/454" rel="noreferrer">boto3</a>.</p>
+<p>I could ignore the warning or <a href="https://stackoverflow.com/questions/14938716/socket-resourcewarning-using-urllib-in-python-3">filter it</a> completely.  If was my service, I could set the <code>connection: close</code> header in my response (<a href="https://stackoverflow.com/questions/14938716/socket-resourcewarning-using-urllib-in-python-3">link</a>).</p>
+<p>Here's an example that exhibits the warning in <code>Python 3.6.1</code>:</p>
+<p><strong>app.py</strong></p>
+<pre><code>import requests
+
+class Service(object):
+    def __init__(self):
+        self.session = requests.Session()
+
+    def get_info(self):
+        uri = 'http://api.stackexchange.com/2.2/info?site=stackoverflow'
+        response = self.session.get(uri)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            response.raise_for_status()
+
+    def __del__(self):
+        self.session.close()
+
+if __name__ == '__main__':
+    service = Service()
+    print(service.get_info())
+</code></pre>
+<p><strong>test.py</strong></p>
+<pre><code>import unittest
+
+class TestService(unittest.TestCase):
+    def test_growing(self):
+        import app
+        service = app.Service()
+        res = service.get_info()
+        self.assertTrue(res['items'][0]['new_active_users'] &gt; 1)
+
+
+if __name__ == '__main__':
+    unittest.main()
+</code></pre>
+<p>Is there a better / correct way to manage the session so that it gets explicitly closed and not rely on <code>__del__()</code> to result in this sort of warning.</p>
+<p>Thanks for any help.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Having the teardown logic in <code>__del__</code> can make your program incorrect or harder to reason about, because there is no guarantee on when that method will get called, potentially leading to the warning you got. There are a couple of ways to address this:</p>
+<h1>1) Expose a method to close the session, and call it in the test <code>tearDown</code></h1>
+<p><code>unittest</code>'s <a href="https://docs.python.org/3/library/unittest.html#unittest.TestCase.tearDown" rel="nofollow noreferrer"><code>tearDown</code></a> method allows you to define some code that will be run after each test. Using this hook to close the session will work even if the test fails or has an exception, which is nice.</p>
+<p><strong>app.py</strong></p>
+<pre><code>import requests
+
+class Service(object):
+
+    def __init__(self):
+        self.session = requests.Session()
+
+    def get_info(self):
+        uri = 'http://api.stackexchange.com/2.2/info?site=stackoverflow'
+        response = self.session.get(uri)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            response.raise_for_status()
+
+    def close(self):
+        self.session.close()
+
+if __name__ == '__main__':
+    service = Service()
+    print(service.get_info())
+    service.close()
+</code></pre>
+<p><strong>test.py</strong></p>
+<pre><code>import unittest
+import app
+
+class TestService(unittest.TestCase):
+
+    def setUp(self):
+        self.service = app.Service()
+        super().setUp()
+
+    def tearDown(self):
+        self.service.close()
+
+    def test_growing(self):
+        res = self.service.get_info()
+        self.assertTrue(res['items'][0]['new_active_users'] &gt; 1)
+
+if __name__ == '__main__':
+    unittest.main()
+</code></pre>
+<h1>2) Use a context manager</h1>
+<p>A <a href="https://docs.python.org/3/library/stdtypes.html#typecontextmanager" rel="nofollow noreferrer">context manager</a> is also a very useful way to explicitly define the scope of something. In the previous example, you have to make sure <code>.close()</code> is called correctly at every call site, otherwise your resources will leak. With a context manager, this is handled automatically even if there is an exception within the scope of the context manager.</p>
+<p>Building on top of solution 1), you can define extra magic methods (<code>__enter__</code> and <code>__exit__</code>) so that your class works with the <code>with</code> statement.</p>
+<p><em>Note: The nice thing here is that this code also supports the usage in solution 1), with explicit <code>.close()</code>, which can be useful if a context manager was inconvenient for some reason.</em></p>
+<p><strong>app.py</strong></p>
+<pre><code>import requests
+
+class Service(object):
+
+    def __init__(self):
+        self.session = requests.Session()
+
+    def __enter__(self):
+        return self
+
+    def get_info(self):
+        uri = 'http://api.stackexchange.com/2.2/info?site=stackoverflow'
+        response = self.session.get(uri)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            response.raise_for_status()
+
+    def close(self):
+        self.session.close()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+if __name__ == '__main__':
+    with Service() as service:
+        print(service.get_info())
+</code></pre>
+<p><strong>test.py</strong></p>
+<pre><code>import unittest
+
+import app
+
+class TestService(unittest.TestCase):
+
+    def test_growing(self):
+        with app.Service() as service:
+            res = service.get_info()
+        self.assertTrue(res['items'][0]['new_active_users'] &gt; 1)
+
+if __name__ == '__main__':
+    unittest.main()
+</code></pre>
+<p>Depending on what you need, you can use either, or a combination of <code>setUp</code>/<code>tearDown</code> and context manager, and get rid of that warning, plus having more explicit resource management in your code!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is the best solution if you are not much concern about warnings</p>
+<p>Just import warnings and add this line where your driver is initiating -</p>
+<p><code>warnings.filterwarnings(action="ignore", message="unclosed", 
+                         category=ResourceWarning)</code></p>
+</div>
+<span class="comment-copy">Make a <code>close</code> method for your class that delegates to the underlying resource's <code>close</code>? Even better, make your class implement <a href="https://docs.python.org/3/glossary.html#term-context-manager" rel="nofollow noreferrer">the context manager</a> protocol, then use it with the <code>with</code> statement (the <code>__exit__</code> can just call your <code>close</code> method, and the <code>__enter__</code> can be a trivial <code>return self</code>, so it's not much extra work).</span>
+<span class="comment-copy">Dont use <b>del</b> as it is not guaranteed that this gets called in he correct order when shutting down. This is the reason that context managers were invented. @ShadowRanger is correct - add <b>enter</b> and <b>exit</b> methods and use the with syntax</span>

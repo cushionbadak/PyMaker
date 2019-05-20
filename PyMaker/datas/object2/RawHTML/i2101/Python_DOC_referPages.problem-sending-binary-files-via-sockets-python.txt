@@ -1,0 +1,113 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to write a program that transfers binary files from the client to the server. Here's the code:</p>
+<p>Client (send file)</p>
+<pre><code>  def send_file(self,filename):
+        print("Sending: " + filename)
+        size = self.BUFFER_SIZE
+        with open(filename,'rb') as f:
+            raw = f.read().decode()
+        buffer = [raw[i:i + size] for i in range(0, len(raw), size)]
+        for x in range(len(buffer)):
+            self.sock.sendall(buffer[x].encode())
+
+        return
+</code></pre>
+<p>Server (recv file)</p>
+<pre><code>def recv_file(self, conn, filename):
+    packet = ""
+    buffer = ""
+    while True:
+        buffer = conn.recv(self.BUFFER_SIZE)
+        packet = packet + str(buffer.decode())
+        if not len(buffer) == self.BUFFER_SIZE:
+            break
+    with open(filename, 'wb') as f:
+        f.write(bytes(packet.encode()))
+    #print(packet)
+    return 
+</code></pre>
+<p>This way I can transfer txt files, but when I have to transfer jpeg or any other type of file, it freezes in the loop.
+Can someone please explain me why? I'm new to py and i'm trying to learn</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It shouldn't freeze if both sides have the same locale encoding, but it could easily die with an exception.</p>
+<p>You're reading and sending as binary (good), but inexplicably <code>decode</code>-ing to <code>str</code>, then <code>encode</code>ing back to <code>bytes</code> (bad). Problem is, arbitrary binary data isn't guaranteed to be decodable in any given locale; if your locale encoding is UTF-8, odds are it's not legal. If it's <code>latin-1</code> it's legal, but pointless.</p>
+<p>Worse, if your client and server have different locale encodings, the result of decoding might be different on each side (and therefore the lengths won't match).</p>
+<p>Use <code>bytes</code> consistently, don't convert to and from strings, and locale settings won't matter. Your code will also run faster. You also need to actually send the file length ahead of time; your loop is hoping <code>recv</code> will return a short length only when the file is done, but if:</p>
+<ol>
+<li>The file is an exact multiple of the buffer size, or</li>
+<li>The socket happens to send data in chunks that don't match the buffer size</li>
+</ol>
+<p>you can each get short <code>recv</code> results, by coincidence in case #2, and deterministically in case #1.</p>
+<p>A safer approach is to actually prefix your transmission with the file length, rather than hoping the chunking works as expected:</p>
+<pre><code>def send_file(self,filename):
+    print("Sending:", filename)
+    with open(filename, 'rb') as f:
+        raw = f.read()
+    # Send actual length ahead of data, with fixed byteorder and size
+    self.sock.sendall(len(raw).to_bytes(8, 'big'))
+    # You have the whole thing in memory anyway; don't bother chunking
+    self.sock.sendall(raw)
+
+def recv_file(self, conn, filename):
+    # Get the expected length (eight bytes long, always)
+    expected_size = b""
+    while len(expected_size) &lt; 8:
+        more_size = conn.recv(8 - len(expected_size))
+        if not more_size:
+            raise Exception("Short file length received")
+        expected_size += more_size
+
+    # Convert to int, the expected file length
+    expected_size = int.from_bytes(expected_size, 'big')
+
+    # Until we've received the expected amount of data, keep receiving
+    packet = b""  # Use bytes, not str, to accumulate
+    while len(packet) &lt; expected_size:
+        buffer = conn.recv(expected_size - len(packet))
+        if not buffer:
+            raise Exception("Incomplete file received")
+        packet += buffer
+    with open(filename, 'wb') as f:
+        f.write(packet)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>As an addendum to ShadowRanger's post, If you do want to maintain the file chunking without using <code>socket.sendfile</code> you can utilize a few tricks to clean up your code and reduce memory footprint. </p>
+<p>The sending process is fairly simple as we copied the process of sending the file size from ShadowRanger, and added a very simple loop to send chunks of data until the chunk comes up empty (end of the file).</p>
+<pre><code>def send_file(self,filename):
+    print("Sending: " + filename)
+    #send file size as big endian 64 bit value (8 bytes)
+    self.sock.sendall(os.stat(filename).st_size.tobytes(8,'big'))
+    with open(filename,'rb') as f: #open our file to read
+        while True:
+            chunk = f.read(self.BUFFER_SIZE) #get next chunk
+            if not chunk: #empty chunk indicates EOF
+                break
+            self.sock.sendall(chunk) #send the chunk
+</code></pre>
+<p>Receiving a file is also very straightforward with the same process to read the expected file size at the beginning, then a loop to read data into that file until we reach our expected size. We then use <code>f.tell()</code> as we receive data as an easy way to tell if the whole file has been sent yet.</p>
+<pre><code>def recv_file(self, conn, filename):
+    # file size transfer copied from ShadowRanger
+    # Get the expected length (eight bytes long, always)
+    expected_size = b"" #buffer to read in file size
+    while len(expected_size) &lt; 8: #while buffer is smaller than 8 bytes
+        more_size = conn.recv(8 - len(expected_size)) #read up to remaining bytes
+        if not more_size: #nothing was read
+            raise Exception("Short file length received")
+        expected_size += more_size #extend buffer
+    expected_size = int.from_bytes(expected_size, 'big') #Convert to int, the expected file length
+    with open(filename, 'wb') as f: #open our file to write
+        while f.tell() &lt; expected_size: #while it's smaller than our expected size
+            bytes_recvd = conn.recv() #read any available data 
+            f.write(bytes_recvd)
+</code></pre>
+</div>
+<span class="comment-copy">Note: If you're on 3.5 or higher, it would usually make sense to replace the explicit <code>read</code>-all then <code>sendall</code> for the file data with a simple <code>os.stat</code> (to get file size), <code>sendall</code> for the file size only, then <a href="https://docs.python.org/3/library/socket.html#socket.socket.sendfile" rel="nofollow noreferrer">use <code>sendfile</code></a> on the file handle itself. Where the <code>sendfile</code> system call is available, this is <i>much</i> faster (it pushes all the work to the kernel, getting zero copy transmission of data). Even where it's not available, it will chunk the <code>read</code>/<code>send</code> loop so it doesn't hold the whole file in memory at once.</span>
+<span class="comment-copy">Thanks, really appreciate that. So dividing the file in chunks as I did is pointless?</span>
+<span class="comment-copy">@MarioValentino: Dividing into chunks makes sense if the goal is to avoid storing the entire file in memory at once. But your original code was loading the whole file into memory eagerly (calling <code>.read()</code> with no arguments), then splitting into chunks (also eagerly), so instead of avoiding storing the whole file in memory, it was storing it <i>twice</i>. It didn't help with the socket operations at all; TCP connections (by default) <a href="https://en.wikipedia.org/wiki/Nagle%27s_algorithm" rel="nofollow noreferrer">buffer data to avoid sending small packets</a>, and that buffering effectively re-chunks your data anyway.</span>
+<span class="comment-copy">You've got some problems here: 1) You can't <code>recv_into</code> an open file object (you could <code>recv_into</code> a <code>mmap</code>-ed file wrapped in a <code>memoryview</code> that would be used to target the write, but it's probably not worth the trouble). 2) (Minor) There is no need to check the return value from <code>sendall</code> at all (it's documented as returning <code>None</code> on success, and raising an exception on failure, so your <code>while</code> condition is guaranteed to either be true, or unevaluated). Moving the <code>sendall</code> to the end of the loop and changing to <code>while True:</code> would allow you to remove the duplicated <code>read</code> call too.</span>
+<span class="comment-copy">@ShadowRanger good catch, I saw 'buffer' in the docs and assumed it would work with files.</span>
+<span class="comment-copy">I would have assumed TCP would take care of any error detection / correction, so that's somewhat surprising.. Perhaps this deserves a new question..</span>
+<span class="comment-copy">@MarioValentino: My assumption would be that you're intermingling this with other data transmissions, and mistaking part of the end of one transmission for the beginning of the length field of the next. Am I correct that you're sending data beyond just file length and data? Given your original design (where you assumed sending 10 bytes at a time from the client would receive 10 bytes at a time on the server, which is a bad assumption), it's highly likely you're picking up random bytes from earlier <code>send</code>s on the same socket that weren't properly <code>recv</code> when they were intended to be received.</span>
+<span class="comment-copy">The fact that it works just fine for client to server, but not in reverse, makes it seem fairly likely that there is a bug only in the server to client direction; obviously the basic design should work, but it's easy to make simple mistakes.</span>

@@ -1,0 +1,119 @@
+<div class="post-text" itemprop="text">
+<p>From what I understand, a <code>for x in a_generator: foo(x)</code> loop in Python is roughly equivalent to this:</p>
+<pre><code>try:
+    while True:
+        foo(next(a_generator))
+except StopIteration:
+    pass
+</code></pre>
+<p>That suggests that something like this:</p>
+<pre><code>for outer_item in a_generator:
+    if should_inner_loop(outer_item):
+        for inner_item in a_generator:
+            foo(inner_item)
+            if stop_inner_loop(inner_item): break
+    else:
+        bar(outer_item)
+</code></pre>
+<p>would do two things:</p>
+<ol>
+<li>Not raise any exceptions, segfault, or anything like that</li>
+<li>Iterate over <code>y</code> until it reaches some <code>x</code> where <code>should_inner_loop(x)</code> returns truthy, then loop over it in the inner <code>for</code> until <code>stop_inner_loop(thing)</code> returns true. Then, the outer loop resumes <em>where the inner one left off</em>.</li>
+</ol>
+<p>From my admittedly not very good tests, it seems to perform as above. However, I couldn't find anything in the spec guaranteeing that this behavior is constant across interpreters. Is there anywhere that says or implies that I can be sure it will always be like this? Can it cause errors, or perform in some other way? (i.e. do something other than what's described above</p>
+<hr/>
+<p>N.B. The code equivalent above is taken from my own experience; I don't know if it's actually accurate. That's why I'm asking.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>TL;DR: it is safe with CPython (but I could not find any specification of this), although it may not do what you want to do.</p>
+<hr/>
+<p>First, let's talk about your first assumption, the equivalence.</p>
+<p>A for loop actually calls first <code>iter()</code> on the object, then runs <code>next()</code> on its result, until it gets a <code>StopIteration</code>.</p>
+<p>Here is the relevant bytecode (a low level form of Python, used by the interpreter itself):</p>
+<pre><code>&gt;&gt;&gt; import dis
+&gt;&gt;&gt; def f():
+...  for x in y:
+...   print(x)
+... 
+&gt;&gt;&gt; dis.dis(f)
+  2           0 SETUP_LOOP              24 (to 27)
+              3 LOAD_GLOBAL              0 (y)
+              6 GET_ITER
+        &gt;&gt;    7 FOR_ITER                16 (to 26)
+             10 STORE_FAST               0 (x)
+
+  3          13 LOAD_GLOBAL              1 (print)
+             16 LOAD_FAST                0 (x)
+             19 CALL_FUNCTION            1 (1 positional, 0 keyword pair)
+             22 POP_TOP
+             23 JUMP_ABSOLUTE            7
+        &gt;&gt;   26 POP_BLOCK
+        &gt;&gt;   27 LOAD_CONST               0 (None)
+             30 RETURN_VALUE
+</code></pre>
+<p><code>GET_ITER</code> calls <code>iter(y)</code> (which itself calls <code>y.__iter__()</code>) and pushes its result on the stack (think of it as a bunch of local unnamed variables), then enters the loop at <code>FOR_ITER</code>, which calls <code>next(&lt;iterator&gt;)</code> (which itself calls <code>&lt;iterator&gt;.__next__()</code>), then executes the code inside the loop, and the <code>JUMP_ABSOLUTE</code> makes the execution comes back to <code>FOR_ITER</code>.</p>
+<hr/>
+<p>Now, for the safety:</p>
+<p>Here are the methods of a generator: <a href="https://hg.python.org/cpython/file/101404/Objects/genobject.c#l589" rel="nofollow">https://hg.python.org/cpython/file/101404/Objects/genobject.c#l589</a>
+As you can see at <a href="https://hg.python.org/cpython/file/101404/Objects/genobject.c#l617" rel="nofollow">line 617</a>, the implementation of <code>__iter__()</code> is <code>PyObject_SelfIter</code>, whose implementation you can find <a href="https://hg.python.org/cpython/file/tip/Objects/object.c#l987" rel="nofollow">here</a>. <code>PyObject_SelfIter</code> simply returns the object (ie. the generator) itself.</p>
+<p>So, when you nest the two loops, both iterate on the same iterator.
+And, as you said, they are just calling <code>next()</code> on it, so it's safe.</p>
+<p>But be cautious: the inner loop will consume items that will not be consumed by the outer loop.
+Even if that is what you want to do, it may not be very readable.</p>
+<p>If that is not what you want to do, consider <a href="https://docs.python.org/3/library/itertools.html#itertools.tee" rel="nofollow"><code>itertools.tee()</code></a>, which buffers the output of an iterator, allowing you to iterate over its output twice (or more). This is only efficient if the tee iterators stay close to each other in the output stream; if one tee iterator will be fully exhausted before the other is used, it's better to just call <code>list</code> on the iterator to materialize a list out of it.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, it's not safe (as in, we won't get the outcome that we might have expected).</p>
+<p>Consider this:</p>
+<pre><code>a = (_ for _ in range(20))
+for num in a:
+    print(num)
+</code></pre>
+<p>Of course, we will get 0 to 19 printed.</p>
+<p>Now let's add a bit of code:</p>
+<pre><code>a = (_ for _ in range(20))
+for num in a:
+    for another_num in a:
+        pass
+    print(num)
+</code></pre>
+<p>The only thing that will be printed is <code>0</code>.
+By the time that we get to the second iteration of the outer loop, the generator will already be exhausted by the inner loop.</p>
+<p>We can also do this:</p>
+<pre><code>a = (_ for _ in range(20))
+for num in a:
+    for another_num in a:
+        print(another_num)
+</code></pre>
+<p>If it was safe we would expect to get 0 to 19 printed 20 times, but we actually get it printed only once, for the same reason I mentioned above.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It's not really an answer to your question, but I would recommend not doing this because the code isn't readable. It took me a while to see that you were using <code>y</code> twice even though that's the entire point of your question. Don't make a future reader get confused by this. When I see a nested loop, I'm not expecting what you've done and my brain has trouble seeing it.</p>
+<p>I would do it like this:</p>
+<pre><code>def generator_with_state(y):
+    state = 0
+    for x in y:
+        if isinstance(x, special_thing):
+            state = 1
+            continue
+        elif state == 1 and isinstance(x, signal):
+            state = 0
+        yield x, state
+
+for x, state in generator_with_state(y):
+    if state == 1:
+        foo(x)
+    else:
+        bar(x)
+</code></pre>
+</div>
+<span class="comment-copy">Even if your logic is sound regarding which elements are consumed and when, it's going to be difficult for someone else (including your future self) to piece together what's going on.</span>
+<span class="comment-copy">@JaredGoguen I agree. In my actual code, I have the inner loop extracted into another method, but I thought the intent of the question would be clearer if I didn't have another method.</span>
+<span class="comment-copy">Hey, I think that because I worded my question badly, I got some answers to the wrong question. Could you do me a favor and double-check this answer with the slightly updated question?</span>
+<span class="comment-copy">Point 1 was what I understood as safety, so yes, it's safe. Point 2 describes what it actually does (which I addressed in the two last paragraphs)</span>
+<span class="comment-copy">Awesome! I didn't quite understand the last little bit about <code>itertools.tee()</code>, but it seemed like it was addressing the question with the misconception I left everyone.</span>
+<span class="comment-copy">Well, depends on the expected outcome. If you include the idea of <code>break</code> that the OP used, and if you understand that it will keep iterating over the generator <i>from where it was</i>, then I'd say you get expected behavior, for generators.</span>
+<span class="comment-copy">I clarified what I mean – this behavior is what I'm looking for. Thanks a ton!</span>
+<span class="comment-copy">That's how I'm doing it in my real code. I asked with the slightly more confusing one because I thought the intent would be clearer – looping over the generator inside of another loop. Apologies.</span>
+<span class="comment-copy">No need to apologise. It's not always obvious what will make code more or less readable. But I think the fact that everyone seems confused about your question demonstrates my point.</span>
+<span class="comment-copy">Reread your code and it's actually... not that similar to what I'm doing. I could only give it a glance on mobile, but it <i>looked</i> similar; my actual code is that I'm defining a function which does the loop, then if the special thing happens, calling that function instead of having an inner loop. Unfortunately, this pattern wouldn't work for me; aside from that, it looks good!</span>

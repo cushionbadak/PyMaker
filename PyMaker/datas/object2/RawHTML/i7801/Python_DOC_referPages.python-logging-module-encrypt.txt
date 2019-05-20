@@ -1,0 +1,126 @@
+<div class="post-text" itemprop="text">
+<p>I've got a python script with logging. Now I want to encrypt log with AES using pycrypto. </p>
+<pre><code>import logging
+import base64
+from Crypto.Cipher import AES
+aes = AES.new(cryptoKey)
+logging.basicConfig(filename='example.log',level=logging.DEBUG) #  file name, not custom file
+logging.info('text')
+</code></pre>
+<p>I want to use <code>base64.b64encode(aes.encrypt('#logging text#'))</code> before write it to log . What is a most estate way to do it?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There's a bit more to encryption than mere forwarding of data. I would suggest writing your own log formatter and setting it as a root formatter - that way no matter where you log from in your app, even parts not controlled by your code, it will always go through a layer of encryption. So, something like:</p>
+<pre><code>import base64
+import logging
+from Crypto.Cipher import AES
+from Crypto.Hash import SHA256
+from Crypto import Random
+
+class EncryptedLogFormatter(logging.Formatter):
+
+    # make sure that the `key` is a byte stream on Python 3.x
+    def __init__(self, key, fmt=None, datefmt=None):
+        self._key = SHA256.new(key).digest()  # use SHA-256 for a proper-sized AES key
+        super(EncryptedLogFormatter, self).__init__(fmt=fmt, datefmt=datefmt)
+
+    def format(self, record):
+        message = record.msg  # log message to encrypt, if any
+        if message:  # no sense to encrypt empty log messages
+            # on Python 3.x encode first: message = message.encode("utf-8")
+            iv = Random.new().read(AES.block_size)  # we'll be using CBC so generate an IV
+            cipher = AES.new(self._key, AES.MODE_CBC, iv)
+            # AES demands all blocks to be of `AES.block_size` so we have to pad the message
+            # you can use any padding you prefer, I think PKCS#7 is the best option
+            padding = AES.block_size - len(message) % AES.block_size
+            # pad the message...
+            message += chr(padding) * padding # Python 3.x: bytes([padding]) * padding
+            message_enc = iv + cipher.encrypt(message)  # add iv and encrypt
+            # finally, replace our plain-text message with base64 encoded encrypted one
+            record.msg = base64.b64encode(message_enc).decode("latin-1")
+        # you can do more here, even print out your own string but we'll just
+        # pass it to the default formatter now that the message is encrypted
+        # so that it can respect other formatting options.
+        return super(EncryptedLogFormatter, self).format(record)
+</code></pre>
+<p>Then you can use it wherever you can change the logging formatter, i.e.:</p>
+<pre><code>import sys
+import logging
+
+# lets get the root logger
+root = logging.getLogger()
+root.handlers = []  # blank out the existing handlers
+
+# create a new handler, file handler instead of stdout is perfectly fine
+handler = logging.StreamHandler(stream=sys.stdout)
+# now lets get to business
+handler.setFormatter(EncryptedLogFormatter("Whatever key/pass you'd like to use",
+                                           "[%(levelname)s] %(message)s"))
+# lets add it to the root logger so it gets called by the rest of the app automatically
+root.addHandler(handler)
+
+# And lets see what happens:
+logging.warn("Sensitive stuff, hide me!")
+# [WARNING] NDKeIav5G5DtbaSPB4Y/DR3+GZ9IwmXKzVTua1tTuDZ7uMwxBAKTXgIi0lam2dOQ
+# YMMV, the IV is random so every block will be different every time
+</code></pre>
+<p>You can of course encrypt levels, timestamps, pretty much anything from the <code>logging.LogRecord</code>, and you can output whatever format you prefer. When the time comes to read your logs, you just need to do the reverse - see an example in <a href="https://stackoverflow.com/a/44212550">this answer</a>.</p>
+<p><strong>UPDATE</strong>: As per request, here's how to do the 'reverse' (i.e. decrypt the encrypted logs). First, lets create a few log entries for testing (continuing with the previous):</p>
+<pre><code>root.setLevel(logging.DEBUG)  # let's make sure we support all levels
+
+logging.warn("Lorem ipsum dolor sit amet.")
+logging.info("Consectetur adipiscing elit.")
+logging.debug("Sed do eiusmod tempor.")
+</code></pre>
+<p>Provided that the format remained the same (<code>[%(levelname)s] %(message)s</code>), this will result in a log like (of course, it will always be different due to the random IV):</p>
+<pre>[WARNING] LQMLkbx3YF7ra3e5ZLRj3p1mi2dwCOJe/GMfo2Xg8BBSZMDmZO75rrgoiy/6kqjf
+[INFO] D+ehnsq1kWQi61AsLOBkqglXla7jgc2myPFaCGcfCRe6drk9ZmNl+M3UkKPWkDiU
+[DEBUG] +rHEHkM2YHJCkIL+YwWI4FNqg6AOXfaBLRyhZpk8/fQxrXLWxcGoGxh9A2vO+7bq</pre>
+<p>To create a <em>reader</em> for such a log (file) we need to be aware of the format so we can differentiate encrypted from non-encrypted data. In this case, separating the parts is easy - each log entry is on a new line, the levels are not encrypted and the actual encrypted data is always separated by a whitespace from the actual log level. So, to put all that together we might construct something like:</p>
+<pre><code>import base64
+from Crypto.Cipher import AES
+from Crypto.Hash import SHA256
+
+# make sure that the `key` is a byte stream on Python 3.x
+def log_decryptor(key, stream):  # assume the stream can be iterated line-by-line
+    key = SHA256.new(key).digest()  # same derivation as in the EncryptedLogFormatter
+    for line in stream:
+        if not line.strip():  # empty line...
+            continue  # ignore it!
+        level, stream = line.split(None, 1)  # split on log level and log data
+        message_enc = base64.b64decode(stream.encode("latin-1"))  # decode the stream
+        iv = message_enc[:AES.block_size]  # grab the IV from the beginning
+        # decrypt the stream
+        message = AES.new(key, AES.MODE_CBC, iv).decrypt(message_enc[AES.block_size:])
+        padding = ord(message[-1])  # get the padding value; Python 3.x: message[-1]
+        if message[-padding:] != chr(padding) * padding:  # verify the padding
+            # on Python 3.x:     bytes([padding]) * padding
+            raise ValueError("Invalid padding encountered.")
+        # Python 3.x: decode the message: message[:-padding].decode("utf-8")
+        yield "{} {}".format(level, message[:-padding])   # yield the decrypted value
+</code></pre>
+<p>And then you can use it as a regular generator to decrypt your logs, e.g.:</p>
+<pre><code>logs = ["[WARNING] LQMLkbx3YF7ra3e5ZLRj3p1mi2dwCOJe/GMfo2Xg8BBSZMDmZO75rrgoiy/6kqjf",
+        "[INFO] D+ehnsq1kWQi61AsLOBkqglXla7jgc2myPFaCGcfCRe6drk9ZmNl+M3UkKPWkDiU",
+        "[DEBUG] +rHEHkM2YHJCkIL+YwWI4FNqg6AOXfaBLRyhZpk8/fQxrXLWxcGoGxh9A2vO+7bq"]
+
+for line in log_decryptor("Whatever key/pass you'd like to use", logs):
+    print(line)
+
+# [WARNING] Lorem ipsum dolor sit amet.
+# [INFO] Consectetur adipiscing elit.
+# [DEBUG] Sed do eiusmod tempor.
+</code></pre>
+<p>Or if you've set your log to stream to a file, you can directly decrypt such file as:</p>
+<pre><code>with open("path/to/encrypted.log", "r") as f:
+    for line in log_decryptor("Whatever key/pass you'd like to use", f):
+        print(line)  # or write to a 'decrypted.log' for a more persistent solution
+</code></pre>
+</div>
+<span class="comment-copy">You will have to think about how you distinguish multiple "lines" in the binary log file, because <code>\n</code> can also appear in the middle of the ciphertext of a single log message.</span>
+<span class="comment-copy">Good remark, thanks. I can use base64 instead of binary.</span>
+<span class="comment-copy">The <code>setFormatter</code> does not exist for python3 is there any alternative for that?</span>
+<span class="comment-copy">@MasoudR. - It should be fine on Python 3.x, too - nothing changed in the base structure according to the official Python docs: <a href="https://docs.python.org/3/library/logging.html#logging.Handler.setFormatter" rel="nofollow noreferrer"><code>logging.Handler.setFormatter()</code></a>. I've just double-checked it and it works fine. What kind of error do you get?</span>
+<span class="comment-copy">Thanks, I missed the logging. It works fine on Python3 but the message in <code>EncryptedLogFormatter</code> must be encoded.</span>
+<span class="comment-copy">Can you please add a decryption method too?</span>
+<span class="comment-copy">@MasoudR. - Check the update.</span>

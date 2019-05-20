@@ -1,0 +1,197 @@
+<div class="post-text" itemprop="text">
+<p><strong>Is there any way to wait for termination of a thread, but still intercept signals?</strong> </p>
+<p>Consider the following <strong>C</strong> program:</p>
+<pre><code>#include &lt;signal.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;stdlib.h&gt;
+
+void* server_thread(void* dummy) {
+    sleep(10);
+    printf("Served\n");
+    return NULL;
+}
+
+void* kill_thread(void* dummy) {
+    sleep(1); // Let the main thread join
+    printf("Killing\n");
+    kill(getpid(), SIGUSR1);
+    return NULL;
+}
+
+void handler(int signum) {
+    printf("Handling %d\n", signum);
+    exit(42);
+}
+
+int main() {
+    pthread_t servth;
+    pthread_t killth;
+
+    signal(SIGUSR1, handler);
+
+    pthread_create(&amp;servth, NULL, server_thread, NULL);
+    pthread_create(&amp;killth, NULL, kill_thread, NULL);
+
+    pthread_join(servth, NULL);
+
+    printf("Main thread finished\n");
+    return 0;
+}
+</code></pre>
+<p>It ends after one second and prints:</p>
+<pre><code>Killing
+Handling 10
+</code></pre>
+<p>In contrast, here's my attempt to write it in <strong>Python</strong>:</p>
+<pre><code>#!/usr/bin/env python
+import signal, time, threading, os, sys
+
+def handler(signum, frame):
+    print("Handling " + str(signum) + ", frame:" + str(frame))
+    exit(42)
+signal.signal(signal.SIGUSR1, handler)
+
+def server_thread():
+    time.sleep(10)
+    print("Served")
+servth = threading.Thread(target=server_thread)
+servth.start()
+
+def kill_thread():
+    time.sleep(1) # Let the main thread join
+    print("Killing")
+    os.kill(os.getpid(), signal.SIGUSR1)
+killth = threading.Thread(target=kill_thread)
+killth.start()
+
+servth.join()
+
+print("Main thread finished")
+</code></pre>
+<p>It prints:</p>
+<pre><code>Killing
+Served
+Handling 10, frame:&lt;frame object at 0x12649c0&gt;
+</code></pre>
+<p><strong>How do I make it behave like the C version?</strong></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Threads in Python are somewhat strange beasts given the global interpreter lock. You may not be able to achieve what you want without resorting to a join timeout and isAlive as eliben suggests.</p>
+<p>There are two spots in the docs that give the reason for this (and possibly more).</p>
+<p>The first:</p>
+<p>From <a href="http://docs.python.org/library/signal.html#module-signal" rel="noreferrer">http://docs.python.org/library/signal.html#module-signal</a>:</p>
+<blockquote>
+<p>Some care must be taken if both
+  signals and threads are used in the
+  same program. The fundamental thing to
+  remember in using signals and threads
+  simultaneously is: always perform
+  signal() operations in the main thread
+  of execution. Any thread can perform
+  an alarm(), getsignal(), pause(),
+  setitimer() or getitimer(); only the
+  main thread can set a new signal
+  handler, and the main thread will be
+  the only one to receive signals (this
+  is enforced by the Python signal
+  module, even if the underlying thread
+  implementation supports sending
+  signals to individual threads). This
+  means that signals can’t be used as a
+  means of inter-thread communication.
+  Use locks instead.</p>
+</blockquote>
+<p>The second, from <a href="http://docs.python.org/library/thread.html#module-thread" rel="noreferrer">http://docs.python.org/library/thread.html#module-thread</a>:</p>
+<blockquote>
+<p>Threads interact strangely with interrupts: the KeyboardInterrupt exception will be
+  received by an arbitrary thread. (When the signal module is available, interrupts
+  always go to the main thread.)</p>
+</blockquote>
+<p><strong>EDIT:</strong> There was a decent discussion of the mechanics of this on the python bug tracker here: <a href="http://bugs.python.org/issue1167930" rel="noreferrer">http://bugs.python.org/issue1167930</a>. Of course, it ends with Guido saying: " That's unlikely to go away, so you'll just have to live
+with this.  As you've discovered, specifying a timeout solves the issue
+(sort of)."  YMMV :-)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Jarret Hardie already <a href="https://stackoverflow.com/questions/631441/interruptible-thread-join-in-python/631605#631605">mentioned it</a>: According to <a href="http://bugs.python.org/msg56947" rel="nofollow noreferrer">Guido van Rossum</a>, there's no better way as of now: As stated in the <a href="http://docs.python.org/library/threading.html#threading.Thread.join" rel="nofollow noreferrer">documentation</a>, <code>join(None)</code> blocks (and that means no signals). The alternative - calling with a huge timeout (<code>join(2**31)</code> or so) and checking <code>isAlive</code> looks great. However, the way Python handles timers is disastrous, as seen when running the python test program with <code>servth.join(100)</code> instead of <code>servth.join()</code>:</p>
+<pre><code>select(0, NULL, NULL, NULL, {0, 1000})  = 0 (Timeout)
+select(0, NULL, NULL, NULL, {0, 2000})  = 0 (Timeout)
+select(0, NULL, NULL, NULL, {0, 4000})  = 0 (Timeout)
+select(0, NULL, NULL, NULL, {0, 8000})  = 0 (Timeout)
+select(0, NULL, NULL, NULL, {0, 16000}) = 0 (Timeout)
+select(0, NULL, NULL, NULL, {0, 32000}) = 0 (Timeout)
+select(0, NULL, NULL, NULL, {0, 50000}) = 0 (Timeout)
+select(0, NULL, NULL, NULL, {0, 50000}) = 0 (Timeout)
+select(0, NULL, NULL, NULL, {0, 50000}) = 0 (Timeout)
+--- Skipped 15 equal lines ---
+select(0, NULL, NULL, NULL, {0, 50000}Killing
+</code></pre>
+<p>I.e., Python wakes up every 50 ms, leading to a single application keeping the CPU from sleeping.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Poll on <code>isAlive</code> before calling <code>join</code>. This polling can be interrupted, of course, and once the thread isn't <code>isAlive</code>, <code>join</code> is immediate.</p>
+<p>An alternative would be polling on <code>join</code> with a timeout, checking with <code>isAlive</code> whether the timeout occurred. This can spend less CPU than the previous method.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As far as I understand, a similar question is solved in <a href="http://greenteapress.com/semaphores/" rel="nofollow">The Little Book of Semaphores</a> (free download), appendix A part 3…</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I know I'm a bit late to the party, but I came to this question hoping for a better answer than joining with a timeout, which I was already doing. In the end I cooked something up that may or may not be a horrible bastardisation of signals, but it involves using <code>signal.pause()</code> instead of <code>Thread.join()</code> and signalling the current process when the thread reaches the end of its execution:</p>
+<pre><code>import signal, os, time, sys, threading, random
+
+threadcount = 200
+
+threadlock = threading.Lock()
+pid = os.getpid()
+sigchld_count = 0
+
+def handle_sigterm(signalnum, frame):
+    print "SIGTERM"
+
+def handle_sigchld(signalnum, frame):
+    global sigchld_count
+    sigchld_count += 1
+
+def faux_join():
+    global threadcount, threadlock
+    threadlock.acquire()
+    threadcount -= 1
+    threadlock.release()
+    os.kill(pid, signal.SIGCHLD)
+
+def thread_doer():
+    time.sleep(2+(2*random.random()))
+    faux_join()
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGCHLD, handle_sigchld)
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
+    print pid
+    for i in xrange(0, threadcount):
+        t = threading.Thread(target=thread_doer)
+        t.start()
+
+    while 1:
+        if threadcount == 0: break
+        signal.pause()
+        print "Signal unpaused, thread count %s" % threadcount
+
+    print "All threads finished"
+    print "SIGCHLD handler called %s times" % sigchld_count
+</code></pre>
+<p>If you want to see the SIGTERMs in action, extend the length of the sleep time in <code>thread_doer</code> and issue a <code>kill $pid</code> command from another terminal, where <code>$pid</code> is the pid id printed at the start.</p>
+<p>I post this as much in the hope of helping others as being told that this is crazy or has a bug. I'm not sure if the lock on threadcount is still necessary - I put it in there early in my experimentation and thought I should leave it in there in case.</p>
+</div>
+<span class="comment-copy"><code>gcc -pthread thread.c</code> is the way to compile C source if anyone faced errors like me by trying <code>gcc thread.c</code> alone.</span>
+<span class="comment-copy">Well, I <i>am</i> calling signal.signal in the main thread(1), and the signal module is available(2).</span>
+<span class="comment-copy">Right, but the signal will only go to the main thread, so you have to wait for servth to join before the signal will go to the signal handler (via the main thread). Confusing, no?</span>
+<span class="comment-copy">In Python 3,  <code>servth.join()</code> blocked on <a href="https://docs.python.org/3/library/_thread.html#_thread.lock.acquire" rel="nofollow noreferrer"><code>lock.acquire()</code></a> can be interrupted by a signal.</span>
+<span class="comment-copy">i am posting to concur with @phihag (in python 2.6 centos-6): i was expecting to receive signals when my main thread does a <code>if thread.is_alive(): thread.join()</code> ... but unfortunately I did not receive the signal. strangely when i do a <code>while thread.is_alive(): thread.join(30.0)</code> i do receive the signal as expected. --&gt; <b>in summary I found the same behavior that @phihag found (i.e. you have to do use <code>thread.join</code> with a timeout... otherwise you can't receive signals).</b></span>
+<span class="comment-copy">here's <a href="https://stackoverflow.com/a/29661280/52074">another answer</a> that concurs you have to use a thread join with a timeout</span>
+<span class="comment-copy">Sure, polling works, but it uses more resources and prevents CPU sleep state which can be quite costly on notebooks. I'm looking for another solution.</span>
+<span class="comment-copy">yes, but using the second method you don't waste CPU, because join with timeout blocks and releases it. so even a relatively small timeout of a few dozens of milliseconds will leave you 99.9% of CPU free</span>
+<span class="comment-copy">eliben: 99.9% CPU free is not in the least desirable if the work is spread evenly, I'd very much prefer 80% CPU free in a single burst for a desktop application. See <a href="http://www.lesswatts.org/projects/applications-power-management/avoid-pulling.php" rel="nofollow noreferrer">lesswatts.org/projects/applications-power-management/…</a> for details.</span>
+<span class="comment-copy">That's quite a hack though, essentially replacing intra- with inter-process communication</span>

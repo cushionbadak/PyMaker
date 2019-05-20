@@ -1,0 +1,392 @@
+<div class="post-text" itemprop="text">
+<p>I have been transforming some of my original <code>xml.etree.ElementTree</code> (<code>ET</code>) code to <code>lxml.etree</code> (<code>lxmlET</code>). Luckily there are a lot of similarities between the two. <em>However</em>, I did stumble upon some strange behaviour that I cannot find written down in any documentation. It considers the internal representation of descendant nodes.</p>
+<p>In ET, <code>iter()</code> is used to iterate over all descendants of an Element, optionally filtered by tag name. Because I could not find any details about this in the documentation, I expected similar behaviour for lxmlET. The thing is that from testing I conclude that in lxmlET, there is a different internal representation of a tree.</p>
+<p>In the example below, I iterate over nodes in a tree and print each node's children, but in addition I also create all different combinations of those children and print those. This means, if an element has children <code>('A', 'B', 'C')</code> I create alterations, namely trees <code>[('A'), ('A', 'B'), ('A', 'C'), ('B'), ('B', 'C'), ('C')]</code>.</p>
+<pre><code># import lxml.etree as ET
+import xml.etree.ElementTree as ET
+from itertools import combinations
+from copy import deepcopy
+
+
+def get_combination_trees(tree):
+    children = list(tree)
+    for i in range(1, len(children)):
+        for combination in combinations(children, i):
+            new_combo_tree = ET.Element(tree.tag, tree.attrib)
+            for recombined_child in combination:
+                new_combo_tree.append(recombined_child)
+                # when using lxml a deepcopy is required to make this work (or make change in parse_xml)
+                # new_combo_tree.append(deepcopy(recombined_child))
+            yield new_combo_tree
+
+    return None
+
+
+def parse_xml(tree_p):
+    for node in ET.fromstring(tree_p):
+        if not node.tag == 'node_main':
+            continue
+        # replace by node.xpath('.//node') for lxml (or use deepcopy in get_combination_trees)
+        for subnode in node.iter('node'):
+            children = list(subnode)
+            if children:
+                print('-'.join([child.attrib['id'] for child in children]))
+            else:
+                print(f'node {subnode.attrib["id"]} has no children')
+
+            for combo_tree in get_combination_trees(subnode):
+                combo_children = list(combo_tree)
+                if combo_children:
+                    print('-'.join([child.attrib['id'] for child in combo_children]))    
+
+    return None
+
+
+s = '''&lt;root&gt;
+  &lt;node_main&gt;
+    &lt;node id="1"&gt;
+      &lt;node id="2" /&gt;
+      &lt;node id="3"&gt;
+        &lt;node id="4"&gt;
+          &lt;node id="5" /&gt;
+        &lt;/node&gt;
+        &lt;node id="6" /&gt;
+      &lt;/node&gt;
+    &lt;/node&gt;
+  &lt;/node_main&gt;
+&lt;/root&gt;
+'''
+
+parse_xml(s)
+</code></pre>
+<p>The expected output here is the id's of the children of each node joined together with a hyphen, and also all possible combinations of the children (cf. supra) in a top-down breadth-first fashion.</p>
+<pre><code>2-3
+2
+3
+node 2 has no children
+4-6
+4
+6
+5
+node 5 has no children
+node 6 has no children
+</code></pre>
+<p>However, when you use the <code>lxml</code> module instead of <code>xml</code> (uncomment the import for lxmlET and comment the import for ET), and run the code you'll see that the output is </p>
+<pre><code>2-3
+2
+3
+node 2 has no children
+</code></pre>
+<p>So the deeper descendant nodes are never visited. This can be circumvented by either:</p>
+<ol>
+<li>using <code>deepcopy</code> (comment/uncomment relevant part in <code>get_combination_trees()</code>), or</li>
+<li>using <code>for subnode in node.xpath('.//node')</code> in <code>parse_xml()</code> instead of <code>iter()</code>.</li>
+</ol>
+<p>So I know that there is a way around this, but I am mainly wondering <strong>what is happening?!</strong> It took me ages to debug this, and I can't find any documentation on it. What is going on, what is the <em>actual</em> underlying difference here between the two modules? And what is the most <strong>efficient</strong> work-around when working with very large trees?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>While Louis's answer is correct and I completely agree that modifying a data structure as you traverse it generally a Bad Idea<sup>(tm)</sup>, you also asked why the code works with <code>xml.etree.ElementTree</code> and not <code>lxml.etree</code> and there is a very reasonable explanation for that.</p>
+<h2>Implementation of <code>.append</code> in <code>xml.etree.ElementTree</code></h2>
+<p>This library is implemented directly in Python and could vary depending on which Python runtime you're using. Assuming you're using CPython, the implementation you're looking for is implemented <a href="https://github.com/python/cpython/blob/5c52f48200e9aeb099a3ca9c2d22b281765387e4/Lib/xml/etree/ElementTree.py#L229-L238" rel="noreferrer">in vanilla Python</a>:</p>
+<pre><code>def append(self, subelement):
+    """Add *subelement* to the end of this element.
+    The new element will appear in document order after the last existing
+    subelement (or directly after the text, if it's the first subelement),
+    but before the end tag for this element.
+    """
+    self._assert_is_element(subelement)
+    self._children.append(subelement)
+</code></pre>
+<p>The last line is the only part we're concerned with. As it turns out, <code>self._children</code> is initialized <a href="https://github.com/python/cpython/blob/5c52f48200e9aeb099a3ca9c2d22b281765387e4/Lib/xml/etree/ElementTree.py#L175" rel="noreferrer">towards the top of that file</a> as:</p>
+<pre><code>self._children = []
+</code></pre>
+<p>So adding a child to a tree is just appending an element to a list. Intuitively, that's exactly what you're looking for (in this case) and the implementation behaves in a completely unsurprising way.</p>
+<h2>Implementation <code>.append</code> in <code>lxml.etree</code></h2>
+<p><code>lxml</code> is implemented as a mix of Python, non-trivial Cython, and C code so spelunking through it was significantly harder than the pure-Python implementation. First off, <a href="https://github.com/lxml/lxml/blob/0cf95e6baaa414b2bda9cb3262723bc9913727ac/src/lxml/etree.pyx#L815-L822" rel="noreferrer"><code>.append</code> is implemented as</a>:</p>
+<pre><code>def append(self, _Element element not None):
+    u"""append(self, element)
+    Adds a subelement to the end of this element.
+    """
+    _assertValidNode(self)
+    _assertValidNode(element)
+    _appendChild(self, element)
+</code></pre>
+<p><code>_appendChild</code> is implemented over in <a href="https://github.com/lxml/lxml/blob/11623abac2079fc58dd7522c31cbc20a816935d0/src/lxml/apihelpers.pxi#L1271-L1288" rel="noreferrer"><code>apihelper.pxi</code></a>:</p>
+<pre><code>cdef int _appendChild(_Element parent, _Element child) except -1:
+    u"""Append a new child to a parent element.
+    """
+    c_node = child._c_node
+    c_source_doc = c_node.doc
+    # prevent cycles
+    if _isAncestorOrSame(c_node, parent._c_node):
+        raise ValueError("cannot append parent to itself")
+    # store possible text node
+    c_next = c_node.next
+    # move node itself
+    tree.xmlUnlinkNode(c_node)
+    tree.xmlAddChild(parent._c_node, c_node)
+    _moveTail(c_next, c_node)
+    # uh oh, elements may be pointing to different doc when
+    # parent element has moved; change them too..
+    moveNodeToDocument(parent._doc, c_source_doc, c_node)
+    return 0
+</code></pre>
+<p>There's definitely a bit more going on here. In particular, <code>lxml</code> explicitly removes the node from the tree and then adds it elsewhere. This prevents you from accidentally creating a cyclic XML <em>graph</em> while manipulating nodes (which is something you could probably do with the <code>xml.etree</code> version).</p>
+<h2>Workarounds for <code>lxml</code></h2>
+<p>Now that we know that <code>xml.etree</code> <em>copies</em> nodes when appending but <code>lxml.etree</code> <em>moves</em> them, why do those workarounds work? Based on the <code>tree.xmlUnlinkNode</code> method (which is actually <a href="https://github.com/GNOME/libxml2/blob/35e83488505d501864826125cfe6a7950d6cba78/tree.c#L3799-L3871" rel="noreferrer">defined in C inside of <code>libxml2</code></a>), unlinking just messes with a bunch of pointers. So, anything that copies node metadata will do the trick. Because all of the metadata we care about are direct fields on <a href="https://github.com/lxml/lxml/blob/11623abac2079fc58dd7522c31cbc20a816935d0/src/lxml/includes/tree.pxd#L162-L176" rel="noreferrer">the <code>xmlNode</code> struct</a>, anything that <em>shallow</em> copies nodes will do the trick</p>
+<ul>
+<li><code>copy.deepcopy()</code> definitely works</li>
+<li><code>node.xpath</code> returns nodes <a href="https://github.com/lxml/lxml/blob/6d54319c91193af2e9eb24f28309c5512f3d734a/src/lxml/etree.pyx#L1589-L1612" rel="noreferrer">wrapped in proxy elements</a> which happens to shallow copy the tree metadata</li>
+<li><a href="https://docs.python.org/3/library/copy.html#copy.copy" rel="noreferrer"><code>copy.copy()</code></a> also does the trick</li>
+<li>If you don't need your combinations to actually be in an official tree, setting <code>new_combo_tree = []</code> also gives you list appending just like <code>xml.etree</code>.</li>
+</ul>
+<p>If you're really concerned about performance and large trees, I'd probably start with shallow copying with <code>copy.copy()</code> although you should absolutely profile a few different options and see which one works best for you.</p>
+</div>
+<div class="post-text" itemprop="text">
+<h2>Copying Problem</h2>
+<p>In general, the safe thing to do when you are manipulating an XML tree and want to <strong>copy</strong> information in multiple places in the tree (by opposition to <em>moving</em> information from one place to another) is to perform a <strong>deep copy operation on those elements rather than just add them to their new location.</strong> The vast majority of XML parsing libraries that produce trees <strong>require</strong> you to perform a deep copy if you want to copy structures around. They just won't give you the results you want if you do not deep copy. <code>lxml</code> is one such library that requires you to deep copy the structures you want to copy.</p>
+<p>The fact that <code>xml.etree.ElementTree</code> works in a way such that <code>.append</code> effectively allows you to have the same element in two places in the tree is <em>definitely unusual</em> in my experience.</p>
+<h2>Walking-while-Modifying Problem</h2>
+<p>You mentioned that <code>for subnode in node.xpath('.//node')</code> also solves you problem. Note that if you use <code>for subnode in list(node.iter('node'))</code>, you'll get the same result. What is going on here is that using <code>list(node.iter('node'))</code> or <code>node.xpath('.//node')</code> or using <code>deepcopy</code> to copy the nodes instead of moving them protect you against <em>another</em> problem with your code: <strong>you are walking a structure while modifying it.</strong></p>
+<p><code>node.iter('node')</code> creates an iterator that goes over the XML structure as you iterate it. If you wrap it in <code>list()</code>, then the structure is walked immediately and the result put in a list. So you've effectively taken a snapshot of the structure before you walk it. That prevents your walking operation from being affected by changes to the tree. If you do <code>node.xpath('.//node')</code> you are also obtaining a snapshot of the tree before you walk it because that method returns a list of nodes. And if you do a <code>deepcopy</code> of the nodes and append the copy of the node instead of appending the original node, then you are <em>not modifying</em> the tree you are walking while you are walking it.</p>
+<p>Whether you can get away with using XPath or using <code>node.xpath('.//node')</code> <em>instead of</em> using <code>deepcopy</code> depends on what you plan to do with your combinations. The code you show in your question prints the combinations to the screen as soon you create them. They look fine when you print them, but if you do not use a <code>deepcopy</code> for creating them, then as soon as you create a new combination, the old one will get messed up because any node that appeared in the old combination and needs to appear in the new one <em>will be moved instead of copied</em>.</p>
+<hr/>
+<blockquote>
+<p>And what is the most efficient work-around when working with very large trees?</p>
+</blockquote>
+<p>It depends on the specifics of your application and the data you need to parse. You gave one example which is a small document but you ask about "large trees". What applies to small documents does not necessarily transfer to large documents. You can optimize for case X but if case X happens only extremely rarely in <em>real</em> data, then your optimization may not pan out. In some cases, it may actually be harmful.</p>
+<p>In one application of mine, I had to replace references to some structures with the structures themselves. A simplified illustration would be a document that contains elements like <code>&lt;define id="..."&gt;...&lt;/def&gt;</code> and references like <code>&lt;ref idref="..."/&gt;</code>. Every instance of <code>ref</code> would have to be replaced with the <code>define</code> it points to. In general, this may mean copying a single <code>define</code> multiple times but sometimes a <code>define</code> may be referred by only one <code>ref</code> so one optimization was to detect this and skip the deep copy in those cases where there was only one reference. I got this optimization "for free" because the application already required recording each instance of <code>ref</code> and <code>define</code> for other purposes. If I've had to add bookkeeping <em>just for this optimization</em>, it is not clear it would have been worth it.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>At the beginning I didn't think there was such a difference (neither did I check), but both @supersam654 and @Louis answers pinpointed it very clearly.</p>
+<p>But code that is dependent on <strong>internal representation</strong> (rather than <strong>interface</strong>) of stuff that it uses, <strong>doesn't seem right</strong> (from design <em>PoV</em>) to me. Also, as I was asking in my comment: <em>combo_children</em> seems totally useless:</p>
+<ol>
+<li>Get child nodes combo (as a list)</li>
+<li>Append each node from the list as a child to <em>combo_children</em></li>
+<li>Return <em>combo_children</em></li>
+<li>Get <em>combo_children</em> children (as a list)</li>
+<li>Use the list (combo)</li>
+</ol>
+<p>when things could be easily done:</p>
+<ol>
+<li>Get child nodes combo (as a list)</li>
+<li>Return the list</li>
+<li>Use the list (combo)</li>
+</ol>
+<p>Apparently, the <em>combo_children</em> approach was also exposing the behavioral difference between the modules.</p>
+<p><em>code_orig_lxml.py</em>:</p>
+<pre class="lang-py prettyprint-override"><code>import lxml.etree as ET
+#import xml.etree.ElementTree as ET
+from itertools import combinations
+from copy import deepcopy
+
+
+def get_combination_trees(tree):
+    children = list(tree)
+    for i in range(1, len(children)):
+        for combination in combinations(children, i):
+            #new_combo_tree = ET.Element(tree.tag, tree.attrib)
+            #for recombined_child in combination:
+                #new_combo_tree.append(recombined_child)
+                # when using lxml a deepcopy is required to make this work (or make change in parse_xml)
+                # new_combo_tree.append(deepcopy(recombined_child))
+            #yield new_combo_tree
+            yield combination
+
+    return None
+
+
+def parse_xml(tree_p):
+    for node in ET.fromstring(tree_p):
+        if not node.tag == 'node_main':
+            continue
+        # replace by node.xpath('.//node') for lxml (or use deepcopy in get_combination_trees)
+        for subnode in node.iter('node'):
+            children = list(subnode)
+            if children:
+                print('-'.join([child.attrib['id'] for child in children]))
+            else:
+                print(f'node {subnode.attrib["id"]} has no children')
+
+            #for combo_tree in get_combination_trees(subnode):
+            for combo_children in get_combination_trees(subnode):
+                #combo_children = list(combo_tree)
+                if combo_children:
+                    print('-'.join([child.attrib['id'] for child in combo_children]))
+
+    return None
+
+
+s = """
+&lt;root&gt;
+  &lt;node_main&gt;
+    &lt;node id="1"&gt;
+      &lt;node id="2" /&gt;
+      &lt;node id="3"&gt;
+        &lt;node id="4"&gt;
+          &lt;node id="5" /&gt;
+        &lt;/node&gt;
+        &lt;node id="6" /&gt;
+      &lt;/node&gt;
+    &lt;/node&gt;
+  &lt;/node_main&gt;
+&lt;/root&gt;
+"""
+
+parse_xml(s)
+</code></pre>
+<p><strong>Notes</strong>:</p>
+<ul>
+<li>This is your code with the changes above</li>
+<li>I didn't removed anything, instead just commented stuff (which would generate the smallest <em>diff</em> between the old and new versions)</li>
+</ul>
+<p><strong>Output</strong>:</p>
+<blockquote>
+<pre class="lang-py prettyprint-override"><code>(py36x86_test) e:\Work\Dev\StackOverflow\q050749937&gt;"e:\Work\Dev\VEnvs\py36x86_test\Scripts\python.exe" code_orig_lxml.py
+2-3
+2
+3
+node 2 has no children
+4-6
+4
+6
+5
+node 5 has no children
+node 6 has no children
+</code></pre>
+</blockquote>
+<p>While I was investigating, I modified your code further, to:</p>
+<ul>
+<li>Fix the issue</li>
+<li>Improve printing</li>
+<li>Make it modular</li>
+<li>Use both parsing methods, to make differences between them clearer</li>
+</ul>
+<p><em>xml_data.py</em>:</p>
+<pre class="lang-py prettyprint-override"><code>DATA = """
+&lt;root&gt;
+  &lt;node_main&gt;
+    &lt;node id="1"&gt;
+      &lt;node id="2" /&gt;
+      &lt;node id="3"&gt;
+        &lt;node id="4"&gt;
+          &lt;node id="5" /&gt;
+        &lt;/node&gt;
+        &lt;node id="6" /&gt;
+      &lt;/node&gt;
+    &lt;/node&gt;
+  &lt;/node_main&gt;
+&lt;/root&gt;
+"""
+</code></pre>
+<p><em>code.py</em>:</p>
+<pre class="lang-py prettyprint-override"><code>import sys
+import xml.etree.ElementTree as xml_etree_et
+import lxml.etree as lxml_etree
+from itertools import combinations
+from xml_data import DATA
+
+
+MAIN_NODE_NAME = "node_main"
+
+
+def get_children_combinations(tree):
+    children = list(tree)
+    for i in range(1, len(children)):
+        yield from combinations(children, i)
+
+
+def get_tree(xml_str, parse_func, tag=None):
+    root_node = parse_func(xml_str)
+    if tag:
+        return [item for item in root_node if item.tag == tag]
+    return [root_node]
+
+
+def process_xml(xml_node):
+    for node in xml_node.iter("node"):
+        print(f"\nNode ({node.tag}, {node.attrib['id']})")
+        children = list(node)
+        if children:
+            print("    Children: " + " - ".join([child.attrib["id"] for child in children]))
+
+        for children_combo in get_children_combinations(node):
+            if children_combo:
+                print("    Combo: " + " - ".join([child.attrib["id"] for child in children_combo]))
+
+
+def main():
+    parse_funcs = (xml_etree_et.fromstring, lxml_etree.fromstring)
+    for func in parse_funcs:
+        print(f"\nParsing xml using: {func.__module__} {func.__name__}")
+        nodes = get_tree(DATA, func, tag=MAIN_NODE_NAME)
+        for node in nodes:
+            print(f"\nProcessing node: {node.tag}")
+            process_xml(node)
+
+
+if __name__ == "__main__":
+    print("Python {:s} on {:s}\n".format(sys.version, sys.platform))
+    main()
+</code></pre>
+<p><strong>Output</strong>:</p>
+<blockquote>
+<pre class="lang-py prettyprint-override"><code>(py36x86_test) e:\Work\Dev\StackOverflow\q050749937&gt;"e:\Work\Dev\VEnvs\py36x86_test\Scripts\python.exe" code.py
+Python 3.6.2 (v3.6.2:5fd33b5, Jul  8 2017, 04:14:34) [MSC v.1900 32 bit (Intel)] on win32
+
+
+Parsing xml using: xml.etree.ElementTree XML
+
+Processing node: node_main
+
+Node (node, 1)
+    Children: 2 - 3
+    Combo: 2
+    Combo: 3
+
+Node (node, 2)
+
+Node (node, 3)
+    Children: 4 - 6
+    Combo: 4
+    Combo: 6
+
+Node (node, 4)
+    Children: 5
+
+Node (node, 5)
+
+Node (node, 6)
+
+Parsing xml using: lxml.etree fromstring
+
+Processing node: node_main
+
+Node (node, 1)
+    Children: 2 - 3
+    Combo: 2
+    Combo: 3
+
+Node (node, 2)
+
+Node (node, 3)
+    Children: 4 - 6
+    Combo: 4
+    Combo: 6
+
+Node (node, 4)
+    Children: 5
+
+Node (node, 5)
+
+Node (node, 6)
+</code></pre>
+</blockquote>
+</div>
+<span class="comment-copy">Both modules have the code publicly available (but I see that <i>lxml</i> is partly written in <i>C</i>). Not related to question: why do you create the <code>new_combo_tree</code> element? Note that the behavioral difference doesn't necessarily imply a difference in internal representation.</span>
+<span class="comment-copy">@CristiFati Unfortunately I'm afraid that my python skills are not good enough to debug this further, nor do I have the time. Perhaps someone with knowledge of the topic can find an answer more quickly. Also, in my specific case I need different combinations of the tree to derive some patterns from their xml attributes, however that is not relevant for this question.</span>
+<span class="comment-copy">Here is what I think happens. In a compliant DOM API any one node can only exist in exactly one spot. If you append it to another node, it will automatically be removed from its previous parent. That's what lxml (correctly) does, and ET doesn't seem to do. If you need the same node in multiple spots <i>in the same tree</i>, the right thing would be to use <code>deepcopy</code> to create node copies (compare towards the end of <a href="http://lxml.de/tutorial.html#elements-are-lists" rel="nofollow noreferrer">"Elements are Lists"</a> in the docs). If you just need combinations and want optimal performance, work with lists of node references.</span>
+<span class="comment-copy">@Tomalak But why then does it behave differently when using xpath instead of iter? (in which a copy is not needed?) Does that work with node references, then?</span>
+<span class="comment-copy">I'm assuming copy.copy() is less memory-heavy than  copy.deepcopy(), so just to be sure; you are certain that this maintains the information that I need? What exactly does it do? Does copy() just keep a pointer to the original node, whereas deepcopy() makes an actual copy?</span>
+<span class="comment-copy"><code>lxml</code>'s proxies are not special to the <code>.xpath()</code> method. <code>lxml</code> creates proxy elements for <i>all elements</i> that it exposes, not just elements returned from an XPath evaluation. Just put a breakpoint on <code>_elementFactory</code> and run <code>ET.fromstring("&lt;doc/&gt;")</code> without any other code. You'll see the factory being called once, even though XPath is not involved at all in this code. Moreover, the proxies do not do shallow copies. That's not their job. If they did then calling <code>.node()</code> in the OP's code would work just as well as calling <code>.xpath()</code>.</span>
+<span class="comment-copy">@BramVanroy using <code>deepcopy()</code> or <code>copy()</code> boils down to the same work being done behind the scenes because <code>lxml</code> defines a <code>__deepcopy__</code> method that calls <code>__copy__</code>. See <a href="https://github.com/lxml/lxml/blob/14d8cc5dfb75c3c9fa0e57eed2b9a3caba92f6be/src/lxml/etree.pyx#L784-L805" rel="nofollow noreferrer">that bit</a>. Using <code>copy</code> is slightly faster because you skip a call.</span>

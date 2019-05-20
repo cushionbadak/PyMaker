@@ -1,0 +1,121 @@
+<div class="post-text" itemprop="text">
+<p>This is a post inspired from <a href="https://stackoverflow.com/questions/18520825/defaultdict-one-step-initialization/18520982?noredirect=1#comment27237819_18520982">this comment</a> about how memory is allocated for objects in CPython. Originally, this was in the context of creating a list and appending to it in a for loop <em>vis a vis</em> a list comprehension.</p>
+<p>So here are my questions:</p>
+<ol>
+<li>how many different allocaters are there in CPython?
+
+<ul>
+<li>what is the function of each?</li>
+</ul></li>
+<li>when is <code>malloc</code> acutally called? (a list comprehension may not result in a call to <code>malloc</code>, based on what's said in <a href="https://stackoverflow.com/questions/18520825/defaultdict-one-step-initialization/18520982?noredirect=1#comment27237819_18520982">this comment</a></li>
+<li>How much memory does python allocate for itself at startup?
+
+<ol>
+<li>are there rules governing which data structures get first "dibs" on this memory?</li>
+</ol></li>
+<li>What happens to the memory used by an object when it is deleted (does python still hold on to the memory to allocate to another object in the future, or does the GC free up the memory for another process, say Google Chrome, to use)?</li>
+<li>When is a GC triggered?</li>
+<li><code>list</code>s are dynamic arrays, which means they need a contiguous piece of memory. This means that if I try to append an object into a list, whose underlying-C-data-structure array cannot be extended, the array is copied over onto a different part of memory, where a larger contiguous block is available. So how much space is allocated to this array when I initialize a list?
+
+<ul>
+<li>how much extra space is allocated to the new array, which now holds the old list and the appended object? </li>
+</ul></li>
+</ol>
+<p><strong>EDIT</strong>: From the comments, I gather that there are far too many questions here. I only did this because these questions are all pretty related. Still, I'd be happy to split this up into several posts if that is the case (please let me know to do so in the comments)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Much of this is answered in the <a href="http://docs.python.org/3/c-api/memory.html">Memory Management</a> chapter of the C API documentation.</p>
+<p>Some of the documentation is vaguer than you're asking for. For further details, you'd have to turn to the source code. And nobody's going to be willing to do that unless you pick a specific version. (At least 2.7.5, pre-2.7.6, 3.3.2, pre-3.3.3, and pre-3.4 would be interesting to different people.)</p>
+<p>The source to the <a href="http://hg.python.org/cpython/file/3.3/Objects/obmalloc.c"><code>obmalloc.c</code></a> file is a good starting place for many of your questions, and the comments at the top have a nice little ASCII-art graph:</p>
+<pre><code>    Object-specific allocators
+    _____   ______   ______       ________
+   [ int ] [ dict ] [ list ] ... [ string ]       Python core         |
++3 | &lt;----- Object-specific memory -----&gt; | &lt;-- Non-object memory --&gt; |
+    _______________________________       |                           |
+   [   Python`s object allocator   ]      |                           |
++2 | ####### Object memory ####### | &lt;------ Internal buffers ------&gt; |
+    ______________________________________________________________    |
+   [          Python`s raw memory allocator (PyMem_ API)          ]   |
++1 | &lt;----- Python memory (under PyMem manager`s control) ------&gt; |   |
+    __________________________________________________________________
+   [    Underlying general-purpose allocator (ex: C library malloc)   ]
+ 0 | &lt;------ Virtual memory allocated for the python process -------&gt; |
+
+   =========================================================================
+    _______________________________________________________________________
+   [                OS-specific Virtual Memory Manager (VMM)               ]
+-1 | &lt;--- Kernel dynamic storage allocation &amp; management (page-based) ---&gt; |
+    __________________________________   __________________________________
+   [                                  ] [                                  ]
+-2 | &lt;-- Physical memory: ROM/RAM --&gt; | | &lt;-- Secondary storage (swap) --&gt; |
+</code></pre>
+<hr/>
+<blockquote>
+<p>how many different allocaters are there in CPython?</p>
+</blockquote>
+<p>According to the docs, "several". You could count up the ones in the builtin and stdlib types, then add the handful of generic ones, if you really wanted. But I'm not sure what it would tell you. (And it would be pretty version-specific. IIRC, the exact number even changed within the 3.3 tree, as there was an experiment with whether the new-style strings should use three different allocators or one.)</p>
+<hr/>
+<blockquote>
+<p>what is the function of each?</p>
+</blockquote>
+<p>The object-specific allocators at level +3 are for specific uses cases that are worth optimizing. As the docs say:</p>
+<blockquote>
+<p>For example, integer objects are managed differently within the heap than strings, tuples or dictionaries because integers imply different storage requirements and speed/space tradeoffs.</p>
+</blockquote>
+<p>Below that, there are various generic supporting allocators at level +2 (and +1.5 and maybe +2.5)—at least an object allocator, an arena allocator, and a small-block allocator, etc.—but all but the first are private implementation details (meaning private even to the C-API; obviously all of it is private to Python code).</p>
+<p>And below that, there's the raw allocator, whose function is to ask the OS for more memory when the higher-level allocators need it.</p>
+<hr/>
+<blockquote>
+<p>when is malloc acutally called?</p>
+</blockquote>
+<p>The raw memory allocator (or its heap manager) <em>should</em> be the only thing that ever calls <code>malloc</code>. (In fact, it might not even necessarily call <code>malloc</code>; it might use functions like <code>mmap</code> or <code>VirtualAlloc</code> instead. But the point is that it's the only thing that ever asks the OS for memory.) There are a few exceptions within the core of Python, but they'll rarely be relevant.</p>
+<p>The docs explicitly say that higher-level code should never try to operate on Python objects in memory obtained from <code>malloc</code>.</p>
+<p>However, there are plenty of stdlib and extension modules that use <code>malloc</code> for purposes <em>besides</em> Python objects.</p>
+<p>For example, a numpy array of 1000x1000 int32 values doesn't allocate 1 million Python <code>int</code>s, so it doesn't have to go through the <code>int</code> allocator. Instead, it just <code>malloc</code>s an array of 1 million C <code>int</code>s, and wraps them up in Python objects as needed when you access them.</p>
+<hr/>
+<blockquote>
+<p>How much memory does python allocate for itself at startup?</p>
+</blockquote>
+<p>This is platform-specific, and a bit hard to figure out from the code. However, when I launch a new <code>python3.3</code> interpreter on my 64-bit Mac, it starts of with 13.1MB of virtual memory, and almost immediately expands to 201MB. So, that should be a rough ballpark guide.</p>
+<blockquote>
+<p>are there rules governing which data structures get first "dibs" on this memory?</p>
+</blockquote>
+<p>Not really, no. A malicious or buggy object-specific allocator could immediately grab all of the pre-allocated memory and more, and there's nothing to stop it.</p>
+<hr/>
+<blockquote>
+<p>What happens to the memory used by an object when it is deleted (does python still hold on to the memory to allocate to another object in the future, or does the GC free up the memory for another process, say Google Chrome, to use)?</p>
+</blockquote>
+<p>It goes back to the object-specific allocator, which may keep it on a freelist, or release it to the raw allocator, which keeps its own freelist. The raw allocator almost <em>never</em> releases memory back to the OS.</p>
+<p>This is because there's usually no good reason to release memory back to a modern OS. If you have a ton of unused pages lying around, the OS's VM will just page them out if another process needs it. And when there <em>is</em> a good reason, it's almost always application-specific, and the simplest solution is to use multiple processes to manage your huge short-lived memory requirements.</p>
+<hr/>
+<blockquote>
+<p>When is a GC triggered?</p>
+</blockquote>
+<p>It depends on what you mean by "a GC".</p>
+<p>CPython uses refcounting; every time you release a reference to an object (by rebinding a variable or a slot in a collection, letting a variable go out of scope, etc.), if it was the last reference, it will be cleaned up immediately. This is explained in the <a href="http://docs.python.org/3/c-api/refcounting.html">Reference Counting</a> section in the docs.</p>
+<p>However, there's a problem with refcounting: if two objects reference each other, even when all outside references go away, they still won't get cleaned up. So, CPython has always had a cycle collector that periodically walks objects looking for cycles of objects that reference each other, but have no outside references. (It's a little more complicated, but that's the basic idea.) This is fully explained in the docs for the <a href="http://docs.python.org/3/library/gc.html"><code>gc</code></a> module. The collector can run when you ask it to explicitly, when the freelists are getting low, or when it hasn't run in a long time; this is dynamic and to some extent configurable, so it's hard to give a specific answer to "when".</p>
+<hr/>
+<blockquote>
+<p>lists are dynamic arrays, which means they need a contiguous piece of memory. This means that if I try to append an object into a list, whose underlying-C-data-structure array cannot be extended, the array is copied over onto a different part of memory, where a larger contiguous block is available. So how much space is allocated to this array when I initialize a list?</p>
+</blockquote>
+<p>The code for this is mostly inside <a href="http://hg.python.org/cpython/file/3.3/Objects/listobject.c"><code>listobject.c</code></a>. It's complicated; there are a bunch of special cases, like the code used by timsort for creating temporary intermediate lists and for non-in-place sorting. But ultimately, some piece of code decides it needs room for N pointers. </p>
+<p>It's also not particularly interesting. Most lists are either never expanded, or expanded far beyond the original size, so doing extra allocation at the start wastes memory for static lists and doesn't help much for most growing lists. So, Python plays it conservative. I believe it starts by looking through its internal freelist that's not too much bigger than N pointers (it might also consolidate adjacent freed list storage; I don't know if it does), so it might overallocate a little bit occasionally, but generally it doesn't. The exact code should be in <a href="http://hg.python.org/cpython/file/3.3/Objects/listobject.c#l129"><code>PyList_New</code></a>.</p>
+<p>At any rate, if there's no space in the list allocator's freelist, it drops down to the object allocator, and so on through the levels; it may end up hitting level 0, but usually it doesn't.</p>
+<blockquote>
+<p>how much extra space is allocated to the new array, which now holds the old list and the appended object?</p>
+</blockquote>
+<p>This is handled in <a href="http://hg.python.org/cpython/file/3.3/Objects/listobject.c#l26"><code>list_resize</code></a>, and this is the interesting part.</p>
+<p>The only way to avoid <code>list.append</code> being quadratic is to over allocate geometrically. Overallocating by too small of a factor (like 1.2) wastes way too much time for the first few expansions; using too large of a factor (like 1.6) wastes way too much space for very large arrays. Python handles this by using a sequence that starts off at 2.0 but quickly converges toward somewhere around 1.25. According to the 3.3 source:</p>
+<blockquote>
+<p>The growth pattern is:  0, 4, 8, 16, 25, 35, 46, 58, 72, 88, ...</p>
+</blockquote>
+<hr/>
+<p>You didn't ask specifically about <code>sorted</code>, but I know that's what prompted you.</p>
+<p>Remember that timsort is primarily a merge sort, with an insertion sort for small sublists that aren't already sorted. So, most of its operations involve allocating a new list of about size 2N and freeing two lists of about size N. So, it can be almost as space- and allocation-efficient when copying as it would be in-place. There is up to O(log N) waste, but this usually isn't the factor that makes a copying sort slower.</p>
+</div>
+<span class="comment-copy">Why the downvote? I see a legit question that for once is not simple, bordering stupid.</span>
+<span class="comment-copy">Probably because this is incredibly broad. There are at least 6 questions here.</span>
+<span class="comment-copy">Much of this is answered in the <a href="http://docs.python.org/3/c-api/memory.html" rel="nofollow noreferrer">Memory Management</a> chapter of the C API documentation. Some of it is vaguer than you're asking for ("… several object-specific allocators" doesn't tell you how many "several" is), but you're not going to get more detail without picking a specific version and diving into the code.</span>
+<span class="comment-copy">I actually had a half-written blog post explaining some of this stuff. I added in a few extra paragraphs about the stuff that wasn't relevant to my post (like the GC) and rewrote a bit and posted it as a community answer.</span>
+<span class="comment-copy">@abarnert: Thank you so much for such a detailed answer. It's really a very interesting read</span>
+<span class="comment-copy">Kudos for mentioning <code>sorted</code>. For the benefit of others who might wonder, abarnert is referring to the discussion on <a href="http://stackoverflow.com/a/18520982/198633">this post</a></span>

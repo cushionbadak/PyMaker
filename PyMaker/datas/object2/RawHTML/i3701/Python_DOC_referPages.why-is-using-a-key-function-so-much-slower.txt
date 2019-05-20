@@ -1,0 +1,91 @@
+<div class="post-text" itemprop="text">
+<p>There is a drastic performance hit when using a keyfunc in <a href="https://docs.python.org/3/library/heapq.html#heapq.nlargest" rel="noreferrer"><code>heapq.nlargest</code></a>:</p>
+<pre><code>&gt;&gt;&gt; from random import random
+&gt;&gt;&gt; from heapq import nlargest
+&gt;&gt;&gt; data = [random() for _ in range(1234567)]
+&gt;&gt;&gt; %timeit nlargest(10, data)
+30.2 ms ± 1.19 ms per loop (mean ± std. dev. of 7 runs, 10 loops each)
+&gt;&gt;&gt; %timeit nlargest(10, data, key=lambda n: n)
+159 ms ± 6.32 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+</code></pre>
+<p>I expected a small extra cost, perhaps something like 30% - not 400%. This degradation seems to be reproducible over a few different data sizes. You can see in the source code there is a special-case handling for <code>if key is None</code>, but otherwise the implementation looks more or less the same.</p>
+<p>Why is performance so degraded by using a key function? Is it only due to the extra function call overhead, or is the algorithm fundamentally changed somehow by using a keyfunc?</p>
+<p>For comparison, <code>sorted</code> takes about a 30% hit with the same data and lambda.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Say your iterable has <code>N</code> elements.  Whether sorting or doing <code>nlargest</code>, the key function will be called <code>N</code> times.  When sorting, that overhead is largely buried under roughly <code>N * log2(N)</code> other operations.  But when doing <code>nlargest</code> of <code>k</code> items, there are only roughly <code>N * log2(k)</code> other operations, which is much smaller when <code>k</code> is much smaller than <code>N</code>.</p>
+<p>In your example, <code>N = 1234567</code> and <code>k = 10</code>, and so the ratio of other operations, sorting over <code>nlargest</code>, is roughly:</p>
+<pre><code>&gt;&gt;&gt; log2(1234567) / log2(10)
+6.0915146640862625
+</code></pre>
+<p>That this is close to 6 is purely coincidence ;-)  It's the qualitative point that matters:  the overhead of using a key function is much more significant for <code>nlargest</code> than for sorting randomly ordered data, provided <code>k</code> is much smaller than <code>N</code>.</p>
+<p>In fact, that greatly understates the relative burden for <code>nlargest</code>, because the <code>O(log2(k))</code> <code>heapreplace</code> is called in the latter only when the next element is larger than the <code>k</code>'th largest seen so far.  Most of the time it isn't, and so the loop on such an iteration is nearly pure overhead, calling a Python-level key function just to discover that the result isn't interesting.</p>
+<p>Quantifying that is beyond me, though; for example, on my Win10 box under Python 3.6.5, I only see a timing difference in your code a bit less than a factor of 3.  That doesn't surprise me - calling a Python-level function is <em>much</em> more expensive than poking a list iterator and doing an integer compare (both "at C speed").</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The extra overhead of calling <code>lambda n: n</code> so many times is really just that expensive.</p>
+<pre><code>In [17]: key = lambda n: n
+
+In [18]: x = [random() for _ in range(1234567)]
+
+In [19]: %timeit nlargest(10, x)
+33.1 ms ± 2.71 ms per loop (mean ± std. dev. of 7 runs, 10 loops each)
+
+In [20]: %timeit nlargest(10, x, key=key)
+133 ms ± 3.7 ms per loop (mean ± std. dev. of 7 runs, 10 loops each)
+
+In [21]: %%timeit
+    ...: for i in x:
+    ...:     key(i)
+    ...: 
+93.2 ms ± 978 µs per loop (mean ± std. dev. of 7 runs, 10 loops each)
+
+In [22]: %%timeit
+    ...: for i in x:
+    ...:     pass
+    ...: 
+10.1 ms ± 298 µs per loop (mean ± std. dev. of 7 runs, 100 loops each)
+</code></pre>
+<p>As you can see, the cost of calling <code>key</code> on all the elements accounts for almost the entirety of the overhead.</p>
+<hr/>
+<p>Key evaluations are equally expensive for <code>sorted</code>, but because the total work of sorting is more expensive, the overhead of key calls is a smaller percentage of the total. You should have compared the absolute overhead of using a key with <code>nlargest</code> or <code>sorted</code>, rather than the overhead as a percentage of the base.</p>
+<pre><code>In [23]: %timeit sorted(x)
+542 ms ± 13.5 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+
+In [24]: %timeit sorted(x, key=key)
+683 ms ± 12.1 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+</code></pre>
+<p>As you can see, the cost of <code>key</code> calls accounts for about half the overhead of using this key with <code>sorted</code> on this input, the rest of the overhead probably coming from the work of shuffling more data around in the sort itself.</p>
+<hr/>
+<p>You might wonder how <code>nlargest</code> manages to do so little work per element. For the no-key case, most iteration happens in the following loop:</p>
+<pre><code>for elem in it:
+    if top &lt; elem:
+        _heapreplace(result, (elem, order))
+        top = result[0][0]
+        order -= 1
+</code></pre>
+<p>or for the case with a key:</p>
+<pre><code>for elem in it:
+    k = key(elem)
+    if top &lt; k:
+        _heapreplace(result, (k, order, elem))
+        top = result[0][0]
+        order -= 1
+</code></pre>
+<p>The crucial realization is that the <code>top &lt; elem</code> and <code>top &lt; k</code> branches are almost never taken. Once the algorithm has found 10 fairly large elements, most of the remaining elements are going to be smaller than the 10 current candidates. On the rare occasions where a heap element needs to be replaced, that just makes it even harder for further elements to pass the bar needed to call <code>heapreplace</code>.</p>
+<p>On a random input, the number of heapreplace calls <code>nlargest</code> makes is expected logarithmic in the size of the input. Specifically, for <code>nlargest(10, x)</code>, aside from the first 10 elements of <code>x</code>, element <code>x[i]</code> has a <code>10/(i+1)</code> probability of being in the top 10 elements of <code>l[:i+1]</code>, which is the condition necessary for a heapreplace call. By linearity of expectation, the expected number of heapreplace calls is the sum of these probabilities, and that sum is O(log(len(x))). (This analysis holds with 10 replaced by any constant, but a slightly more sophisticated analysis is needed for a variable <code>n</code> in <code>nlargest(n, l)</code>.)</p>
+<p>The performance story would be very different for a sorted input, where every element would pass the <code>if</code> check:</p>
+<pre><code>In [25]: sorted_x = sorted(x)
+
+In [26]: %timeit nlargest(10, sorted_x)
+463 ms ± 26 ms per loop (mean ± std. dev. of 7 runs, 1 loop each)
+</code></pre>
+<p>Over 10 times as expensive as the unsorted case!</p>
+</div>
+<span class="comment-copy">What Python version are you on?</span>
+<span class="comment-copy">@user2357112  Python 3.7 (saw same in 3.6.4)</span>
+<span class="comment-copy">Trying to run this with line_profiler suggests that it really should be about a 30% hit (the iteration, lambda, and comparison each take up about 30% of the time). So, I guess in this case the extra overhead of running the profiler is changing things.</span>
+<span class="comment-copy">@wim: No, the iterator is advanced by the list comprehension, so the subsequent loop doesn't re-consider those elements.</span>
+<span class="comment-copy">Correct, thanks!</span>
+<span class="comment-copy">Nope.  It's called exactly once per input element.  In <code>for elem in it:</code>, the iterator (<code>it</code>) has already advanced beyond the first <code>k</code> elements thanks to the earlier <code>zip</code>.</span>
+<span class="comment-copy">Looks right. I should have clicked that <code>nlargest(1234567, data)</code> is essentially a sort (with reverse=True), and tried that. Now I see <code>max</code> and <code>min</code> with keyfunc take the same huge hit.</span>

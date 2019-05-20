@@ -1,0 +1,123 @@
+<div class="post-text" itemprop="text">
+<p>I have an large script where i found out that lot of connections to a machine are left open and the reason was that for one of the class destructor was never getting called. </p>
+<p>below is a simplified version of script manifesting the issue. 
+I tiered searching around and found out that it could be because of GC and weakref does help but in this case no help.</p>
+<p>2 cases where i can see that the destructor is getting called are</p>
+<ol>
+<li><p>If i call B_class object without passing A_class function</p>
+<pre><code>self.b = B_class("AA")
+</code></pre></li>
+<li><p>I call the make the B_class objects not global i.e not use self</p>
+<pre><code>b = B_class("AA",self.myprint)
+b.do_something()
+</code></pre></li>
+</ol>
+<p>Both of these cases will cause further issues for my case. Last resort will be to close/del the objects at the end myself but i don't want to go that way.</p>
+<p>can anybody suggest a better way out of this and help me understand this issue? Thanks in advance.</p>
+<pre><code>import weakref
+
+
+class A_class:
+
+    def __init__(self,debug_level=1,version=None):
+        self.b = B_class("AA",self.myprint)
+        self.b.do_something()
+
+    def myprint(self, text):
+        print text
+
+class B_class:
+
+    def __init__(self,ip,printfunc=None):
+        self.ip=ip
+        self.new_ip =ip
+        #self.printfunc = printfunc
+        self.printfunc = weakref.ref(printfunc)()
+    def __del__(self):
+        print("##B_Class Destructor called##")
+
+    def do_something(self,timeout=120):
+        self.myprint("B_Class ip=%s!!!" % self.new_ip)
+
+    def myprint(self,text):
+        if self.printfunc:
+            print ("ExtenalFUNC:%s" %text)
+        else:
+            print ("JustPrint:%s" %text)
+
+def _main():
+  a = A_class()
+
+if __name__ == '__main__':
+    _main()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You're not using the <code>weakref.ref</code> object properly. You're calling it immediately after it is created, which returns the referred-to object (the function passed in as <code>printref</code>).</p>
+<p>Normally, you'd want to save the weak reference and only call it when you're going to use the reffered-to object (e.g. in <code>myprint</code>). However, that won't work for the bound method <code>self.myprint</code> you're getting passed in as <code>printfunc</code>, since the bound method object doesn't have any other references (every access to a method creates a new object).</p>
+<p>If you're using Python 3.4 or later and you know that the object passed in will always be a bound method, you can use the <a href="https://docs.python.org/3/library/weakref.html#weakref.WeakMethod" rel="nofollow"><code>WeakMethod</code> class</a>, rather than a regular <code>ref</code>. If you're not sure what kind of callable you're going to get, you might need to do some type checking to see if <code>WeakMethod</code> is required or not.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Use Python's "with" statement (<a href="http://www.python.org/dev/peps/pep-0343/" rel="nofollow">http://www.python.org/dev/peps/pep-0343/</a>).
+It creates a syntactic scope and the <strong>__exit__</strong> function which it creates <strong>is guaranteed to get called as soon as execution leaves the scope</strong>.  You can also emulate "__enter__/__exit__" behavior by creating a generator with "contextmanager" decorator from the contextlib module (python 2.6+ or 2.5 using "from __future__ import with_statement" see PEP for examples).</p>
+<p>Here's an example from the PEP:</p>
+<pre><code>import contextlib
+
+@contextlib.contextmanger
+def opening(filename):
+   f = open(filename) # IOError is untouched by GeneratorContext
+   try:
+       yield f
+   finally:
+       f.close() # Ditto for errors here (however unlikely)
+</code></pre>
+<p>and then in your main code, you write</p>
+<pre><code>with opening(blahblahblah) as f:
+    pass
+    # use f for something
+# here you exited the with scope and f.close() got called
+</code></pre>
+<p>In your case, you'll want to use a different name (connecting or something) instead of "opening" and do socket connecting/disconnecting inside of your context manager.</p>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>self.printfunc = weakref.ref(printfunc)()
+</code></pre>
+<p>isn't actually using <code>weakref</code>s to solve your problem; the line is effectively a noop. You create a <code>weakref</code> with <code>weakref.ref(printfunc)</code>, but you follow it up with call parens, which converts back from <code>weakref</code> to a strong ref which you store (and the <code>weakref</code> object promptly disappears). Apparently it's not possible to store a <code>weakref</code> to the bound method itself (because the bound method is its own object created each time it's referenced on <code>self</code>, not a cached object whose lifetime is tied to <code>self</code>), so you have to get a bit hacky, unbinding the method so you can take a <code>weakref</code> on the object itself. Python 3.4 introduced <a href="https://docs.python.org/3/library/weakref.html#weakref.WeakMethod" rel="nofollow"><code>WeakMethod</code></a> to simplify this, but if you can't use that, then you're stuck doing it by hand.</p>
+<p>Try changing it to (on Python 2.7, and you must <code>import inspect</code>):</p>
+<pre><code># Must special case printfunc=None, since None is not weakref-able
+if printfunc is None:
+    # Nothing provided
+    self.printobjref = self.printfuncref = None
+elif inspect.ismethod(printfunc) and printfunc.im_self is not None:
+    # Handling bound method
+    self.printobjref = weakref.ref(printfunc.im_self)
+    self.printfuncref = weakref.ref(printfunc.im_func)
+else:
+    self.printobjref = None
+    self.printfuncref = weakref.ref(printfunc)
+</code></pre>
+<p>and change <code>myprint</code> to:</p>
+<pre><code>def myprint(self,text):
+    if self.printfuncref is not None:
+        printfunc = self.printfuncref()
+        if printfunc is None:
+            self.printfuncref = self.printobjref = None  # Ref died, so clear it to avoid rechecking later
+        elif self.printobjref is not None:
+            # Bound method not known to have disappeared
+            printobj = self.printobjref()
+            if printobj is not None:
+                print ("ExtenalFUNC:%s" %text)  # To call it instead of just saying you have it, do printfunc(printobj, text)
+                return
+            self.printobjref = self.printfuncref = None  # Ref died, so clear it to avoid rechecking later
+        else:
+            print ("ExtenalFUNC:%s" %text)  # To call it instead of just saying you have it, do printfunc(text)
+            return
+    print ("JustPrint:%s" %text)        
+</code></pre>
+<p>Yeah, it's ugly. You could factor out the ugly if you like (borrowing <a href="https://hg.python.org/cpython/file/tip/Lib/weakref.py" rel="nofollow">the implementation of <code>WeakMethod</code> from Python 3.4's source code</a> would make sense, but names would have to change; <code>__self__</code> is <code>im_self</code> in Py2, <code>__func__</code> is <code>im_func</code>), but it's unpleasant even so. It's definitely not thread safe if the <code>weakref</code>s could actually go dark, since the checks and clears of the <code>weakref</code> members aren't protected.</p>
+</div>
+<span class="comment-copy">Thanks a lot for the reply!.. But there is an issue in this...by the time do_something() is called the weakref is already dead and basically printfunc is never used &lt;weakref at 0235CA50; dead&gt; ...is there a workaround this?</span>
+<span class="comment-copy">Yeah, it looks like the problem is that the bound method itself is being collected as soon as it is no longer referenced, rather than as soon as the object it's bound to is collected. And virtually any simple mechanism for keeping it alive would create a cycle in a different way. The best solution I can come up with is unbinding the method when you receive it to split it into the instance and the function. I'll update to include that option, but it's ugly.</span>
+<span class="comment-copy">Thanks again!...can you update how can i do that(unbinding the method when you receive it to split it into the instance and the function)?</span>
+<span class="comment-copy">I just did so. Hope it helps; it's decidedly sub-optimal in terms of code readability/complexity though, so (as I note), it might make sense to backport Python 3.4+'s <code>weakref.WeakMethod</code> class to simplify it.</span>
+<span class="comment-copy">I'll note, if you can avoid using <code>__del__</code> by switching to using context management, that's probably a better option (since it means you can just let the cyclic garbage collector handle cycles). Similarly, if you can move to Python 3.4 or higher, <a href="https://docs.python.org/3/whatsnew/3.4.html#pep-442-safe-object-finalization" rel="nofollow noreferrer">object finalization has been fixed</a> so cycles wouldn't be a problem even with a <code>__del__</code> involved.</span>

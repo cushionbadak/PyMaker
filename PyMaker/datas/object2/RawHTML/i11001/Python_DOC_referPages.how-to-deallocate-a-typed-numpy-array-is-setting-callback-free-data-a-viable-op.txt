@@ -1,0 +1,70 @@
+<div class="post-text" itemprop="text">
+<p>While using an open source Cython library I found a memory leak. The leak seems to come from a typed numpy array, which is not freed from the memory when it goes out of scope. The declaration is the following:</p>
+<pre><code>cdef np.ndarray[object, ndim=1] my_array = np.empty(my_size, dtype=object)
+</code></pre>
+<p>In my understanding, this should be considered by the garbage collector like any other numpy array and the GC should free its memory as soon as the array goes out of scope -- in this case at the end of the function in which it is declared. Apparently this does not happen. </p>
+<p>If the array were created using a cython array first, and then casting it to numpy array, one could use the callback_free_data function like described <a href="https://groups.google.com/forum/#!topic/cython-users/p2l2JsxdHJ0" rel="nofollow">here</a> and <a href="http://docs.cython.org/src/userguide/memoryviews.html#cython-arrays" rel="nofollow">here</a>. However, in this case it is not possible to reach the pointers of <code>my_array</code> and it is not possible to set the callback. </p>
+<p>Any idea on why this kind of declaration could cause a memory leak and/or how to force the deallocation?</p>
+<p><strong>Update:</strong></p>
+<p>My question was very generic, and I wanted to avoid posting the code because it is a bit intricate, but since someone asked here we go: </p>
+<pre><code>cdef dijkstra(Graph G, int start_idx, int end_idx):
+
+    # Some code
+
+    cdef np.ndarray[object, ndim=1] fiboheap_nodes = np.empty([G.num_nodes], dtype=object) # holds all of our FiboHeap Nodes Pointers
+
+    Q = FiboHeap()
+
+    fiboheap_nodes[start_idx] = Q.insert(0, start_idx)
+
+    # Some other code where it could perform operations like:
+    # Q.decrease_key(fiboheap_nodes[w], vw_distance)
+
+    # End of operations
+
+    # do we need to cleanup the fiboheap_nodes array here?
+
+    return
+</code></pre>
+<p>The <code>FiboHeap</code> is a Cython wrapper for the c implementation. For example, the insert function looks like this:</p>
+<pre><code>cimport cfiboheap
+from cpython.pycapsule cimport PyCapsule_New, PyCapsule_GetPointer
+from python_ref cimport Py_INCREF, Py_DECREF 
+
+cdef inline object convert_fibheap_el_to_pycapsule(cfiboheap.fibheap_el* element):
+    return PyCapsule_New(element, NULL, NULL)
+
+cdef class FiboHeap:
+
+    def __cinit__(FiboHeap self):
+        self.treeptr = cfiboheap.fh_makekeyheap()
+        if self.treeptr is NULL:
+            raise MemoryError()
+
+    def __dealloc__(FiboHeap self):
+        if self.treeptr is not NULL:
+            cfiboheap.fh_deleteheap(self.treeptr)
+
+    cpdef object insert(FiboHeap self, double key, object data=None):
+        Py_INCREF(data)
+        cdef cfiboheap.fibheap_el* retValue = cfiboheap.fh_insertkey(self.treeptr, key, &lt;void*&gt;data)
+        if retValue is NULL:
+            raise MemoryError()
+
+        return convert_fibheap_el_to_pycapsule(retValue)
+</code></pre>
+<p>The <code>__dealloc__()</code> function works as it is supposed to, so the FiboHeap is released from the memory at the end of the function <code>dijkstra(...)</code>. My guess is that something is going wrong with the pointers contained in fiboheap_nodes.
+Any guess?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem (solved in the comments) turned out not to be the deallocation of the numpy array. Instead, the numpy array held a bunch of <code>Fiboheap</code> objects, which themselves held pointers to a bunch of Python objects. It's these objects that weren't freed.</p>
+<p>When the Python object pointers in the <code>Fiboheap</code> were acquired (in <code>insert</code>) their reference count was incremented to ensure they were kept alive. However, when the <code>Fiboheap</code> was destroyed (in <code>__dealloc__</code>) the reference count of the Python objects it held was not decreased, causing the memory leak. The solution is to ensure that <code>Py_DECREF</code> is called on all the held Python objects during <code>__dealloc__</code>.</p>
+<hr/>
+<p>There's potentially a second, more challenging problem waiting to appear: it might be possible for the objects held by the <code>Fiboheap</code> to themselves contain a reference back to the <code>Fiboheap</code>, maybe indirectly. Python uses the function <a href="https://docs.python.org/3/c-api/typeobj.html#c.PyTypeObject.tp_traverse" rel="nofollow"><code>tp_tranverse</code></a> to find these loops and <code>tp_clear</code> to break them. Cython will automatically generate a <code>tp_traverse</code> for its <code>cdef</code> classes, however since it has no way of knowing about the Python object pointers hidden within the C <code>Fiboheap</code> structure it won't handle these correctly (maybe generating another memory leak).</p>
+<p>This is a probably unlikely to happen in reality, so may not be worth worrying about, but it's something to be aware of. A <a href="https://groups.google.com/forum/#!topic/cython-users/OW3z9HsxlNI" rel="nofollow">newsgroup post</a> describes a means of generating custom <code>tp_traverse</code> functions in Cython. For most applications this should not be necessary - it's only the mixture of Cython <code>object</code> and <code>PyObject*</code> that makes it slightly possible here.</p>
+</div>
+<span class="comment-copy">It really should be freed. By far the most likely explanation is that a reference to it has been kept elsewhere. Given it's an <code>object</code> array, it's not completely impossible that it contains a circular reference to itself (in which case a call to <code>gc.collect()</code> might work).</span>
+<span class="comment-copy">Other than that you'd probably have to post the code (or a pointer to the open source library in question) to get a useful answer (preferably in a minimal complete form). Or at very least a more detailed description - is this a global variable, a local function variable, a member of a class... etc?</span>
+<span class="comment-copy">I tried <code>gc.collect()</code> already and it does not work. It appears in this weird cases (arrays containing object pointers), the gc does not behave deterministically (see <a href="http://stackoverflow.com/questions/15974561/i-cant-get-dealloc-be-called-when-deleting-an-object">this</a>).</span>
+<span class="comment-copy">My first thought is that this might be related to <code>tp_traverse</code> (the function used by the garbage collector to find cycles) - Cython apparently generates it automatically, but it won't know about the pointers contained in the C <code>fiboheap</code>. I found this link <a href="https://groups.google.com/forum/#!topic/cython-users/OW3z9HsxlNI" rel="nofollow noreferrer">groups.google.com/forum/#!topic/cython-users/OW3z9HsxlNI</a> but actually doing it looks difficult... (I may have a go sometime later, possibly)</span>
+<span class="comment-copy">Another thought - in the code you've shown the objects aren't getting their reference decreased when <code>FiboHeap</code> is deallocated. If that code is complete you certainly have a memory leak for the objects stored on the heap.</span>

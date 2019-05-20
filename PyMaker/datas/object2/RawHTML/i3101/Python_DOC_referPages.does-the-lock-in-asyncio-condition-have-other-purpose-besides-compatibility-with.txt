@@ -1,0 +1,42 @@
+<div class="post-text" itemprop="text">
+<p>I'd like to ask about <a href="https://docs.python.org/3/library/asyncio-sync.html#condition" rel="nofollow noreferrer">asyncio.Condition</a>. I'm not familiar with the concept, but I know and understand locks, semaphores, and queues since my student years.</p>
+<p>I could not find a good explanation or typical use cases, just <a href="https://pymotw.com/3/asyncio/synchronization.html" rel="nofollow noreferrer">this example</a>. I looked at the source. The core fnctionality is achieved with a FIFO of futures. Each waiting coroutine adds a new future and awaits it. Another coroutine may call <code>notify()</code> which sets the result of one or optionally more futures from the FIFO and that wakes up the same number of waiting coroutines. Really simple up to this point.</p>
+<p>However, the implementation and the usage is more complicated than this. A waiting coroutine must first acquire a lock associated with the condition in order to be able to wait (and the <code>wait()</code> releases it while waiting). Also the notifier must acquire a lock to be able to notify(). This leads to <code>with</code> statement before each operation:</p>
+<pre><code>async with condition:
+    # condition operation (wait or notify)
+</code></pre>
+<p>or else a <code>RuntimeError</code> occurrs.</p>
+<p>I do not understand the point of having this lock. What resource do we need to protect with the lock? In asyncio there could be always only one coroutine executing in the event loop, there are no "critical sections" as known from threading. </p>
+<p>Is this lock really needed (why?) or is it for compatibility with threading code only?</p>
+<p>My first idea was it is for the compatibility, but in such case why didn't they remove the lock while preserving the usage? i.e. making</p>
+<pre><code>async with condition:
+</code></pre>
+<p>basically an optional no-op.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The answer for this is essentially the same as for <a href="https://stackoverflow.com/questions/7424590/threading-condition-vs-threading-event">threading.Condition vs threading.Event</a>; a condition <em>without</em> a lock is an event, not a condition<sup>(*)</sup>.</p>
+<p>Conditions are used to signal that a resource is available. Whomever was waiting for the condition, can <strong>use that resource until they are done with it</strong>. To ensure that no-one else can use the resource, you need to <em>lock</em> the resource:</p>
+<pre><code>resource = get_some_resource()
+
+async with resource.condition:
+    await resource.condition.wait()
+    # this resource is mine, no-one will touch it
+    await resource.do_something_async()
+
+# lock released, resource is available again for the next user
+</code></pre>
+<p>Note how the lock is not released after <code>wait()</code> resumes! Until the lock is released, no other co-routine waiting for the same condition can proceed, access to the resource is made exclusive by virtue of the lock. Note that the lock is released while waiting, so other coroutines can add themselves to the queue, but for <code>wait()</code> to finally return the lock must first be re-acquired.</p>
+<p>If you don't need to coordinate access to a shared resource, use an event; a condition is basically a lock and event combined into one primitive, avoiding common implementation pitfalls.</p>
+<p>Note that multiple conditions can <em>share locks</em>. This would let you signal specific stages, and other coroutines can wait for that specific stage to arrive. The shared lock would coordinate access to a single resource, but different conditions are signalled when each stage is initiated.</p>
+<p>For threading, the typical use-case for conditions offered is that of a single producer, and multiple consumers all waiting on items from the producer to process. The work queue is the shared resource, the producer acquires the condition lock to push an item into the queue and then call <code>notify()</code>, at which point the next consumer waiting on the condition is given the lock (as it returns from <code>wait()</code>) and can remove the item from the queue to work on. This doesn't quite translate to a coroutine-based application, as coroutines don't have the sitting-idle-waiting-for-work-to-be-done problems threading systems have, it's much easier to just spin up consumer co-routines as needed (with perhaps a semaphore to impose a ceiling).</p>
+<p>Perhaps a better example is the <a href="https://github.com/bamthomas/aioimaplib" rel="nofollow noreferrer"><code>aioimaplib</code> library</a>, which supports IMAP4 transactions in full. These transactions are asynchronous, but you need to have access to the shared connection resource. So the library uses a single Condition object and <code>wait_for()</code> to wait for a specific state to arrive and thus give exclusive connection access to the coroutine waiting for that transaction state.</p>
+<hr/>
+<p><sup>(*)</sup>: Events have a different use-case from conditions, and thus behave a little different from a condition without locking. Once set, an event needs to be cleared explicitly, while a condition 'auto-clears' when used, and is never 'set' when no-one is waiting on the condition. But if you want to signal between tasks and don't need to control access to a shared resource, then you probably wanted an event.</p>
+</div>
+<span class="comment-copy">If you remove the lock, you have an <i>event</i>, and not a condition.</span>
+<span class="comment-copy"><i>In asyncio there could be always only one coroutine executing in the event loop, there are no "critical sections" as known from threading.</i> This holds only as long as the critical section doesn't <code>await</code>. It's true that with threads you must lock <i>everything</i> (or use atomic instructions), but in asyncio you still have to lock if there is a possibility of suspension, which there is whenever an <code>await</code> is present.</span>
+<span class="comment-copy">@MartijnPieters I will study your full answer tomorrow, but I'd like to react to your comment. There is a difference: <code>Event</code>: - if <code>set()</code> is called before <code>await wait()</code>, the wait returns immediately. <code>Condition</code>: if <code>notify()</code> is called before <code>await.wait()</code>, the wait blocks. I think the lock is not involved in this, that's why a condition without the lock differs from event.</span>
+<span class="comment-copy">@VPfB: of course the lock is involved in this, since you can't wait or notify without the lock.</span>
+<span class="comment-copy">@VPfB: Yes, events and conditions differ a little more, i was simplifying. If you were to implement something like a condition primitive using events and locks, you'd have to make sure the event was cleared before waiting, and to clear the event each time <code>wait()</code> returns. And if you don't need locking, then you were probably looking for events and not conditions.</span>
+<span class="comment-copy">Thank you @MartinjPieters. Good usage examples explained my question well. Now I see the description in the docs <i>"A condition variable allows one or more coroutines to wait until they are notified by another coroutine."</i> is not the whole picture. The similarity between Event and Condition (with or "without" the lock) is still not so big in my eyes, but never mind.</span>
+<span class="comment-copy">@VPfB: conditions and events is a common comparison to make, because most people confused about the condition lock requirement really just wanted events instead; e.g. to signal from one task (or thread) to another that something has taken place. Conditions are specialised events in that way, tied to a shared resource. "I want to use this resource, but only when this thing I am waiting for has taken place" sounds a lot like an event, doesn't it?</span>

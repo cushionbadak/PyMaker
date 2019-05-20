@@ -1,0 +1,87 @@
+<div class="post-text" itemprop="text">
+<p>I use behave for running our gherkin based test suite, with a custom runner that handles running behave in parallel.</p>
+<p>This functions perfectly on my local (Windows 8.1) machine, and allows me to change environment variables within my subprocesses, using os.environ.update</p>
+<p>This fails on our Ubuntu 14.04 server and is not able to change the environment variables, which coincide with database names for each test to run under. Some stripped out code for what I am doing follows:</p>
+<pre><code>def create_database(name):
+    #create a postgres database, this works.    
+    return "our_test_database_%s" % name
+
+def drop_database(name):
+    #drop a postgres database, also works
+    return name
+
+def get_features():
+    return [feature for feature in os.listdir(features) if feature.endswith(".feature")
+
+def main():
+    manager = multiprocessing.Manager()
+    databases = manager.Queue()
+    cpu_count = multiprocessing.cpu_count()
+
+    for i in range(cpu_count):
+        databases.put(create_database(str(i)))
+
+    pool = multiprocessing.Pool(processes=cpu_count, maxtaskperchild=1)
+    results = pool.map(run_test, (feature, databases for feature in features), chunksize=1)
+
+    while database = databases.get_nowait():
+        drop_database(database)
+
+def run_test(feature, databases):
+    database = databases.get(block=True)
+    os.environ.update({
+        'DATABASE_URL': database
+    })
+
+    config = behave.configuration.Configuration(("--no-logcapture", "--tags=~@skip", "-f", "plain", feature))
+    runner = behave.runner.Runner(config)
+    failed = runner.run()
+
+    databases.put(database)
+</code></pre>
+<p>Inside behave, we use the database in testing our Flask application. Flask is unable to find the set environment variable when running. </p>
+<p>EDIT: I dont know what changed, we are using the same version of Python on the server and my machine, and the same version of all known used packages. Environment variables are not being updated properly, and are therefore not accessible in later code.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Well, you could avoid using a <code>multiprocessing.Manager()</code> altogether, by using the <code>initializer</code> keyword argument to <code>multiprocessing.Pool</code> to pass a normal <code>multiprocessing.Queue</code> to all the workers:</p>
+<pre><code>def main():
+    databases = multiprocessing.Queue()
+    cpu_count = multiprocessing.cpu_count()
+
+    for i in range(cpu_count):
+        databases.put(create_database(str(i)))
+
+    pool = multiprocessing.Pool(processes=cpu_count, maxtasksperchild=1, 
+                                initializer=init, initargs=(databases,))
+    results = pool.map(run_test, features, chunksize=1)
+
+    while database = databases.get_nowait():
+        drop_database(database)
+
+def init(dbs):
+    global databases
+    databases = dbs
+
+def run_test(feature):
+    database = databases.get(block=True)  # databases will be defined in the global namespace
+    os.environ.update({
+        'DATABASE_URL': database
+    })
+
+    config = behave.configuration.Configuration(("--no-logcapture", "--tags=~@skip", "-f", "plain", feature))
+    runner = behave.runner.Runner(config)
+    failed = runner.run()
+</code></pre>
+<p>This doesn't really address whatever is going on with the <code>Manager</code>, but will let you avoid the issue (assuming the <code>Manager</code> is  the real root cause).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The real problem came in my <code>get_features()</code> function.</p>
+<p>The actual code used was a fair bit more complicated, and used behave's dry run to get a list of all unskipped scenarios in my feature files. Seemingly, this dry run imported our flask application.</p>
+<p>On windows, multiprocessing.Process does not share the sys.modules space with the parent process, on linux this is not the case. As the application was being imported in the parent process context, the children were all reusing that imported and configured flask app.</p>
+<p>This is documented at <a href="https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods" rel="nofollow">https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods</a></p>
+<p>On Python3, multiprocessing.set_start_method('spawn') can be used to configure this to work on Linux, instead of forking. On windows, spawn is the default, hence why it worked there</p>
+<p>Python2 does not have this option, however, and I am looking into another solution to run this and collect the scenario list to run</p>
+</div>
+<span class="comment-copy">You said that this worked on Windows, but fails on Ubuntu? Did it ever work on Ubuntu? Does it fail now on Windows?</span>
+<span class="comment-copy">Used to work on Ubuntu 14.04. We run from jenkins CI, it started failing monday for some reason, after 190+ successful builds. It fails the same way run directly command line as when running under jenkins</span>
+<span class="comment-copy">You were right, Manager wasnt the cause. I dont know what could have changed, but the updated environment variables are no longer being set.</span>

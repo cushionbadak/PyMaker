@@ -1,0 +1,112 @@
+<div class="post-text" itemprop="text">
+<p>There are a couple of ways to construct a dictionary in python, for example:</p>
+<pre><code>keyvals = [('foo', 1), ('bar', 'bar'), ('baz', 100)]
+
+dict(keyvals)
+</code></pre>
+<p>and</p>
+<pre><code>dkwargs = {'foo': 1, 'bar': 'bar', 'baz': 100}
+
+dict(**dkwargs)
+</code></pre>
+<p>When you benchmark these</p>
+<pre><code>In [0]: %timeit dict(keyvals)
+667 ns ± 38 ns per loop (mean ± std. dev. of 7 runs, 1000000 loops each)
+
+In [1]: %timeit dict(**dkwargs)
+225 ns ± 7.09 ns per loop (mean ± std. dev. of 7 runs, 1000000 loops each)
+</code></pre>
+<p>you see that the first method is almost 3x slower than the second. Why is this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>dict(**kwargs)</code> passes in a ready-made dictionary, so Python can just copy an already existing internal structure.</p>
+<p>A list of tuples, on the other hand, requires iteration, validation, hashing and slotting the results into a fresh, empty table. That's not nearly as fast.</p>
+<p>A Python dictionary is implemented as a <a href="https://en.m.wikipedia.org/wiki/Hash_table" rel="nofollow noreferrer">hash table</a>, and is grown <em>dynamically</em> as keys are added over time; they start small and as the need arises a new, larger hash table is constructed, data (keys, values and hashes) are copied across. That’s all invisible from Python code but resizing takes time. But when you use <code>dict(**kwargs)</code> (or <code>dict(other_dict)</code> CPython (the default Python implementation you used to test with) can take a shortcut: <em>start with a hash table that’s big enough immediately</em>. You can’t do that same trick with a sequence of tuples, because you can’t know up front if there won’t be duplicate keys in the sequence.</p>
+<p>For more details, see the C source code of the <code>dict</code> type, specifically <a href="https://github.com/python/cpython/blob/f3267144269b873bcb87a9fcafe94b37be1bcfdc/Objects/dictobject.c#L2230-L2262" rel="nofollow noreferrer"><code>dict_update_common</code> implementation</a> (which is called from <a href="https://github.com/python/cpython/blob/f3267144269b873bcb87a9fcafe94b37be1bcfdc/Objects/dictobject.c#L3176-L3180" rel="nofollow noreferrer"><code>dict_init()</code></a>); this calls either <code>PyDict_MergeFromSeq2()</code> for the sequence-of-tuples case, or calls <code>PyDict_Merge()</code> when keyword arguments are passed in.</p>
+<p>The <a href="https://github.com/python/cpython/blob/master/Objects/dictobject.c#L2275-L2361" rel="nofollow noreferrer"><code>PyDict_MergeFromSeq2()</code> function</a> iterates over the sequence, tests each result to make sure there are two elements, then essentially calls <code>.__setitem__(key, value)</code> on the dictionary. This may need to resize the dictionary at some point!</p>
+<p>The <code>PyDict_Merge()</code> function (via <code>dict_merge()</code>) specifically detects if a regular dictionary was passed in, then <a href="https://github.com/python/cpython/blob/master/Objects/dictobject.c#L2393-L2445" rel="nofollow noreferrer">executes a fast path</a> that resizes the internal structures <em>once</em>, and then copies across the hashes and structure from the original dictionary directly using <code>insertdict()</code> calls (follow the <code>override == 1</code> path, as <code>override</code> has been set to <code>1</code> when the target dictionary is empty, which is always the case for <code>dict(**kwargs)</code>). Just resizing once and using internal data directly is a lot faster, far less work needs to be done!</p>
+<p>All of this is an implementation detail specific to CPython. Other Python implementations such as Jython, IronPython and PyPy can make their own decisions on how the internals of the <code>dict</code> type work, and will show different performance differences for the same operations. </p>
+</div>
+<div class="post-text" itemprop="text">
+<h3>Short answer (TL;DR)</h3>
+<p>This is because in the first test the CPython implementation of <code>dict</code> will create a new dict from the list, but the second only copies the dictionary. Copying takes less time than parsing the list. </p>
+<h3>Additional info</h3>
+<p>Consider this code:</p>
+<pre><code>import dis
+dis.dis("dict([('foo', 1), ('bar', 'bar'), ('baz', 100)])", depth=10)
+print("------------")
+dis.dis("dict({'foo': 1, 'bar': 'bar', 'baz': 100})", depth=10)
+</code></pre>
+<p>Where </p>
+<blockquote>
+<p>The dis module supports the analysis of CPython bytecode by
+  disassembling it.</p>
+</blockquote>
+<p>Which lets us see the bytecode operations performed. Output shows</p>
+<pre><code>  1           0 LOAD_NAME                0 (dict)
+              2 LOAD_CONST               0 (('foo', 1))
+              4 LOAD_CONST               1 (('bar', 'bar'))
+              6 LOAD_CONST               2 (('baz', 100))
+              8 BUILD_LIST               3
+             10 CALL_FUNCTION            1
+             12 RETURN_VALUE
+------------
+  1           0 LOAD_NAME                0 (dict)
+              2 LOAD_CONST               0 (1)
+              4 LOAD_CONST               1 ('bar')
+              6 LOAD_CONST               2 (100)
+              8 LOAD_CONST               3 (('foo', 'bar', 'baz'))
+             10 BUILD_CONST_KEY_MAP      3
+             12 CALL_FUNCTION            1
+             14 RETURN_VALUE
+</code></pre>
+<p>From the output you can see:</p>
+<ol>
+<li>Both calls need to load the <code>dict</code> name that is going to be called.</li>
+<li>After that, the first method loads a list to memory (<code>BUILD_LIST</code>) whereas the second builds a dictionary (<code>BUILD_CONST_KEY_MAP</code>) (see <a href="https://docs.python.org/3/library/dis.html#opcode-BUILD_CONST_KEY_MAP" rel="nofollow noreferrer">here</a>)</li>
+<li>For that reason, when the dict function is called (the <code>CALL_FUNCTION</code> step (see <a href="https://docs.python.org/3/library/dis.html#opcode-CALL_FUNCTION" rel="nofollow noreferrer">here</a>)), it takes much shorter in the second case, because the dictionary has been already created so it simply makes a copy instead of having to iterate over the list to create a hash table.</li>
+</ol>
+<p><em>Note</em>: with the bytecode you can't conclusively decide that <code>CALL_FUNCTION</code> does that, since its implementation is written in C and only by reading it you can actually know that (see Martijn Pieters' answer for an accurate explanation on how this part works). However, it helps see how the dictionary object is already created <em>outside</em> <code>dict()</code> (step-wise, not syntactically-wise in the example), while as for the list, this is not the case.</p>
+<h3>Edit</h3>
+<p>To be clear, when you say</p>
+<blockquote>
+<p>There are a couple of ways to construct a dictionary in python</p>
+</blockquote>
+<p>It is true that by doing:</p>
+<pre><code>dkwargs = {'foo': 1, 'bar': 'bar', 'baz': 100}
+</code></pre>
+<p>You are creating a dictionary, in the sense that the interpreter transforms an expression into a dictionary object stored in memory, and makes the variable <code>dkwargs</code> point to it. However, by doing: <code>dict(**kwargs)</code> or if you prefer <code>dict(kwargs)</code>, you are not really <em>creating a dictionary</em>, but just <em>copying</em> an already existing object (and it's important to emphasise <em>copying</em>): </p>
+<pre><code>&gt;&gt;&gt; dict(dkwargs) is dkwargs
+False
+</code></pre>
+<p><code>dict(kwargs)</code> forces Python to create a new object; however, that does not mean it has to <em>re-build</em> the object. In fact, that operation is useless because in practice they are equal objects (though not the same object).</p>
+<pre><code>&gt;&gt;&gt; id(dkwargs)
+2787648914560
+&gt;&gt;&gt; new_dict = dict(dkwargs)
+&gt;&gt;&gt; id(new_dict)
+2787652299584
+&gt;&gt;&gt; new_dict == dkwargs
+True
+&gt;&gt;&gt; id(dkwargs) is id(new_dict)
+False
+</code></pre>
+<p>Where id:</p>
+<blockquote>
+<p>Return the “identity” of an object. This is an integer which is guaranteed to be unique and constant for this object during its lifetime [...]</p>
+<p><strong>CPython implementation detail</strong>: This is the address of the object in memory.</p>
+</blockquote>
+<p>Unless, of course, you want to specifically duplicate the object in order to modify one so edits are not linked to the other reference.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>dkwargs is already a dictionary so you basically make a copy of it. That is why it is so much faster.</p>
+</div>
+<span class="comment-copy">Your answer is very good and accurate but it turns a bit complex towards the end, which can be rather unclear for the common reader.</span>
+<span class="comment-copy">Yet it is that part that matters if you want to know why there is such a big difference: internal implementation details.</span>
+<span class="comment-copy">True. But you are assuming the OP: 1. knows and can understanda shred of C (when they only asked about Python), 2. wants to read the CPython implementation code to actually believe that one way you copy the dictionary and the other way you parse the list and create it each time, which I personally consider that does not have to be neccesary.</span>
+<span class="comment-copy">That said, I really liked to read your answer; it is good - in fact I learned from it.</span>
+<span class="comment-copy">I’ve edited the answer to add a bit more exposition about dict internals, and why that matters here.</span>
+<span class="comment-copy">This doesn’t actually explain why the <code>dict()</code> calls with <i>already constructed objects</i> differ in speed.  The bytecode doesn’t illuminate anything as that’s not even correspond to what is being tested in the question.</span>
+<span class="comment-copy">@MartijnPieters What do you mean it does not correspond? It is the same operation, without the variable assignment, which is not neccessary to be analysed for this purpose.</span>
+<span class="comment-copy">The answer says why: "not creating a dictionary, but just copying an already existing object". What you mean is that the bytecode does not prove that <code>CALL_FUNCTION</code> does what I (and you) claim it to do. However, it does show how the dictionary is created before the function is called, and it reconciles with the argument if you take it as true.</span>
+<span class="comment-copy">In your explanation, you give good reasons why <code>CALL_FUNCTION</code> copies the already existing hash table structure; however, for me, those reasons are not necessarily understandable <i>or</i> relevant for some users. That is why I have given a simpler verbose explanation that can be grasped by more unexperienced users</span>
+<span class="comment-copy">Since both timed blocks execute <code>CALL_FUNCTION</code> on <code>dict</code> it is that very call itself that makes the difference. Since the call itself is handled entirely in C, there is actually nothing that can be said about how <code>dict()</code> performs by looking at bytecode.</span>

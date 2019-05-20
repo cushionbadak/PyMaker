@@ -1,0 +1,123 @@
+<div class="post-text" itemprop="text">
+<p>In Python 3, the <a href="https://docs.python.org/3/library/re.html" rel="nofollow"><code>re</code></a> module can be used with a <a href="https://docs.python.org/3/library/stdtypes.html#memoryview" rel="nofollow"><code>memoryview</code></a>:</p>
+<pre><code>~$ python3
+Python 3.2.3 (default, Feb 20 2013, 14:44:27)
+[GCC 4.7.2] on linux2
+Type "help", "copyright", "credits" or "license" for more information.
+&gt;&gt;&gt; x = b"abc"
+&gt;&gt;&gt; import re
+&gt;&gt;&gt; re.search(b"b", memoryview(x))
+&lt;_sre.SRE_Match object at 0x7f14b5fb8988&gt;
+</code></pre>
+<p>However, in Python 2, this does not seem to be the case:</p>
+<pre><code>~$ python
+Python 2.7.3 (default, Mar 13 2014, 11:03:55)
+[GCC 4.7.2] on linux2
+Type "help", "copyright", "credits" or "license" for more information.
+&gt;&gt;&gt; x = "abc"
+&gt;&gt;&gt; import re
+&gt;&gt;&gt; re.search(b"b", memoryview(x))
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+  File "/usr/lib/python2.7/re.py", line 142, in search
+    return _compile(pattern, flags).search(string)
+TypeError: expected string or buffer
+</code></pre>
+<p>I can cast the string to a <code>buffer</code>, but looking at the <a href="https://docs.python.org/2/library/functions.html?highlight=buffer#buffer" rel="nofollow">buffer documentation</a>, it doesn't mention exactly how a <code>buffer</code> works compared to a <code>memoryview</code>.</p>
+<p>Doing an empirical comparison shows that using a <code>buffer</code> object in Python 2 does not offer the performance benefits of using a <code>memoryview</code> in Python 3:</p>
+<pre><code>playground$ cat speed-test.py
+import timeit
+import sys
+
+print(timeit.timeit("regex.search(mv[10:])", setup='''
+import re
+regex = re.compile(b"ABC")
+PYTHON_3 = sys.version_info &gt;= (3, )
+if PYTHON_3:
+    mv = memoryview(b"Can you count to three or sing 'ABC?'" * 1024)
+else:
+    mv = buffer(b"Can you count to three or sing 'ABC?'" * 1024)
+'''))
+playground$ python2.7 speed-test.py
+2.33041596413
+playground$ python2.7 speed-test.py
+2.3322429657
+playground$ python3.2 speed-test.py
+0.381270170211792
+playground$ python3.2 speed-test.py
+0.3775448799133301
+playground$
+</code></pre>
+<p>If the <code>regex.search</code> argument is changed from <code>mv[10:]</code> to <code>mv</code>, Python 2's performance is roughly the same as Python 3's, but in the code I'm writing, there's lots of repeated string slicing.</p>
+<p>Is there a way to circumvent this issue in Python 2 while still having the zero-copy performance benefits of a <code>memoryview</code>?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The way that I understand the <a href="https://docs.python.org/2/library/functions.html#buffer" rel="nofollow">buffer object</a> in Python 2, you’re supposed to use it without slicing:</p>
+<pre><code>&gt;&gt;&gt; s = b"Can you count to three or sing 'ABC?'"
+&gt;&gt;&gt; str(buffer(s, 10))
+"unt to three or sing 'ABC?'"
+</code></pre>
+<p>So instead of slicing the resulting buffer, you use the buffer function directly to perform your slicing which results in a fast access to the substring you are interested in:</p>
+<pre><code>import timeit
+import sys
+import re
+
+r = re.compile(b'ABC')
+s = b"Can you count to three or sing 'ABC?'" * 1024
+
+PYTHON_3 = sys.version_info &gt;= (3, )
+if len(sys.argv) &gt; 1: # standard slicing
+    print(timeit.timeit("r.search(s[10:])", setup='from __main__ import r, s'))
+elif PYTHON_3: # memoryview in Python 3
+    print(timeit.timeit("r.search(s[10:])", setup='from __main__ import r, s; s = memoryview(s)'))
+else: # buffer in Python 2
+    print(timeit.timeit("r.search(buffer(s, 10))", setup='from __main__ import r, s'))
+</code></pre>
+<p>I got very similar results in Python 2 and 3 which suggests that using <code>buffer</code> like that with the <code>re</code> module has a similar effect as the newer <code>memoryview</code> (which then seems to be a lazily evaluated buffer):</p>
+<pre><code>$ python2 .\speed-test.py
+0.681979371561
+$ python3 .\speed-test.py
+0.5693422508853488
+</code></pre>
+<p>And as a comparison with standard string slicing:</p>
+<pre><code>$ python2 .\speed-test.py standard-slicing
+7.92006735956
+$ python3 .\speed-test.py standard-slicing
+7.817641705304309
+</code></pre>
+<hr/>
+<p>If you want to support the slice access (so that you can use the same syntax everywhere), you could easily create a type that dynamically creates a new buffer when you slice on it:</p>
+<pre><code>class slicingbuffer:
+    def __init__ (self, source):
+        self.source = source
+    def __getitem__ (self, index):
+        if not isinstance(index, slice):
+            return buffer(self.source, index, 1)
+        elif index.stop is None:
+            return buffer(self.source, index.start)
+        else:
+            end = max(index.stop - index.start, 0)
+            return buffer(self.source, index.start, end)
+</code></pre>
+<p>If you only use it with the <code>re</code> module, it could probably work as a direct drop-in replacement for <code>memoryview</code>. However, my tests show that this already gives you a large overhead. So you might want to do the opposite instead and wrap Python 3’s memoryview object in a wrapper that gives you the same interface as <code>buffer</code>:</p>
+<pre><code>def memoryviewbuffer (source, start, end = -1):
+    return source[start:end]
+
+PYTHON_3 = sys.version_info &gt;= (3, )
+if PYTHON_3:
+    b = memoryviewbuffer
+    s = memoryview(s)
+else:
+    b = buffer
+
+print(timeit.timeit("r.search(b(s, 10))", setup='from __main__ import r, s, b'))
+</code></pre>
+</div>
+<span class="comment-copy"><code>Memoryview</code> <a href="https://docs.python.org/2/library/stdtypes.html#memoryview-type" rel="nofollow noreferrer">supports the buffer protocol in Python 2</a>. I think the fundamental difference is how <code>re</code> gets the buffer pointer between <a href="https://github.com/python/cpython/blob/5056e0855c75d3213c67b934923fb63d983875f5/Modules/_sre.c#L1709-L1715" rel="nofollow noreferrer">Python 2</a> and <a href="https://github.com/python/cpython/blob/f36b73c02f10ebee365cb95d5704195fafaa0b76/Modules/_sre.c#L1692-L1699" rel="nofollow noreferrer">Python 3</a>. There is a PEP dedicate for this change -- have a look at <a href="https://www.python.org/dev/peps/pep-3118/" rel="nofollow noreferrer">PEP 3118</a>.</span>
+<span class="comment-copy">But why would you use <code>memoryview</code> in <code>re.search</code>? I don't think you'd get any performance benefits from it.  <code>~ » python3 -m timeit 'import re; x = b"abc"; re.search(b"b", memoryview(x))' 100000 loops, best of 3: 2.25 usec per loop</code> <code>~ » python3 -m timeit 'import re; x = b"abc"; re.search(b"b", x)'      1000000 loops, best of 3: 1.79 usec per loop</code></span>
+<span class="comment-copy">@SeyeongJeong , that's not a very good test. You're importing the "re" module every single loop, and on top of that, you're recreating a memoryview object every single invocation. In my use case, I'm repeatedly calling re.search at different offsets of a string. With <code>a_string[offset:]</code>, Python creates a new string every time, but with <code>a_memoryview[offset:]</code>, Python re-uses the existing buffer despite the end-user requesting a slice.</span>
+<span class="comment-copy">@SeyeongJeong , I've updated my post with a speed test that matches my scenario more closely than your tests.</span>
+<span class="comment-copy">Perfect. Thanks to the clarification on how to use buffer, my code is Performant in both Python 2 and 3. I originally had: <code>if self._memoryview:     target = self._memoryview else:     target = self.source_code  return target[self.offset:]</code> but now have <code>if self._memoryview:     return self._memoryview[self.offset:] else:     return buffer(self.source_code, self.offset)</code>.</span>
+<span class="comment-copy">I thought memoryview works on py27 as well.</span>
+<span class="comment-copy">@ikaros45 memoryview exists and works in the same way, but the <code>re</code> module does not work with a memoryview object.</span>
+<span class="comment-copy">@poke, interesting, thanks for pointing it out.</span>

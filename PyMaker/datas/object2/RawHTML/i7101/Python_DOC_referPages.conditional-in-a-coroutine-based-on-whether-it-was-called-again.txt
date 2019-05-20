@@ -1,0 +1,276 @@
+<div class="post-text" itemprop="text">
+<p>I am trying to translate this key "debouncing" logic from Javascript to Python. </p>
+<pre><code>function handle_key(key) {
+    if (this.state == null) {
+        this.state = ''
+    }
+    this.state += key
+    clearTimeout(this.timeout)
+    this.timeout = setTimeout(() =&gt; {
+        console.log(this.state)
+    }, 500)
+}
+
+handle_key('a')
+handle_key('b')
+</code></pre>
+<p>The idea is that subsequent key presses extend the timeout. The Javascript version prints:</p>
+<pre><code>ab 
+</code></pre>
+<p>I don't want to translate the JS timeout functions, I'd rather have idiomatic Python using asyncio. My attempt in Python (3.5) is below, but it doesn't work as <code>global_state</code> is not actually updated when I expect.</p>
+<pre><code>import asyncio
+
+global_state = ''
+
+@asyncio.coroutine
+def handle_key(key):
+    global global_state
+    global_state += key
+    local_state = global_state
+    yield from asyncio.sleep(0.5)
+    #if another call hasn't modified global_state we print it
+    if local_state == global_state:
+        print(global_state)
+
+@asyncio.coroutine
+def main():
+    yield from handle_key('a')
+    yield from handle_key('b')
+
+ioloop = asyncio.get_event_loop()
+ioloop.run_until_complete(main())
+</code></pre>
+<p>It prints: </p>
+<pre><code>a
+ab
+</code></pre>
+<p>I have looked into asyncio <a href="https://docs.python.org/3.5/library/asyncio-sync.html" rel="nofollow noreferrer"><code>Event</code>, <code>Queue</code> and <code>Condition</code></a> but it isn't clear to me how to use them for this. How would you implement the desired behavior using Python's asyncio? </p>
+<p>EDIT</p>
+<p>Some more details on how I'd like to use <code>handle_keys</code>. I have an async function that checks for key presses.</p>
+<pre><code>@asyncio.coroutine
+def check_keys():
+    keys = driver.get_keys()
+    for key in keys:
+        yield from handle_key(key)
+</code></pre>
+<p>Which in turn is scheduled along with other program tasks</p>
+<pre><code>@asyncio.coroutine
+def main():
+    while True:
+        yield from check_keys()
+        yield from do_other_stuff()
+
+ioloop = asyncio.get_event_loop()
+ioloop.run_until_complete(main())
+</code></pre>
+<p><a href="https://stackoverflow.com/a/45584545/738768">Qeek's use of <code>asyncio.create_task</code> and <code>asyncio.gather</code></a> makes sense. But how would I use it within a loop like this? Or is there another way to schedule the async tasks that would allow <code>handle_keys</code> calls to "overlap"? </p>
+<p><a href="https://github.com/Bristol-Braille/canute-ui/blob/5fa44e82d374fd7900c12d614dcf8d734b7963d7/canute_ui#L92" rel="nofollow noreferrer">Actual code on GitHub if you are interested</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<h2>What's wrong</h2>
+<p>Basically the <code>yield from xy()</code> is very similar to the normal function call. The difference between function call and <code>yield from</code> is that the function call immediately start processing called function. The <code>yield from</code> statement insert called coroutine into queue inside event loop and give control to event loop and it decide which coroutine in it's queue will be processed.</p>
+<p>Here is the explanation of what you code does:</p>
+<ol>
+<li>It adds the <code>main</code> into event loop's queue.</li>
+<li>The event loop start processing coroutine in the queue.</li>
+<li>The queue contains only the <code>main</code> coroutine so it starts that.</li>
+<li>The code hits the <code>yield from handle_key('a')</code>.</li>
+<li>It adds the <code>handle_key('a')</code> in the event loop's queue.</li>
+<li>The event loop now contains the <code>main</code> and <code>handle_key('a')</code> but the main cannot be started because it is waiting for the result of the <code>handle_key('a')</code>.</li>
+<li>So the event loop starts the <code>handle_key('a')</code>.</li>
+<li>It will do some stuff until it hits the <code>yield from asyncio.sleep(0.5)</code>.</li>
+<li>Now the event loop contains <code>main()</code>, <code>handle_key('a')</code> and <code>sleep(0.5)</code>.
+
+<ul>
+<li>The <code>main()</code> is waiting for result from <code>handle_key('a')</code>.</li>
+<li>The <code>handle_key('a')</code> is waiting for result from <code>sleep(0.5)</code>.</li>
+<li>The sleep has no dependency so it can be started.</li>
+</ul></li>
+<li>The <code>asyncio.sleep(0.5)</code> returns <code>None</code> after 0.5 second.</li>
+<li>The event loop takes the <code>None</code> and return it into the <code>handle_key('a')</code> coroutine.</li>
+<li>The return value is ignored because it isn't assign into anything</li>
+<li>The <code>handle_key('a')</code> prints the key (because nothing change the state)</li>
+<li>The <code>handle_key</code> coroutine at the end return None (because there isn't return statement).</li>
+<li>The <code>None</code> is returned to the main.</li>
+<li>Again the return value is ignored.</li>
+<li>The code hits the <code>yield from handle_key('b')</code> and start processing new key.</li>
+<li>It run same steps from step 5 (but with the key <code>b</code>).</li>
+</ol>
+<h2>How to fix it</h2>
+<p>The <code>main</code> coroutinr replace with this:</p>
+<pre><code>@asyncio.coroutine
+def main(loop=asyncio.get_event_loop()):
+    a_task = loop.create_task(handle_key('a'))
+    b_task = loop.create_task(handle_key('b'))
+    yield from asyncio.gather(a_task, b_task)
+</code></pre>
+<p>The <code>loop.create_task</code> adds into the event loop's queue the <code>handle_key('a')</code> and <code>handle_key('b')</code> and then the <code>yield from asyncio.gather(a_task, b_task)</code> give control to the event loop. The event loop from this point contains <code>handle_key('a')</code>, <code>handle_key('b')</code>, <code>gather(...)</code> and <code>main()</code>.</p>
+<ul>
+<li>The <code>main()</code> wiating for result from <code>gather()</code></li>
+<li>The <code>gather()</code> waiting until all tasks given as parameters are finished</li>
+<li>The <code>handle_key('a')</code> and <code>handle_key('b')</code> has no dependencies so they can be started. </li>
+</ul>
+<p>The event loop now contains 2 coroutine which can start but which one will it pick? Well... who knows it is implementation depended. So for better simulation of pressed keys this one replace should be a little better:</p>
+<pre><code>@asyncio.coroutine
+def main(loop=asyncio.get_event_loop()):
+    a_task = loop.create_task(handle_key('a'))
+    yield from asyncio.sleep(0.1)
+    b_task = loop.create_task(handle_key('b'))
+    yield from asyncio.gather(a_task, b_task)
+</code></pre>
+<hr/>
+<h2>Python 3.5 bonus</h2>
+<p>From the documentation:</p>
+<blockquote>
+<p>Coroutines used with asyncio may be implemented using the async def statement.</p>
+<p>The async def type of coroutine was added in Python 3.5, and is recommended if there is no need to support older Python versions.</p>
+</blockquote>
+<p>It means that you can replace: </p>
+<pre><code>@asyncio.coroutine
+def main():
+</code></pre>
+<p>with newer statement</p>
+<pre><code>async def main():
+</code></pre>
+<p>If you start using the new syntax then you have to also replace <code>yield from</code> with <code>await</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<h2>Why your code doesn't work now?</h2>
+<p>Both <code>handle_key</code> javascript functions don't block execution. Each just clear timeout callback and set new one. It happens immediately.</p>
+<p>Coroutines work another way: using <code>yield from</code> or <a href="https://docs.python.org/3/reference/compound_stmts.html#async-def" rel="nofollow noreferrer">newer syntax</a> <code>await</code> on coroutine means that we want to resume execution flow only after this coroutine if fully done:</p>
+<pre><code>async def a():
+    await asyncio.sleep(1)
+
+async def main():
+    await a()
+    await b()  # this line would be reached only after a() done - after 1 second delay
+</code></pre>
+<p><code>asyncio.sleep(0.5)</code> in your code - is not setting callback by timeout, but code that should be done before <code>handle_key</code> finsihed.</p>
+<h2>Let's try to make code work</h2>
+<p>You can create <a href="https://docs.python.org/3/library/asyncio-task.html#task" rel="nofollow noreferrer">task</a> to start execution some coroutine "in background". You can also <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.Task.cancel" rel="nofollow noreferrer">cancel task</a> (just like you do with <code>clearTimeout(this.timeout)</code>) if you don't want it to be finished.</p>
+<p>Python version that emulates your javascript snippet:</p>
+<pre><code>import asyncio
+from contextlib import suppress
+
+global_state = ''
+timeout = None
+
+async def handle_key(key):
+    global global_state, timeout
+
+    global_state += key
+
+    # cancel previous callback (clearTimeout(this.timeout))
+    if timeout:
+        timeout.cancel()
+        with suppress(asyncio.CancelledError):
+            await timeout
+
+    # set new callback (this.timeout = setTimeout ...)
+    async def callback():
+        await asyncio.sleep(0.5)
+        print(global_state)
+    timeout = asyncio.ensure_future(callback())
+
+
+async def main():
+    await handle_key('a')
+    await handle_key('b')
+
+    # both handle_key functions done, but task isn't finished yet
+    # you need to await for task before exit main() coroutine and close loop
+    if timeout:
+        await timeout
+
+loop = asyncio.get_event_loop()
+try:
+    loop.run_until_complete(main())
+finally:
+    loop.close()
+</code></pre>
+<h2>Idiomatic?</h2>
+<p>While code above works, it is not how <code>asyncio</code> should be used. Your javascript code based on callbacks, while <code>asyncio</code> usually is about to avoid using of callbacks.</p>
+<p>It's hard to demonstrate difference on your example since it's callback based by nature (key handling - is some sort of global callback) and doesn't have more async logic. But this understanding would be important later when you'll add more async operations.</p>
+<p>Right now I advice you to read about <code>async</code>/<code>await</code> in modern javascript (it's similar to Python's <code>async</code>/<code>await</code>) and look at examples comparing it to callbacks/promises. <a href="https://hackernoon.com/6-reasons-why-javascripts-async-await-blows-promises-away-tutorial-c7ec10518dd9" rel="nofollow noreferrer">This article</a> looks good.</p>
+<p>It'll help you understand how you can use coroutine-based approach in Python.</p>
+<p><strong>Upd:</strong></p>
+<ol>
+<li><p>Since <code>buttons.check</code> needs to periodically call <code>driver.get_buttons()</code> you'll have to use loop. But it can be done as task along with your event loop.</p>
+<p>If you had some sort of <code>button_handler(callback)</code> (this is usually how different libs allow to handle user input) you could use it to set some <code>asyncio.Future</code> directly and avoid loop.</p></li>
+<li><p>Consider possibility write some little gui app with <code>asyncio</code> from the beginning. I think it may help you to better understand how you can adapt your existing project.</p></li>
+<li><p>Here's some pseudo-code that shows background task to handle
+buttons and using asyncio to handle some simple UI events/states logic:</p></li>
+</ol>
+<p>.</p>
+<pre><code>import asyncio
+from contextlib import suppress
+
+
+# GUI logic:
+async def main():
+    while True:
+        print('We at main window, popup closed')
+
+        key = await key_pressed
+        if key == 'Enter':
+            print('Enter - open some popup')
+
+            await popup()
+            # this place wouldn't be reached until popup is not closed
+
+            print('Popup was closed')
+
+        elif key == 'Esc':
+            print('Esc - exit program')
+            return
+
+
+async def popup():
+    while True:
+        key = await key_pressed
+        if key == 'Esc':
+            print('Esc inside popup, let us close it')
+            return
+        else:
+            print('Non escape key inside popup, play sound')
+
+
+# Event loop logic:
+async def button_check():
+    # Where 'key_pressed' is some global asyncio.Future
+    # that can be used by your coroutines to know some key is pressed
+    while True:
+        global key_pressed
+        for key in get_buttons():
+            key_pressed.set_result(key)
+            key_pressed = asyncio.Future()
+        await asyncio.sleep(0.01)
+
+
+def run_my_loop(coro):
+    loop = asyncio.get_event_loop()
+
+    # Run background task to process input
+    buttons_task = asyncio.ensure_future(button_check())
+
+    try:
+        loop.run_until_complete(main())
+    finally:
+
+        # Shutdown task
+        buttons_task.cancel()
+        with suppress(asyncio.CancelledError):
+            loop.run_until_complete(buttons_task)
+
+        loop.close()
+
+
+if __name__ == '__main__':
+    run_my_loop(main())
+</code></pre>
+</div>
+<span class="comment-copy">Makes a lot of sense, but when would I gather tasks if I am calling handle_keys along with other functions in a loop? I have given more details in an edit to my question.</span>
+<span class="comment-copy">Thanks for your answer, I am not so interested in translating the actual callback/timeout logic but thinking about how to do it with async/await in JS makes sense. I added some more details on how I'd like to use <code>handle_keys</code> to my question.</span>
+<span class="comment-copy">@kasbah I updated answer, hope it'll help. As I said there consider possibility to write some little GUI project using asyncio from the beginning. It'll be easier to solve asyncio related issues and come to understanding how adapt asyncio to existing project.</span>
+<span class="comment-copy">So if <code>driver.get_buttons()</code> as asynchronous I could avoid calling everything in a "synchronous" loop and <code>handle_keys</code> invocations could overlap?</span>
+<span class="comment-copy">@kasbah exactly.   Usually GUIs allow to have press (or other) events through callbacks, like <code>on_key_press(callback)</code>. You can register callback that just set result (pressed key) of some <code>asyncio.Future</code> on this event and await of this future in your <code>asyncio</code> code. In other words, <code>asyncio.Future</code>/<code>asyncio.Event</code> - are adapters from callback world to <code>asyncio</code> world.   In case you don't have callbacks, you'll need to create some loop to cast synchronous code to asynchronous.</span>

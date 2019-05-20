@@ -1,0 +1,282 @@
+<div class="post-text" itemprop="text">
+<p>I have a class that has several methods which each have certain properties (in the sense of quality). I'd like these methods to be available in a list inside the class so they can be executed at once. Note that the properties can be interchangeable so this can't be solved by using further classes that would inherit from the original one. In an ideal world it would look something like this:</p>
+<pre><code>class MyClass:
+    def __init__():
+        red_rules = set()
+        blue_rules = set()
+        hard_rules = set()
+        soft_rules = set()
+
+    @red
+    def rule_one(self):
+        return 1
+
+    @blue
+    @hard
+    def rule_two(self):
+        return 2
+
+    @hard
+    def rule_three(self):
+        return 3
+
+    @blue
+    @soft
+    def rule_four(self):
+        return 4
+</code></pre>
+<p>When the class is instantiated, it should be easy to simply execute all red and soft rules by combining the sets and executing the methods. The decorators for this are tricky though since a regular registering decorator can fill out a global object but not the class attribute:</p>
+<pre><code>def red(fn):
+    red_rules.add(fn)
+    return fn
+</code></pre>
+<p>How do I go about implementing something like this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can subclass <code>set</code> and give it a decorator method:</p>
+<pre><code>class MySet(set):
+    def register(self, method):
+        self.add(method)
+        return method
+
+class MyClass:
+    red_rules = MySet()
+    blue_rules = MySet()
+    hard_rules = MySet()
+    soft_rules = MySet()
+
+    @red_rules.register
+    def rule_one(self):
+        return 1
+
+    @blue_rules.register
+    @hard_rules.register
+    def rule_two(self):
+        return 2
+
+    @hard_rules.register
+    def rule_three(self):
+        return 3
+
+    @blue_rules.register
+    @soft_rules.register
+    def rule_four(self):
+        return 4
+</code></pre>
+<p>Or if you find using the <code>.register</code> method ugly, you can always define the <code>__call__</code> method to use the set itself as a decorator:</p>
+<pre><code>class MySet(set):
+    def __call__(self, method):
+        """Use set as a decorator to add elements to it."""
+        self.add(method)
+        return method
+
+class MyClass:
+    red_rules = MySet()
+    ...
+
+    @red_rules
+    def rule_one(self):
+        return 1
+
+    ...
+</code></pre>
+<p>This looks better, but it's less explicit, so for other collaborators (or future yourself) it might be harder to grasp what's happening here.</p>
+<hr/>
+<p>To call the stored functions, you can just loop over the set you want and pass in the instance as the <code>self</code> argument:</p>
+<pre><code>my_instance = MyClass()
+for rule in MyClass.red_rules:
+    rule(my_instance)
+</code></pre>
+<p>You can also create an utility function to do this for you, for example you can create a <code>MySet.invoke()</code> method:</p>
+<pre><code>class MySet(set):
+    ...
+    def invoke(self, obj):
+        for rule in self:
+            rule(obj)
+</code></pre>
+<p>And now just call:</p>
+<pre><code>MyClass.red_rules.invoke(my_instance)
+</code></pre>
+<p>Or you could have <code>MyClass</code> handle this instead:</p>
+<pre><code>class MyClass:
+    ...
+    def invoke_rules(self, rules):
+        for rule in rules:
+            rule(self)
+</code></pre>
+<p>And then call this on an instance of <code>MyClass</code>:</p>
+<pre><code>my_instance.invoke_rules(MyClass.red_rules)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Decorators are applied <em>when the function is defined</em>; in a class that's when the class is defined. At this point in time there are no instances yet!</p>
+<p>You have three options:</p>
+<ol>
+<li><p>Register your decorators at the class level. This is not as clean as it may sound; you either have to explicitly pass additional objects to your decorators (<code>red_rules = set()</code>, then <code>@red(red_rules)</code> so the decorator factory can then add the function to the right location), or you have to use some kind of class initialiser to pick up specially marked functions; you could do this with a base class that defines the <a href="https://docs.python.org/3/reference/datamodel.html#object.__init_subclass__" rel="nofollow noreferrer"><code>__init_subclass__</code> class method</a>, at which point you can iterate over the namespace and find those markers (attributes set by the decorators).</p></li>
+<li><p>Have your <code>__init__</code> method (or a <code>__new__</code> method) loop over all the methods on the class and look for special attributes the decorators have put there. </p>
+<p>The decorator would only need to add a <code>_rule_name</code> or similar attribute to decorated methods, and <code>{getattr(self, name) for for name in dir(self) if getattr(getattr(self, name), '_rule_name', None) == rule_name}</code> would pick up any method that has the right rule name defined in <code>rule_name</code>.</p></li>
+<li><p>Make your decorators produce new <a href="https://docs.python.org/3/reference/datamodel.html#descriptors" rel="nofollow noreferrer">descriptor objects</a>; descriptors have their <a href="https://docs.python.org/3/reference/datamodel.html#object.__set_name__" rel="nofollow noreferrer"><code>__set_name__()</code> method</a> called when the class object is created. This gives you access to the class, and thus you can add attributes to that class.</p></li>
+</ol>
+<p>Note that <code>__init_subclass__</code> and <code>__set_name__</code> require Python 3.6 or newer; you'd have to resort to a <a href="https://docs.python.org/3/reference/datamodel.html#metaclasses" rel="nofollow noreferrer">metaclass</a> to achieve similar functionality in earlier versions.</p>
+<p>Also note that when you register functions at the class level, that you need to then explicitly <em>bind</em> them with <code>function.__get__(self, type(cls))</code> to turn them into methods, <em>or</em> you can explicitly pass in <code>self</code> when calling them. You could automate this by making a dedicated class to hold the rule sets, and make this class a descriptor too:</p>
+<pre><code>import types
+from collections.abc import MutableSet
+
+class RulesSet(MutableSet):
+    def __init__(self, values=(), rules=None, instance=None, owner=None):
+        self._rules = rules or set()  # can be a shared set!
+        self._instance = instance
+        self._owner = owner
+        self |= values
+
+    def __repr__(self):
+        bound = ''
+        if self._owner is not None:
+            bound = f', instance={self._instance!r}, owner={self._owner!r}'
+        rules = ', '.join([repr(v) for v in iter(self)])
+        return f'{type(self).__name__}({{{rules}}}{bound})'
+
+    def __contains__(self, ob):
+        try:
+            if ob.__self__ is self._instance or ob.__self__ is self._owner:
+                # test for the unbound function instead when both are bound, this requires staticmethod and classmethod to be unwrapped!
+                ob = ob.__func__
+                return any(ob is getattr(f, '__func__', f) for f in self._rules)
+        except AttributeError:
+            # not a method-like object
+            pass
+        return ob in self._rules
+
+    def __iter__(self):
+        if self._owner is not None:
+            return (f.__get__(self._instance, self._owner) for f in self._rules)
+        return iter(self._rules)
+
+    def __len__(self):
+        return len(self._rules)
+
+    def add(self, ob):
+        while isinstance(ob, Rule):
+            # remove any rule wrappers
+            ob = ob._function
+        assert isinstance(ob, (types.FunctionType, classmethod, staticmethod))
+        self._rules.add(ob)
+
+    def discard(self, ob):
+        self._rules.discard(ob)
+
+    def __get__(self, instance, owner):
+        # share the set with a new, bound instance.
+        return type(self)(rules=self._rules, instance=instance, owner=owner)
+
+class Rule:
+    @classmethod
+    def make_decorator(cls, rulename):
+        ruleset_name = f'{rulename}_rules'
+        def decorator(f):
+            return cls(f, ruleset_name)
+        decorator.__name__ = rulename
+        return decorator
+
+    def __init__(self, function, ruleset_name):
+        self._function = function
+        self._ruleset_name = ruleset_name
+
+    def __get__(self, *args):
+        # this is mostly here just to make Python call __set_name__
+        return self._function.__get__(*args)
+
+    def __set_name__(self, owner, name):
+        # register, then replace the name with the original function
+        # to avoid being a performance bottleneck
+        ruleset = getattr(owner, self._ruleset_name, None)
+        if ruleset is None:
+            ruleset = RulesSet()
+            setattr(owner, self._ruleset_name, ruleset)
+        ruleset.add(self)
+        # transfer controrol to any further rule objects
+        if isinstance(self._function, Rule):
+            self._function.__set_name__(owner, name)
+        else:
+            setattr(owner, name, self._function)
+
+red = Rule.make_decorator('red')
+blue = Rule.make_decorator('blue')
+hard = Rule.make_decorator('hard')
+soft = Rule.make_decorator('soft')
+</code></pre>
+<p>Then just use:</p>
+<pre><code>class MyClass:
+    @red
+    def rule_one(self):
+        return 1
+
+    @blue
+    @hard
+    def rule_two(self):
+        return 2
+
+    @hard
+    def rule_three(self):
+        return 3
+
+    @blue
+    @soft
+    def rule_four(self):
+        return 4
+</code></pre>
+<p>and you can access <code>self.red_rules</code>, etc. as a set with bound methods:</p>
+<pre><code>&gt;&gt;&gt; inst = MyClass()
+&gt;&gt;&gt; inst.red_rules
+RulesSet({&lt;bound method MyClass.rule_one of &lt;__main__.MyClass object at 0x106fe7550&gt;&gt;}, instance=&lt;__main__.MyClass object at 0x106fe7550&gt;, owner=&lt;class '__main__.MyClass'&gt;)
+&gt;&gt;&gt; inst.blue_rules
+RulesSet({&lt;bound method MyClass.rule_two of &lt;__main__.MyClass object at 0x106fe7550&gt;&gt;, &lt;bound method MyClass.rule_four of &lt;__main__.MyClass object at 0x106fe7550&gt;&gt;}, instance=&lt;__main__.MyClass object at 0x106fe7550&gt;, owner=&lt;class '__main__.MyClass'&gt;)
+&gt;&gt;&gt; inst.hard_rules
+RulesSet({&lt;bound method MyClass.rule_three of &lt;__main__.MyClass object at 0x106fe7550&gt;&gt;, &lt;bound method MyClass.rule_two of &lt;__main__.MyClass object at 0x106fe7550&gt;&gt;}, instance=&lt;__main__.MyClass object at 0x106fe7550&gt;, owner=&lt;class '__main__.MyClass'&gt;)
+&gt;&gt;&gt; inst.soft_rules
+RulesSet({&lt;bound method MyClass.rule_four of &lt;__main__.MyClass object at 0x106fe7550&gt;&gt;}, instance=&lt;__main__.MyClass object at 0x106fe7550&gt;, owner=&lt;class '__main__.MyClass'&gt;)
+&gt;&gt;&gt; for rule in inst.hard_rules:
+...     rule()
+...
+2
+3
+</code></pre>
+<p>The same rules are accessible on the class; normal functions remain unbound:</p>
+<pre><code>&gt;&gt;&gt; MyClass.blue_rules
+RulesSet({&lt;function MyClass.rule_two at 0x107077a60&gt;, &lt;function MyClass.rule_four at 0x107077b70&gt;}, instance=None, owner=&lt;class '__main__.MyClass'&gt;)
+&gt;&gt;&gt; next(iter(MyClass.blue_rules))
+&lt;function MyClass.rule_two at 0x107077a60&gt;
+</code></pre>
+<p>Containment testing works as expected:</p>
+<pre><code>&gt;&gt;&gt; inst.rule_two in inst.hard_rules
+True
+&gt;&gt;&gt; inst.rule_two in inst.soft_rules
+False
+&gt;&gt;&gt; MyClass.rule_two in MyClass.hard_rules
+True
+&gt;&gt;&gt; MyClass.rule_two in inst.hard_rules
+True
+</code></pre>
+<p>You can use these rules to register <code>classmethod</code> and <code>staticmethod</code> objects too:</p>
+<pre><code>&gt;&gt;&gt; class Foo:
+...     @hard
+...     @classmethod
+...     def rule_class(cls):
+...         return f'rule_class of {cls!r}'
+...
+&gt;&gt;&gt; Foo.hard_rules
+RulesSet({&lt;bound method Foo.rule_class of &lt;class '__main__.Foo'&gt;&gt;}, instance=None, owner=&lt;class '__main__.Foo'&gt;)
+&gt;&gt;&gt; next(iter(Foo.hard_rules))()
+"rule_class of &lt;class '__main__.Foo'&gt;"
+&gt;&gt;&gt; Foo.rule_class in Foo.hard_rules
+True
+</code></pre>
+</div>
+<span class="comment-copy">Yet you can't reach those names from the decorators; you don't get access to the local namespace of the scope when a class body is executed, not without additional hackery with the frame stack (very much not recommended).</span>
+<span class="comment-copy">Agreed with @MartijnPieters, I tried this but the decorator can't be included in the class and can't reach the instance attributes if defined outside of a class.</span>
+<span class="comment-copy">@mart1n fixed, try now</span>
+<span class="comment-copy">You can just pass the <code>m</code> object as an argument to the function call: <code>list(MyClass.blue_rules)[0](m)</code> or probably you'd use a <code>for</code> loop: <code>for func in MyClass.blue_rules: func(m)</code></span>
+<span class="comment-copy">@mart1n I updated the answer to show how you can do this without having to use the <code>.register</code>, and two different ways to "hide" the <code>for</code> loop.</span>
+<span class="comment-copy">For option #2, would the decorator that adds attributes on the methods be defined outside of the class? I still can't quite grasp what this would look like in code.</span>
+<span class="comment-copy">@mart1n: functions can have arbitrary attributes, when bound to methods those attributes are transparently taken along, so <code>def red(f): f._rule_name = 'red'; return f</code> would be enough to mark them. You can then use <code>red_rules = {getattr(self, name) for for name in dir(self) if getattr(getattr(self, name), '_rule_name', None) == 'red'}</code> to create a set of those bound methods that have the attribute.</span>
+<span class="comment-copy">Wow, the code in your last edit is awesome. Thank you!</span>

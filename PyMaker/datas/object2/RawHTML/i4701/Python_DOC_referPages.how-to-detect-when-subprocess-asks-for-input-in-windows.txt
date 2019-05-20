@@ -1,0 +1,262 @@
+<div class="post-text" itemprop="text">
+<p>I have a subprocess that either quits with a returncode, or asks something and waits for user input.</p>
+<p>I would like to detect when the process asks the question and quit immediately. The fact that the process asks the question or not is enough for me to decide the state of the system.</p>
+<p>The problem is that I cannot read the question because the child process probably does not flush standard output. So I cannot rely on parsing <code>subprocess.Popen().stdout</code>: when trying to read it, well, it blocks because input is being read first.</p>
+<p>A bit like this</p>
+<pre><code># ask.py, just asks something without printing anything if a condition is met
+# here, we'll say that the condition is always met
+input()
+</code></pre>
+<p>Of course, the actual subprocess is a third party binary, and I cannot modify it easily to add the necessary flush calls, which would solve it.</p>
+<p>I could also try the Windows equivalent of <code>unbuffer</code> (<a href="https://stackoverflow.com/questions/11516258/what-is-the-equivalent-of-unbuffer-program-on-windows">What is the equivalent of unbuffer program on Windows?</a>) which is called <code>winpty</code>, which would (maybe) allow me to detect output and solve my current issue, but I'd like to keep it simple and I'd like to solve the standard <em>input</em> issue first...</p>
+<p>I tried... well, lots of things that don't work, including trying to pass a fake file as <code>stdin</code> argument, which doesn't work because <code>subprocess</code> takes the <code>fileno</code> of the file, and we cannot feed it rubbish...</p>
+<pre><code>p = subprocess.Popen(["python","ask.py"],...)
+</code></pre>
+<p>Using <code>communicate</code> with a string doesn't work either, because you cannot control when the string is read to be fed to the subprocess (probably through a system pipe).</p>
+<p>Those questions were promising but either relied on standard output, or only apply to Linux</p>
+<ul>
+<li><a href="https://stackoverflow.com/questions/18107541/detecting-when-a-child-process-is-waiting-for-input">Detecting when a child process is waiting for input</a></li>
+<li><a href="https://stackoverflow.com/questions/12180073/how-can-i-know-whether-my-subprocess-is-waiting-for-my-input-in-python3">How can I know whether my subprocess is waiting for my input ?(in python3)</a></li>
+</ul>
+<p>What I'm currently doing is running the process with a timeout, and if the timeout is reached, I then decide that the program is blocked. But it costs the timeout waiting time. If I could decide as soon as <code>stdin</code> is read by the subprocess, that would be better.</p>
+<p>I'd like to know if there's a native python solution (possibly using <code>ctypes</code> and windows extensions) to detect read from stdin. But a native solution that doesn't use Python but a non-Microsoft proprietary language could do.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>if we not want let to child process process user input, but simply kill it in this case, solution can be next:</p>
+<ul>
+<li>start child process with redirected <em>stdin</em> to pipe.</li>
+<li>pipe server end we create in asynchronous mode and main set pipe
+buffer to 0 size</li>
+<li>before start child - write 1 byte to this pipe.</li>
+<li>because pipe buffer is 0 size - operation not complete, until another
+side not read this byte</li>
+<li>after we write this 1 byte and operation in progress (pending) -
+start child process.</li>
+<li>finally begin wait what complete first: write operation or child process ?</li>
+<li>if write complete first - this mean, that child process begin read
+from <em>stdin</em>  - so kill it at this point</li>
+</ul>
+<p>one possible implementation on <em>c++</em>:</p>
+<pre><code>struct ReadWriteContext : public OVERLAPPED
+{
+    enum OpType : char { e_write, e_read } _op;
+    BOOLEAN _bCompleted;
+
+    ReadWriteContext(OpType op) : _op(op), _bCompleted(false)
+    {
+    }
+};
+
+VOID WINAPI OnReadWrite(DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, OVERLAPPED* lpOverlapped)
+{
+    static_cast&lt;ReadWriteContext*&gt;(lpOverlapped)-&gt;_bCompleted = TRUE;
+    DbgPrint("%u:%x %p\n", static_cast&lt;ReadWriteContext*&gt;(lpOverlapped)-&gt;_op, dwErrorCode, dwNumberOfBytesTransfered);
+}
+
+void nul(PCWSTR lpApplicationName)
+{
+    ReadWriteContext wc(ReadWriteContext::e_write), rc(ReadWriteContext::e_read);
+
+    static const WCHAR pipename[] = L"\\\\?\\pipe\\{221B9EC9-85E6-4b64-9B70-249026EFAEAF}";
+
+    if (HANDLE hPipe = CreateNamedPipeW(pipename, PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED, 
+        PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT, 1, 0, 0, 0, 0))
+    {
+        static SECURITY_ATTRIBUTES sa = { sizeof(sa), 0, TRUE };
+        PROCESS_INFORMATION pi;
+        STARTUPINFOW si = { sizeof(si)};
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = CreateFileW(pipename, FILE_GENERIC_READ|FILE_GENERIC_WRITE, 0, &amp;sa, OPEN_EXISTING, 0, 0);
+
+        if (INVALID_HANDLE_VALUE != si.hStdInput)
+        {
+            char buf[256];
+
+            if (WriteFileEx(hPipe, "\n", 1, &amp;wc, OnReadWrite))
+            {
+                si.hStdError = si.hStdOutput = si.hStdInput;
+
+                if (CreateProcessW(lpApplicationName, 0, 0, 0, TRUE, CREATE_NO_WINDOW, 0, 0, &amp;si, &amp;pi))
+                {
+                    CloseHandle(pi.hThread);
+
+                    BOOLEAN bQuit = true;
+
+                    goto __read;
+                    do 
+                    {
+                        bQuit = true;
+
+                        switch (WaitForSingleObjectEx(pi.hProcess, INFINITE, TRUE))
+                        {
+                        case WAIT_OBJECT_0:
+                            DbgPrint("child terminated\n");
+                            break;
+                        case WAIT_IO_COMPLETION:
+                            if (wc._bCompleted)
+                            {
+                                DbgPrint("child read from hStdInput!\n");
+                                TerminateProcess(pi.hProcess, 0);
+                            }
+                            else if (rc._bCompleted)
+                            {
+__read:
+                                rc._bCompleted = false;
+                                if (ReadFileEx(hPipe, buf, sizeof(buf), &amp;rc, OnReadWrite))
+                                {
+                                    bQuit = false;
+                                }
+                            }
+                            break;
+                        default:
+                            __debugbreak();
+                        }
+                    } while (!bQuit);
+
+                    CloseHandle(pi.hProcess);
+                }
+            }
+
+            CloseHandle(si.hStdInput);
+
+            // let execute pending apc
+            SleepEx(0, TRUE);
+        }
+
+        CloseHandle(hPipe);
+    }
+}
+</code></pre>
+<hr/>
+<p>another variant of code - use event completion, instead apc. however this not affect final result. this variant of code give absolute the same result as first:</p>
+<pre><code>void nul(PCWSTR lpApplicationName)
+{
+    OVERLAPPED ovw = {}, ovr = {};
+
+    if (ovr.hEvent = CreateEvent(0, 0, 0, 0))
+    {
+        if (ovw.hEvent = CreateEvent(0, 0, 0, 0))
+        {
+            static const WCHAR pipename[] = L"\\\\?\\pipe\\{221B9EC9-85E6-4b64-9B70-249026EFAEAF}";
+
+            if (HANDLE hPipe = CreateNamedPipeW(pipename, PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED, 
+                PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT, 1, 0, 0, 0, 0))
+            {
+                static SECURITY_ATTRIBUTES sa = { sizeof(sa), 0, TRUE };
+                PROCESS_INFORMATION pi;
+                STARTUPINFOW si = { sizeof(si)};
+                si.dwFlags = STARTF_USESTDHANDLES;
+                si.hStdInput = CreateFileW(pipename, FILE_GENERIC_READ|FILE_GENERIC_WRITE, 0, &amp;sa, OPEN_EXISTING, 0, 0);
+
+                if (INVALID_HANDLE_VALUE != si.hStdInput)
+                {
+                    char buf[256];
+
+                    if (!WriteFile(hPipe, "\n", 1, 0, &amp;ovw) &amp;&amp; GetLastError() == ERROR_IO_PENDING)
+                    {
+                        si.hStdError = si.hStdOutput = si.hStdInput;
+
+                        if (CreateProcessW(lpApplicationName, 0, 0, 0, TRUE, CREATE_NO_WINDOW, 0, 0, &amp;si, &amp;pi))
+                        {
+                            CloseHandle(pi.hThread);
+
+                            BOOLEAN bQuit = true;
+
+                            HANDLE h[] = { ovr.hEvent, ovw.hEvent, pi.hProcess };
+
+                            goto __read;
+                            do 
+                            {
+                                bQuit = true;
+
+                                switch (WaitForMultipleObjects(3, h, false, INFINITE))
+                                {
+                                case WAIT_OBJECT_0 + 0://read completed
+__read:
+                                    if (ReadFile(hPipe, buf, sizeof(buf), 0, &amp;ovr) || GetLastError() == ERROR_IO_PENDING)
+                                    {
+                                        bQuit = false;
+                                    }
+                                    break;
+                                case WAIT_OBJECT_0 + 1://write completed
+                                    DbgPrint("child read from hStdInput!\n");
+                                    TerminateProcess(pi.hProcess, 0);
+                                    break;
+                                case WAIT_OBJECT_0 + 2://process terminated
+                                    DbgPrint("child terminated\n");
+                                    break;
+                                default:
+                                    __debugbreak();
+                                }
+                            } while (!bQuit);
+
+                            CloseHandle(pi.hProcess);
+                        }
+                    }
+
+                    CloseHandle(si.hStdInput);
+                }
+
+                CloseHandle(hPipe);
+                // all pending operation completed here.
+            }
+
+            CloseHandle(ovw.hEvent);
+        }
+
+        CloseHandle(ovr.hEvent);
+    }
+}
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>My idea to find out if the subprocess reads user input is to (ab)use the fact that file objects are stateful: if the process reads data from its stdin, we should be able to detect a change in the stdin's state.</p>
+<p>The procedure is as follows:</p>
+<ol>
+<li>Create a temporary file that'll be used as the subprocess's stdin</li>
+<li>Write some data to the file</li>
+<li>Start the process</li>
+<li>Wait a little while for the process to read the data (or not), then use the <a href="https://docs.python.org/3/library/io.html#io.IOBase.tell" rel="nofollow noreferrer"><code>tell()</code></a> method to find out if anything has been read from the file</li>
+</ol>
+<p>This is the code:</p>
+<pre><code>import os
+import time
+import tempfile
+import subprocess
+
+# create a file that we can use as the stdin for the subprocess
+with tempfile.TemporaryFile() as proc_stdin:
+    # write some data to the file for the subprocess to read
+    proc_stdin.write(b'whatever\r\n')
+    proc_stdin.seek(0)
+
+    # start the thing
+    cmd = ["python","ask.py"]
+    proc = subprocess.Popen(cmd, stdin=proc_stdin, stdout=subprocess.PIPE)
+
+    # wait for it to start up and do its thing
+    time.sleep(1)
+
+    # now check if the subprocess read any data from the file
+    if proc_stdin.tell() == 0:
+        print("it didn't take input")
+    else:
+        print("it took input")
+</code></pre>
+<p>Ideally the temporary file could be replaced by some kind of pipe or something that doesn't write any data to disk, but unfortunately I couldn't find a way to make it work without a real on-disk file.</p>
+</div>
+<span class="comment-copy">do you have any control over the subprocess you are trying to detect the state of?</span>
+<span class="comment-copy">well, I can certainly run it :) what do you mean?</span>
+<span class="comment-copy">By control I mean whether you can <i>modify its code or not</i></span>
+<span class="comment-copy">err, no it's a third party binary.</span>
+<span class="comment-copy">If you can, you should go with the <code>pexepct</code> package available at <a href="https://pypi.python.org/pypi/pexpect" rel="nofollow noreferrer">pypi.python.org/pypi/pexpect</a>. Otherwise you probably need to use the <code>pty</code> package to open up a pseudo-terminal, to make your subprocess believe it is communcating with a terminal and not being a (terminal free) subprocess. Or, if your third-party file is a python script you can force it to not buffer output by using the <code>-u</code> flag when calling the script (<code>['python', '-u', 'ask.py']</code>) but then you could probably edit it as well.</span>
+<span class="comment-copy">I think I won't even try to port that to python. I'll use the code as-is in a small tool exe which takes the command as argument, so I can run it from my python code. Thanks. I'm going to test that soon enough.</span>
+<span class="comment-copy">@Jean-FrançoisFabre - in my test with cmd.exe/notepad (xp-win10) this work well. of course can litle change code, for use instead apc completion, event completion in overlapped. but this not affect result</span>
+<span class="comment-copy">@Jean-FrançoisFabre - DbgPrint this is only for debug output. you can at all remove it (without replace) - it not have any functional point. and i use UNICODE (W) api. you look like try ansi. i use CL.EXE (msvc) compiler</span>
+<span class="comment-copy">@Jean-FrançoisFabre - declare direct <code>STARTUPINFOW</code> with <code>W</code>. i simply use unicode defined and it auto added for me. change to <code>STARTUPINFOW si = { sizeof(si)};</code></span>
+<span class="comment-copy">ok, it builds &amp; links fine now. Test time :)</span>
+<span class="comment-copy">nice try, but if the process is allowed to take all the input, it will reach end of file and will perform the task I don't want it to perform. I need to detect one char read so I can kill the process.</span>
+<span class="comment-copy">this would answer if the question was "How to detect when subprocess <i>asked</i> for input in Windows". I need an instant detection.</span>
+<span class="comment-copy">@Jean-FrançoisFabre - <i>I need to detect one char read so I can kill the process</i> - if you want kill process, if it begin read from <i>stdin</i> - you need create asynchronous pipe with 0 size buffer. connect child <i>stdin</i> to this pipe, and write 1 byte to pipe with event as completion. because pipe buffer is 0 - operation not complete until somebody not read from connected pipe end (<i>stdin</i>) or you not close pipe handle. then you start child process with redirected <i>stdin</i> and wait for event + child exit. if event fire first - child begin read from <i>stdin</i>.</span>
+<span class="comment-copy">don`t know in pyton, but in c++ this is very easy to implement</span>
+<span class="comment-copy"><code>time.sleep(1)</code> - why not <code>time.sleep(748)</code> ?</span>

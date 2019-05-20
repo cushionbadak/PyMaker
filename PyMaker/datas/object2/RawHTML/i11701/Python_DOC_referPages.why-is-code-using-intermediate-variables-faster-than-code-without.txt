@@ -1,0 +1,116 @@
+<div class="post-text" itemprop="text">
+<p>I have encountered this weird behavior and failed to explain it. These are the benchmarks:</p>
+<pre><code>py -3 -m timeit "tuple(range(2000)) == tuple(range(2000))"
+10000 loops, best of 3: 97.7 usec per loop
+py -3 -m timeit "a = tuple(range(2000));  b = tuple(range(2000)); a==b"
+10000 loops, best of 3: 70.7 usec per loop
+</code></pre>
+<p>How come comparison with variable assignment is faster than using a one liner with temporary variables by more than 27%?</p>
+<p>By the Python docs, garbage collection is disabled during timeit so it can't be that. Is it some sort of an optimization?</p>
+<p>The results may also be reproduced in Python 2.x though to lesser extent.</p>
+<p>Running Windows 7, CPython 3.5.1, Intel i7 3.40 GHz, 64 bit both OS and Python. Seems like a different machine I've tried running at Intel i7 3.60 GHz with Python 3.5.0 does not reproduce the results.</p>
+<hr/>
+<p>Running using the same Python process with <code>timeit.timeit()</code> @ 10000 loops produced 0.703 and 0.804 respectively. Still shows although to lesser extent. (~12.5%)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>My results were similar to yours: the code using intermediate variables was pretty consistently at least 10-20 % faster in the Python 3.4 that I tired. However when I used IPython on the very same Python 3.4 interpreter, I got these results:</p>
+<pre><code>In [1]: %timeit -n10000 -r20 tuple(range(2000)) == tuple(range(2000))
+10000 loops, best of 20: 74.2 µs per loop
+
+In [2]: %timeit -n10000 -r20 a = tuple(range(2000));  b = tuple(range(2000)); a==b
+10000 loops, best of 20: 75.7 µs per loop
+</code></pre>
+<p>Notably, I never managed to get even close to the 74.2 µs for the former when I used <code>-mtimeit</code> from the command line.</p>
+<p>So this Heisenbug turned out to be something quite interesting. I decided to run the command with <code>strace</code> and indeed there is something fishy going on:</p>
+<pre><code>% strace -o withoutvars python3 -m timeit "tuple(range(2000)) == tuple(range(2000))"
+10000 loops, best of 3: 134 usec per loop
+% strace -o withvars python3 -mtimeit "a = tuple(range(2000));  b = tuple(range(2000)); a==b"
+10000 loops, best of 3: 75.8 usec per loop
+% grep mmap withvars|wc -l
+46
+% grep mmap withoutvars|wc -l
+41149
+</code></pre>
+<p>Now that is a good reason for the difference. The code that does not use variables causes the <code>mmap</code> system call be called almost 1000x more than the one that uses intermediate variables.</p>
+<p>The <code>withoutvars</code> is full of <code>mmap</code>/<code>munmap</code> for a 256k region; these same lines are repeated over and over again:</p>
+<pre><code>mmap(NULL, 262144, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f32e56de000
+munmap(0x7f32e56de000, 262144)          = 0
+mmap(NULL, 262144, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f32e56de000
+munmap(0x7f32e56de000, 262144)          = 0
+mmap(NULL, 262144, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7f32e56de000
+munmap(0x7f32e56de000, 262144)          = 0
+</code></pre>
+<hr/>
+<p>The <code>mmap</code> call seems to be coming from the function <code>_PyObject_ArenaMmap</code> from <code>Objects/obmalloc.c</code>; the <code>obmalloc.c</code> also contains the macro <code>ARENA_SIZE</code>, which is <code>#define</code>d to be <code>(256 &lt;&lt; 10)</code> (that is <code>262144</code>); similarly the <code>munmap</code> matches the <code>_PyObject_ArenaMunmap</code> from <code>obmalloc.c</code>.</p>
+<p><code>obmalloc.c</code> says that</p>
+<blockquote>
+<p>Prior to Python 2.5, arenas were never <code>free()</code>'ed.  Starting with Python 2.5,
+  we do try to <code>free()</code> arenas, and use some mild heuristic strategies to increase
+  the likelihood that arenas eventually can be freed.</p>
+</blockquote>
+<p>Thus these heuristics and the fact that Python object allocator releases these free arenas as soon as they're emptied lead to <code>python3 -mtimeit 'tuple(range(2000)) == tuple(range(2000))'</code> triggering pathological behaviour where one 256 kiB memory area is re-allocated and released repeatedly; and this allocation happens with <code>mmap</code>/<code>munmap</code>, which is comparatively costly as they're system calls - furthermore, <code>mmap</code> with <code>MAP_ANONYMOUS</code> requires that the newly mapped pages must be zeroed - even though Python wouldn't care.</p>
+<p>The behaviour is not present in the code that uses intermediate variables, because it is using slightly <strong>more</strong> memory and no memory arena can be freed as some objects are still allocated in it. That is because <code>timeit</code> will make it into a loop not unlike</p>
+<pre><code>for n in range(10000)
+    a = tuple(range(2000))
+    b = tuple(range(2000))
+    a == b
+</code></pre>
+<p>Now the behaviour is that both <code>a</code> and <code>b</code> will stay bound until they're *reassigned, so in the second iteration, <code>tuple(range(2000))</code> will allocate a 3rd tuple, and the assignment <code>a = tuple(...)</code> will decrease the reference count of the old tuple, causing it to be released, and increase the reference count of the new tuple; then the same happens to <code>b</code>. Therefore after the first iteration there are always at least 2 of these tuples, if not 3, so the thrashing doesn't occur.</p>
+<p>Most notably it cannot be guaranteed that the code using intermediate variables is always faster - indeed in some setups it might be that using intermediate variables will result in extra <code>mmap</code> calls, whereas the code that compares return values directly might be fine.</p>
+<hr/>
+<p>Someone asked that why this happens, when <code>timeit</code> disables garbage collection. It is indeed true that <a href="https://docs.python.org/3/library/timeit.html#timeit.Timer.timeit" rel="nofollow noreferrer"><code>timeit</code> does it</a>:</p>
+<blockquote>
+<p><strong>Note</strong></p>
+<p>By default, <code>timeit()</code> temporarily turns off garbage collection during the timing. The advantage of this approach is that it makes independent timings more comparable. This disadvantage is that GC may be an important component of the performance of the function being measured. If so, GC can be re-enabled as the first statement in the setup string. For example: </p>
+</blockquote>
+<p>However, the garbage collector of Python is only there to reclaim <em>cyclic garbage</em>, i.e. collections of objects whose references form cycles. It is not the case here; instead these objects are freed immediately when the reference count drops to zero.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The first question here has to be, is it reproducable? For some of us at least it definitely is though other people say they aren't seeing the effect.
+This on Fedora, with the equality test changed to <code>is</code> as actually doing a comparison seems irrelevant to the result, and the range pushed up to 200,000 as that seems to maximise the effect:</p>
+<pre><code>$ python3 -m timeit "a = tuple(range(200000));  b = tuple(range(200000)); a is b"
+100 loops, best of 3: 7.03 msec per loop
+$ python3 -m timeit "a = tuple(range(200000)) is tuple(range(200000))"
+100 loops, best of 3: 10.2 msec per loop
+$ python3 -m timeit "tuple(range(200000)) is tuple(range(200000))"
+100 loops, best of 3: 10.2 msec per loop
+$ python3 -m timeit "a = b = tuple(range(200000)) is tuple(range(200000))"
+100 loops, best of 3: 9.99 msec per loop
+$ python3 -m timeit "a = b = tuple(range(200000)) is tuple(range(200000))"
+100 loops, best of 3: 10.2 msec per loop
+$ python3 -m timeit "tuple(range(200000)) is tuple(range(200000))"
+100 loops, best of 3: 10.1 msec per loop
+$ python3 -m timeit "a = tuple(range(200000));  b = tuple(range(200000)); a is b"
+100 loops, best of 3: 7 msec per loop
+$ python3 -m timeit "a = tuple(range(200000));  b = tuple(range(200000)); a is b"
+100 loops, best of 3: 7.02 msec per loop
+</code></pre>
+<p>I note that variations between the runs, and the order in which the expressions are run make very little difference to the result.</p>
+<p>Adding assignments to <code>a</code> and <code>b</code> into the slow version doesn't speed it up. In fact as we might expect assigning to local variables has negligible effect. The only thing that does speed it up is splitting the expression entirely in two. The only difference this should be making is that it reduces the maximum stack depth used by Python while evaluating the expression (from 4 to 3).</p>
+<p>That gives us the clue that the effect is related to stack depth, perhaps the extra level pushes the stack across into another memory page. If so we should see that making other changes that affect the stack will change (most likely kill the effect), and in fact that is what we see:</p>
+<pre><code>$ python3 -m timeit -s "def foo():
+   tuple(range(200000)) is tuple(range(200000))" "foo()"
+100 loops, best of 3: 10 msec per loop
+$ python3 -m timeit -s "def foo():
+   tuple(range(200000)) is tuple(range(200000))" "foo()"
+100 loops, best of 3: 10 msec per loop
+$ python3 -m timeit -s "def foo():
+   a = tuple(range(200000));  b = tuple(range(200000)); a is b" "foo()"
+100 loops, best of 3: 9.97 msec per loop
+$ python3 -m timeit -s "def foo():
+   a = tuple(range(200000));  b = tuple(range(200000)); a is b" "foo()"
+100 loops, best of 3: 10 msec per loop
+</code></pre>
+<p>So, I think the effect is entirely due to how much Python stack is consumed during the timing process. It is still weird though.</p>
+</div>
+<span class="comment-copy">Compare <code>dis.dis("tuple(range(2000)) == tuple(range(2000))")</code> to <code>dis.dis("a = tuple(range(2000));  b = tuple(range(2000)); a==b")</code>. In my configuration second snippet actually contains <b>all of bytecode</b> from first one, and some additional instructions. It's hard to believe that more bytecode instructions results in faster execution. Maybe it's some bug in specific Python version?</span>
+<span class="comment-copy">If you attempt to reproduce this, please run the test multiple times in different execution orders. – Regardless of the result and the odd-ness of this, I think the question is not particularly valuable for SO.</span>
+<span class="comment-copy">I think this is pretty interesting. @poke you need to remember that an answer to a similar phenomenon is now the most upvoted answer in stackoverflow.</span>
+<span class="comment-copy">Also, please try to run the test in a single Python process using the <code>timeit</code> module directly. Comparisons between two separate Python processes might be affected by the operating system’s task scheduler or other effects.</span>
+<span class="comment-copy">@aluriak "best of 3" means best of three <i>averages</i>. This is done because some average might include, say, an unexpected process stall. Taking the best of averages avoids that.</span>
+<span class="comment-copy">Woha, that's interesting. Shouldn't the garbage collector (which is disabled on timeit) take care of freeing or at least should take care of it? And it raises another question: Aren't those repeated calls a bug?</span>
+<span class="comment-copy">@Bharel more like "broken as designed"</span>
+<span class="comment-copy">last but not least, how would this explain the difference between systems, even with the same OS?</span>
+<span class="comment-copy">@Bharel It depends whether or not a <i>new</i> memory arena is allocated; it is quite possible that other systems have partially free arenas that have enough free memory in the pools that more is not required. Even the same Python version on superficially similar systems might have differing behaviour - things like Python installation path, number of packages in <code>site-packages</code>, environment variables, current working directory - they all affect the memory layout of the process.</span>
+<span class="comment-copy">@Bharel: The garbage collector in CPython is more properly called the "cyclic garbage collector"; it's solely concerned with freeing isolated reference cycles, not general garbage collection. All other cleanup is synchronous and in-order; if the last reference to the last object in an arena is released, the object is immediately deleted, and the arena immediately freed, no cyclic garbage collector involvement required. That's why it's legal to disable <code>gc</code>; if it disabled general cleanup, you'd run out of memory pretty darn quick.</span>
+<span class="comment-copy">2 machines with the same memory sticks and same OS cause different results though. Stack depth sounds like a good theory but it does not explain the difference between machines.</span>

@@ -1,0 +1,130 @@
+<div class="post-text" itemprop="text">
+<p>I have a fuzzy string matching script that looks for some 30K needles in a haystack of 4 million company names. While the script works fine, my attempts at speeding up things via parallel processing on an AWS h1.xlarge failed as I'm running out of memory. </p>
+<p>Rather than trying to get more memory as explained in response to <a href="https://stackoverflow.com/questions/18706532/python-multiprocess-using-pool-fails-on-aws-ubuntu" title="my previous question">my previous question</a>, I'd like to find out how to optimize the workflow - I'm fairly new to this so there should be plenty of room. Btw, I've already experimented with <a href="https://stackoverflow.com/questions/9038711/python-pool-with-worker-processes?rq=1" title="queues">queues</a> (also worked but ran into the same <code>MemoryError</code>, plus looked through a bunch of very helpful SO contributions, but not quite there yet. </p>
+<p>Here's what seems most relevant of the code. I hope it sufficiently clarifies the logic - happy to provide more info as needed:</p>
+<pre><code>def getHayStack():
+    ## loads a few million company names into id: name dict
+    return hayCompanies
+
+def getNeedles(*args):
+    ## loads subset of 30K companies into id: name dict (for allocation to workers)
+    return needleCompanies
+
+def findNeedle(needle, haystack):
+    """ Identify best match and return results with score """
+    results = {}
+    for hayID, hayCompany in haystack.iteritems():
+        if not isnull(haystack[hayID]):
+            results[hayID] = levi.setratio(needle.split(' '), 
+                                           hayCompany.split(' '))
+    scores = list(results.values())
+    resultIDs = list(results.keys())
+    needleID = resultIDs[scores.index(max(scores))]
+    return [needleID, haystack[needleID], max(scores)]
+
+def runMatch(args):
+    """ Execute findNeedle and process results for poolWorker batch"""
+    batch, first = args
+    last = first + batch
+    hayCompanies = getHayStack()
+    needleCompanies = getTargets(first, last)
+    needles = defaultdict(list)
+    current = first
+    for needleID, needleCompany in needleCompanies.iteritems():
+        current += 1
+        needles[targetID] = findNeedle(needleCompany, hayCompanies)
+    ## Then store results
+
+if __name__ == '__main__':
+    pool = Pool(processes = numProcesses)
+    totalTargets = len(getTargets('all'))
+    targetsPerBatch = totalTargets / numProcesses
+    pool.map_async(runMatch, 
+                   itertools.izip(itertools.repeat(targetsPerBatch),
+                                  xrange(0, 
+                                         totalTargets,
+                                         targetsPerBatch))).get(99999999)
+    pool.close()
+    pool.join()
+</code></pre>
+<p>So I guess the questions are: How can I avoid loading the haystack for all workers - e.g. by sharing the data or taking a different approach like dividing the much larger haystack across workers rather than the needles? How can I otherwise improve memory usage by avoiding or eliminating clutter?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your design is a bit confusing. You're using a pool of N workers, and then breaking your M jobs work up into N tasks of size M/N. In other words, if you get that all correct, you're simulating worker processes on top of a pool built on top of worker processes. Why bother with that? If you want to use processes, just use them directly. Alternatively, use a pool as a pool, sends each job as its own task, and use the batching feature to batch them up in some appropriate (and tweakable) way.</p>
+<p>That means that <code>runMatch</code> just takes a single needleID and needleCompany, and all it does is call <code>findNeedle</code> and then do whatever that <code># Then store results</code> part is. And then the main program gets a lot simpler:</p>
+<pre><code>if __name__ == '__main__':
+    with Pool(processes=numProcesses) as pool:
+        results = pool.map_async(runMatch, needleCompanies.iteritems(), 
+                                 chunkSize=NUMBER_TWEAKED_IN_TESTING).get()
+</code></pre>
+<p>Or, if the results are small, instead of having all of the processes (presumably) fighting over some shared resulting-storing thing, just return them. Then you don't need <code>runMatch</code> at all, just:</p>
+<pre><code>if __name__ == '__main__':
+    with Pool(processes=numProcesses) as pool:
+        for result in pool.imap_unordered(findNeedle, needleCompanies.iteritems(), 
+                                          chunkSize=NUMBER_TWEAKED_IN_TESTING):
+            # Store result
+</code></pre>
+<p>Or, alternatively, if you <em>do</em> want to do exactly N batches, just create a Process for each one:</p>
+<pre><code>if __name__ == '__main__':
+    totalTargets = len(getTargets('all'))
+    targetsPerBatch = totalTargets / numProcesses
+    processes = [Process(target=runMatch, 
+                         args=(targetsPerBatch,
+                               xrange(0, 
+                                      totalTargets,
+                                      targetsPerBatch))) 
+                 for _ in range(numProcesses)]
+    for p in processes:
+        p.start()
+    for p in processes:
+        p.join()
+</code></pre>
+<hr/>
+<p>Also, you seem to be calling <code>getHayStack()</code> once for each task (and <code>getNeedles</code> as well). I'm not sure how easy it would be to end up with multiple copies of this live at the same time, but considering that it's the largest data structure you have by far, that would be the first thing I try to rule out. In fact, even if it's not a memory-usage problem, <code>getHayStack</code> could easily be a big performance hit, unless you're already doing some kind of caching (e.g., explicitly storing it in a global or a mutable default parameter value the first time, and then just using it), so it may be worth fixing anyway.</p>
+<p>One way to fix both potential problems at once is to use an initializer in the <a href="http://docs.python.org/3.3/library/multiprocessing.html#multiprocessing.pool.Pool" rel="nofollow"><code>Pool</code></a> constructor:</p>
+<pre><code>def initPool():
+    global _haystack
+    _haystack = getHayStack()
+
+def runMatch(args):
+    global _haystack
+    # ...
+    hayCompanies = _haystack
+    # ...
+
+if __name__ == '__main__':
+    pool = Pool(processes=numProcesses, initializer=initPool)
+    # ...
+</code></pre>
+<hr/>
+<p>Next, I notice that you're explicitly generating lists in multiple places where you don't actually need them. For example:</p>
+<pre><code>scores = list(results.values())
+resultIDs = list(results.keys())
+needleID = resultIDs[scores.index(max(scores))]
+return [needleID, haystack[needleID], max(scores)]
+</code></pre>
+<p>If there's more than a handful of results, this is wasteful; just use the <code>results.values()</code> iterable directly. (In fact, it looks like you're using Python 2.x, in which case <code>keys</code> and <code>values</code> are <em>already</em> lists, so you're just making an extra copy for no good reason.)</p>
+<p>But in this case, you can simplify the whole thing even farther. You're just looking for the key (resultID) and value (score) with the highest score, right? So:</p>
+<pre><code>needleID, score = max(results.items(), key=operator.itemgetter(1))
+return [needleID, haystack[needleID], score]
+</code></pre>
+<p>This also eliminates all the repeated searches over <code>score</code>, which should save some CPU.</p>
+<hr/>
+<p>This may not directly solve the memory problem, but it should hopefully make it easier to debug and/or tweak.</p>
+<p>The first thing to try is just to use much smaller batches—instead of input_size/cpu_count, try 1. Does memory usage go down? If not, we've ruled that part out.</p>
+<p>Next, try <code>sys.getsizeof(_haystack)</code> and see what it says. If it's, say, 1.6GB, then you're cutting things pretty fine trying to squeeze everything else into 0.4GB, so that's the way to attack it—e.g., use a <a href="http://docs.python.org/3/library/shelve.html" rel="nofollow"><code>shelve</code></a> database instead of a plain <code>dict</code>.</p>
+<p>Also try dumping memory usage (with the <a href="http://docs.python.org/3/library/resource.html" rel="nofollow"><code>resource</code></a> module, <code>getrusage(RUSAGE_SELF)</code>) at the start and end of the initializer function. If the final haystack is only, say, 0.3GB, but you allocate another 1.3GB building it up, that's the problem to attack. For example, you might spin off a single child process to build and pickle the dict, then have the pool initializer just open it and unpickle it. Or combine the two—build a <code>shelve</code> db in the first child, and open it read-only in the initializer. Either way, this would also mean you're only doing the CSV-parsing/dict-building work once instead of 8 times.</p>
+<p>On the other hand, if your total VM usage is still low (note that <code>getrusage</code> doesn't directly have any way to see your total VM size—<code>ru_maxrss</code> is often a useful approximation, especially if <code>ru_nswap</code> is 0) at time the first task runs, the problem is with the tasks themselves.</p>
+<p>First, <code>getsizeof</code> the arguments to the task function and the value you return. If they're large, especially if they either keep getting larger with each task or are wildly variable, it could just be pickling and unpickling that data takes too much memory, and eventually 8 of them are together big enough to hit the limit.</p>
+<p>Otherwise, the problem is most likely in the task function itself. Either you've got a memory leak (you can only have a <em>real</em> leak by using a buggy C extension module or <code>ctypes</code>, but if you keep any references around between calls, e.g., in a global, you could just be holding onto things forever unnecessarily), or some of the tasks themselves take too much memory. Either way, this should be something you can test more easily by pulling out the multiprocessing and just running the tasks directly, which is a lot easier to debug.</p>
+</div>
+<span class="comment-copy">Just a short comment, might give a detailed answer later. I've been working on fuzzy string matching too, lately - most of the time I <b>iterate</b> over the things I need to process, one by one or in smaller chunks - keeps things simple and memory usage mostly under 1%.</span>
+<span class="comment-copy">Part of the problem may be that you're re-generating the whole haystack as part of each task. Either (1) generate the haystack as part of the pool's <code>initializer</code> and just reuse it, or (2) make the haystack an iterator instead of a sequence, so you never have the whole thing in memory. In this case, I think (1) makes more sense, but without a bit more idea of how the real <code>getHayStack</code> works it's hard to be sure.</span>
+<span class="comment-copy">As a side note, why are you using <code>needles = defaultdict(list)</code> if you never to anything to it but set <code>needles[targetID] = …</code>? A plain old <code>dict</code> will do just as well there.</span>
+<span class="comment-copy">Thanks again - <code>getHayStack()</code> is very simple - reads a csv file into a dataframe and then converts to dictionary: <code>def getHayStack():     hayCompanies = read_csv(hayCompanies.txt').to_dict()     return hayCompanies</code></span>
+<span class="comment-copy">I'm storing a few more more things in the <code>defaultdict(list)</code>, just didn't show this.</span>
+<span class="comment-copy">Thanks, this very helpful! My logic was: I divide 30K needle search tasks into as many batches as there will be pooled workers (picked 8 for # of cores). Then, I pass each of them a batch of needles, have them load their haystack (already 150MB each), and store the best match for each needle (every 50 needles). It makes a lot of sense to return the results straight to the parent process. With runMatch gone, I assume I'd still use the <code>initializer</code> but create the global value in <code>findNeedle</code>? Thanks for the hints on the lists as well!</span>
+<span class="comment-copy">@StefanJansen: You'd <i>access</i> the global value in <code>findNeedle</code>; only <code>create</code> it in the initializer. But yeah, otherwise you've got it. At least that should be enough to get you to the next bug or bottleneck. :)</span>
+<span class="comment-copy">While it certainly makes for much leaner and more sensible code, it doesn't solve the original problem - I'm still getting the same <code>MemoryError</code> on Ubuntu, and virtual memory use isn't any smaller on my Mac either. In fact, tracking the program flow, it seems to operate very similar to how it did previously...</span>
+<span class="comment-copy">@StefanJansen: But now it should hopefully be easier to tweak and debug, at least. See the edited answer for some suggestions.</span>
+<span class="comment-copy">How great is this answer! Jeez!</span>

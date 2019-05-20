@@ -1,0 +1,85 @@
+<div class="post-text" itemprop="text">
+<p><a href="http://thonny.org" rel="nofollow noreferrer">My debugger</a> uses AST instrumentation to get notifications for all logical steps of code execution (including steps in expression evaluation).</p>
+<p>There is one step I'm not able to pin down -- the moment when for-loop is just about to assign new value to the loop variable.</p>
+<p>Inside <code>For</code>-node the loop variable (or something more complicated) is represented with an expression inside <code>target</code> attribute. This expression has <code>ctx</code> attribute set to <code>ast.Store()</code>. I don't know how to trace the usage of this node.</p>
+<p>As a special case, I could replace simple loop variables with indexing to <code>locals()</code>:</p>
+<pre><code>for locals()["i"] in range(10):
+    print(i)
+</code></pre>
+<p>This would give me a <code>ctx=ast.Load()</code> node inside the <code>ctx=ast.Store()</code> node and I know how to trace this. Unfortunately this won't scale to more complex targets. </p>
+<p>How does the interpreter use these <code>ctx=ast.Store()</code> expressions? Can I somehow instrument them directly to get notified when interpreter performs the store operation?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>One option is to rewrite the <code>for</code> loop so that the assignment targets a temporary variable and insert your tracing code into the loop body. For example, a loop like this:</p>
+<pre><code>for foo.x in range(3):
+    print(foo.x)
+</code></pre>
+<p>could be rewritten to this:</p>
+<pre><code>for _temp in range(3):
+    print('loop variable will be set to', _temp)
+    foo.x = _temp
+    print(foo.x)
+</code></pre>
+<p>For this purpose, we implement a <a href="https://docs.python.org/3/library/ast.html#ast.NodeTransformer" rel="nofollow noreferrer"><code>NodeTransformer</code></a>:</p>
+<pre><code>class ForLoopRewriter(ast.NodeTransformer):
+    def __init__(self, nodes_to_insert):
+        super().__init__()
+        self.nodes_to_insert = nodes_to_insert
+
+    def visit_For(self, node):
+        # redirect the assignment to a usually invalid variable name so it
+        # doesn't clash with other variables in the code
+        target = ast.Name('@loop_var', ast.Store())
+
+        # insert the new nodes
+        loop_body = self.nodes_to_insert.copy()
+
+        # then reassign the loop variable to the actual target
+        reassign = ast.Assign([node.target], ast.Name('@loop_var', ast.Load()))
+        loop_body.append(reassign)
+
+        # visit all the ast nodes in the loop body
+        for n in node.body:
+            loop_body.append(self.visit(n))
+
+        # make a new For node and return it
+        new_node = ast.For(target, node.iter, loop_body, node.orelse)
+        ast.fix_missing_locations(new_node)
+        return new_node
+</code></pre>
+<p>Which can be used like this:</p>
+<pre><code>code = '''
+class Foo:
+    @property
+    def x(self):
+        pass
+
+    @x.setter
+    def x(self, x):
+        print('Setting x')
+
+foo = Foo()
+itr = (print('yielding', x) for x in range(1))
+
+for foo.x in itr:
+    pass
+'''
+
+tree = ast.parse(code)
+tracing_code = ast.parse('print("Your tracing code")').body
+tree = ForLoopRewriter(tracing_code).visit(tree)
+codeobj = compile(tree, 'foo.py', 'exec')
+exec(codeobj)
+
+# output:
+# yielding 0
+# Your tracing code
+# Setting x
+</code></pre>
+</div>
+<span class="comment-copy">Umm, what do you mean by "instrument"?</span>
+<span class="comment-copy">@Aran-Fey, I meant "adding some synthetic code to the original code". In this case I want to add some kind of tracing code which gets executed when Python executes (or is about to execute) a store operation.</span>
+<span class="comment-copy">So you just want to add an AST node as the first instruction in the loop?</span>
+<span class="comment-copy">@Aran-Fey, If you meant first instruction in for body, then not really. I already can trace the moment before executing the first statement in for-body. I want to visualize the state before loop variable gets its (next) value.</span>
+<span class="comment-copy">Okay, I see. I guess you could rewrite the loop and do the assignment to the loop variable manually. But I have to admit that I don't know what the difference between <code>Load</code> and <code>Store</code> is. Why (and how) can you do it with <code>Load</code>, but not with <code>Store</code>?</span>
+<span class="comment-copy">Great idea! This solves my case perfectly. I still hope that someone posts also more info about how to use <code>ctx=ast.Store()</code> expressions</span>

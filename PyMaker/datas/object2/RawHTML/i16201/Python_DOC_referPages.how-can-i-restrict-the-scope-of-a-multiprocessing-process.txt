@@ -1,0 +1,125 @@
+<div class="post-text" itemprop="text">
+<p>Using python's <a href="https://docs.python.org/2/library/multiprocessing.html" rel="noreferrer"><code>multiprocessing</code></a> module, the following contrived example runs with minimal memory requirements:</p>
+<pre><code>import multiprocessing 
+# completely_unrelated_array = range(2**25)
+
+def foo(x):
+    for x in xrange(2**28):pass
+    print x**2
+
+P = multiprocessing.Pool()
+
+for x in range(8):
+    multiprocessing.Process(target=foo, args=(x,)).start()
+</code></pre>
+<p>Uncomment the creation of the <code>completely_unrelated_array</code> and you'll find that each spawned process allocates the memory for a copy of the <code>completely_unrelated_array</code>! This is a minimal example of a much larger project that I can't figure out how to workaround; multiprocessing seems to make a copy of everything that is global. I <strong>don't</strong> need a shared memory object, I simply need to pass in <code>x</code>, and process it <em>without</em> the memory overhead of the entire program.</p>
+<p><em>Side observation</em>: What's interesting is that <code>print id(completely_unrelated_array)</code> inside <code>foo</code> gives the same value, suggesting that somehow that might not be copies...</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Because of the nature of <code>os.fork()</code>, any variables in the global namespace of your <code>__main__</code> module will be inherited by the child processes (assuming you're on a Posix platform), so you'll see the memory usage in the children reflect that as soon as they're created. I'm not sure if all that memory is really being allocated though, as far as I know that memory is shared until you actually try to change it in the child, at which point a new copy is made. Windows, on the other hand, doesn't use <code>os.fork()</code> - it re-imports the main module in each child, and pickles any local variables you want sent to the children. So, using Windows you can actually avoid the large global ending up copied in the child by only defining it inside an <code>if __name__ == "__main__":</code> guard, because everything inside that guard will only run in the parent process:</p>
+<pre><code>import time
+import multiprocessing 
+
+
+def foo(x):
+    for x in range(2**28):pass
+    print(x**2)
+
+if __name__ == "__main__":
+    completely_unrelated_array = list(range(2**25)) # This will only be defined in the parent on Windows
+    P = multiprocessing.Pool()
+
+    for x in range(8):
+        multiprocessing.Process(target=foo, args=(x,)).start()
+</code></pre>
+<p>Now, in Python 2.x, you can only create new <code>multiprocessing.Process</code> objects by forking if you're using a Posix platform. But on Python 3.4, you can specify how the new processes are created, by using contexts. So, we can specify the <a href="https://docs.python.org/3/library/multiprocessing.html?highlight=multiprocessing#contexts-and-start-methods" rel="noreferrer"><code>"spawn"</code></a> context, which is the one Windows uses, to create our new processes, and use the same trick:</p>
+<pre><code># Note that this is Python 3.4+ only
+import time
+import multiprocessing 
+
+def foo(x):
+    for x in range(2**28):pass
+    print(x**2)
+
+
+if __name__ == "__main__":
+    completely_unrelated_array = list(range(2**23))  # Again, this only exists in the parent
+    ctx = multiprocessing.get_context("spawn") # Use process spawning instead of fork
+    P = ctx.Pool()
+
+    for x in range(8):
+        ctx.Process(target=foo, args=(x,)).start()
+</code></pre>
+<p>If you need 2.x support, or want to stick with using <code>os.fork()</code> to create new <code>Process</code> objects, I think the best you can do to get the reported memory usage down is immediately delete the offending object in the child:</p>
+<pre><code>import time
+import multiprocessing 
+import gc
+
+def foo(x):
+    init()
+    for x in range(2**28):pass
+    print(x**2)
+
+def init():
+    global completely_unrelated_array
+    completely_unrelated_array = None
+    del completely_unrelated_array
+    gc.collect()
+
+if __name__ == "__main__":
+    completely_unrelated_array = list(range(2**23))
+    P = multiprocessing.Pool(initializer=init)
+
+    for x in range(8):
+        multiprocessing.Process(target=foo, args=(x,)).start()
+    time.sleep(100)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>What is important here is which platform you are targeting.
+Unix systems processes are created by using Copy-On-Write (cow) memory. So even though each process gets a copy of the full memory of the parent process, that memory is only actually allocated on a per page bases (4KiB)when it is modified.
+So if you are only targeting these platforms you don't have to change anything.</p>
+<p>If you are targeting platforms without cow forks you may want to use python 3.4 and its new forking contexts <code>spawn</code> and <code>forkserver</code>, see the <a href="https://docs.python.org/3/library/multiprocessing.html?highlight=multiprocessing#contexts-and-start-methods" rel="nofollow">documentation</a>
+These methods will create new processes which share nothing or limited state with the parent and all memory passing is explicit.</p>
+<p>But not that that the spawned process will import your module so all global data will be explicitly copied and no copy-on-write is possible. To prevent this you have to reduce the scope of the data.</p>
+<pre><code>import multiprocessing  as mp
+import numpy as np
+
+def foo(x):
+    import time
+    time.sleep(60)
+
+if __name__ == "__main__":
+    mp.set_start_method('spawn')
+    # not global so forks will not have this allocated due to the spawn method
+    # if the method would be fork the children would still have this memory allocated
+    # but it could be copy-on-write
+    completely_unrelated_array = np.ones((5000, 10000))
+    P = mp.Pool()
+    for x in range(3):
+        mp.Process(target=foo, args=(x,)).start()
+</code></pre>
+<p>e.g top output with spawn:</p>
+<pre><code>%MEM     TIME+ COMMAND
+29.2   0:00.52 python3                                                
+0.5   0:00.00 python3    
+0.5   0:00.00 python3    
+0.5   0:00.00 python3    
+</code></pre>
+<p>and with fork:</p>
+<pre><code>%MEM     TIME+ COMMAND
+29.2   0:00.52 python3                                                
+29.1   0:00.00 python3    
+29.1   0:00.00 python3                                                
+29.1   0:00.00 python3
+</code></pre>
+<p>note how its more than 100%, due to copy-on-write</p>
+</div>
+<span class="comment-copy">What version of Python are you targeting, and what platform are you using?</span>
+<span class="comment-copy">@dano Python 2.7.6, though I'd be interested to know if multiprocessing has changed in 3.</span>
+<span class="comment-copy"><code>multiprocessing</code> has changed quite a bit in Python 3.3, with the introduction of <a href="https://docs.python.org/3/library/multiprocessing.html?highlight=multiprocessing#contexts-and-start-methods" rel="nofollow noreferrer">contexts</a>.</span>
+<span class="comment-copy">I'd say factor out anything you don't want to happen in all the child processes into their own module, right? i.e. put <code>foo</code> in its own module and then import it.</span>
+<span class="comment-copy">@dano If you show me a python 3 example that fixes this problem, that will work for me (and possibly others in the future!).</span>
+<span class="comment-copy">Thanks for the great answer! If I understand correctly, your 2.x method will still incur the overhead of the copy correct? I think it's time to start thinking about Python 3...</span>
+<span class="comment-copy">@Hooked With <code>os.fork()</code>, the objects aren't actually copied in the child process unless you write to them. Prior to that, the memory is shared between the parent the forked children. Note though, that it <a href="http://stackoverflow.com/q/14941729/2073595">doesn't take much</a> for the children to write to the inherited objects under the covers.</span>
+<span class="comment-copy">@Hooked You actually may be better off <i>not</i> trying to delete the global variables, since the <code>global completely_unrelated_array</code> probably results in an INCREF on the object. Just don't touch them at all in the children.</span>

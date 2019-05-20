@@ -1,0 +1,56 @@
+<div class="post-text" itemprop="text">
+<p>What happens behind the scenes (in CPython 3.6.0) when code uses <a href="https://github.com/python/cpython/blob/6f0eb93183519024cb360162bdd81b9faec97ba6/Lib/os.py#L51" rel="nofollow noreferrer"><code>import posix</code></a>?  This module doesn't have a <code>__file__</code> attribute.  When starting the interpreter in verbose mode, I see this line:</p>
+<pre><code>import 'posix' # &lt;class '_frozen_importlib.BuiltinImporter'&gt;
+</code></pre>
+<p>It's already present in <code>sys.modules</code> in a newly openened interpreter, and importing it just binds a name to the existing module.  </p>
+<p>I'm trying to look at implementation detail of <code>os.lstat</code> on my platform to determine if and when it uses <code>os.stat</code>.  </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here, have more detail than you're likely to need.</p>
+<hr/>
+<p><code>posix</code> is a built-in module. When you hear "built-in module", you might think of ordinary standard library modules, or you might think of modules written in C, but <code>posix</code> is more built-in than most.</p>
+<p>The <code>posix</code> module is written in C, in <a href="https://github.com/python/cpython/blob/3.6/Modules/posixmodule.c" rel="nofollow noreferrer"><code>Modules/posixmodule.c</code></a>. However, while most C modules, even standard library C modules, are compiled to <code>.so</code> or <code>.pyd</code> files and placed on the import path like regular Python modules, <code>posix</code> actually gets compiled right into the Python executable itself.</p>
+<hr/>
+<p>One of the internal details of CPython's import system is the <a href="https://github.com/python/cpython/blob/3.6/Python/import.c#L30" rel="nofollow noreferrer"><code>PyImport_Inittab</code> array</a>:</p>
+<pre><code>extern struct _inittab _PyImport_Inittab[];
+
+struct _inittab *PyImport_Inittab = _PyImport_Inittab;
+</code></pre>
+<p>This is an array of <code>struct _inittab</code>s, which consist of a name and a C module initialization function for the module with that name. Modules listed here are built-in.</p>
+<p>This array is initially set to <code>_PyImport_Inittab</code>, which comes from <code>Modules/config.c</code> (or <code>PC/config.c</code> depending on your OS, but that's not the case here). Unfortunately, <code>Modules/config.c</code> is generated from <a href="https://github.com/python/cpython/blob/3.6/Modules/config.c.in" rel="nofollow noreferrer"><code>Modules/config.c.in</code></a> during the Python build process, so I can't show you a source code link, but here's part of what it looks like when I generate the file:</p>
+<pre><code>struct _inittab _PyImport_Inittab[] = {
+
+        {"_thread", PyInit__thread},
+        {"posix", PyInit_posix},
+        // ...
+</code></pre>
+<p>As you can see, there's an entry for the <code>posix</code> module, along with the module initialization function, <code>PyInit_posix</code>.</p>
+<hr/>
+<p>As part of the import system, when trying to load a module, Python goes through <code>sys.meta_path</code>, a list of module <a href="https://docs.python.org/3/reference/import.html#finders-and-loaders" rel="nofollow noreferrer">finders</a>. One of these finders is responsible for performing the <code>sys.path</code> search you're likely more familiar with, but one of the others is <code>_frozen_importlib.BuiltinImporter</code>, responsible for finding built-in modules like <code>posix</code>. When Python tries that finder, it runs the finder's <a href="https://github.com/python/cpython/blob/3.6/Lib/importlib/_bootstrap.py#L698" rel="nofollow noreferrer"><code>find_spec</code></a> method:</p>
+<pre><code>@classmethod
+def find_spec(cls, fullname, path=None, target=None):
+    if path is not None:
+        return None
+    if _imp.is_builtin(fullname):
+        return spec_from_loader(fullname, cls, origin='built-in')
+    else:
+        return None
+</code></pre>
+<p>which uses <a href="https://github.com/python/cpython/blob/3.6/Python/import.c#L934" rel="nofollow noreferrer"><code>_imp.is_builtin</code></a> to search <code>PyImport_Inittab</code> for the <code>"posix"</code> name. The search finds the name, so <code>find_spec</code> returns a module spec representing the fact that the loader for built-in modules should handle creating this module. (The loader is the second argument to <code>spec_from_loader</code>. It's <code>cls</code> here, because <code>BuiltinImporter</code> is both the finder and loader.)</p>
+<p>Python then runs the loader's <a href="https://github.com/python/cpython/blob/3.6/Lib/importlib/_bootstrap.py#L719" rel="nofollow noreferrer"><code>create_module</code></a> method to generate the module object:</p>
+<pre><code>@classmethod
+def create_module(self, spec):
+    """Create a built-in module"""
+    if spec.name not in sys.builtin_module_names:
+        raise ImportError('{!r} is not a built-in module'.format(spec.name),
+                          name=spec.name)
+    return _call_with_frames_removed(_imp.create_builtin, spec)
+</code></pre>
+<p>which delegates to <a href="https://github.com/python/cpython/blob/3.6/Python/import.c#L1023" rel="nofollow noreferrer"><code>_imp.create_builtin</code></a>, which searches <code>PyImport_Inittab</code> for the module name and runs the corresponding initialization function.</p>
+<p>(<code>_call_with_frames_removed(x, y)</code> just calls <code>x(y)</code>, but <a href="https://github.com/python/cpython/blob/3.6/Python/import.c#L1278" rel="nofollow noreferrer">part of the import system</a> treats it as a magic indicator to strip <code>importlib</code> frames from stack traces, which is why you never see those frames in the stack trace when your imports go wrong.)</p>
+<hr/>
+<p>If you want to see more of the code path involved, you can look through <a href="https://github.com/python/cpython/blob/3.6/Lib/importlib/_bootstrap.py" rel="nofollow noreferrer"><code>Lib/importlib/_bootstrap.py</code></a>, where most of the import implementation lives, <a href="https://github.com/python/cpython/blob/3.6/Python/import.c" rel="nofollow noreferrer"><code>Python/import.c</code></a>, where most of the C part of the implementation lives, and <a href="https://github.com/python/cpython/blob/3.6/Python/ceval.c#L2843" rel="nofollow noreferrer"><code>Python/ceval.c</code></a>, which is where the bytecode interpreter loop lives, and thus is where execution of an <code>import</code> statement starts, before it reaches the more core parts of the import machinery.</p>
+<p>Relevant documentation includes the <a href="https://docs.python.org/3/reference/import.html" rel="nofollow noreferrer">section of the language reference on the import system</a>, as well as PEPs <a href="https://www.python.org/dev/peps/pep-0451/" rel="nofollow noreferrer">451</a> and <a href="https://www.python.org/dev/peps/pep-0302/" rel="nofollow noreferrer">302</a>. There isn't much documentation on built-in modules, although I did find <a href="https://docs.python.org/3/c-api/import.html#c._inittab" rel="nofollow noreferrer">a bit of documentation</a> targeted toward people embedding Python in other programs, since they might want to modify <code>PyImport_Inittab</code>, and there is the <a href="https://docs.python.org/3/library/sys.html#sys.builtin_module_names" rel="nofollow noreferrer"><code>sys.builtin_module_names</code></a> list.</p>
+</div>
+<span class="comment-copy">If you're just looking for the source code, it's <a href="https://github.com/python/cpython/blob/master/Modules/posixmodule.c#L2420" rel="nofollow noreferrer">here</a>, and it's in C.</span>
+<span class="comment-copy">Thanks.  I'm also interested to learn how the C code gets bound to a Python object.</span>

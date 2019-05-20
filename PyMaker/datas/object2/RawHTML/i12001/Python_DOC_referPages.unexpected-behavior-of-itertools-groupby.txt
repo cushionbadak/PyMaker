@@ -1,0 +1,98 @@
+<div class="post-text" itemprop="text">
+<p>This is the observed behavior:</p>
+<pre><code>In [4]: x = itertools.groupby(range(10), lambda x: True)
+
+In [5]: y = next(x)
+
+In [6]: next(x)
+---------------------------------------------------------------------------
+StopIteration                             Traceback (most recent call last)
+&lt;ipython-input-6-5e4e57af3a97&gt; in &lt;module&gt;()
+----&gt; 1 next(x)
+
+StopIteration: 
+
+In [7]: y
+Out[7]: (True, &lt;itertools._grouper at 0x10a672e80&gt;)
+
+In [8]: list(y[1])
+Out[8]: [9]
+</code></pre>
+<p>The expected output of <code>list(y[1])</code> is <code>[0,1,2,3,4,5,6,7,8,9]</code></p>
+<p>What's going on here?</p>
+<p>I observed this on <code>cpython 3.4.2</code>, but others have seen this with <code>cpython 3.5</code> and <code>IronPython 2.9.9a0 (2.9.0.0) on Mono 4.0.30319.17020 (64-bit)</code>.</p>
+<p>The observed behavior on <code>Jython 2.7.0</code> and pypy:</p>
+<pre><code>Python 2.7.10 (5f8302b8bf9f, Nov 18 2015, 10:46:46)
+[PyPy 4.0.1 with GCC 4.8.4]
+
+&gt;&gt;&gt;&gt; x = itertools.groupby(range(10), lambda x: True)
+&gt;&gt;&gt;&gt; y = next(x)
+&gt;&gt;&gt;&gt; next(x)
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+StopIteration
+&gt;&gt;&gt;&gt; y
+(True, &lt;itertools._groupby object at 0x00007fb1096039a0&gt;)
+&gt;&gt;&gt;&gt; list(y[1])
+[]
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://docs.python.org/3/library/itertools.html#itertools.groupby" rel="nofollow"><code>itertools.groupby</code></a> documentation tells that</p>
+<blockquote>
+<p><code>itertools.groupby(iterable, key=None)</code></p>
+<p>[...]</p>
+<p>The operation of <code>groupby()</code> is similar to the uniq filter in Unix. It generates a break or new group every time the value of the key function changes (which is why it is usually necessary to have sorted the data using the same key function). That behavior differs from SQL’s GROUP BY which aggregates common elements regardless of their input order.</p>
+<p>The returned group is itself an iterator that shares the underlying iterable with <code>groupby()</code>. Because the source is shared, when the `groupby() object is advanced, the previous group is no longer visible. So, if that data is needed later, <strong>it should be stored as a list</strong> [--]</p>
+</blockquote>
+<p>So the <strong>assumption</strong> from the last paragraph is that that the generated list would be the empty list <code>[]</code>, since the iterator advanced already, and met <code>StopIteration</code>; but instead in CPython the result is surprising <code>[9]</code>.</p>
+<hr/>
+<p>This is because the <a href="https://github.com/python/cpython/blob/a3922b02c124b5e564d7ea5a3cb62256b988de28/Modules/itertoolsmodule.c#L275" rel="nofollow"><code>_grouper</code> iterator</a> lags one item behind the original iterator, which is because <code>groupby</code> needs to peek one item ahead to see if it belongs to the current or the next group, yet it must be able to later yield this item as the first item of the new group.</p>
+<p>However the <code>currkey</code> and <code>currvalue</code> attributes of the <code>groupby</code> are <em>not</em> reset when the <a href="https://github.com/python/cpython/blob/a3922b02c124b5e564d7ea5a3cb62256b988de28/Modules/itertoolsmodule.c#L98" rel="nofollow">original iterator is exhausted</a>, so <code>currvalue</code> still points to the last item from the iterator.</p>
+<p>The CPython documentation actually contains this equivalent code, that also has the exact same behaviour as the C version code:</p>
+<pre><code>class groupby:
+    # [k for k, g in groupby('AAAABBBCCDAABBB')] --&gt; A B C D A B
+    # [list(g) for k, g in groupby('AAAABBBCCD')] --&gt; AAAA BBB CC D
+    def __init__(self, iterable, key=None):
+        if key is None:
+            key = lambda x: x
+        self.keyfunc = key
+        self.it = iter(iterable)
+        self.tgtkey = self.currkey = self.currvalue = object()
+    def __iter__(self):
+        return self
+    def __next__(self):
+        while self.currkey == self.tgtkey:
+            self.currvalue = next(self.it)    # Exit on StopIteration
+            self.currkey = self.keyfunc(self.currvalue)
+        self.tgtkey = self.currkey
+        return (self.currkey, self._grouper(self.tgtkey))
+    def _grouper(self, tgtkey):
+        while self.currkey == tgtkey:
+            yield self.currvalue
+            try:
+                self.currvalue = next(self.it)
+            except StopIteration:
+                return
+            self.currkey = self.keyfunc(self.currvalue)
+</code></pre>
+<p>Notably the <code>__next__</code> finds the first item of the next group, and stores it its key into <code>self.currkey</code> and its value to <code>self.currvalue</code>. But the key is the line</p>
+<pre><code>self.currvalue = next(self.it)    # Exit on StopIteration
+</code></pre>
+<p>When <code>next</code> throws <code>StopItertion</code> the <code>self.currvalue</code> still contains the last key of the previous group. Now, when <code>y[1]</code> is made into a <code>list</code>, it <strong>first</strong> yields the value of <code>self.currvalue</code>, and only then runs <code>next()</code> on the underlying iterator (and meets <code>StopIteration</code> again).</p>
+<hr/>
+<p>Even though there is Python equivalent in the documentation, that behaves exactly like the authoritative C code implementation in CPython, IronPython, Jython and PyPy give different results.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem is that you group all of them into one group so after the first <code>next</code> call everything is already grouped:</p>
+<pre><code>import itertools
+x = itertools.groupby(range(10), lambda x: True)
+key, elements = next(x)
+</code></pre>
+<p>but the <code>elements</code> are a generator, so you need to pass it immediatly into some structure taking an iterable to "print" or "save" it, i.e. a <code>list</code>:</p>
+<pre><code>print('Key: "{}" with value "{}"'.format(key, list(elements)))
+</code></pre>
+<p>and then your <code>range(10)</code> is empty and the groupy-generator is finished:</p>
+<pre><code>Key: True with value [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+</code></pre>
+</div>

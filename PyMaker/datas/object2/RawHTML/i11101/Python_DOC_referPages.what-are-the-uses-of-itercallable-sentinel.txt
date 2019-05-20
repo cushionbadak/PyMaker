@@ -1,0 +1,128 @@
+<div class="post-text" itemprop="text">
+<p>So, I was watching Raymond Hettinger's talk <a href="https://www.youtube.com/watch?v=OSGv2VnC0go" rel="noreferrer">Transforming Code into Beautiful, Idiomatic Python</a> and he brings up this form of <code>iter</code> which I was never aware of. His example is the following:</p>
+<p>Instead of:</p>
+<pre><code>blocks = []
+while True:
+    block = f.read(32)
+    if block == '':
+        break
+    blocks.append(block)
+</code></pre>
+<p>Use:</p>
+<pre><code>blocks = []
+read_block = partial(f.read, 32)
+for block in iter(read_block, ''):
+    blocks.append(block)
+</code></pre>
+<p>After checking the <a href="https://docs.python.org/3/library/functions.html#iter" rel="noreferrer">documentation</a> of <code>iter</code>, I found a similar example:</p>
+<pre><code>with open('mydata.txt') as fp:
+    for line in iter(fp.readline, ''):
+        process_line(line)
+</code></pre>
+<p>This looks pretty useful to me, but I was wondering if of you Pythonistas know of any examples of this construct that doesn't involve I/O-read loops? Perhaps in the Standard Library? </p>
+<p>I can think of very contrived examples, like the following:</p>
+<pre><code>&gt;&gt;&gt; def f():
+...     f.count += 1
+...     return f.count
+... 
+&gt;&gt;&gt; f.count = 0
+&gt;&gt;&gt; list(iter(f,20))
+[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+&gt;&gt;&gt; 
+</code></pre>
+<p>But obviously this is not any more useful that the built-in iterables. Also, it seems like code smell to me when you are assigning state to a function. At that point, I'd likely should be working with a class, but if I'm going to write a class, I might as well implement the iterator protocol for whatever I want to accomplish.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As a rule, the main uses I've seen for two arg iter involve converting functions that are similar to C APIs (implicit state, no concept of iteration) to iterators. File-like objects are a common example, but it shows up in other libraries that poorly wrap C APIs. The pattern you'd expect would be one seen in APIs like <code>FindFirstFile</code>/<code>FindNextFile</code>, where a resource is opened, and each call advances internal state and returns a new value or a marker variable (like <code>NULL</code> in C). Wrapping it in a class implementing the iterator protocol is usually best, but if you have to do it yourself, while the API is a C level built-in, the wrapping can end up slowing usage, where two arg iter, implemented in C as well, can avoid the expense of additional byte code execution.</p>
+<p>Other examples involve mutable objects that are changed during the loop itself, for example, looping in reverse order over lines in a bytearray, removing the line only once processing is complete:</p>
+<pre><code>&gt;&gt;&gt; from functools import partial
+&gt;&gt;&gt; ba = bytearray(b'aaaa\n'*5)
+&gt;&gt;&gt; for i in iter(partial(ba.rfind, b'\n'), -1):
+...     print(i)
+...     ba[i:] = b''
+...
+24
+19
+14
+9
+4
+</code></pre>
+<p>Another case is when using slicing in a progressive manner, for example, an efficient (if admittedly ugly) way to group an iterable into groups of <code>n</code> items while allowing the final group to be less than <code>n</code> items if the input iterable isn't an even multiple of <code>n</code> items in length (this one I've actually used, though I usually use <code>itertools.takewhile(bool</code> instead of two arg <code>iter</code>):</p>
+<pre><code># from future_builtins import map  # Python 2 only
+from itertools import starmap, islice, repeat
+
+def grouper(n, iterable):
+    '''Returns a generator yielding n sized tuples from iterable
+
+    For iterables not evenly divisible by n, the final group will be undersized.
+    '''
+    # Keep islicing n items and converting to groups until we hit an empty slice
+    return iter(map(tuple, starmap(islice, repeat((iter(iterable), n)))).__next__, ())  # Use .next instead of .__next__ on Py2
+</code></pre>
+<p>Another use: Writing multiple pickled objects to a single file, followed by a sentinel value (<code>None</code> for example), so when unpickling, you can use this idiom instead of needing to somehow remember the number of items pickled, or needing to call <code>load</code> over and over until <code>EOFError</code>:</p>
+<pre><code>with open('picklefile', 'rb') as f:
+    for obj in iter(pickle.Unpickler(f).load, None):
+        ... process an object ...
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's a silly example I came up with:</p>
+<pre><code>from functools import partial
+from random import randint
+
+pull_trigger = partial(randint, 1, 6)
+
+print('Starting a game of Russian Roulette...')
+print('--------------------------------------')
+
+for i in iter(pull_trigger, 6):
+    print('I am still alive, selected', i)
+
+print('Oops, game over, I am dead! :(')
+</code></pre>
+<p>Sample output:</p>
+<pre><code>$ python3 roulette.py 
+Starting a game of Russian Roulette...
+--------------------------------------
+I am still alive, selected 2
+I am still alive, selected 4
+I am still alive, selected 2
+I am still alive, selected 5
+Oops, game over, I am dead! :(
+</code></pre>
+<p>The idea is to have a generator that yields random values, and you want to a process once a particular value has been selected. You could e.g. use this pattern in each run of a simulation that tries to determine the average outcome of a stochastic process.</p>
+<p>Of course the process you would be modelling would likely be much more complicated under the hood than a simple dice roll...</p>
+<p>Another example I can think of would be repeatedly performing an operation until it succeeds, indicated by an empty error message (let's just assume here that some 3rd party function is designed like that instead of e.g. using exceptions):</p>
+<pre><code>from foo_lib import guess_password
+
+for msg in iter(guess_password, ''):
+    print('Incorrect attempt, details:', msg)
+
+# protection cracked, continue...
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>In multiprocessing/multithreading code you will (hopefully) find this construct often for polling a queue or pipe. In the standard lib you'll also find this in <code>multiprocessing.Pool</code>:</p>
+<pre><code>@staticmethod
+def _handle_tasks(taskqueue, put, outqueue, pool, cache):
+    thread = threading.current_thread()
+
+    for taskseq, set_length in iter(taskqueue.get, None):
+        task = None
+        try:
+            # iterating taskseq cannot fail
+            for task in taskseq:
+        ...
+    else:
+        util.debug('task handler got sentinel')
+</code></pre>
+<p>Some while ago I came across <a href="https://amir.rachum.com/blog/2013/11/10/python-tips-iterate-with-a-sentinel-value/" rel="nofollow noreferrer">this</a> blog entry, which IMO wraps up really nice the advantage of <code>iter(callable, sentinel)</code> over <code>while True ... break</code>:</p>
+<blockquote>
+<p>Usually, when we iterate over an objects or until a condition happens, we understand the scope of the loop in its first line. e.g., when reading a loop that starts with for book in books we realize we’re iterating over all the books. When we see a loop that starts with while not battery.empty() we realize that the scope of the loop is for as long as we still have battery.
+  When we say “Do forever” (i.e., while True), it’s obvious that this scope is a <em>lie</em>. So it requires us to hold that thought in our head and search the rest of the code for a statement that’ll get us out of it. We are entering the loop with less information and so it is less readable.</p>
+</blockquote>
+</div>
+<span class="comment-copy">For people that downvoted the question or voted to close, I would appreciate some feedback as to how to better ask this question.</span>
+<span class="comment-copy">Relevant question <a href="https://stackoverflow.com/questions/52446415/line-in-iterfp-readline-rather-than-line-in-fp/" title="line in iterfp readline rather than line in fp">stackoverflow.com/questions/52446415/…</a> and bug report <a href="https://bugs.python.org/issue34764" rel="nofollow noreferrer">bugs.python.org/issue34764</a></span>
+<span class="comment-copy">Thanks for the background regarding converting functions similar to C APIs, that is exactly what I was looking for.</span>
+<span class="comment-copy">I should have thought of a functions that return random values myself!</span>

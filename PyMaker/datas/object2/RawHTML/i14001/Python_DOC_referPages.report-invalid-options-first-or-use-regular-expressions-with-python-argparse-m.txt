@@ -1,0 +1,160 @@
+<div class="post-text" itemprop="text">
+<p>When using the argparse module in Python I am looking for a way to trap invalid options and report them better.
+The documentation at <a href="https://docs.python.org/3/library/argparse.html#invalid-arguments">https://docs.python.org/3/library/argparse.html#invalid-arguments</a> provides an example:</p>
+<pre><code>parser = argparse.ArgumentParser(prog='PROG'
+parser.add_argument('--foo', type=int)
+parser.add_argument('bar', nargs='?')
+
+# invalid option
+parser.parse_args(['--bar'])
+usage: PROG [-h] [--foo FOO] [bar]
+PROG: error: no such option: --bar
+</code></pre>
+<p>However it is quite easy to trip this up as bad options are not reported first. For example:</p>
+<pre><code>import argparse
+import datetime
+
+def convertIsoTime(timestamp):
+    """read ISO-8601 time-stamp using the AMS conventional format YYYY-MM-DDThh:mm:ssUTC"""
+    try:
+        return datetime.datetime.strptime(timestamp,"%Y-%m-%dT%H:%M:%SUTC")
+    except:
+        raise argparse.ArgumentTypeError("'{}' is not a valid ISO-8601 time-stamp".format(timestamp))
+
+parser = argparse.ArgumentParser()
+parser.add_argument('startTime', type=convertIsoTime)
+parser.add_argument('--good', type=int,
+                    help='foo')
+
+args = parser.parse_args(['--gold','5','2015-01-01T00:00:00UTC'])
+</code></pre>
+<p>will report:</p>
+<pre><code>error: argument startTime: '5' is not a valid ISO-8601 time-stamp
+</code></pre>
+<p>When I would prefer it to report the more useful:</p>
+<pre><code>error: no such option: --gold
+</code></pre>
+<p>Is it possible to achieve this?
+It seems to me a quite basic use case.
+When writing argument parsers directly I typically use a pattern
+such that anything starting with a -- option prefix that is not a known option is rejected immediately. 
+For example in bash</p>
+<pre><code># Process command-line arguments
+while [ $# -gt 0 ]; do
+   case "$1" in
+   --debug)
+      DEBUGOPTION="--debug"
+      shift
+      break;;
+   --)
+      shift
+      break;;
+   --*)
+      handleUsageError "$1"
+      shift;;
+   *)
+      break;;
+   esac
+done
+</code></pre>
+<p>I believe argparse uses regular expressions internally but I don't think they are accessible via add_argument()</p>
+<p>Is there any way to do the equivalent easily with argparse?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The short answer is that <code>parse_args</code> uses <code>parse_known_args</code>.  This method lets you handle unknown arguments like <code>--gold</code>.  As a result, argument type errors get raised before <code>unknown arguments</code> errors.</p>
+<p>I've added a solution that involves subclassing <code>ArgumentParser</code> and modifying a method deep in its calling stack.</p>
+<hr/>
+<p>I'll try to outline <code>parse_args</code> as applied to your example.</p>
+<p>The first thing it does is categorize the strings as either <code>O</code> or <code>A</code>.  Put simply, ones that begin with <code>-</code> are <code>O</code>, others <code>A</code>.  It also tries to match the <code>O</code> ones with a defined argument.</p>
+<p>In your example, it finds <code>OAA</code>.  Regex is used to match this string against patterns defined by the argument <code>nargs</code>.  (if needed I can explain this step in more detail)</p>
+<p><code>--gold</code> does not match; at some point (whether in this initial loop or later) it gets put into a <code>extras</code> list.  (I'll check the code for details).</p>
+<p>For the 2nd loop through the strings it alternately tries to handle postionals and optionals.</p>
+<p>It's when trying to match the <code>5</code> with <code>starttime</code> that your Action class raises the type error, which propagates up to printing the usage and exiting.  Because <code>--gold</code> is not defined, <code>5</code> is not consumed as an optional's argument.  Thus it gets parsed as the first positional string.  (Some kinds of optionals take 0 arguments, so it does not assume anything following an <code>--...</code> is an optionals argument).</p>
+<p>I think, that without the <code>5</code>, the last string would match.  <code>parse_known_args</code> would return with <code>--gold</code> in the <code>extras</code> term.  <code>parse_args</code> uses <code>parse_known_args</code> but raises an error when <code>extras</code> is not empty.</p>
+<p>So in a sense the parser does detect both errors, but it's the <code>starttime</code> one that triggers the error message.  It waits till the end to complain about unrecognized <code>--gold</code>.</p>
+<p>As a general philosophy, <code>argparse</code> does not try to detect and present all errors.  It does not collect a list of errors to present in one final comprehensive message.</p>
+<p>I'll review the code to check the details.  I don't think you can easily change basic parsing pattern.  If I think of a way to force an earlier <code>unrecognized option</code> error, I'll edit this answer.</p>
+<hr/>
+<p><code>def _parse_optional(self, arg_string):</code> tries to classify an <code>argv</code> string.  If the string looks like a <code>positional</code> it returns <code>None</code>.  If it matches an Action option_string, it returns a tuple '(action, option_string, None)` with the matching action.  Finally if not match, it returns:</p>
+<pre><code>    # it was meant to be an optional but there is no such option
+    # in this parser (though it might be a valid option in a subparser)
+    return None, arg_string, None
+</code></pre>
+<p>I think that is what happens with your <code>--gold</code>.  Note the reason why it might still be a valid option.</p>
+<p>This function is called by </p>
+<pre><code>def _parse_known_args(self, arg_strings, namespace):
+  ...
+  for i, arg_string in enumerate(arg_strings_iter):
+      ....
+      option_tuple = self._parse_optional(arg_string)
+      if option_tuple is None:
+         pattern = 'A'
+      else:
+         option_string_indices[i] = option_tuple
+         pattern = 'O'
+      arg_string_pattern_parts.append(pattern)
+  ...
+  # at the end
+  # return the updated namespace and the extra arguments
+  return namespace, extras
+</code></pre>
+<p>collecting that <code>'AOO'</code> pattern, as well a list of these tuples.</p>
+<p>During a 2nd loop it alternates between consuming positionals and optionals.  The function that consumes an optional is:</p>
+<pre><code>def consume_optional(start_index):
+    option_tuple = option_string_indices[start_index]
+    action, option_string, explicit_arg = option_tuple
+    if action is None:
+       extras.append(arg_strings[start_index])
+    ...otherwise...
+       take_action(action, args, option_string)
+</code></pre>
+<p>As I wrote earlier, your <code>--gold</code> gets put on the <code>extras</code> list, while <code>5</code> remains on the list of arguments that can be parsed as positionals.</p>
+<p>The <code>namespace</code> and <code>extras</code> are passed on through <code>parse_known_args</code> to you, the user, or to <code>parse_args</code>.</p>
+<p>Conceivably you could subclass <code>ArgumentParser</code> and define a modified <code>_parse_optional</code> method.  It could raise an error instead of returning that <code>(None, arg_string, None)</code> tuple.</p>
+<pre><code>import argparse
+import datetime
+
+class MyParser(argparse.ArgumentParser):
+    def _parse_optional(self, arg_string):
+        arg_tuple = super(MyParser, self)._parse_optional(arg_string)
+        if arg_tuple is None:
+            return arg_tuple  # positional
+        else:
+            if arg_tuple[0] is not None:
+                return arg_tuple # valid optional
+            else:
+                msg = 'error: no such option: %s'%arg_string
+                self.error(msg)
+
+def convertIsoTime(timestamp):
+    """read ISO-8601 time-stamp using the AMS conventional format YYYY-MM-DDThh:mm:ssUTC"""
+    try:
+        return datetime.datetime.strptime(timestamp,"%Y-%m-%dT%H:%M:%SUTC")
+    except:
+        raise argparse.ArgumentTypeError("'{}' is not a valid ISO-8601 time-stamp".format(timestamp))
+
+# parser = argparse.ArgumentParser()
+parser = MyParser()
+parser.add_argument('startTime', type=convertIsoTime)
+parser.add_argument('--good', type=int,
+                    help='foo')
+
+args = parser.parse_args(['--good','5','2015-01-01T00:00:00UTC'])
+print(args)
+
+args = parser.parse_args(['--gold','5','2015-01-01T00:00:00UTC'])
+</code></pre>
+<p>produces</p>
+<pre><code>1505:~/mypy$ python3 stack31317166.py 
+Namespace(good=5, startTime=datetime.datetime(2015, 1, 1, 0, 0))
+usage: stack31317166.py [-h] [--good GOOD] startTime
+stack31317166.py: error: error: no such option: --gold
+</code></pre>
+<p>Subclassing to provide custom action is good <code>argparse</code> (and Python) practice.</p>
+<p>If you want more consideration of this case by Python developers, consider writing a <code>bug/issue</code>  (at PEP is for more developed formal ideas).  But there is quite a backlog of <code>argparse</code> bugs/patches, and a lot of caution about backwards compatibility.</p>
+<hr/>
+<p><a href="http://bugs.python.org/issue?%40columns=id%2Cactivity%2Ctitle%2Ccreator%2Cassignee%2Cstatus%2Ctype&amp;%40sort=-activity&amp;%40filter=status&amp;%40action=searchid&amp;ignore=file%3Acontent&amp;%40search_text=_parse_optional&amp;submit=search&amp;status=-1%2C1%2C2%2C3" rel="nofollow">http://bugs.python.org/issue?%40columns=id%2Cactivity%2Ctitle%2Ccreator%2Cassignee%2Cstatus%2Ctype&amp;%40sort=-activity&amp;%40filter=status&amp;%40action=searchid&amp;ignore=file%3Acontent&amp;%40search_text=_parse_optional&amp;submit=search&amp;status=-1%2C1%2C2%2C3</a></p>
+<p>is a list of bug/issues that reference <code>_parse_optional</code>.  Possible changes include how ambiguous optionals are handled.  (I'll scan them to see if I'm forgetting anything.  A some of the patches are mine.)  But by using <code>super</code>, my suggested change is not affected by changes within the function.  It's affected only by changes in how the function is called and what it returns, which is much less likely to occur.  By filing your own issue, you at least put the developers on notice that someone depends on this interface.</p>
+</div>
+<span class="comment-copy">Thanks for a detailed and useful explanation. My only concern would be that it could break if argparse is updated. I will add a request to the argparse backlog.</span>
+<span class="comment-copy">I added a note on existing issues.</span>

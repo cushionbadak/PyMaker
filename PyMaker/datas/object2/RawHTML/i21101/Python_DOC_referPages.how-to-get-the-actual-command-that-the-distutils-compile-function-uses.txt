@@ -1,0 +1,54 @@
+<div class="post-text" itemprop="text">
+<p>I have a Distutils setup.py script which uses new_compiler().compile() to compile test programs to make sure certain features (eg. MPI) are available on the system.</p>
+<p>My problem is that there is one case where the compile() call results in a compiler error, but compiling the same little test program manually does not. The error is inside a standard header (mpi.h). All my actual source files also include this header but they compile fine! This particular check would be very useful to have, but I need to figure out why it's failing when it shouldn't be.</p>
+<p>So my question is, how can I get the actual command used by ccompiler.compile()?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Adam (Wagner)'s comment is the right place to start: you have to hunt through the Distutils source code. There are a lot of levels of abstraction so you do have to trace the execution through several different files, but here's the gist:</p>
+<ul>
+<li>The package <code>distutils.ccompiler</code> includes an abstract class <code>CCompiler</code> which handles invoking the actual compiler. It has methods for the various tasks a compiler needs to perform: <code>preprocess</code>, <code>compile</code>, and <code>link</code>. <code>CCompiler</code> itself does not implement any of these methods except for <code>compile</code>, but even there it delegates the actual compiler invocation to the method <code>_compile</code>. So you need to check the subclass of <code>CCompiler</code> that is used on your platform and look at its implementation of <code>_compile</code>.</li>
+<li>There are several different subclasses of <code>CCompiler</code>, each implemented in its own package, but the "big two" are <code>distutils.unixccompiler.UnixCCompiler</code> (which invokes the native compiler on a UNIX-like system) and <code>distutils.msvccompiler.MSVCCompiler</code> (which invokes Visual Studio). Both of these use the function <code>distutils.spawn.spawn</code> to actually run the external process.</li>
+<li>In the source for <code>distutils.spawn.spawn</code>, you'll notice that each command is logged at the level <code>INFO</code> before it is run. But the catch is, this doesn't use Python's builtin logging system; rather it uses Distutils' custom logger implemented in <code>distutils.log</code>.</li>
+<li><p>If you now look at the source for <code>distutils.log</code>, you'll see that there is a function <code>set_verbosity</code> which sets the logging level. Unfortunately, it isn't tied to any of the other debugging infrastructure in Distutils (such as the <code>DISTUTILS_DEBUG</code> environment variable), so you'll need to manually call</p>
+<pre><code>distutils.log.set_verbosity(1)
+</code></pre>
+<p>somewhere in your setup script, before any compilation commands are run. Once you do that, all compilation commands (and who knows what other information) should be printed to standard output.</p></li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is insanely late, but I found out how to do this from within python (without checking logs) in case anyone is wondering:</p>
+<pre><code>import distutils.sysconfig
+import distutils.ccompiler
+compiler = distutils.ccompiler.new_compiler()
+distutils.sysconfig.customize_compiler(compiler)
+print compiler.compiler_so   # This attribute is what you want
+</code></pre>
+<p>The "compiler_so" attribute is a list of every argument that distutils is going to use when compiling something. It adds on the filename and <code>-c</code> (for object files) when it actually starts compiling. </p>
+<p>EDIT: I have only tested this on macOS and Linux, it doesn't seem like this will work on Windows. </p>
+<p>EDIT2: I should add, it is not the full command, but only the arguments before distutils processes any Extension() instances. The remaining arguments are unique to the extension and depend on the <a href="https://docs.python.org/3/distutils/apiref.html#distutils.core.Extension" rel="nofollow noreferrer">arguments</a> you give when making an Extension class, like sources, include_dirs, define_macros. </p>
+<p>If you want the full raw command that distutils runs, the only way I know of (without parsing logs) is to grab the command string at the last minute after all the processing and right before <a href="https://bitbucket.org/carljm/python-distutils/src/48c42eeaee4410d76675b637bcd401b8919ff19a/spawn.py?at=default&amp;fileviewer=file-view-default#spawn.py-17" rel="nofollow noreferrer">the spawn function</a>. Here is an incredibly hacky way of doing it:</p>
+<pre><code># Put this at the very top of all your imports 
+import distutils.spawn
+old_spawn = distutils.spawn.spawn
+def my_spawn(*args, **kwargs):
+    print " ".join(args[0]) # &lt;-- this is your command right here 
+    old_spawn(*args, **kwargs)
+distutils.spawn.spawn = my_spawn
+</code></pre>
+<p>The more elegant thing would be to fork distutils and add this functionality but that's like so much work and stuff. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Additionally, if you would like to see the linker flags, you can do the following:</p>
+<pre><code>import distutils.sysconfig
+import distutils.ccompiler
+compiler = distutils.ccompiler.new_compiler()
+distutils.sysconfig.customize_compiler(compiler)
+print compiler.linker_so   # This gives linker information
+</code></pre>
+</div>
+<span class="comment-copy">If you don't mind wading through many lines of unfamiliar python, you can take a look at the source Distutils, which is all python, I believe.  I poked around a bit, but wasn't able to find a good answer for you though.  On my machine, ccompiler is here: /usr/lib64/python2.7/distutils/ccompiler.py</span>
+<span class="comment-copy">This is incorrect. I just gave this a go to see what it would spit out and then without the sysconfig part, I ran a compilation but also added a pre-args of <code>-v</code>, and it's a completely different set of arguments. The sysconfig here creates a different commandline that is not helpful to see when trying to compare against an alternate scripts (i.e. Make, csh, bash, etc) invocation of the compiler.</span>
+<span class="comment-copy">It looks like this only works on Unix-type systems. Are you on Windows?</span>
+<span class="comment-copy">Looks like the MSVCCompiler puts the compile args in an attribute called "compile_options"</span>
+<span class="comment-copy">No, I'm on a Linux RedHat using the GCC compiler driver and this doesn't work. This has to do with the <code>sysconfig</code> library, not the OS. use <code>distutils.log.set_verbosity(1)</code> without <code>sysconfig</code> and look at your stdout, then do your way. The way that I'm getting the true command line is by redirecting <code>sys.stdout</code> to my own <code>cStringIO.StringIO</code> object before I invoke the <code>CCompiler.compile</code> function, and then right after putting <code>sys.stdout</code> to the true stdout, and dumping my <code>StringIO</code> to the true stdout and to my other handlers that are not stdout.</span>
+<span class="comment-copy">I think my answer wasn't clear: these are the general args specific to the os BEFORE it processes the extension (I assume you are making Extension instances since we are talking about distutils). You cannot get the full command when the source file and object files are unknown. The only way to do that is to intercept the argument "cmd" in distutils.spawn.spawn after it has processed the extension: <a href="https://bitbucket.org/carljm/python-distutils/src/48c42eeaee4410d76675b637bcd401b8919ff19a/spawn.py?at=default&amp;fileviewer=file-view-default#spawn.py-17" rel="nofollow noreferrer">bitbucket.org/carljm/python-distutils/src/…</a></span>

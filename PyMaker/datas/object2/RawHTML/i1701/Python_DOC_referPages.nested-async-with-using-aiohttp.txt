@@ -1,0 +1,110 @@
+<div class="post-text" itemprop="text">
+<p>I would like to create a scheduler class that uses aiohttp to make API calls. I tried this:</p>
+<pre><code>import asyncio
+import aiohttp
+
+class MySession:
+    def __init__(self):
+        self.session = None
+
+    async def __aenter__(self):
+        async with aiohttp.ClientSession() as session:
+            self.session = session
+            return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+
+async def method1():
+    async with MySession() as s:
+        async with s.session.get("https://www.google.com") as resp:
+            if resp.status == 200:
+                print("successful call!")
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(method1())
+loop.close()
+</code></pre>
+<p>but this just results in an error: <code>RuntimeError: Session is closed</code>. A second approach for the <code>__aenter__</code> function:</p>
+<pre><code>    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+</code></pre>
+<p>works well. Is this a good construct? It doesn't adhere to examples of how to use aiohttp. Also wondering why the first approach isn't working?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can't use <code>with</code> inside a function and have the context manager remain open, no. The <code>with with aiohttp.ClientSession() as session:</code> block exits as soon as you use <code>return</code> to exit the <code>__aenter__</code> coroutine!</p>
+<p>For the specific case, entering a <code>aiohttp.ClientSession()</code> context manager <a href="https://github.com/aio-libs/aiohttp/blob/690a3d4053e416d8c0c534ba1e330326074ea664/aiohttp/client.py#L861-L862" rel="nofollow noreferrer">does nothing but return <code>self</code></a>. So for <em>that type</em>, just creating the instance and storing it in <code>self.session</code>, and awaiting on <code>self.session.close()</code> suffices here, yes.</p>
+<p>The <em>general</em> pattern for a nested asynchronous context manager is to await the <code>__aenter__</code> and <code>__aexit__</code> methods of a nested async context manager from your own such methods (and perhaps pass along the exception information):</p>
+<pre><code>class MySession:
+    def __init__(self):
+        self.session = None
+
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        await self.session.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            return await self.session.__aexit__(exc_type, exc_val, exc_tb)
+</code></pre>
+<p>Technically speaking, you should first assure that there is an actual <code>__aexit__</code> attribute before entering a nested context manager:</p>
+<pre><code>class MySession:
+    def __init__(self):
+        self.session = None
+        self._session_aexit = None
+
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        self._session_aexit = type(self.session).__aexit__
+        await self.session.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            return await self._session_aexit.__aexit__(
+                self.session, exc_type, exc_val, exc_tb)
+</code></pre>
+<p>See the <a href="https://www.python.org/dev/peps/pep-0492/#asynchronous-context-managers-and-async-with" rel="nofollow noreferrer">official PEP that added the concept</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can manage that dependency externally:</p>
+<pre><code>import asyncio
+import aiohttp
+
+class MySession:
+
+    def __init__(self, client_session):
+        self.session = client_session
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+async def method1():
+    async with aiohttp.ClientSession() as client_session:
+        async with MySession(client_session) as s:
+            async with s.session.get("https://www.google.com") as resp:
+                if resp.status == 200:
+                    print("successful call!")
+
+asyncio.run(method1())
+</code></pre>
+<p>When that <code>async with</code> chain becomes too ridiculous you can use <a href="https://docs.python.org/3/library/contextlib.html#contextlib.AsyncExitStack" rel="nofollow noreferrer"><code>AsyncExitStack</code></a>:</p>
+<pre><code>from contextlib import AsyncExitStack
+
+async def method1():
+    async with AsyncExitStack() as stack:
+        client_session = await stack.enter_async_context(aiohttp.ClientSession())
+        s = await stack.enter_async_context(MySession(client_session))
+        async with s.session.get("https://www.google.com") as resp:
+            if resp.status == 200:
+                print("successful call!")
+</code></pre>
+</div>
+<span class="comment-copy">To be 100% correct I think you should use the value returned by aenter: <code>self.session = await self.session.__aenter__()</code> Most of the context managers just <code>return self</code> in aenter but that doesn't have to be always the case.</span>
+<span class="comment-copy">@Messa: that depends on your use-cases for your wrapper and the wrapped context manager, though. If the wrapped context manager returns <code>self</code>, you want your wrapper to replace it and so <code>return self</code> is the correct choice, for example.</span>

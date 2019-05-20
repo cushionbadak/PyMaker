@@ -1,0 +1,266 @@
+<div class="post-text" itemprop="text">
+<p>Is there a Pool class for worker <strong>threads</strong>, similar to the multiprocessing module's <a href="http://docs.python.org/library/multiprocessing.html#module-multiprocessing.pool" rel="noreferrer">Pool class</a>?</p>
+<p>I like for example the easy way to parallelize a map function</p>
+<pre><code>def long_running_func(p):
+    c_func_no_gil(p)
+
+p = multiprocessing.Pool(4)
+xs = p.map(long_running_func, range(100))
+</code></pre>
+<p>however I would like to do it without the overhead of creating new processes.</p>
+<p>I know about the GIL. However, in my usecase, the function will be an IO-bound C function for which the python wrapper will release the GIL before the actual function call.</p>
+<p>Do I have to write my own threading pool?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I just found out that there actually  <em>is</em> a thread-based Pool interface in the <code>multiprocessing</code> module, however it is hidden somewhat and not properly documented.</p>
+<p>It can be imported via</p>
+<pre><code>from multiprocessing.pool import ThreadPool
+</code></pre>
+<p>It is implemented using a dummy Process class wrapping a python thread.  This thread-based Process class can be found in <a href="http://docs.python.org/dev/py3k/library/multiprocessing.html#module-multiprocessing.dummy" rel="noreferrer"><code>multiprocessing.dummy</code></a> which is mentioned briefly in the <a href="http://docs.python.org/dev/py3k/library/multiprocessing.html#module-multiprocessing.dummy" rel="noreferrer">docs</a>.  This dummy module supposedly provides the whole multiprocessing interface based on threads.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>In Python 3 you can use <a href="https://docs.python.org/dev/library/concurrent.futures.html#threadpoolexecutor" rel="noreferrer"><code>concurrent.futures.ThreadPoolExecutor</code></a>, i.e.:</p>
+<pre><code>executor = ThreadPoolExecutor(max_workers=10)
+a = executor.submit(my_function)
+</code></pre>
+<p>See the <a href="http://docs.python.org/py3k/library/concurrent.futures.html" rel="noreferrer">docs</a> for more info and examples.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Yes, and it seems to have (more or less) the same API. </p>
+<pre><code>import multiprocessing
+
+def worker(lnk):
+    ....    
+def start_process():
+    .....
+....
+
+if(PROCESS):
+    pool = multiprocessing.Pool(processes=POOL_SIZE, initializer=start_process)
+else:
+    pool = multiprocessing.pool.ThreadPool(processes=POOL_SIZE, 
+                                           initializer=start_process)
+
+pool.map(worker, inputs)
+....
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>For something very simple and lightweight (slightly modified from <a href="http://code.activestate.com/recipes/577187-python-thread-pool/" rel="nofollow noreferrer">here</a>):</p>
+<pre><code>from Queue import Queue
+from threading import Thread
+
+
+class Worker(Thread):
+    """Thread executing tasks from a given tasks queue"""
+    def __init__(self, tasks):
+        Thread.__init__(self)
+        self.tasks = tasks
+        self.daemon = True
+        self.start()
+
+    def run(self):
+        while True:
+            func, args, kargs = self.tasks.get()
+            try:
+                func(*args, **kargs)
+            except Exception, e:
+                print e
+            finally:
+                self.tasks.task_done()
+
+
+class ThreadPool:
+    """Pool of threads consuming tasks from a queue"""
+    def __init__(self, num_threads):
+        self.tasks = Queue(num_threads)
+        for _ in range(num_threads):
+            Worker(self.tasks)
+
+    def add_task(self, func, *args, **kargs):
+        """Add a task to the queue"""
+        self.tasks.put((func, args, kargs))
+
+    def wait_completion(self):
+        """Wait for completion of all the tasks in the queue"""
+        self.tasks.join()
+
+if __name__ == '__main__':
+    from random import randrange
+    from time import sleep
+
+    delays = [randrange(1, 10) for i in range(100)]
+
+    def wait_delay(d):
+        print 'sleeping for (%d)sec' % d
+        sleep(d)
+
+    pool = ThreadPool(20)
+
+    for i, d in enumerate(delays):
+        pool.add_task(wait_delay, d)
+
+    pool.wait_completion()
+</code></pre>
+<p>To support callbacks on task completion you can just add the callback to the task tuple.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Hi to use the thread pool in Python you can use this library :</p>
+<pre><code>from multiprocessing.dummy import Pool as ThreadPool
+</code></pre>
+<p>and then for use, this library do like that :</p>
+<pre><code>pool = ThreadPool(threads)
+results = pool.map(service, tasks)
+pool.close()
+pool.join()
+return results
+</code></pre>
+<p>The threads are the number of threads that you want and tasks are a list of task that most map to the service.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's the result I finally ended up using. It's a modified version of the classes by dgorissen above.</p>
+<p>File: <code>threadpool.py</code></p>
+<pre><code>from queue import Queue, Empty
+import threading
+from threading import Thread
+
+
+class Worker(Thread):
+    _TIMEOUT = 2
+    """ Thread executing tasks from a given tasks queue. Thread is signalable, 
+        to exit
+    """
+    def __init__(self, tasks, th_num):
+        Thread.__init__(self)
+        self.tasks = tasks
+        self.daemon, self.th_num = True, th_num
+        self.done = threading.Event()
+        self.start()
+
+    def run(self):       
+        while not self.done.is_set():
+            try:
+                func, args, kwargs = self.tasks.get(block=True,
+                                                   timeout=self._TIMEOUT)
+                try:
+                    func(*args, **kwargs)
+                except Exception as e:
+                    print(e)
+                finally:
+                    self.tasks.task_done()
+            except Empty as e:
+                pass
+        return
+
+    def signal_exit(self):
+        """ Signal to thread to exit """
+        self.done.set()
+
+
+class ThreadPool:
+    """Pool of threads consuming tasks from a queue"""
+    def __init__(self, num_threads, tasks=[]):
+        self.tasks = Queue(num_threads)
+        self.workers = []
+        self.done = False
+        self._init_workers(num_threads)
+        for task in tasks:
+            self.tasks.put(task)
+
+    def _init_workers(self, num_threads):
+        for i in range(num_threads):
+            self.workers.append(Worker(self.tasks, i))
+
+    def add_task(self, func, *args, **kwargs):
+        """Add a task to the queue"""
+        self.tasks.put((func, args, kwargs))
+
+    def _close_all_threads(self):
+        """ Signal all threads to exit and lose the references to them """
+        for workr in self.workers:
+            workr.signal_exit()
+        self.workers = []
+
+    def wait_completion(self):
+        """Wait for completion of all the tasks in the queue"""
+        self.tasks.join()
+
+    def __del__(self):
+        self._close_all_threads()
+
+
+def create_task(func, *args, **kwargs):
+    return (func, args, kwargs)
+</code></pre>
+<p>To use the pool</p>
+<pre><code>from random import randrange
+from time import sleep
+
+delays = [randrange(1, 10) for i in range(30)]
+
+def wait_delay(d):
+    print('sleeping for (%d)sec' % d)
+    sleep(d)
+
+pool = ThreadPool(20)
+for i, d in enumerate(delays):
+    pool.add_task(wait_delay, d)
+pool.wait_completion()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The overhead of creating the new processes is minimal, especially when it's just 4 of them. I doubt this is a performance hot spot of your application. Keep it simple, optimize where you have to and where profiling results point to. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There is no built in thread based pool. However, it can be very quick to implement a producer/consumer queue with the <code>Queue</code> class.</p>
+<p>From:
+<a href="https://docs.python.org/2/library/queue.html" rel="nofollow noreferrer">https://docs.python.org/2/library/queue.html</a></p>
+<pre><code>from threading import Thread
+from Queue import Queue
+def worker():
+    while True:
+        item = q.get()
+        do_work(item)
+        q.task_done()
+
+q = Queue()
+for i in range(num_worker_threads):
+     t = Thread(target=worker)
+     t.daemon = True
+     t.start()
+
+for item in source():
+    q.put(item)
+
+q.join()       # block until all tasks are done
+</code></pre>
+</div>
+<span class="comment-copy">Here's something that looks promising over in the Python Cookbook: <a href="http://code.activestate.com/recipes/576519-thread-pool-with-same-api-as-multiprocessingpool/" rel="nofollow noreferrer">Recipe 576519: Thread pool with same API as (multi)processing.Pool (Python)</a></span>
+<span class="comment-copy">Nowadays it's built-in: <code>from multiprocessing.pool import ThreadPool</code>.</span>
+<span class="comment-copy">That's awesome. I had a problem creating ThreadPools outside the main thread, you can use them from a child thread once created though. I put an issue in for it: <a href="http://bugs.python.org/issue10015" rel="nofollow noreferrer">bugs.python.org/issue10015</a></span>
+<span class="comment-copy">I don't get it why this class has no documentation. Such helper classes are so important nowadays.</span>
+<span class="comment-copy">@Wernight: it isn't public primarily because nobody has offered a patch that provides it (or something similar) as threading.ThreadPool, including documentation and tests. It would indeed be a good battery to include in the standard library, but it won't happen if nobody writes it. One nice advantage of this existing implementation in multiprocessing, is that it should make any such threading patch <i>much</i> easier to write (<a href="http://docs.python.org/devguide/" rel="nofollow noreferrer">docs.python.org/devguide</a>)</span>
+<span class="comment-copy">Noted as <a href="http://bugs.python.org/issue17140" rel="nofollow noreferrer">bugs.python.org/issue17140</a></span>
+<span class="comment-copy">@daniel.gindi: <a href="https://docs.python.org/3/library/multiprocessing.html#module-multiprocessing.dummy" rel="nofollow noreferrer">Read further</a>: "<code>multiprocessing.dummy</code> replicates the API of <code>multiprocessing</code> but is no more than a wrapper around the <code>threading</code> module." <code>multiprocessing</code> in general is about processes, but to allow switching between processes and threads, they (mostly) replicated the <code>multiprocessing</code> API in <code>multiprocessing.dummy</code>, but backed with threads, not processes. The goal is to allow you to do <code>import multiprocessing.dummy as multiprocessing</code> to change process-based code to thread-based.</span>
+<span class="comment-copy">What does this add that the other answers have not?</span>
+<span class="comment-copy">@AustinHenley a cleaner, more documented, more canonical API.</span>
+<span class="comment-copy">It's also been backported to Python 2.5-2.7 <a href="https://pypi.python.org/pypi/futures" rel="nofollow noreferrer">pypi.python.org/pypi/futures</a></span>
+<span class="comment-copy">in order to use the backported futures module, run <code>sudo pip install futures</code></span>
+<span class="comment-copy">Import path for <code>ThreadPool</code> is different from <code>Pool</code>. Correct import is <code>from multiprocessing.pool import ThreadPool</code>.</span>
+<span class="comment-copy">Strangely this is not a documented API, and multiprocessing.pool is only briefly mentioned as providing AsyncResult.  But it is available in 2.x and 3.x.</span>
+<span class="comment-copy">This is what I was looking for. It's just a single import line and a small change to my existing pool line and it works perfectly.</span>
+<span class="comment-copy">how can the threads ever join if they unconditionally infinite loop?</span>
+<span class="comment-copy">@JosephGarvin I've tested it, and the threads keep blocking on an empty queue(since the call to <code>Queue.get()</code> is blocking) till the program ends, after which they are terminated automatically.</span>
+<span class="comment-copy">@JosephGarvin, good question. <a href="https://docs.python.org/3/library/queue.html#queue.Queue.join" rel="nofollow noreferrer"><code>Queue.join()</code></a> will actually join the task queue, <b>not</b> worker threads. So, when queue is empty, <code>wait_completion</code> returns, program ends, and threads are reaped by the OS.</span>
+<span class="comment-copy">If all of this code is wrapped up into a neat function it doesn't seem to be stopping threads even when the queue is empty and <code>pool.wait_completion()</code> returns.  The result is that threads just keep building.</span>
+<span class="comment-copy">Thanks, that is a great suggestion! From the docs: multiprocessing.dummy replicates the API of multiprocessing but is no more than a wrapper around the threading module.  One correction - I think you want to say that the pool api is (function,iterable)</span>
+<span class="comment-copy">We missed the <code>.close()</code> and <code>.join()</code> calls and that causes <code>.map()</code> to finish before all the threads are finished. Just a warning.</span>
+<span class="comment-copy">Annotion for other readers: This code is Python 3 (shebang <code>#!/usr/bin/python3</code>)</span>
+<span class="comment-copy">Why do you use <code>for i, d in enumerate(delays):</code> and then ignore the <code>i</code> value?</span>
+<span class="comment-copy">@martineau - probably just a relic from development where they probably wanted to print <code>i</code> during a run.</span>
+<span class="comment-copy">Why is <code>create_task</code> there? What is it for?</span>
+<span class="comment-copy">I can't believe and answer with 4 votes on SO is the way to do ThreadPooling in Python. The Threadpool in the official python distribution is still broken? What am I missing?</span>
+<span class="comment-copy">If the questioner is under Windows (which I do not believe he specified), then I think that process spinup can be a significant expense. At least it is on the projects that I have been recently doing. :-)</span>
+<span class="comment-copy">This is no longer the case with the <code>concurrent.futures</code> module.</span>
+<span class="comment-copy">I don't think this is true at all anymore. <code>from multiprocessing.pool import ThreadPool</code></span>
+<span class="comment-copy"><a href="https://stackoverflow.com/a/46049195/5579463">The multiprocessing.pool.ThreadPool is not documented as its implementation has never been completed. It lacks tests and documentation</a>.</span>

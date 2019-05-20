@@ -1,0 +1,49 @@
+<div class="post-text" itemprop="text">
+<p>So I have an app structured something like this (highly simplified): </p>
+<pre><code>operations_handler.py 
+database.py
+api.py 
+main.py 
+</code></pre>
+<p>the relevant main.py stuff looks like: </p>
+<pre><code>db= database.DataBaseWrapper(db_name)
+handler = operations_handler.OperationHandler(args, db) 
+api_server = api.APIServer()
+api_server.run(handler)
+</code></pre>
+<p>All the handler methods work fine. The api methods are just a wrapped calls to handler methods. 
+Now the problem is api which starts new worker threads on receiving a request: </p>
+<pre><code>WARNING:root:at api method called &lt;WorkerThread \ 
+(CP Server Thread-1, started 139656470746880)&gt; 
+
+WARNING:root:at api method called &lt;WorkerThread \
+   (CP Server Thread-2, started 139656462354176)&gt;
+</code></pre>
+<p>which is turn causes SQlite errors: </p>
+<pre><code>'message': 'SQLite objects created in a thread can only be used in that \
+same thread.The object was created in thread id 139656604452608 \ 
+and this is thread id 139656462354176'
+</code></pre>
+<p>No cursors or database objects are ever passed out of the database module, all the cursors are closed. But even though the handler object is the same across both threads sqlite raises an error when any of the api methods are accessed? IDK what the idea is, do I have to make a new database connection for every thread? Why is it not enough to have one database object referenced by different threads? The documentation is really sparse on this...</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is explained in <a href="https://docs.python.org/3/library/sqlite3.html#multithreading" rel="nofollow">the documentation</a>:</p>
+<blockquote>
+<p>Older SQLite versions had issues with sharing connections between threads. That’s why the Python module disallows sharing connections and cursors between threads. If you still try to do so, you will get an exception at runtime.</p>
+</blockquote>
+<hr/>
+<p>This is actually configurable at build time, but most people don't configure and build their Python and stdlib from scratch. However, notice that the docs link to the page for <a href="https://github.com/ghaering/pysqlite" rel="nofollow"><code>pysqlite</code></a>, pointing out that "<code>sqlite3</code> is developed externally under the name <code>pysqlite</code>." And you can build and install <code>pysqlite</code>, and use that in place of the stdlib module, if you really need free-threading.</p>
+<hr/>
+<p>In fact, IIRC, as of somewhere around <code>pysqlite</code> 2.5/Python 3.4, <code>sqlite3</code>, 
+there's a not-quite-undocumented feature that allows you to disable the thread-safety checks by passing <code>check_same_thread=False</code> to the <code>Connection</code> constructor (and any <code>Cursor</code> objects you create will then inherit it from the <code>Connection</code>). If you do that, then you can safely share the objects between threads—but you still can't use them in parallel, only within a mutex, because concurrency hasn't been fully tested yet (which is also why it's a not-quite-undocumented feature instead of a documented feature).</p>
+<hr/>
+<p>The portable approach, of course, is to not share connections and cursors between threads, as the docs say.</p>
+<p>One way to do this is to have each <code>WorkerThread</code> (or even each task, if they're part of a thread pool) create its own <code>Connection</code>. The performance cost of opening a bunch of connections isn't that high. However, make sure you read the <a href="http://www.sqlite.org/faq.html#q5" rel="nofollow">SQLite FAQ</a> on concurrent access and thread safety. In practice, if you want to be fully portable (including database files that may be on network shared drives, old versions of SQLite, etc.), you will want to create a shared <code>threading.Lock</code> and have your threads acquire that lock around each access to the database (including their initial <code>Connection</code> constructor).</p>
+<p>Another way to do it is to run all your SQLite queries on a single thread, and have your other threads just submit a query and get back a future they can block on. If you can require either Python 3.2+, or the PyPI backport (which works back to 2.6, IIRC), <a href="https://docs.python.org/3/library/concurrent.futures.html" rel="nofollow"><code>concurrent.futures</code></a> is the easiest way to do this. If not, you can build futures and a single-thread executor yourself pretty easily out of, e.g., a thread, a queue, and a condition per future.</p>
+<p>I've personally used the futures solution a few times. It may seem like you're throwing away a lot of parallelism, but you're actually not; if you use a connection from multiple threads, it uses its own mutexes and also requires you to add mutexes on top of it; if you use multiple connections, it uses file locks, which are even heavier. If the single-thread executor isn't giving you enough concurrency, getting rid of it probably won't either, and you'll need to use MySQL or something similar instead of SQLite.</p>
+</div>
+<span class="comment-copy">Thanks for the reply. Is there an approach you would recommend that is not thread sharing? I'd like for this to be easily portable.</span>
+<span class="comment-copy">@user3467349: See my updated answer.</span>
+<span class="comment-copy">Thanks again for the feedback. Also I realized that last time I used sqlite with python I used apsw instead of the builtin library, which is why the threading errors had me confused. (apsw supports connection sharing across threads)</span>
+<span class="comment-copy">@user3467349: Yeah, APSW does the locks for you. IIRC, at one point, pysqlite was going to be able to use APSW as its lower level instead of talking directly to SQLite, and that was the recommended way to do threading, but that was abandoned. Then Haering was going to add implicit locking to pysqlite, at which point either <code>check_same_thread=False</code> would become an official feature, or he'd drop support for ancient SQLite 3.x versions and just allow threading, but I don't know what came of that. Since <a href="https://github.com/ghaering/pysqlite" rel="nofollow noreferrer">the repo</a> has been unchanged for over a year…</span>
+<span class="comment-copy">Newer verisons of sqlite seem thread safe to me.    I just tried 10,000 threads in python simultaenously incrementing an integer row in ... and inserting records in the same table ... with no errors, and exactly 10,000 rows inserted and 10,000 counts recorded.  EDIT:   You do need a lock to update rows.   About 1 in 100K times, I skipped an increment!   But inserts are fine.</span>

@@ -1,0 +1,143 @@
+<div class="post-text" itemprop="text">
+<pre><code>import concurrent.futures
+import time 
+
+def process_one(i):
+    try:                                                                             
+        print("dealing with {}".format(i))                                           
+        time.sleep(50)
+        print("{} Done.".format(i))                                                  
+    except Exception as e:                                                           
+        print(e)
+
+def process_many():
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor: 
+        executor.map(process_one,
+                range(100),                                                          
+                timeout=3)                                                           
+
+
+if __name__ == '__main__':                                                           
+    MAX_WORKERS = 10
+    try:
+        process_many()
+    except Exception as e:                                                           
+        print(e)      
+</code></pre>
+<p>The <a href="https://docs.python.org/3/library/concurrent.futures.html" rel="noreferrer">docs</a> say:</p>
+<blockquote>
+<p>The returned iterator raises a <code>concurrent.futures.TimeoutError</code> if <code>__next__()</code> is called and the result isn’t available after <code>timeout</code> seconds from the original call to <code>Executor.map()</code></p>
+</blockquote>
+<p>But here the script didn't raise any exception and kept waiting. Any suggestions?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As the docs specify, the timeout error will only be raised if you're calling the <code>__next__()</code> method on the map. To call this method, you could for example convert the output to a list:</p>
+<pre><code>from concurrent import futures
+import threading
+import time
+
+
+def task(n):
+    print("Launching task {}".format(n))
+    time.sleep(n)
+    print('{}: done with {}'.format(threading.current_thread().name, n))
+    return n / 10
+
+
+with futures.ThreadPoolExecutor(max_workers=5) as ex:
+    results = ex.map(task, range(1, 6), timeout=3)
+    print('main: starting')
+    try:
+        # without this conversion to a list, the timeout error is not raised
+        real_results = list(results) 
+    except futures._base.TimeoutError:
+        print("TIMEOUT")
+</code></pre>
+<p>Output:</p>
+<pre><code>Launching task 1
+Launching task 2
+Launching task 3
+Launching task 4
+Launching task 5
+ThreadPoolExecutor-9_0: done with 1
+ThreadPoolExecutor-9_1: done with 2
+TIMEOUT
+ThreadPoolExecutor-9_2: done with 3
+ThreadPoolExecutor-9_3: done with 4
+ThreadPoolExecutor-9_4: done with 5
+</code></pre>
+<p>Here, the n-th task sleeps for <code>n</code> seconds, so the timeout is raised after task 2 is completed.</p>
+<hr/>
+<p><strong>EDIT</strong>: If you want to terminate the tasks that didn't complete, you could try the answers in <a href="https://stackoverflow.com/questions/6509261/how-to-use-concurrent-futures-with-timeouts">this</a> question (they don't use <code>ThreadPoolExecutor.map()</code> though), or you could just ignore the returned values from the other tasks and let them finish:</p>
+<pre><code>from concurrent import futures
+import threading
+import time
+
+
+def task(n):
+    print("Launching task {}".format(n))
+    time.sleep(n)
+    print('{}: done with {}'.format(threading.current_thread().name, n))
+    return n
+
+
+with futures.ThreadPoolExecutor(max_workers=5) as ex:
+    results = ex.map(task, range(1, 6), timeout=3)
+    outputs = []
+    try:
+        for i in results:
+            outputs.append(i)
+    except futures._base.TimeoutError:
+        print("TIMEOUT")
+    print(outputs)
+</code></pre>
+<p>Output:</p>
+<pre><code>Launching task 1
+Launching task 2
+Launching task 3
+Launching task 4
+Launching task 5
+ThreadPoolExecutor-5_0: done with 1
+ThreadPoolExecutor-5_1: done with 2
+TIMEOUT
+[1, 2]
+ThreadPoolExecutor-5_2: done with 3
+ThreadPoolExecutor-5_3: done with 4
+ThreadPoolExecutor-5_4: done with 5
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>As we see in the <a href="https://github.com/python/cpython/blob/0964aac446d1ddf9fb61ddeed3b8586f2a619d2e/Lib/concurrent/futures/_base.py#L550-L592" rel="nofollow noreferrer">source</a> (for python 3.7) map returns a function:</p>
+<pre><code>def map(self, fn, *iterables, timeout=None, chunksize=1):
+    ...
+    if timeout is not None:
+        end_time = timeout + time.time()
+    fs = [self.submit(fn, *args) for args in zip(*iterables)]
+    # Yield must be hidden in closure so that the futures are submitted
+    # before the first iterator value is required.
+    def result_iterator():
+        try:
+            # reverse to keep finishing order
+            fs.reverse()
+            while fs:
+                # Careful not to keep a reference to the popped future
+                if timeout is None:
+                    yield fs.pop().result()
+                else:
+                    yield fs.pop().result(end_time - time.time())
+        finally:
+            for future in fs:
+                future.cancel()
+    return result_iterator()
+</code></pre>
+<p>The <code>TimeoutError</code> is raised from <code>yield fs.pop().result(end_time - time.time())</code> call but you have to request a result to reach that call.</p>
+<p>The rationale is that you do not care about <em>submitting</em> the tasks. The tasks are submitted and start running in the background threads. What you care about is timing out when you request a result - it is a usual use case you submit tasks and you request a result from them in a limited time, not just submitting them and expect them to terminate in a limited time.</p>
+<p>If the latter is what you were about you could use <code>wait</code>, as illustrated for instance in <a href="https://stackoverflow.com/a/38576573/281545">Individual timeouts for concurrent.futures</a></p>
+</div>
+<span class="comment-copy">Are you trying to kill jobs that hang or do you want the entire <code>process_many</code> call to take ~3 seconds or less?</span>
+<span class="comment-copy">@arachnivore Kill the jobs that hang and free up the threads they are occupying.</span>
+<span class="comment-copy">Which python version?</span>
+<span class="comment-copy"><b>task(n)</b> will always be executed (printing "done with n"). Any way to interrupt it in case of TimeoutException? I also tried the generator way, explicitly calling __next__(); with the same result.</span>
+<span class="comment-copy">@HaoWang I've edited my answer to adress this issue. However, I've just realised the second solution only works if your tasks are in time order, ie. if the task after has a higher delay - which makes it very impractical. I'll try and find something else.</span>
+<span class="comment-copy">Thanks for pointing out the direction. I found the following answer the best solution so far: <a href="https://stackoverflow.com/a/44719580/1405762">stackoverflow.com/a/44719580/1405762</a></span>
+<span class="comment-copy">In my case, there is a huge pool of urls, I would like to sample them (get the page content of each) as much as possible, but would not mind to give up a slow connection and try the next.</span>

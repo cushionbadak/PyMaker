@@ -1,0 +1,191 @@
+<div class="post-text" itemprop="text">
+<p>Cpython optimizes string increment operations,When initializing memory for a string, the program leaves extra expansion space for it,so, when incrementing, the original string is not copied to the new location.
+my question is why the id of string variable changes.</p>
+<pre><code>&gt;&gt;&gt; s = 'ab'
+&gt;&gt;&gt; id(s)
+991736112104
+&gt;&gt;&gt; s += 'cd'
+&gt;&gt;&gt; id(s)
+991736774080
+</code></pre>
+<p>why the id of string variable changes.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The optimization you are trying to trigger is an implementation detail of CPython and is a quite subtle thing:  there are many details (e.f. one you are experiencing) which can be preventing it.</p>
+<p>For a detailed explanation, one needs to dive into the CPython's implementation, so first I will try to give a hand-waving explanation, which should give at least the gist of what is going on. The gory details will be in the second part which highlights the important code-parts.</p>
+<hr/>
+<p>Let's take a look at this function, which exhibits the desired/optimized behavior</p>
+<pre><code>def add_str(str1, str2, n):
+    for i in range(n):
+        str1+=str2
+        print(id(str1))
+    return str1
+</code></pre>
+<p>Calling it, leads to the following output:</p>
+<pre><code>&gt;&gt;&gt; add_str("1","2",100)
+2660336425032
+... 4 times
+2660336425032
+2660336418608
+... 6 times
+2660336418608
+2660336361520
+... 6 times
+2660336361520
+2660336281800
+ and so on
+</code></pre>
+<p>I.e. a new string is created only every 8 addition, otherwise the old string (or as we will see the memory) is reused. The first id is printed only 6 times because it starts printing when the size of the unicode-object is 2 modulo 8 (and not 0 as in the later cases).</p>
+<p>The first question is, if a string is immutable in CPython, how (or better when) can it be changed? Obviously, we can't change the string if it is bound to different variables - but we could change it, if the current variable is the only one reference - which can be checked pretty easily due to reference counting of CPython (and it is the reason why this optimization isn't available for other implementation which don't use reference counting).</p>
+<p>Let's change the function above by adding a additional reference: </p>
+<pre><code>def add_str2(str1, str2, n):
+    for i in range(n):
+        ref = str1
+        str1+=str2
+        print(id(str1))
+    return str1
+</code></pre>
+<p>Calling it leads to:</p>
+<pre><code>&gt;&gt;&gt; add_str2("1","2",20)
+2660336437656
+2660337149168
+2660337149296
+2660337149168
+2660337149296
+... every time a different string - there is copying!
+</code></pre>
+<p>This actually explains your observation:</p>
+<pre><code>import sys
+s = 'ab'
+print(sys.getrefcount(s))
+# 9
+print(id(s))
+# 2660273077752
+s+='a'
+print(id(s))
+# 2660337158664  Different
+</code></pre>
+<p>Your string <code>s</code> is <a href="https://docs.python.org/3/library/sys.html#sys.intern" rel="nofollow noreferrer">interned</a> (see for example <a href="https://stackoverflow.com/a/53506425/5769463">this SO-answer</a> for more information about string interning and integer pool), and thus <code>s</code> is not only one "using" this string and thus this string cannot be changed.</p>
+<p>If we avoid the interning, we can see, that the string is reused:</p>
+<pre><code>import sys
+s = 'ab'*21  # will not be interned
+print(sys.getrefcount(s))
+# 2, that means really not interned
+print(id(s))
+# 2660336107312
+s+='a'
+print(id(s))
+# 2660336107312  the same id!
+</code></pre>
+<p>But how does this optimization works? </p>
+<p>CPython uses its own memory management - <a href="https://docs.python.org/3/c-api/memory.html#the-pymalloc-allocator" rel="nofollow noreferrer">the pymalloc allocator</a>, which is optimized for small objects with short lifetimes. The used memory-blocks are multiple of <code>8</code> bytes, that means if allocator is asked for only 1 byte, still 8 bytes are marked as used (more precise because of the <a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Objects/obmalloc.c#L791" rel="nofollow noreferrer">8-byte aligment</a> of the returned pointers the the remaining 7 bytes cannot be used for other objects). </p>
+<p>There is however the function <a href="https://docs.python.org/3/c-api/memory.html#c.PyMem_Realloc" rel="nofollow noreferrer"><code>PyMem_Realloc</code></a>: if the allocator is asked to reallocate a 1byte-block as a 2byte-block, there is nothing to do - there were some reserved bytes anyway.</p>
+<p>This way, if there is only one reference to the string, CPython can ask the allocator to reallocate the string and require a byte more. In 7 cases of 8 there is nothing to do for allocator and the additional byte becomes available almost free.</p>
+<p>However, if the size of the string changes by more than 7 bytes, the copying becomes mandatory:</p>
+<pre><code>&gt;&gt;&gt; add_str("1", "1"*8, 20)  # size change of 8
+2660337148912
+2660336695312
+2660336517728
+... every time another id
+</code></pre>
+<p>Furthermore, pymalloc falls back to <code>PyMem_RawMalloc</code>, which is usually the memory manager of the C-runtime, and the above optimization for strings is no longer possible:</p>
+<pre><code>&gt;&gt;&gt; add_str("1"*512, "1", 20) #  str1 is larger as 512 bytes
+2660318800256
+2660318791040
+2660318788736
+2660318807744
+2660318800256
+2660318796224
+... every time another id
+</code></pre>
+<p>Actually, whether the addresses are different after each reallocation depends on the memory allocator of the C-runtime and its state. If memory isn't defragmented, the chances are high,  that <code>realloc</code> manages to extend memory without copying (but it was not the case on my machine as I did these experiments), see also <a href="https://stackoverflow.com/a/55065575/5769463">this SO-post</a>.</p>
+<hr/>
+<p>For the curious, here is the whole traceback of the <code>str1+=str2</code> operation, which can be easily followed in <a href="https://devguide.python.org/gdb/" rel="nofollow noreferrer">a debugger</a>:</p>
+<p>That is what going on: </p>
+<p>The <code>+=</code> is compiled to <code>BINARY_ADD</code>-optcode and when evaluated in <code>ceval.c</code>, there is a hook/<a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Python/ceval.c#L1287" rel="nofollow noreferrer">special handling for unicode objects</a> (see <code>PyUnicode_CheckExact</code>):</p>
+<pre><code>case TARGET(BINARY_ADD): {
+    PyObject *right = POP();
+    PyObject *left = TOP();
+    PyObject *sum;
+    ...
+    if (PyUnicode_CheckExact(left) &amp;&amp;
+             PyUnicode_CheckExact(right)) {
+        sum = unicode_concatenate(left, right, f, next_instr);
+        /* unicode_concatenate consumed the ref to left */
+    }
+    ...
+</code></pre>
+<p><a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Python/ceval.c#L5075" rel="nofollow noreferrer"><code>unicode_concatenate</code></a> ends up calling <a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Objects/unicodeobject.c#L11312" rel="nofollow noreferrer"><code>PyUnicode_Append</code></a>, which checks whether the left-operand is modifiable (which <a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Objects/unicodeobject.c#L1855" rel="nofollow noreferrer">basically checks</a> that there is only one reference, string isn't interned and some further stuff) and resizes it or creates a new unicode-object otherwise:</p>
+<pre><code>if (unicode_modifiable(left)
+    &amp;&amp; ...)
+{
+    /* append inplace */
+    if (unicode_resize(p_left, new_len) != 0)
+        goto error;
+
+    /* copy 'right' into the newly allocated area of 'left' */
+    _PyUnicode_FastCopyCharacters(*p_left, left_len, right, 0, right_len);
+}
+else {
+    ...
+    /* Concat the two Unicode strings */
+    res = PyUnicode_New(new_len, maxchar);
+    if (res == NULL)
+        goto error;
+    _PyUnicode_FastCopyCharacters(res, 0, left, 0, left_len);
+    _PyUnicode_FastCopyCharacters(res, left_len, right, 0, right_len);
+    Py_DECREF(left);
+    ...
+}
+</code></pre>
+<p><a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Objects/unicodeobject.c#L1874" rel="nofollow noreferrer"><code>unicode_resize</code></a> ends up calling <a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Objects/unicodeobject.c#L918" rel="nofollow noreferrer"><code>resize_compact</code></a> (mostly because in our case we have only ascii-characters), <a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Objects/unicodeobject.c#L954" rel="nofollow noreferrer">which ends up</a> calling <code>PyObject_REALLOC</code>:</p>
+<pre><code>...
+new_unicode = (PyObject *)PyObject_REALLOC(unicode, new_size);
+...
+</code></pre>
+<p>which basically will be calling <a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Objects/obmalloc.c#L1819" rel="nofollow noreferrer"><code>pymalloc_realloc</code></a>:</p>
+<pre><code>static int
+pymalloc_realloc(void *ctx, void **newptr_p, void *p, size_t nbytes)
+{
+    ...
+    /* pymalloc is in charge of this block */
+    size = INDEX2SIZE(pool-&gt;szidx);
+    if (nbytes &lt;= size) {
+        /* The block is staying the same or shrinking.
+          ....
+            *newptr_p = p;
+            return 1; // 1 means success!
+          ...
+    }
+    ...
+}
+</code></pre>
+<p>Where <a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Objects/obmalloc.c#L802" rel="nofollow noreferrer"><code>INDEX2SIZE</code></a> just rounds up to the nearest multiple of 8:</p>
+<pre><code>#define ALIGNMENT               8               /* must be 2^N */
+#define ALIGNMENT_SHIFT         3
+
+/* Return the number of bytes in size class I, as a uint. */
+#define INDEX2SIZE(I) (((uint)(I) + 1) &lt;&lt; ALIGNMENT_SHIFT)
+</code></pre>
+<p>qed. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Strings are immutabale.  Using <code>+=</code> on a <code>str</code> is not an in-place operation; it creates a new object with a new memory address, which is what <code>id()</code> gives under CPython's implementation.</p>
+<hr/>
+<p>For <code>str</code> specifically, <code>__iadd__</code> is not defined, so the operation falls back to a either <code>__add__</code> or <code>__radd__</code>.  See the <a href="https://docs.python.org/3/reference/datamodel.html#object.__iadd__" rel="noreferrer">data model</a> section of the Python docs for some detail.</p>
+<pre><code>&gt;&gt;&gt; hasattr(s, '__iadd__')                                                                                                                                
+False
+</code></pre>
+</div>
+<span class="comment-copy">Don't you mean cpython (and not cython)?</span>
+<span class="comment-copy">Why do you think, there is an extra space in string available?</span>
+<span class="comment-copy">If you do actually mean Cython, then string concatenation is <a href="https://stackoverflow.com/questions/35787022/cython-string-concatenation-is-super-slow-what-else-does-it-do-poorly">actually something it does not optimise, and that the CPython interpreter sometimes does</a>.</span>
+<span class="comment-copy">i'm wrong, it's CPython. i see it on the book 'fluent python'</span>
+<span class="comment-copy">Because while the <i>underlying buffer may not change</i>, the <i>string object</i> does. And <code>id</code> is the <code>id</code> of the <i>string object</i>.</span>
+<span class="comment-copy">You speak very well. But I have a question: &gt;&gt;&gt; add_str("1","2",100) 2660336425032 ... 4 times 2660336425032 2660336418608 ... 6 times 2660336418608, why is it 4 times instead of 5 times there</span>
+<span class="comment-copy">Some people say that <code>if allocator is asked for only 1 byte, still 8 bytes are marked as used</code> is wrong, <a href="https://github.com/python/cpython/blob/master/Objects/unicodeobject.c#L1855" rel="nofollow noreferrer">github.com/python/cpython/blob/master/Objects/…</a>.   Can you explain what <code>resize</code>is?</span>
+<span class="comment-copy">@WangTanxu Who says it and where? Because pointers are 8byte alligned <a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Objects/obmalloc.c#L791" rel="nofollow noreferrer">github.com/python/cpython/blob/…</a>, the remaining bytes cannot be used in other objects.</span>
+<span class="comment-copy">I arrived at the same conclusion by trying simply in python and not in cython. But, why do you think <code>s='a' id(s+'b') != id('ab')</code> ?</span>
+<span class="comment-copy">I thought <code>s + 'b'</code> was modifying the pointer to 'ab', thanks for the clarification</span>
+<span class="comment-copy">@Salomon: actually, <code>id(1) == id(1)</code> (as well, obviously, as <code>1 is 1</code>) is true (due to an implementation detail - cpython caches small integers). <code>id(1) is id(1)</code> is <i>usually</i> false because CPython ids are memory addresses expressed as integers, and those integers are (here again <i>usually</i>) way greater than what CPython considers as "small enough" to be cached.  Also, strings that <i>could</i> be valid python names are cached too (try  <code>id("foo") == id("f" + "oo")</code> for example). As a conclusion: do not rely on identity for immutable types, as they can - or not - be subject to runtime optimisations.</span>
+<span class="comment-copy">Under some conditions <code>+=</code> is done in place for unicode-strings in CPython. However, because <code>ab</code> is interned, those conditions aren't satisfied in the example of OP.</span>

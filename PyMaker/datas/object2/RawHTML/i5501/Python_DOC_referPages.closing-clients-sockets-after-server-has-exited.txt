@@ -1,0 +1,136 @@
+<div class="post-text" itemprop="text">
+<p>I am writing a simple client/server socket program where clients connect with server and communicate and then they send exit msg to server and then server closes the connection. The code looks like below.</p>
+<p><em><strong>server.py</strong></em></p>
+<pre><code>import socket
+import sys
+from threading import Thread
+
+try:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    # This is to prevent the socket going into TIME_WAIT status and OSError
+    # "Address already in use"
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+except socket.error as e:
+    print('Error occured while creating the socket {}'.format(e))
+
+server_address = ('localhost', 50000)
+sock.bind(server_address)
+
+print('**** Server started on {}:{} ****'.format(*server_address))
+
+sock.listen(5)
+
+
+def client_thread(conn_sock, client_add):
+    while True:
+        client_msg = conn_sock.recv(1024).decode()
+        if client_msg.lower() != 'exit':
+            print('[{0}:{1}] {2}'.format(*client_add, client_msg))
+            serv_reply = 'Okay ' + client_msg.upper()
+            conn_sock.send(bytes(serv_reply, 'utf-8'))
+        else:
+            conn_sock.close()
+            print('{} exitted !!'.format(client_add[0]))
+            sys.exit()
+
+
+try:
+    # Keep the server until there are incominmg connections
+    while True:
+        # Wait for the connctions to accept
+        conn_sock, client_add = sock.accept()
+        print('Recieved connection from {}:{}'.format(*client_add))
+        conn_sock.send(
+            bytes('***** Welcome to {} *****'.format(server_address[0]), 'utf-8'))
+        Thread(target=client_thread, args=(
+            conn_sock, client_add), daemon=True).start()
+
+except Exception as e:
+    print('Some error occured \n {}'.format(e))
+except KeyboardInterrupt as e:
+    print('Program execution cancelled by user')
+    conn_sock.send(b'exit')
+    sys.exit(0)
+
+finally:
+    sock.close()
+</code></pre>
+<p><em><strong>client.py</strong></em></p>
+<pre><code>import socket
+import sys
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server_address = ('localhost', 50000)
+print('Connecting to {} on {}'.format(*server_address))
+sock.connect(server_address)
+
+
+def exiting(host=''):
+    print('{} exitted !!'.format(host))
+    sys.exit()
+
+
+while True:
+    serv_msg = sock.recv(1024).decode()
+    if serv_msg.lower() != 'exit':
+        print('{1}: {0}'.format(serv_msg, server_address[0]))
+        client_reply = input('You: ')
+        sock.send(bytes(client_reply, 'utf-8'))
+
+        if client_reply.lower() == 'exit':
+            exiting()
+    else:
+        exiting('Server')
+</code></pre>
+<p>What i want is in case server exits either through ctrl-c or any other way i want all client sockets to be closed and send msg to clients upon which they should close their socket as well.</p>
+<p>I am doing below in except section but for some reason the msg sent by server is not being received by the client.</p>
+<pre><code>except KeyboardInterrupt as e:
+print('Program execution cancelled by user')
+conn_sock.send(b'exit')
+sys.exit(0)
+</code></pre>
+<p>Surprisingly if i send the 'exit' msg from client_thread as srvr_reply, the client accepts the msg and exit the client socket at its end just fine. So i am going nuts as to know why server is not able to send the same message in except section of the code as mentioned above.</p>
+<p>Any help pls !!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'm sorry to say that abnormal termination of TCP/IP connections is undetectable unless you try to send data through the connection.</p>
+<p>This is known as a "Half Open" socket and it's also mention in the <a href="https://docs.python.org/3/howto/sockets.html#when-sockets-die" rel="nofollow noreferrer">Python documentation</a>.</p>
+<p>Usually, when a server process crashes, the OS will close TCP/IP sockets, signaling the client about the closure.</p>
+<p>When a client receives the signal, the server's termination can be detected while polling. The polling mechanism (i.e. <code>poll</code> / <code>epoll</code> / <code>kqueue</code>) will test for the <code>HUP</code> (hung up) event.</p>
+<p>This is why "Half Open" sockets don't happen in development unless the issue is forced. When both the client and the server run on the same machine, the OS will send the signal about the closure.</p>
+<p>But if the server computer crashes, or connectivity is lost (i.e. mobile devices), no such signal is sent and the client never knows.</p>
+<p>The only way to detect an abnormal termination is a failed <code>write</code> attempt <code>read</code> will not detect the issue (it will act as if no data was received).</p>
+<p>This is why they invented the <code>ping</code> concept and this is why HTTP/1.1 servers and clients (that don't support pings) use timeouts to assume termination.</p>
+<p>There's <a href="https://blog.stephencleary.com/2009/05/detection-of-half-open-dropped.html" rel="nofollow noreferrer">a good blog post about Half Open sockets here</a>.</p>
+<hr/>
+<p><strong>EDIT</strong> (clarifications due to comments)</p>
+<p><strong>How to handle the situation</strong>:</p>
+<p>I would recommend the following:</p>
+<ul>
+<li><p>Add an explicit Ping message (or an Empty/NULL message) to your protocol (the messages understood by both the clients and the server).</p></li>
+<li><p>Monitor the socket for inactivity by recording each <code>send</code> or <code>recv</code> operation.</p></li>
+<li><p>Add timeout monitoring to your code. This means that you will need to implement polling, such as <code>select</code> (or <code>poll</code> or the OS specific <code>epoll</code>/<code>kqueue</code>), instead of blocking on <code>recv</code>.</p></li>
+<li><p>When connection timeout is reached, send the Ping / empty message.</p></li>
+<li><p>For an easy solution, reset the timeout after sending the Ping.</p>
+<p>The next time you poll the socket, the polling mechanism should alert you about the failed connection. Alternatively, the second time you try to ping the server/client you will get an error message.</p></li>
+</ul>
+<p>Note that the first <code>send</code> operation might succeed even though the connection was lost.</p>
+<p>This is because the TCP/IP layer sends the message but the <code>send</code> function doesn't wait for the TCP/IP's <code>ACK</code> confirmation.</p>
+<p>However, by the second time you get to the ping, the TCP/IP layer would have probably realized that no <code>ACK</code> is coming and registered the error in the socket (this takes time).</p>
+<p><strong>Why the <code>send</code> failed before exiting the server</strong></p>
+<p>The comment I left about this issue is wrong (in part).</p>
+<p>The main reason the <code>conn_sock.send(b'exit')</code> failed is because <code>conn_sock</code> is a local variable in the client thread and isn't accessible from the global state where the <code>SIGINT</code> (CTRL+C) is raised.</p>
+<p>This makes sense, as what would happen if the server has more than a single client?</p>
+<p>However, it is true that <code>socket.send</code> only <em>schedules</em> the data to be sent, so the assumption that the data was actually sent is incorrect.</p>
+<p>Also note that <a href="https://docs.python.org/3.6/library/socket.html#socket.socket.send" rel="nofollow noreferrer"><code>socket.send</code> might not send the whole message if there isn't enough room in the kernel's buffer</a>.</p>
+</div>
+<span class="comment-copy">No ! This procedure does not work, who starts to speak, he tells the last word (including the last word of listening). Shutdown operations are not performed on the server side, either talk to you or refuse. In response to "close" when said "Yes, I'll be trapped after 3 seconds" so the client will not have an error elevation.</span>
+<span class="comment-copy">Server : <code>server_address = ('localhost', 50000)</code> is <b>OK</b> But client need :<code>sock = socket.create_connection(server_address)</code>, A socket can only be used for a transaction, otherwise "you can't connect to yourself !"</span>
+<span class="comment-copy">Client is not connecting to itself, it merely looks like in this case because server socket is running on same host as well.</span>
+<span class="comment-copy">These codes are impossible to operate on the same machine!</span>
+<span class="comment-copy">Apparently it seems to run just fine, and even sending a reply from server with 'exit' msg causes the client to exit the connection as well if i change <code>serv_reply = 'exit'</code> inside the client_thread function. It only does not work if i send the same msg inside except block !!</span>
+<span class="comment-copy">The thing which i am not able to understand here is that if send the same msg like this <code>conn_sock.send(b'exit')</code> in <code>client_thread</code> function everything works just fine and client closes the connection as expected. But if i send the same msg in the except block, the does not even recieve the msg sent by server. I believe there has been some confusion in understanding the problem statement here :)</span>
+<span class="comment-copy">@Rohit, I think I understand your confusion. I'm not sure why it happens, but I think <code>socket.send</code> just <i>schedules</i> the message and the <code>sys.exit(0)</code> happens before the message is actually sent (I think python uses async-io under the hood)... However, I'm not sure it matters. The assumption that it's possible to send a message is incorrect for network applications, because the server or network might crash without being able to send any messages.</span>
+<span class="comment-copy">Okay, that totally makes sense now. So what's the best way to handle this, i mean notifying the client to close its end because either sever/network has gone down or any other reason as well.</span>
+<span class="comment-copy">@Rohit, I updated my answer to answer the question in your comment, but also because I think I made a mistake analyzing the error. If this answers your question, please up-vote / accept the answer.</span>

@@ -1,0 +1,191 @@
+<div class="post-text" itemprop="text">
+<p>tl;dr: I have several threads, one being a thread listening to input() to keep the program running/exit on keypress. But at one time in the program I need to stop this listener or it will intercept the input for a subprocessed program.    </p>
+<p>Long version:<br/>
+- Program should download some data, then hand this over to some other console program to be processed.<br/>
+- Program should either run until download is finished or until ENTER-keypress has been sent.<br/>
+- In both cases the download thread will be ended gracefully and the external processing should be done.<br/>
+- Problem: The input() function is still listening and intercepting the first input to the subprocess'ed console program.   </p>
+<pre class="lang-python prettyprint-override"><code>import os
+import subprocess
+import threading
+import time
+
+
+def thread_do_downloads():
+    # does some downloads and will set the flag "flag_download_completed=True" 
+    # eventually to signal download completed
+    # for this example just set the flag
+    global flag_download_completed
+    flag_download_completed = True
+
+
+def do_stuff_with_downloaded_data():
+    # this is of course not the program I would call,
+    # but this example should show how the input would be intercepted
+
+    if os.name == 'nt':
+        parameters = ["set", "/p", "variable=Press Enter"]        # for this example (Windows) call "set", this program will wait for a user input
+    else:
+        parameters = ["read", "variable"]                        # hope this works for linux...
+    p1 = subprocess.Popen(parameters, shell=True)
+    p1.communicate()
+
+
+def listen_for_keypress():
+    input()
+    print("keypress intercepted")
+
+
+def main():
+    dl = threading.Thread(target=thread_do_downloads)
+    dl.start()
+
+    kill_listener = threading.Thread(target=listen_for_keypress, daemon=True)   # daemon: to not have it lingering after main thread is done
+    kill_listener.start()
+
+
+    print("Press ENTER to stop downloading.")
+    while True:
+        if not kill_listener.is_alive() or flag_download_completed:
+            break
+        time.sleep(1)
+
+    # here are some lines to make sure the download thread above completes gracefully
+    do_stuff_with_downloaded_data()
+    print("All done")
+
+
+if __name__ == '__main__':
+    flag_download_completed = False
+    main()
+</code></pre>
+<p>Will result in:<br/>
+Press ENTER to stop downloading.<br/>
+Press Enter                                 <em>&lt;&lt; stopped here until I   pressed ENTER</em><br/>
+keypress intercepted                        <em>&lt;&lt; stopped here until I   pressed ENTER</em> </p>
+<p>All done  </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you can keep the main thread on top of the console, maybe you could take advantage of the fact that <code>input()</code> is going to block the main thread until <code>Enter</code> is pressed. Once the execution continues (because <code>Enter</code> was pressed), communicate to the running threads that they have to stop using an <a href="https://docs.python.org/3/library/threading.html#event-objects" rel="nofollow noreferrer">Event</a> (another example <a href="http://zulko.github.io/blog/2013/09/19/a-basic-example-of-threads-synchronization-in-python/" rel="nofollow noreferrer">here</a>). If you do want to listen for S.O. signals, I suggest you take a look to the <a href="https://docs.python.org/3.4/library/signal.html" rel="nofollow noreferrer">signal</a> module (watch out, some features may be O.S dependent).</p>
+<pre><code>import threading
+import time
+
+
+def thread_do_downloads(stop_activated):
+    # does some downloads and will set the flag "flag_download_completed=True"
+    # eventually to signal download completed
+    # for this example just set the flag
+    global flag_download_completed
+    while not stop_activated.is_set():
+        time.sleep(0.5)
+        print("ZZZZZZZ")
+
+
+def do_stuff_with_downloaded_data():
+    print("doing stuff with downloaded data")
+
+
+def main():
+    stop_activated = threading.Event()
+
+    dl = threading.Thread(target=thread_do_downloads, args=(stop_activated,))
+    dl.start()
+
+    input("Press ENTER to stop downloading.")
+    stop_activated.set()
+    print("stopping (waiting for threads to finish...)")
+    dl.join()
+
+    # here are some lines to make sure the download thread above completes gracefully
+    do_stuff_with_downloaded_data()
+    print("All done")
+
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p><strong>EDIT</strong> (as per the OP's comment):</p>
+<p>One of the complications that the original question has is how to communicate the termination request to a subprocess. Because processes don't share memory with the parent process (the process who spawned it) this can, indeed, only (or <em>almost only</em>) be done through actual SO signals. Because of this memory isolation, any flags set on the parent process will have no effect in the spawned subprocesses: the only way of inter process communication is either through OS signals, or through files (or file-like structures) that both parent and child process "known about" and use to share information. Also, calling an <code>input()</code> in the parent binds the standard input (<code>stdin</code>) to that process which means by default, the subprocesses are unaware about the keys pressed in the parent (you could always bind the <code>stdin</code> of the child process to the <code>stdin</code> of the parent, but that would complicate a bit more the code)</p>
+<p>Fortunately, the instances of <a href="https://docs.python.org/2/library/subprocess.html#popen-constructor" rel="nofollow noreferrer"><code>Popen</code></a> do offer a nice way to send signals to the child process: the <a href="https://docs.python.org/2/library/subprocess.html#subprocess.Popen.terminate" rel="nofollow noreferrer">TERM</a> signal, which the subprocess could catch and is supposed to interpret as "<em>Hey, you're gonna be stopped real soon, so do your clean-up things, close files and so on and exit</em>" and the <a href="https://docs.python.org/2/library/subprocess.html#subprocess.Popen.kill" rel="nofollow noreferrer">KILL</a> signal that doesn't really tell anything to the subprocess (can't be caught): it just kills it (In Linux, for instance a KILL signal removes all access to memory from the killed process so any action that uses memory, such as a seek for next operation will cause an error. More info <a href="https://unix.stackexchange.com/a/111636/16046">here</a>)</p>
+<p>To demonstrate that, let's say we have a simple <code>script.py</code> file in the same directory where our main program is located that looks like this:</p>
+<p><em>script.py</em> &gt;</p>
+<pre><code>#!/usr/bin/env python
+
+import sys
+import random
+import time
+
+
+def main():
+    done = False
+    while not done:
+        time.sleep(0.5)
+        print("I'm busy doing things!!")
+        done = random.randint(0, 15) == 1
+
+
+if __name__ == "__main__":
+    main()
+    sys.exit(0)  # This is pretty much unnecessary, though
+</code></pre>
+<p>A script that would take a random time to process and that can, potentially, be quite long (at least long enough to demonstrate)</p>
+<p>Now, we could create one (or many) subprocesses in a tread that run that <code>script.py</code> file, regularly check their status (using <a href="https://docs.python.org/2/library/subprocess.html#subprocess.Popen.poll" rel="nofollow noreferrer">poll()</a>) and if the user has requested the forced output send a <code>TERM</code> signal and a bit later a <code>KILL</code> if necessary.</p>
+<pre><code>import threading
+import time
+import subprocess
+
+
+def thread_do_downloads(stop_activated):
+    p = subprocess.Popen('./script.py', stdout=subprocess.PIPE)
+    while p.poll() is None:
+        time.sleep(0.5)
+        print("Subprocess still running... Slepping a bit... ZzzzzzZZZ")
+        if stop_activated.is_set():
+            print("Forcing output requested!!!")
+            print("Trying to terminate the process nicely, which a SIGTERM:")
+            p.terminate()
+            time.sleep(0.5)
+            if p.poll() is None:
+                print("Not being nice anymore... Die, die die!!")
+                p.kill()
+            print("This is what the subprocess 'said':\n%s" % p.stdout.read())
+            return
+    print("stopping normally")
+
+
+def do_stuff_with_downloaded_data():
+    print("doing stuff with downloaded data")
+
+
+def listen_for_keypress(stop_activated):
+    input("Press ENTER to stop downloading.")
+    print("keypress intercepted")
+    stop_activated.set()
+
+
+def main():
+    stop_activated = threading.Event()
+
+    dl = threading.Thread(target=thread_do_downloads, args=(stop_activated,))
+    dl.start()
+
+    kill_listener = threading.Thread(target=listen_for_keypress, args=(stop_activated,), daemon=True)
+    kill_listener.start()
+
+    dl.join()
+    print("Finished downloading data")
+
+    # here are some lines to make sure the download thread above completes gracefully
+    do_stuff_with_downloaded_data()
+    print("All done")
+
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+</div>
+<span class="comment-copy">The downvoter might want to explain the downvote. Disencouraging people from asking by giving them a -1 is rather unhelpful. Thank you.</span>
+<span class="comment-copy">Thank you, but this will force me to press ENTER because of the <code>input()</code> in the main thread(?). This is exactly what I do not want. Pressing ENTER should only be required when I want to abort the program before it would stop itself (because download completed).</span>
+<span class="comment-copy">aaaah, I get it, I get it (I think)... Check the edit?</span>
+<span class="comment-copy">Thank you for your efforts and edit, but this also does not work. You have to keep the subprocess lines in the code. Those are the crucial lines that give the problem. Because the keylistener will still be running and will still intercept the keypress from reaching the subprocess. Without the subprocess this whole problem would not exist in the first place. A thread.stop() would come real handy in here but unfortunately it does not exist.</span>
+<span class="comment-copy">I come from an area whose inhabitants are particularly known for their stubbornness <b>:-D</b> I edited the edit.</span>

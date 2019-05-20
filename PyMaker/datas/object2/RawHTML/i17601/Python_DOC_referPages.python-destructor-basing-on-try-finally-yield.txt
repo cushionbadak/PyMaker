@@ -1,0 +1,94 @@
+<div class="post-text" itemprop="text">
+<p>I've been testing a dirty hack inspired by this <a href="http://docs.python.org/2/library/contextlib.html" rel="nofollow">http://docs.python.org/2/library/contextlib.html</a> .
+The main idea is to bring try/finally idea onto class level and get reliable and simple class destructor.</p>
+<pre><code>class Foo():
+  def __init__(self):
+    self.__res_mgr__ = self.__acquire_resources__()
+    self.__res_mgr__.next()
+
+  def __acquire_resources__(self):
+    try:
+      # Acquire some resources here
+      print "Initialize"
+      self.f = 1
+      yield
+    finally:
+      # Release the resources here
+      print "Releasing Resources"
+      self.f = 0
+
+f = Foo()
+print "testing resources"
+print f.f
+</code></pre>
+<p>But it always gives me: </p>
+<pre><code>Initialize
+testing resources
+1
+</code></pre>
+<p>and never "Releasing Resources". I'm basing my hope on:</p>
+<blockquote>
+<p>As of Python version 2.5, the yield statement is now allowed in the
+  try clause of a try ... finally construct. If the generator is not
+  resumed before it is finalized (by reaching a zero reference count or
+  by being garbage collected), the generator-iterator’s close() method
+  will be called, allowing any pending finally clauses to execute. <a href="http://docs.python.org/2/reference/simple_stmts.html#the-yield-statement" rel="nofollow">Source link</a></p>
+</blockquote>
+<p>But it seems when the class member is being garbage collected together with the class their ref counts don't decrease, so as a result generators close() and thus finally is never called. As for the second part of the quote</p>
+<blockquote>
+<p>"or by being garbage collected"</p>
+</blockquote>
+<p>I just don't know why it's not true. Any chance to make this utopia work? :)</p>
+<p>BTW this works on module level:</p>
+<pre><code>def f():
+  try:
+    print "ack"
+    yield
+  finally:
+    print "release"
+
+a = f()
+a.next()
+print "testing"
+</code></pre>
+<p>Output will be as I expect:</p>
+<pre><code>ack
+testing
+release
+</code></pre>
+<p>NOTE: In my task I'm not able to use WITH manager because I'm releasing the resource inside end_callback of the thread (it will be out of any WITH). So I wanted to get a reliable destructor for cases when callback won't be called for some reason</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem you are having is caused by a reference cycle and an implicit <code>__del__</code> defined on your generator (it's so implicit, <a href="https://bugs.python.org/issue17468" rel="nofollow noreferrer">CPython doesn't actually show <code>__del__</code> when you introspect, because only the C level <code>tp_del</code> exists, no Python-visible <code>__del__</code> is created</a>). Basically, when a generator has a <code>yield</code> inside:</p>
+<ul>
+<li>A <code>try</code> block, or equivalently</li>
+<li>A <code>with</code> block</li>
+</ul>
+<p>it has an implicit <code>__del__</code>-like implementation. On Python 3.3 and earlier, if a reference cycle contains an object whose class implements <code>__del__</code> (technically, has <code>tp_del</code> in CPython), unless the cycle is manually broken, the cyclic garbage collector cannot clean it up, and just sticks it in <code>gc.garbage</code> (<code>import gc</code> to gain access), because it doesn't know which objects (if any) must be collected first to clean up "nicely".</p>
+<p>Because your class's <code>__acquire_resources__(self)</code> contains a reference to the instance's <code>self</code>, you form a reference cycle:</p>
+<p><code>self</code> -&gt; <code>self.__res_mgr__</code> (generator object) -&gt; generator frame (referencing locals which includes) -&gt; <code>self</code></p>
+<p>Because of this reference cycle, and the fact that the generator has a <code>try</code>/<code>finally</code> in it (creating <code>tp_del</code> equivalent to <code>__del__</code>), the cycle is uncollectable, and your <code>finally</code> block never gets executed unless you manually advance <code>self.__res_mgr__</code> (which defeats the whole purpose).</p>
+<p>You experiment happens to display this problem automatically because the reference cycle is implicit/automatic, but any accidental reference cycle where an object in the cycle has a class with <code>__del__</code> will trigger the same problem, so even if you just did:</p>
+<pre><code>class Foo():
+    def __init__(self):
+        # Acquire some resources here
+        print "Initialize"
+        self.f = 1
+
+    def __del__(self):
+        # Release the resources here
+        print "Releasing Resources"
+        self.f = 0
+</code></pre>
+<p>if the "resources" involved could conceivably lead to a reference cycle with an instance of <code>Foo</code>, you'd have the same problem.</p>
+<p>The solution here is one or both of:</p>
+<ol>
+<li>Make your class <a href="https://docs.python.org/3/library/stdtypes.html#typecontextmanager" rel="nofollow noreferrer">a context manager</a> so users provide the information necessary for deterministic finalization (by using <code>with</code> blocks) as well as providing an explicit cleanup method (e.g. <code>close</code>) for when <code>with</code> blocks aren't feasible (part of another object's state that is cleaned up through its own resource management). This is also the only way to provide deterministic cleanup on most non-CPython interpreters where reference counting semantics have never been used (so all finalizers are called non-deterministically, if at all)</li>
+<li>Move to Python 3.4 or higher, where <a href="https://www.python.org/dev/peps/pep-0442/" rel="nofollow noreferrer">PEP 442</a> resolves the issue with uncollectable cyclic garbage (it's technically still possible to produce such cycles on CPython, but only via third party extensions that continue to use <code>tp_del</code> instead of updating to use the <code>tp_finalize</code> slot that allows cyclic garbage to be cleaned properly). It's still non-deterministic cleanup (if a reference cycle exists, you're waiting on the cyclic gc to run, sometime), but it's <em>possible</em>, where pre-3.4, cyclic garbage of this sort could not be cleaned up at all.</li>
+</ol>
+</div>
+<span class="comment-copy">There's no guarantee that anything left when the program ends will be garbage-collected and no guarantee their destructors will run.</span>
+<span class="comment-copy">@user2357112, so why this always works on module level and never on class?</span>
+<span class="comment-copy">Arbitrary implementation decisions. You shouldn't rely on either version working.</span>
+<span class="comment-copy">What exactly do you hope to gain from these contortions, compared to just defining <code>__del__</code>?</span>
+<span class="comment-copy">Well, it's not, essentially because it's just fancy syntax for <code>__del__</code>. Generators are objects too and must be finalized by the same means as other objects.</span>

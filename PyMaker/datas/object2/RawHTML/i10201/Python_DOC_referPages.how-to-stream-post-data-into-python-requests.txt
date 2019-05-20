@@ -1,0 +1,59 @@
+<div class="post-text" itemprop="text">
+<p>I'm using the Python <code>requests</code> library to send a POST request. The part of the program that produces the POST data can <strong>write</strong> into an arbitrary file-like object (output stream).</p>
+<p>How can I make these two parts fit?</p>
+<p>I would have expected that <code>requests</code> provides a streaming interface for this use case, but it seems it doesn't. It only accepts as <code>data</code> argument a file-like object from which it <strong>reads</strong>. It doesn't provide a file-like object into which I can <strong>write</strong>.</p>
+<p>Is this a fundamental issue with the Python HTTP libraries?</p>
+<h1>Ideas so far:</h1>
+<p>It seems that the simplest solution is to <code>fork()</code> and to let the requests library communicate with the POST data producer throgh a <strong>pipe</strong>.</p>
+<p>Is there a better way?</p>
+<p>Alternatively, I could try to complicate the POST data producer. However, that one is parsing one XML stream (from stdin) and producing a new XML stream to used as POST data. Then I have the same problem in reverse: The XML serializer libraries want to <strong>write</strong> into a file-like object, I'm not aware of any possibility that an XML serializer provides a file-like object from which other can <strong>read</strong>.</p>
+<p>I'm also aware that the cleanest, classic solution to this is coroutines, which are somewhat available in Python through generators (<code>yield</code>). The POST data could be streamed through (<code>yield</code>) instead of a file-like object and use a pull-parser.</p>
+<p>However, is possible to make <code>requests</code> accept an iterator for POST data? And is there an XML serializer that can readily be used in combination with <code>yield</code>?</p>
+<p>Or, are there any wrapper objects that turn writing into a file-like object into a generator, and/or provide a file-like object that wraps an iterator?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>request</code> does take an iterator or generator as <code>data</code> argument, the details are described in <a href="http://docs.python-requests.org/en/master/user/advanced/#chunk-encoded-requests" rel="nofollow">Chunk-Encoded Requests</a>. The transfer encoding needs to be chunked in this case because the data size is not known beforehand.</p>
+<p>Here is a very simle example that uses a <a href="https://docs.python.org/3/library/queue.html#queue.Queue" rel="nofollow"><code>queue.Queue</code></a> and can be used as a file-like object for writing:</p>
+<pre><code>import requests
+import queue
+import threading
+
+class WriteableQueue(queue.Queue):
+
+    def write(self, data):
+        # An empty string would be interpreted as EOF by the receiving server
+        if data:
+            self.put(data)
+
+    def __iter__(self):
+        return iter(self.get, None)
+
+    def close(self):
+        self.put(None)
+
+# quesize can be limited in case producing is faster then streaming
+q = WriteableQueue(100)
+
+def post_request(iterable):
+    r = requests.post("http://httpbin.org/post", data=iterable)
+    print(r.text)
+
+threading.Thread(target=post_request, args=(q,)).start()
+
+# pass the queue to the serializer that writes to it ...    
+q.write(b'1...')
+q.write(b'2...')
+
+# closing ends the request
+q.close()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The only way of connecting a data producer that requires a push interface for its data sink with a data consumer that requires a pull interface for its data source is through an intermediate buffer. Such a system can be operated only by running the producer and the consumer in "parallel" - the producer fills the buffer and the consumer reads from it, each of them being suspended as necessary. Such a parallelism can be simulated with <em>cooperative multitasking</em>, where the producer yields the control to the consumer when the buffer is full, and the consumer returns the control to the producer when the buffer gets empty. By taking the generator approach you will be building a custom-tailored cooperative multitasking solution for your case, which will hardly end up being simpler compared to the easy pipe-based approach, where the responsibility of scheduling the producer and the consumer is entirely with the OS.</p>
+</div>
+<span class="comment-copy">Why should <i><code>requests</code></i> be obliged to provide <i>"a file-like object into which one can write"?</i> It's designed to work in foreground rather than background mode so it needs to read rather than provide a descriptor and passively wait for input. If <i>you</i> need it, you can provide it yourself as easily as: <code>r,w=(os.fdopen(f,mode) for f,mode in zip(os.pipe(),("rb","wb")))</code> - then run the two parts in separate threads.</span>
+<span class="comment-copy">I don't think that <code>if data:</code> is really needed. Why would empty data "be interpeted as EOF"? The iterator sentinel is <code>None</code>, not the empty byte string <code>b''</code>. So a <code>q.write(b'')</code> would never be interpreted as EOF anyway, would it?</span>
+<span class="comment-copy">@vog It's not the sentinel that interprets it as EOF, requests terminates streaming the request when it encounters a <code>b''</code>. And when using a external library (e.g. an xml serializer) to write to this file-like object you can't be sure that it won't write an empty string. It may somwere do something like <code>out.write(b''.join(some_maybe_empty_list))</code> unconditionally. Writing an empty string should not "close" the file (it's not really closed but only terminates the current iterator. Adding a <code>closed</code> state wouldn't be too hard)</span>
+<span class="comment-copy">Oh, that's good to know. I adjusted the comment in your code to reflect this issue more clearly. (Feel free to fix the comment if I misunderstood something.)</span>
+<span class="comment-copy">@vog - No problem, it's a helpful edit</span>
+<span class="comment-copy">Acutally, I had to edit again because I checked it again, and it's not requests but the server on the other end that interprets it as EOF. requests just sends a chunk with a size of 0 which the server correctly sees as end of stream.</span>

@@ -1,0 +1,92 @@
+<div class="post-text" itemprop="text">
+<p>I want to recursively crawl a web-server that hosts thousands of files and then check if they are different from what's in the local repository (this is a part of checking the delivery infrastructure for bugs).
+So far I've been playing around with various prototypes and here is what I noticed. If I do a straightforward recursion and put all the files into a list, the operation completes in around 230 seconds. Note that I make only one request per directory, so it makes sense to actually download the files I'm interested in elsewhere:</p>
+<pre><code>def recurse_links(base):
+    result = []
+    try:
+        f = urllib.request.urlopen(base)
+        soup = BeautifulSoup(f.read(), "html.parser")
+        for anchor in soup.find_all('a'):
+            href = anchor.get('href')
+            if href.startswith('/') or href.startswith('..'):
+                pass 
+            elif href.endswith('/'):
+                recurse_links(base + href)
+            else:
+                result.append(base + href)
+    except urllib.error.HTTPError as httperr:
+        print('HTTP Error in ' + base + ': ' + str(httperr))
+</code></pre>
+<p>I figured, if I could start processing the files I'm interested in while the crawler is still working, I could save time. So the next thing I tried was a generator that could be further used as a coroutine. The generator took 260 seconds, slightly more, but still acceptable. Here's the generator:</p>
+<pre><code>def recurse_links_gen(base):
+    try:
+        f = urllib.request.urlopen(base)
+        soup = BeautifulSoup(f.read(), "html.parser")
+        for anchor in soup.find_all('a'):
+            href = anchor.get('href')
+            if href.startswith('/') or href.startswith('..'):
+                pass
+            elif href.endswith('/'):
+                yield from recurse_links_gen(base + href)
+            else:
+                yield base + href
+    except urllib.error.HTTPError as http_error:
+        print(f'HTTP Error in {base}: {http_error}')
+</code></pre>
+<h2>Update</h2>
+<p>Answering some questions that came up in the comments section:</p>
+<ul>
+<li>I've got roughly 370k files, but not all of them will make it to the next step. I will check them against a set or dictionary (to get O(1) lookup) before going ahead and compare them to local repo</li>
+<li>After more tests it looks like sequential crawler takes less time in roughly 4 out of 5 attempts. And generator took less time once. So at this point is seems like generator is okay</li>
+<li>At this point consumer doesn't do anything other than get an item from queue, since it's a concept. However I have flexibility in what I will do with the file URL I get from producer. I can for instance, download only first 100KB of file, calculate it's checksum while in memory and then compare to a pre-calculated local version. What's clear though is that if simply adding thread creation bumps my execution time by a factor of 4 to 5, adding work on consumer thread will not make it any faster.</li>
+</ul>
+<p>Finally I decided to give producer/consumer/queue a shot and a simple PoC ran 4 times longer while loading 100% of one CPU core. Here is the brief code (the crawler is the same generator-based crawler from above):</p>
+<pre><code>class ProducerThread(threading.Thread):
+    def __init__(self, done_event, url_queue, crawler, name):
+        super().__init__()
+        self._logger = logging.getLogger(__name__)
+        self.name = name
+        self._queue = url_queue
+        self._crawler = crawler
+        self._event = done_event
+
+    def run(self):
+        for file_url in self._crawler.crawl():
+            try:
+                self._queue.put(file_url)
+            except Exception as ex:
+                self._logger.error(ex)
+</code></pre>
+<p>So here are my questions:</p>
+<ol>
+<li>Are the threads created with <code>threading</code> library actually threads and is there a way for them to be actually distributed between various CPU cores?</li>
+<li>I believe the great deal of performance degradation comes from the producer waiting to put an item into the queue. But can this be avoided?</li>
+<li>Is the generator slower because it has to save the function context and then load it again over and over?</li>
+<li>What's the best way to start actually doing something with those files while the crawler is still populating the queue/list/whatever and thus make the whole program faster?</li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>1) Are the threads created with threading library actually threads and is there a way for them to be actually distributed between various CPU cores?</p>
+</blockquote>
+<p>Yes, these are the threads, but to utilize multiple cores of your CPU, you need to use <a href="https://docs.python.org/2/library/multiprocessing.html" rel="nofollow noreferrer">multiprocessing</a>  package.</p>
+<blockquote>
+<p>2) I believe the great deal of performance degradation comes from the producer waiting to put an item into the queue. But can this be avoided?</p>
+</blockquote>
+<p>It depends on the number of threads you are created, one reason may be due to context switches, your threads are making. The optimum value for thread should be 2/3, i.e create 2/3 threads and check the performance again.</p>
+<blockquote>
+<p>3) Is the generator slower because it has to save the function context and then load it again over and over?</p>
+</blockquote>
+<p>Generators are not slow, it is rather good for the problem you are working on, as you find a url , you put that into queue.</p>
+<blockquote>
+<p>4) What's the best way to start actually doing something with those files while the crawler is still populating the queue/list/whatever and thus make the whole program faster?</p>
+</blockquote>
+<p>Create a ConsumerThread class, which fetches the data(url in your case) from the queue and start working on it.</p>
+</div>
+<span class="comment-copy">Are the 230 and 260 seconds from one attempt each, or did you try each several times and they're some averages? (Then what were the individual timings?) I don't think there should be such a big difference because of lists vs generators. Not even if the recursion is very deep (how deep is it?).</span>
+<span class="comment-copy">The <code>threading</code> threads are actual threads, but they don't really run simultaneously, they all run on a single core. If you don't want that, look at <a href="https://docs.python.org/3/library/multiprocessing.html" rel="nofollow noreferrer">multiprocessing</a>.</span>
+<span class="comment-copy">I'd think the reason to use threads for this kind of problem would be to separate out the downloading of the files (which is IO limited) from the parsing of the file (which is CPU limited). You can't usefully have multiple CPU limited threads in Python (because of the GIL), but you can have IO limited threads working in parallel with one CPU limited thread.</span>
+<span class="comment-copy">@PM2Ring: a web crawler is normally io bound, not CPU bound, so it is a correct use case for Python threads.</span>
+<span class="comment-copy">@PM2Ring I assume that OP has not parallelized the time consuming operation but has only added thread creation overhead. Neither multithreading nor multiprocessing are magic wands that magically speed up everything and OP failed to explain what he did.</span>
+<span class="comment-copy">Thanks, I accepted the answer. I guess the next steps are to 1) try how much slower the sequential synchronous processing is 2) try adding more actual work to consumer(right now it just gets items from the queue) and 3) move to <code>multiprocessing</code></span>
+<span class="comment-copy">Thanks for accepting the answer. Yes, you are right, initially know the performance of your program by sequential synchronous processing, then add multiprocessing package to see the performance improvement.I would suggest you to create threads inside multiple processes.</span>

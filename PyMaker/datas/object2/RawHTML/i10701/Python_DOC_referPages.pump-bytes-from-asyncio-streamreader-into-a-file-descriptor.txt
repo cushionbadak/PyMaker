@@ -1,0 +1,59 @@
+<div class="post-text" itemprop="text">
+<p>I have a Python function (implemented in C++) that reads from a file descriptor (wrapped in <code>FILE*</code> on the C++ side) and I need to feed the function from an <code>asyncio.StreamReader</code>. Specifically, the reader is the content of a HTTP response: <a href="http://aiohttp.readthedocs.io/en/stable/client_reference.html#aiohttp.ClientResponse.content" rel="nofollow">aiohttp.ClientResponse.content</a>.</p>
+<p>I thought I might <a href="https://docs.python.org/3.5/library/os.html?highlight=fdopen#os.pipe" rel="nofollow">open a pipe</a>, pass the read-end to the C++ function and <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.AbstractEventLoop.connect_write_pipe" rel="nofollow">connect the write-end</a> to <code>asyncio</code>'s event loop. However, how can I move the data from the stream reader to the pipe, with proper flow control and as little copying as possible?</p>
+<p>The skeleton of the code with the missing parts is as following:</p>
+<pre><code># obtain the StreamReader from aiohttp
+content = aiohttp_client_response.content
+# create a pipe
+(pipe_read_fd, pipe_write_fd) = os.pipe()
+
+# now I need a suitable protocol to manage the pipe transport
+protocol = ?
+(pipe_transport, __) = loop.connect_write_pipe(lambda: protocol, pipe_write_fd)
+
+# the protocol should start reading from `content` and writing into the pipe
+return pipe_read_fd
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>From the <a href="https://github.com/python/asyncio/blob/master/examples/subprocess_attach_write_pipe.py" rel="nofollow noreferrer">subprocess_attach_write_pipe</a> asyncio example:</p>
+<pre><code>rfd, wfd = os.pipe()
+pipe = open(wfd, 'wb', 0)
+transport, _ = await loop.connect_write_pipe(asyncio.Protocol, pipe)
+transport.write(b'data')
+</code></pre>
+<hr/>
+<p>EDIT - For write flow control, see the following methods:</p>
+<ul>
+<li><a href="https://docs.python.org/3/library/asyncio-protocol.html?highlight=sendto#asyncio.WriteTransport.set_write_buffer_limits" rel="nofollow noreferrer">WriteTransport.set_write_buffer_limits</a></li>
+<li><a href="https://docs.python.org/3/library/asyncio-protocol.html?highlight=sendto#asyncio.BaseProtocol.pause_writing" rel="nofollow noreferrer">BaseProtocol.pause_writing</a></li>
+<li><a href="https://docs.python.org/3/library/asyncio-protocol.html?highlight=sendto#asyncio.BaseProtocol.resume_writing" rel="nofollow noreferrer">BaseProtocol.resume_writing</a></li>
+</ul>
+<p>Here's a possible <code>FlowControl</code> implementation, inspired by <a href="https://docs.python.org/3/library/asyncio-stream.html?highlight=stream#asyncio.StreamWriter.drain" rel="nofollow noreferrer">StreamWriter.drain</a>:</p>
+<pre><code>class FlowControl(asyncio.streams.FlowControlMixin):
+    async def drain(self):
+        await self._drain_helper()
+</code></pre>
+<p>Usage:</p>
+<pre><code>transport, protocol = await loop.connect_write_pipe(FlowControl, pipe)
+transport.write(b'data')
+await protocol.drain()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I got around this issue by using a <code>ThreadPoolExecutor</code> and blocking calls to <code>os.write</code>:</p>
+<pre><code>(read_fd, write_fd) = os.pipe()
+task_1 = loop.create_task(pump_bytes_into_fd(write_fd))
+task_2 = loop.run_in_executor(executor_1, parse_bytes_from_fd(read_fd))
+
+async def pump_bytes_into_fd(write_fd):
+    while True:
+        chunk = await stream.read(CHUNK_SIZE)
+        if chunk is None: break
+        # process the chunk
+        await loop.run_in_executor(executor_2, os.write, write_fd, chunk)
+</code></pre>
+<p>It is crucial that two different executors are used for blocking reads and writes to avoid deadlocks.</p>
+</div>
+<span class="comment-copy">This shows how to open the pipe for writing with asyncio, but does not show how to correctly copy to the pipe from an <code>asyncio.StreamReader</code>. In particular, simply reading chunks of bytes from the reader and feeding them to <code>transport.write</code> may overflow buffers if the party reading from the pipe is too slow to keep up with the <code>StreamReader</code>.</span>
+<span class="comment-copy">@JanŠpaček See my edit about write flow control, hope that helps.</span>

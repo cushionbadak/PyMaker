@@ -1,0 +1,77 @@
+<div class="post-text" itemprop="text">
+<p>I have a <code>Connection</code> object that is used to contain the read and write streams of <code>asyncio</code> connections:</p>
+<pre><code>class Connection(object):
+
+    def __init__(self, stream_in, stream_out):
+        object.__init__(self)
+
+        self.__in = stream_in
+        self.__out = stream_out
+
+    def read(self, n_bytes : int = -1):
+        return self.__in.read(n_bytes)
+
+    def write(self, bytes_ : bytes):
+        self.__out.write(bytes_)
+        yield from self.__out.drain()
+</code></pre>
+<p>On the server side, <code>connected</code> creates a <code>Connection</code> object every time a client connects, then reads 4 bytes.</p>
+<pre><code>@asyncio.coroutine
+def new_conection(stream_in, stream_out):
+    conn = Connection(stream_in, stream_out)
+    data = yield from conn.read(4)
+    print(data)
+</code></pre>
+<p>And on the client side, 4 bytes are written out.</p>
+<pre><code>@asyncio.coroutine
+def client(loop):
+    ...
+    conn = Connection(stream_in, stream_out)
+    yield from conn.write(b'test')
+</code></pre>
+<p>This works almost as expected, but I have to <code>yield from</code> every <code>read</code> and <code>write</code> call. I've tried <code>yield from</code>ing from inside <code>Connection</code>:</p>
+<pre><code>def read(self, n_bytes : int = -1):
+    data = yield from self.__in.read(n_bytes)
+    return data
+</code></pre>
+<p>But rather than getting data, I get an output like</p>
+<pre><code>&lt;generator object StreamReader.read at 0x1109983b8&gt;
+</code></pre>
+<p>If I call <code>read</code> and <code>write</code> from multiple places, I would prefer not to repeat the <code>yield from</code>s every time; rather keeping them inside <code>Connection</code>. My ultimate goal is cut down my <code>new_conection</code> function to this:</p>
+<pre><code>@asyncio.coroutine
+def new_conection(stream_in, stream_out):
+    conn = Connection(stream_in, stream_out)
+    print(conn.read(4))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Because <a href="https://docs.python.org/3/library/asyncio-stream.html#asyncio.StreamReader.read" rel="noreferrer"><code>StreamReader.read</code> is a coroutine</a>, your only options for calling it are a) wrapping it in a <a href="https://docs.python.org/3/library/asyncio-task.html#task" rel="noreferrer"><code>Task</code></a> or <a href="https://docs.python.org/3/library/asyncio-task.html#future" rel="noreferrer"><code>Future</code></a> and running that via an event loop, b) <code>await</code>ing it from coroutine defined with <code>async def</code>, or c) using <code>yield from</code> with it from a coroutine defined as a function decorated with <code>@asyncio.coroutine</code>.</p>
+<p>Since <code>Connection.read</code> is called from an event loop (via the coroutine <code>new_connection</code>), you can't reuse that event loop to run a <code>Task</code> or <code>Future</code> for <code>StreamReader.read</code>: <a href="https://tio.run/##hY6xCsMwDER3fYVGa8nSrdBvMW6qtAZHErZSyNe7xLTQpXQ77h6Ps90fKqfe82paHVPbZc4KMALeeMFFNdAZEIuq4eWDTHf2yE8Wj8cQ6E1MdZO4iecSZ12tsHO4phqIvqWjOaSWWgP4p/4lHt@o9xc" rel="noreferrer">event loops can't be started while they're already running</a>. You'd either have to <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.AbstractEventLoop.stop" rel="noreferrer">stop the event loop</a> (disastrous and probably not possible to do correctly) or <a href="https://docs.python.org/3/library/asyncio-eventloops.html#asyncio.new_event_loop" rel="noreferrer">create a new event loop</a> (messy and defeating the purpose of using coroutines). Neither of those are desirable, so <code>Connection.read</code> needs to be a coroutine or an <code>async</code> function.</p>
+<p>The other two options (<code>await</code> in an <code>async def</code> coroutine or <code>yield from</code> in a <code>@asyncio.coroutine</code>-decorated function) are mostly equivalent. The only difference is that <a href="https://www.python.org/dev/peps/pep-0492/" rel="noreferrer"><code>async def</code> and <code>await</code> were added in Python 3.5</a>, so for 3.4, using <code>yield from</code> and <code>@asyncio.coroutine</code> is the only option (coroutines and <code>asyncio</code> didn't exist prior to 3.4, so other versions are irrelevant). Personally, I prefer using <code>async def</code> and <code>await</code>, because defining coroutines with <code>async def</code> is cleaner and clearer than with the decorator.</p>
+<p>In brief: have <code>Connection.read</code> and <code>new_connection</code> be coroutines (using either the decorator or the <code>async</code> keyword), and use <code>await</code> (or <code>yield from</code>) when calling other coroutines (<code>await conn.read(4)</code> in <code>new_connection</code>, and <code>await self.__in.read(n_bytes)</code> in <code>Connection.read</code>).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I found a chunk of the <a href="https://github.com/python/cpython/blob/3.6/Lib/asyncio/streams.py" rel="nofollow noreferrer">StreamReader source code</a> on line 620 is actually a perfect example of the function's usage.</p>
+<p>In my previous answer, I overlooked the fact that <code>self.__in.read(n_bytes)</code> is not only a coroutine (which I should've known considering it was from the <code>asyncio</code> module XD) but it yields a result on line . So it is in fact a generator, and you will need to yield from it.</p>
+<p>Borrowing this loop from the source code, your read function should look something like this:</p>
+<pre><code>def read(self, n_bytes : int = -1):
+    data = bytearray() #or whatever object you are looking for
+    while 1:
+        block = yield from self.__in.read(n_bytes)
+        if not block:
+            break
+        data += block
+    return data
+</code></pre>
+<p>Because <code>self.__in.read(n_bytes)</code> is a generator, you have to continue to yield from it until it yields an empty result to signal the end of the read. Now your read function should return data rather than a generator. You won't have to yield from this version of <code>conn.read()</code>.</p>
+</div>
+<span class="comment-copy">Why do you have to yield from? If you don't yield from conn.read(4), it looks to me like it simply returns a bytes object. Is that what you are looking for here?</span>
+<span class="comment-copy">@RageCage: Without <code>yield from</code>ing, <code>conn.read(4)</code> still returns a generator: <code>&lt;generator object Connection.read at 0x1019262b0&gt;</code></span>
+<span class="comment-copy">Sorry I should have clarified; if you don't yield from the first iteration of conn.read() (the single line version) what is the result?</span>
+<span class="comment-copy">@RageCage: If you mean <code>def read(self, n_bytes): return self.__in.read(n_bytes)</code> in conjunction with <code>data = conn.read(4)</code>, I'm still getting a generator (<code>Connection.read</code>).</span>
+<span class="comment-copy">Sounds like there is some context I'm missing. The StreamReader.read function should return a regular byte array, so if you never use the yield keyword anywhere in the reading workflow a generator should never be made.</span>
+<span class="comment-copy">Ah, very nice answer Mego! This is clearly written by someone who knows what their talking about. I learned much from reading it. +1</span>
+<span class="comment-copy">Using the function exactly as you've provided it, I'm still receiving a generator object (<code>Connection.read</code>).</span>
+<span class="comment-copy">Are you still yielding from the conn.read call? Try printing data and type(data) in the read function to see what it is before returning.</span>
+<span class="comment-copy">No, I removed that and tried <code>data = conn.read(4)</code> instead. It is a generator.</span>
+<span class="comment-copy">Using <code>yield from</code> like this won't work, because <code>StreamReader.read</code> isn't a generator - it's a coroutine. The two different uses of <code>yield from</code> (delegating with generators and handing off control between coroutines) is exactly why the <code>await</code> keyword was introduced in 3.5.</span>

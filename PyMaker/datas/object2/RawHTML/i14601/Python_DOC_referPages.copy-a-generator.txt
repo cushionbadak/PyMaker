@@ -1,0 +1,103 @@
+<div class="post-text" itemprop="text">
+<p>Let's say I have a generator like so</p>
+<pre><code>def gen():
+    a = yield "Hello World"
+    a_ = a + 1 #Imagine that on my computer "+ 1" is an expensive operation
+    print "a_ = ", a_
+    b = yield a_
+    print "b =", b
+    print "a_ =", a_
+    yield b
+</code></pre>
+<p>Now let's say I do</p>
+<pre><code>&gt;&gt;&gt; g = gen()
+&gt;&gt;&gt; g.next()
+&gt;&gt;&gt; g.send(42)
+a_ =  43
+43
+</code></pre>
+<p>Now we have calculated <code>a_</code>. Now I would like to clone my generator like so.</p>
+<pre><code>&gt;&gt;&gt; newG = clonify(g)
+&gt;&gt;&gt; newG.send(7)
+b = 7
+a_ = 43
+7
+</code></pre>
+<p>but my original <code>g</code> still works.</p>
+<pre><code>&gt;&gt;&gt; g.send(11)
+b = 11
+a_ = 43
+11
+</code></pre>
+<p>Specifically, <code>clonify</code> takes the state of a generator, and copies it. I could just reset my generator to be like the old one, but that would require calculating <code>a_</code>. Note also that I would not want to modify the generator extensively. Ideally, I could just take a generator object from a library and <code>clonify</code> it.</p>
+<p><strong>Note: <code>itertools.tee</code> won't work, because it does not handle sends.</strong></p>
+<p><strong>Note: I only care about generators created by placing <code>yield</code> statements in a function.</strong></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Python doesn't have any support for cloning generators.</p>
+<p>Conceptually, this should be implementable, at least for CPython. But practically, it turns out to be very hard.</p>
+<hr/>
+<p>Under the covers, a generator is basically nothing but a wrapper around a stack frame.<sup>*</sup></p>
+<p>And a frame object is essentially just a code object, an instruction pointer (an index into that code object), the builtins/globals/locals environment, an exception state, and some flags and debugging info.</p>
+<p>And both types are exposed to the Python level,<sup>**</sup> as are all the bits they need. So, it really should be just a matter of:</p>
+<ul>
+<li>Create a frame object just like <code>g.gi_frame</code>, but with a copy of the locals instead of the original locals. (All the user-level questions come down to whether to shallow-copy, deep-copy, or one of the above plus recursively cloning generators here.) </li>
+<li>Create a generator object out of the new frame object (and its code and running flag).</li>
+</ul>
+<p>And there's no obvious practical reason it shouldn't be possible to construct a frame object out of its bits, just as it is for a code object or most of the other hidden builtin types.</p>
+<hr/>
+<p>Unfortunately, as it turns out, Python doesn't expose a way to construct a frame object. I thought you could get around that just by using <code>ctypes.pythonapi</code> to call <a href="https://hg.python.org/cpython/file/3.4/Objects/frameobject.c#l614" rel="noreferrer"><code>PyFrame_New</code></a>, but the first argument to that is a <code>PyThreadState</code>—which you definitely can't construct from Python, and shouldn't be able to. So, to make this work, you either have to:</p>
+<ul>
+<li>Reproduce everything <code>PyFrame_New</code> does by banging on the C structs via <code>ctypes</code>, or</li>
+<li>Manually build a fake <code>PyThreadState</code> by banging on the C structs (which will still require reading the code to <code>PyFrame_New</code> carefully to know what you have to fake).</li>
+</ul>
+<p>I think this may still be doable (and I plan to play with it; if I come up with anything, I'll update the <a href="http://stupidpythonideas.blogspot.com/2015/04/cloning-generators.html" rel="noreferrer">Cloning generators</a> post on my blog), but it's definitely not going to be trivial—or, of course, even remotely portable.</p>
+<hr/>
+<p>There are also a couple of minor problems.</p>
+<ul>
+<li><p>Locals are exposed to Python as a dict (whether you call <code>locals()</code> for your own, or access <code>g.gi_frame.f_locals</code> for a generator you want to clone). Under the covers, locals are actually stored on the C stack.<sup>***</sup> You can get around this by using <code>ctypes.pythonapi</code> to call <a href="https://hg.python.org/cpython/file/3.4/Objects/frameobject.c#l935" rel="noreferrer"><code>PyFrame_LocalsToFast</code></a> and <code>PyFrame_FastToLocals</code>. But the dict just contains the values, not cell objects, so doing this shuffle will turn all nonlocal variables into local variables in the clone.<sup>****</sup></p></li>
+<li><p>Exception state is exposed to Python as a type/value/traceback 3-tuple, but inside a frame there's also a borrowed (non-refcounted) reference to the owning generator (or NULL if it's not a generator frame). (<a href="https://hg.python.org/cpython/file/3.4/Include/frameobject.h#l17" rel="noreferrer">The source</a> explains why.) So, your frame-constructing function can't refcount the generator or you have a cycle and therefore a leak, but it has to refcount the generator or you have a potentially dangling pointer until the frame is assigned to a generator. The obvious answer seems to be to leave the generator NULL at frame construction, and have the generator-constructing function do the equivalent of <code>self.gi_f.f_generator = self; Py_DECREF(self)</code>.</p></li>
+</ul>
+<hr/>
+<p><sub>* It also keeps a copy of the frame's code object and running flag, so they can be accessed after the generator exits and disposes of the frame.</sub></p>
+<p><sub>** <code>generator</code> and <code>frame</code> are hidden from builtins, but they're available as <a href="https://docs.python.org/3/library/types.html#types.GeneratorType" rel="noreferrer"><code>types.GeneratorType</code></a> <a href="https://docs.python.org/3/library/types.html#types.FrameType" rel="noreferrer"><code>types.FrameType</code></a>. And they have docstrings, descriptions of their attributes in the <code>inspect</code> module, etc., just like function and code objects.</sub></p>
+<p><sub>*** When you compile a function definition, the compiler makes a list of all the locals, stored in <code>co_varnames</code>, and turns each variable reference into a <code>LOAD_FAST</code>/<code>STORE_FAST</code> opcode with the index into <code>co_varnames</code> as its argument. When a function call is executed, the frame object stores the stack pointer in <code>f_valuestack</code>, pushes <code>len(co_varnames)*sizeof(PyObject *)</code> onto the stack, and then <code>LOAD_FAST 0</code> just accesses <code>*f_valuestack[0]</code>. Closures are more complicated; a bit too much to explain in a comment on an SO answer.</sub></p>
+<p><sub>**** I'm assuming you wanted the clone to share the original's closure references. If you were hoping to recursively clone all the frames up the stack to get a new set of closure references to bind, that adds another problem: there's no way to construct new cell objects from Python either.</sub></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can't, in general. However, if you parametrise over some expensive operation why not lift that operation out, creating a generator factory?</p>
+<pre><code>def make_gen(a):
+    a_ = [a + 1]  # Perform expensive calculation
+    def gen(a_=a_):
+        while True:
+            print "a_ = ", a_
+            a_[0] = yield a_[0]
+    return gen
+</code></pre>
+<p>Then you can create as many generators as you like from the returned object:</p>
+<pre><code>gen = make_gen(42)
+g = gen()
+g.send(None)
+# a_ = [43]
+g.send(7)
+# a_ = [7]
+new_g = gen()
+new_g.send(None)
+# a_ = [7]
+</code></pre>
+</div>
+<span class="comment-copy">This isn't as easy as it sounds. What if the generator uses a file or network stream, which can't be cloned? Though take a look at <a href="https://docs.python.org/3/library/itertools.html#itertools.tee" rel="nofollow noreferrer"><code>itertools.tee</code></a></span>
+<span class="comment-copy">The short answer is that you can't clone generators in Python. But it is at least theoretically possible to add your own generator-cloning support, if you don't care about portability between implementations, meaning you could make all the decisions for yourself (do files share, dup, or raise? are closure variables shared? do you deep-copy or shallow-copy locals?). If you're interested in doing so, there are a lot of good questions you could ask about it, but just "how do I do the whole thing" is probably too broad.</span>
+<span class="comment-copy">@user2357112: Actually, even that's implemented by compiling and then calling a hidden function with a <code>yield x+1</code> statement in it…</span>
+<span class="comment-copy">@PyRulez: No, that's not actually a generator. Although it would be substitutable for a generator almost everywhere, so you could call it a "generator-like object", it's not going to pass <code>inspect.isgenerator</code>, or <code>isinstance(g, types.GeneratorType)</code>, and it doesn't have the <code>gi_frame</code> attribute.</span>
+<span class="comment-copy">@JoranBeasley: While his toy example isn't a useful example of using generators for coroutines, there are plenty of good examples out there, which would have this problem. (If there weren't, Guido would have rejected the PEP that added <code>send</code>, instead of becoming its co-author and making sure it got done in time for 2.5…)</span>
+<span class="comment-copy">You should suggest a PEP.</span>
+<span class="comment-copy">@PyRulez: A PEP needs a good Rationale section, and I don't have a good rationale for why constructing <code>frame</code> and <code>generator</code> objects (and <code>cell</code> objects, if you want that) is necessary. Besides, even with a rationale, I don't think the idea is PEP-ready; it would need some discussion on python-ideas first.</span>
+<span class="comment-copy">@PyRulez: You can of course go start that discussion on python-ideas, but be aware that the first 20 responses are going to be asking for a good use case and showing you that toy use case is better served with a solution that doesn't require cloning generators, so I'd first work out the smallest use case you can think of that really is useful and really does require cloning generators if you want to get good uptake.</span>
+<span class="comment-copy">Use Case: Something like Haskells parsec in Python. With cloning, you can try different paths of the code. Nondeterminism with list monads as well.</span>
+<span class="comment-copy">I've got a use case. I'm trying to determine the shape of an n-dimensional generator expression of generator expressions (e.g. <code>((m*i + j for j in range(m)) for i in range(n))</code>) as well as an iterator over the flattened list. I think it's impossible to do without cloning the generator. <a href="https://gist.github.com/castle-bravo/b4ccd4f7013cce06ed7d22e6e586c13f" rel="nofollow noreferrer">Here's a GitHub gist that shows exactly what I mean.</a></span>
+<span class="comment-copy">You can't set <code>a</code> using send.</span>
+<span class="comment-copy">I sure am, right there in the example. Though to be fair, I'm missing a <code>g.send(None)</code></span>
+<span class="comment-copy">@nelfin: I think his point is that if you wanted to do <code>a_ = yield b</code>, it wouldn't work, because you've turned <code>a_</code> into a closure variable. (In Python 3, there would be a trivial fix: just add <code>nonlocal a_</code> to the top of the generator. But in 2.7, it's not as easy.)</span>
+<span class="comment-copy">Ah, okay thanks @abamert. In that case, just wrap <code>a_</code> in a mutable type like a <code>dict</code> and rebind a name for that locally in <code>gen</code>.</span>
+<span class="comment-copy">In the example, <code>g.send(42)</code> was ran to assign 42 to <code>a</code>, but in this, its a function call.</span>

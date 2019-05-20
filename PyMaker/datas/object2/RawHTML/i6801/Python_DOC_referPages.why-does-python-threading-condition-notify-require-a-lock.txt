@@ -1,0 +1,157 @@
+<div class="post-text" itemprop="text">
+<p>My question refers specifically to why it was designed that way, due to the unnecessary performance implication.</p>
+<p>When thread T1 has this code:</p>
+<pre><code>cv.acquire()
+cv.wait()
+cv.release()
+</code></pre>
+<p>and thread T2 has this code:</p>
+<pre><code>cv.acquire()
+cv.notify()  # requires that lock be held
+cv.release()
+</code></pre>
+<p>what happens is that T1 waits and releases the lock, then T2 acquires it, notifies <code>cv</code> which wakes up T1. Now, there is a race-condition between T2's release and T1's reacquiring after returning from <code>wait()</code>. If T1 tries to reacquire first, it will be unnecessarily resuspended until T2's <code>release()</code> is completed.</p>
+<p><strong>Note:</strong> I'm intentionally not using the <code>with</code> statement, to better illustrate the race with explicit calls.</p>
+<p>This seems like a design flaw. Is there any rationale known for this, or am I missing something?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is not a definitive answer, but it's supposed to cover the relevant details I've managed to gather about this problem.</p>
+<p>First, Python's <a href="https://docs.python.org/3/library/threading.html" rel="nofollow noreferrer">threading implementation is based on Java's</a>.  Java's <code>Condition.signal()</code> documentation reads:</p>
+<blockquote>
+<p>An implementation may (and typically does) require that the current thread hold the lock associated with this Condition when this method is called.</p>
+</blockquote>
+<p>Now, the question was why <em>enforce</em> this behavior in Python in particular. But first I want to cover the pros and cons of each approach.</p>
+<p>As to why some think it's often a better idea to hold the lock, I found two main arguments:</p>
+<ol>
+<li><p>From the minute a waiter <code>acquire()</code>s the lock—that is, before releasing it on <code>wait()</code>—it is guaranteed to be notified of signals. If the corresponding <code>release()</code> happened prior to signalling, this would allow the sequence(where <em>P=Producer</em> and <em>C=Consumer</em>) <code>P: release(); C: acquire(); P: notify(); C: wait()</code> in which case the <code>wait()</code> corresponding to the <code>acquire()</code> of the same flow would miss the signal. There are cases where this doesn't matter (and could even be considered to be more accurate), but there are cases where that's undesirable. This is one argument.</p></li>
+<li><p>When you <code>notify()</code> outside a lock, this may cause a scheduling priority inversion; that is, a low-priority thread might end up taking priority over a high-priority thread. Consider a work queue with one producer and two consumers (<em>LC=Low-priority consumer</em> and <em>HC=High-priority consumer</em>), where <em>LC</em> is currently executing a work item and <em>HC</em> is blocked in <code>wait()</code>.</p></li>
+</ol>
+<p>The following sequence may occur:</p>
+<pre><code>P                    LC                    HC
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                     execute(item)                   (in wait())
+lock()                                  
+wq.push(item)
+release()
+                     acquire()
+                     item = wq.pop()
+                     release();
+notify()
+                                                     (wake-up)
+                                                     while (wq.empty())
+                                                       wait();
+</code></pre>
+<p>Whereas if the <code>notify()</code> happened before <code>release()</code>, <em>LC</em> wouldn't have been able to <code>acquire()</code> before <em>HC</em> had been woken-up. This is where the priority inversion occurred. This is the second argument.</p>
+<p>The argument in favor of notifying outside of the lock is for high-performance threading, where a thread need not go back to sleep just to wake-up again the very next time-slice it gets—which was already explained how it might happen in my question.</p>
+<h3>Python's <code>threading</code> Module</h3>
+<p>In Python, as I said, you must hold the lock while notifying. The irony is that the internal implementation does not allow the underlying OS to avoid priority inversion, because it enforces a FIFO order on the waiters. Of course, the fact that the order of waiters is deterministic could come in handy, but the question remains why enforce such a thing when it could be argued that it would be more precise to differentiate between the lock and the condition variable, for that in some flows that require optimized concurrency and minimal blocking, <code>acquire()</code> should not by itself register a preceding waiting state, but only the <code>wait()</code> call itself.</p>
+<p>Arguably, Python programmers would not care about performance to this extent anyway—although that still doesn't answer the question of why, when implementing a standard library, one should not allow several standard behaviors to be possible.</p>
+<p>One thing which remains to be said is that the developers of the <code>threading</code> module might have specifically wanted a FIFO order for some reason, and found that this was somehow the best way of achieving it, and wanted to establish that as a <code>Condition</code> at the expense of the other (probably more prevalent) approaches. For this, they deserve the benefit of the doubt until they might account for it themselves.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There are several reasons which are compelling (when taken together).</p>
+<h1>1. The notifier needs to take a lock</h1>
+<p>Pretend that <code>Condition.notifyUnlocked()</code> exists.</p>
+<p>The standard producer/consumer arrangement requires taking locks on both sides:</p>
+<pre><code>def unlocked(qu,cv):  # qu is a thread-safe queue
+  qu.push(make_stuff())
+  cv.notifyUnlocked()
+def consume(qu,cv):
+  with cv:
+    while True:       # vs. other consumers or spurious wakeups
+      if qu: break
+      cv.wait()
+    x=qu.pop()
+  use_stuff(x)
+</code></pre>
+<p>This fails because both the <code>push()</code> and the <code>notifyUnlocked()</code> can intervene between the <code>if qu:</code> and the <code>wait()</code>.</p>
+<p>Writing <em>either</em> of</p>
+<pre><code>def lockedNotify(qu,cv):
+  qu.push(make_stuff())
+  with cv: cv.notify()
+def lockedPush(qu,cv):
+  x=make_stuff()      # don't hold the lock here
+  with cv: qu.push(x)
+  cv.notifyUnlocked()
+</code></pre>
+<p>works (which is an interesting exercise to demonstrate).  The second form has the advantage of removing the requirement that <code>qu</code> be thread-safe, but it costs no more locks to take it around the call to <code>notify()</code> <em>as well</em>.</p>
+<p>It remains to explain the <em>preference</em> for doing so, especially given that <a href="https://stackoverflow.com/questions/46076186/why-does-python-threading-condition-notify-require-a-lock?answertab=votes#comment79122827_46079706">(as you observed)</a> CPython does wake up the notified thread to have it switch to waiting on the mutex (rather than simply <a href="https://stackoverflow.com/questions/45163701/which-os-platforms-implement-wait-morphing-optimization">moving it to that wait queue</a>).</p>
+<h1>2. The condition variable itself needs a lock</h1>
+<p>The <code>Condition</code> has internal data that must be protected in case of concurrent waits/notifications.  (Glancing at <a href="https://github.com/python/cpython/blob/3.6/Lib/threading.py#L347" rel="nofollow noreferrer">the CPython implementation</a>, I see the possibility that two unsynchronized <code>notify()</code>s could erroneously target the same waiting thread, which could cause reduced throughput or even deadlock.)  It could protect that data with a dedicated lock, of course; since we need a user-visible lock already, using that one avoids additional synchronization costs.</p>
+<h1>3. Multiple wake conditions can need the lock</h1>
+<p>(Adapted from a comment on the blog post linked below.)</p>
+<pre><code>def setTrue(box,cv):
+  signal=False
+  with cv:
+    if not box.val:
+      box.val=True
+      signal=True
+  if signal: cv.notifyUnlocked()
+def waitFor(box,v,cv):
+  v=bool(v)   # to use ==
+  while True:
+    with cv:
+      if box.val==v: break
+      cv.wait()
+</code></pre>
+<p>Suppose <code>box.val</code> is <code>False</code> and thread #1 is waiting in <code>waitFor(box,True,cv)</code>.  Thread #2 calls <code>setSignal</code>; when it releases <code>cv</code>, #1 is still blocked on the condition.  Thread #3 then calls <code>waitFor(box,False,cv)</code>, finds that <code>box.val</code> is <code>True</code>, and waits.  Then #2 calls <code>notify()</code>, waking #3, which is still unsatisfied and blocks again.  Now #1 and #3 are both waiting, despite the fact that one of them must have its condition satisfied.</p>
+<pre><code>def setTrue(box,cv):
+  with cv:
+    if not box.val:
+      box.val=True
+      cv.notify()
+</code></pre>
+<p>Now that situation cannot arise: either #3 arrives before the update and never waits, or it arrives during or after the update and has not yet waited, guaranteeing that the notification goes to #1, which returns from <code>waitFor</code>.</p>
+<h1>4. The hardware might need a lock</h1>
+<p>With wait morphing and no GIL (in some alternate or future implementation of Python), the memory ordering (<em>cf.</em> <a href="http://docs.oracle.com/javase/specs/jls/se8/html/jls-17.html#jls-17.4.4" rel="nofollow noreferrer">Java's rules</a>) imposed by the lock-release after <code>notify()</code> and the lock-acquire on return from <code>wait()</code> might be the only guarantee of the notifying thread's updates being visible to the waiting thread.</p>
+<h1>5. Real-time systems might need it</h1>
+<p>Immediately after the POSIX text <a href="https://stackoverflow.com/questions/46076186/why-does-python-threading-condition-notify-require-a-lock#comment79119873_46076186">you quoted</a> we <a href="http://pubs.opengroup.org/onlinepubs/9699919799/functions/pthread_cond_signal.html" rel="nofollow noreferrer">find</a>:</p>
+<blockquote>
+<p>however, if predictable scheduling behavior is required, then that mutex
+  shall be locked by the thread calling pthread_cond_broadcast() or
+  pthread_cond_signal().</p>
+</blockquote>
+<p><a href="http://www.domaigne.com/blog/computing/condvars-signal-with-mutex-locked-or-not/" rel="nofollow noreferrer">One blog post</a> contains further discussion of the rationale and history of this recommendation (as well as of some of the other issues here).</p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>What happens is that T1 waits and releases the lock, then T2 acquires it, notifies cv which wakes up T1.</p>
+</blockquote>
+<p>Not quite.  The <code>cv.notify()</code> call does not <em>wake</em> the T1 thread:  It only moves it to a different queue.  Before the <code>notify()</code>, T1 was waiting for the condition to be true.  After the <code>notify()</code>, T1 is waiting to acquire the lock.  T2 does not release the lock, and T1 does not "wake up" until T2 explicitly calls <code>cv.release()</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>A couple of months ago exactly the same question occurred to me. But since I had <code>ipython</code> opened, looking at <code>threading.Condition.wait??</code> result (the <a href="https://github.com/python/cpython/blob/master/Lib/threading.py#L264" rel="nofollow noreferrer">source</a> for the method) didn't take long to answer it myself.</p>
+<p>In short, the <code>wait</code> method creates another lock called waiter, acquires it, appends it to a list and then, surprise, releases the lock on itself. After that it acquires the waiter once again, that is it starts to wait until someone releases the waiter. Then it acquires the lock on itself again and returns.</p>
+<p>The <code>notify</code> method pops a waiter from the waiter list (waiter is a lock, as we remember) and releases it allowing the corresponding <code>wait</code> method to continue.</p>
+<p>That is the trick is that the <code>wait</code> method is not holding the lock on the condition itself while waiting for the <code>notify</code> method to release the waiter.</p>
+<p><strong>UPD1</strong>: I seem to have misunderstood the question. Is it correct that you are bothered that T1 might try to reacquire the lock on itself before the T2 release it?</p>
+<p>But is it possible in the context of python's GIL? Or you think that one can insert an IO call before releasing the condition, which would allow T1 to wake up and wait forever?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There is no race condition, this is how condition variables work.</p>
+<p>When wait() is called, then the underlying lock is released until a notification occurs. It is guaranteed that the caller of wait will reacquire the lock before the function returns (eg, after the wait completes).</p>
+<p>You're right that there could be some inefficiency if T1 was directly woken up when notify() is called. However, condition variables are typically implemented via OS primitives, and the OS will often be smart enough to realize that T2 still has the lock, so it won't immediately wake up T1 but instead queue it to be woken.</p>
+<p>Additionally, in python, this doesn't really matter anyways, as there's only a single thread due to the GIL, so the threads wouldn't be able to run concurrently anyways.</p>
+<hr/>
+<p>Additionally, it's preferred to use the following forms instead of calling acquire/release directly:</p>
+<pre><code>with cv:
+    cv.wait()
+</code></pre>
+<p>And:</p>
+<pre><code>with cv:
+    cv.notify()
+</code></pre>
+<p>This ensures that the underlying lock is released even if an exception occurs.</p>
+</div>
+<span class="comment-copy"><code>pthread_cond_signal(3)</code> might be informative</span>
+<span class="comment-copy">@o11c Indeed, thanks, and the question stands: <code>The pthread_cond_broadcast() or pthread_cond_signal() functions may be called by a thread whether or not it currently owns the mutex that threads calling pthread_cond_wait() or pthread_cond_timedwait() have associated with the condition variable during their waits</code></span>
+<span class="comment-copy">then python is just being overrestrictive again. Admittedly, you <i>usually</i> want to hold the lock even in C.</span>
+<span class="comment-copy">From a quick check of other languages' synchronization primitives, this requirement also exists in Java and C#, but it does not exist in pthreads, Windows condition variables, or c++11 condition variables. You'll usually want to hold the lock for whatever you're <code>notify</code>ing the other threads about, but the requirement to hold the lock for the <code>notify</code> itself doesn't seem necessary. It might be copied from a historical design where the lock was needed to protect the condition variable itself, or it might be deemed to promote safer lock usage.</span>
+<span class="comment-copy">It's definitely easier to reason about correctness if you don't have to think about other threads interceding between whatever you're notifying about and the actual notify call. Especially for a language like Python, I'd support this design decision for that reason alone. I suspect the actual historical reason is that they copied what Java did, though; the documentation does mention that the <code>threading</code> module is based on Java's design.</span>
+<span class="comment-copy">Thank you for the detailed answer. I didn't understand the 2nd example in your 1st argument. Other than that, I think the first one is easily solved by pushing while locked. As to the second argument, it assumes Python's specific design decisions, and we know it could be implemented otherwise. As to the 3rd argument, sure, but it's an edge case and doesn't explain why that flow is enforced. As to the 4th argument, A) I'm talking about notifying after a release op; B) Could have inserted a barrier anyway. As to 5th, Python's implementation prevents RT considerations anyway (priority inversion).</span>
+<span class="comment-copy">#1: <code>lockedPush</code> is exactly your suggestion.  #2 and #5: the requirement allows room for other implementations.  #3: I did say you had to consider all these together.  #4: A) the CV's state must be visible; B) that would be more synchronization.</span>
+<span class="comment-copy">This is incorrect. Firstly, my statement is accurate and I have just verified it by tinkering with the threading module and testing the timings and internal wakeups. Secondly, I think you are mistaken about your notion of how it works. The way it works is each waiter creates its own mutex and enqueues it into the condition's waiter queue, and each notify() dequeues one and releases its mutex, effectively waking up the wait() on the other thread. But then there's the reacquiring of the lock of the condition itself. And again, that's where the problem is.</span>
+<span class="comment-copy">By the way, my guess is that they need the condition's lock to be acquired when notifying simply because it was convenient for them to design it that way so that the shared queue would be accessed safely by both notifiers and waiters. But again, that convenience comes at a price. This is the rationale I'm trying to explore.</span>
+<span class="comment-copy">@YamMarcovic, I'm sorry, I did not read your question carefully enough.  I thought you were asking about the programmer's model (i.e., how to understand and <i>use</i> condition variables.)  I did not realize that you were asking about the <i>implementation</i>.</span>
+<span class="comment-copy">Yep you misunderstood the question. :) And your updated understanding is correct. And yes, I can't see why the GIL would disturb anything here since it's a scheduling problem and can occur on a single-core system just as well.</span>
+<span class="comment-copy">I don't understand: I demonstrated the race condition I was talking about. This isn't how condition variables work, it's a Python enforcement. And, in Python there is not one single thread, there is a single interpreted thread. And the race applies even there, because it's a scheduling race. And I can't see how the OS would have any knowledge of this, because it's userspace behavior that can work either way.</span>

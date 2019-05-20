@@ -1,0 +1,98 @@
+<div class="post-text" itemprop="text">
+<p>I have inherited some Python code which is used to create huge tables (of up to 19 columns wide by 5000 rows). It took <strong>nine seconds</strong> for the table to be drawn on the screen. I noticed that each row was added using this code:</p>
+<pre><code>sTable = sTable + '\n' + GetRow()
+</code></pre>
+<p>where <code>sTable</code> is a string.</p>
+<p>I changed that to:</p>
+<pre><code>sTable += '\n' + GetRow()
+</code></pre>
+<p>and I noticed that the table now appeared in <strong>six seconds</strong>.</p>
+<p>And then I changed it to:</p>
+<pre><code>sTable += '\n%s' % GetRow()
+</code></pre>
+<p>based on <a href="https://wiki.python.org/moin/PythonSpeed/PerformanceTips#String_Concatenation">these Python performance tips</a> (still six seconds).</p>
+<p>Since this was called about 5000 times, it highlighted the performance issue. But why was there such a large difference? And why didn't the compiler spot the problem in the first version and optimise it?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This isn't about using inplace <code>+=</code> versus <code>+</code> binary add. You didn't tell us the whole story. Your original version concatenated 3 strings, not just two:</p>
+<pre><code>sTable = sTable + '\n' + sRow  # simplified, sRow is a function call
+</code></pre>
+<p>Python tries to help out and optimises string concatenation; both when using <code>strobj += otherstrobj</code> and <code>strobj = strobj + otherstringobj</code>, but it cannot apply this optimisation when more than 2 strings are involved.</p>
+<p>Python strings are immutable <strong>normally</strong>, but if there are no other references to the left-hand string object <em>and</em> it is being rebound anyway, then Python cheats and <em>mutates the string</em>. This avoids having to create a new string each time you concatenate, and that can lead to a big speed improvement.</p>
+<p>This is implemented in the bytecode evaluation loop. Both when using <a href="http://hg.python.org/cpython/file/23a60d89dbd4/Python/ceval.c#l1202"><code>BINARY_ADD</code> on two strings</a> and when using <a href="http://hg.python.org/cpython/file/23a60d89dbd4/Python/ceval.c#l1406"><code>INPLACE_ADD</code> on two strings</a>, Python delegates concatenation to a special helper function <a href="http://hg.python.org/cpython/file/23a60d89dbd4/Python/ceval.c#l4507"><code>string_concatenate()</code></a>. To be able to optimize the concatenation by mutating the string, it first needs to make sure that the string has no other references to it; if only the stack and the original variable reference it then this can be done, <strong>and</strong> the <strong>next</strong> operation is going to replace the original variable reference.</p>
+<p>So if there are just 2 references to the string, and the next operator is one of <code>STORE_FAST</code> (set a local variable), <code>STORE_DEREF</code> (set a variable referenced by closed over functions) or <code>STORE_NAME</code> (set a global variable), and the affected variable currently references the same string, then that target variable is cleared to reduce the number of references to just 1, the stack.</p>
+<p>And this is why your original code could not use this optimization fully. The first part of your expression is <code>sTable + '\n'</code> and the <em>next</em> operation is <em>another <code>BINARY_ADD</code></em>:</p>
+<pre><code>&gt;&gt;&gt; import dis
+&gt;&gt;&gt; dis.dis(compile(r"sTable = sTable + '\n' + sRow", '&lt;stdin&gt;', 'exec'))
+  1           0 LOAD_NAME                0 (sTable)
+              3 LOAD_CONST               0 ('\n')
+              6 BINARY_ADD          
+              7 LOAD_NAME                1 (sRow)
+             10 BINARY_ADD          
+             11 STORE_NAME               0 (sTable)
+             14 LOAD_CONST               1 (None)
+             17 RETURN_VALUE        
+</code></pre>
+<p>The first <code>BINARY_ADD</code> is followed by a <code>LOAD_NAME</code> to access the <code>sRow</code> variable, not a store operation. This first <code>BINARY_ADD</code> must always result in a new string object, ever larger as <code>sTable</code> grows and it takes more and more time to create this new string object.</p>
+<p>You changed this code to:</p>
+<pre><code>sTable += '\n%s' % sRow
+</code></pre>
+<p>which <strong>removed the second concatenation</strong>. Now the bytecode is:</p>
+<pre><code>&gt;&gt;&gt; dis.dis(compile(r"sTable += '\n%s' % sRow", '&lt;stdin&gt;', 'exec'))
+  1           0 LOAD_NAME                0 (sTable)
+              3 LOAD_CONST               0 ('\n%s')
+              6 LOAD_NAME                1 (sRow)
+              9 BINARY_MODULO       
+             10 INPLACE_ADD         
+             11 STORE_NAME               0 (sTable)
+             14 LOAD_CONST               1 (None)
+             17 RETURN_VALUE        
+</code></pre>
+<p>and all we have left is an <code>INPLACE_ADD</code> followed by a store. Now <code>sTable</code> can be altered in-place, not resulting in a ever larger new string object.</p>
+<p>You'd have gotten the same speed difference with:</p>
+<pre><code>sTable = sTable + ('\n%s' % sRow)
+</code></pre>
+<p>here.</p>
+<p>A time trial shows the difference:</p>
+<pre><code>&gt;&gt;&gt; import random
+&gt;&gt;&gt; from timeit import timeit
+&gt;&gt;&gt; testlist = [''.join([chr(random.randint(48, 127)) for _ in range(random.randrange(10, 30))]) for _ in range(1000)]
+&gt;&gt;&gt; def str_threevalue_concat(lst):
+...     res = ''
+...     for elem in lst:
+...         res = res + '\n' + elem
+... 
+&gt;&gt;&gt; def str_twovalue_concat(lst):
+...     res = ''
+...     for elem in lst:
+...         res = res + ('\n%s' % elem)
+... 
+&gt;&gt;&gt; timeit('f(l)', 'from __main__ import testlist as l, str_threevalue_concat as f', number=10000)
+6.196403980255127
+&gt;&gt;&gt; timeit('f(l)', 'from __main__ import testlist as l, str_twovalue_concat as f', number=10000)
+2.3599119186401367
+</code></pre>
+<p>The moral of this story is that you should not be using string concatenation in the first place. The proper way to build a new string from loads of other strings is to use a list, then use <code>str.join()</code>:</p>
+<pre><code>table_rows = []
+for something in something_else:
+    table_rows += ['\n', GetRow()]
+sTable = ''.join(table_rows)
+</code></pre>
+<p>This is faster still:</p>
+<pre><code>&gt;&gt;&gt; def str_join_concat(lst):
+...     res = ''.join(['\n%s' % elem for elem in lst])
+... 
+&gt;&gt;&gt; timeit('f(l)', 'from __main__ import testlist as l, str_join_concat as f', number=10000)
+1.7978830337524414
+</code></pre>
+<p>but you cannot beat using just <code>'\n'.join(lst)</code>:</p>
+<pre><code>&gt;&gt;&gt; timeit('f(l)', 'from __main__ import testlist as l, nl_join_concat as f', number=10000)
+0.23735499382019043
+</code></pre>
+</div>
+<span class="comment-copy">With no static types, there's very little opportunity for the kind of compile-time optimizations you might be used to from languages like C, and CPython doesn't have a JIT. Also, <code>+=</code> has distinct effects from <code>+</code> and <code>=</code>, so it'd take some extra analysis to determine what other references to <code>sTable</code> exist.</span>
+<span class="comment-copy">Concatenating strings is slow. You might want to use the <a href="http://legacy.python.org/dev/peps/pep-0008/#programming-recommendations" rel="nofollow noreferrer">canonical way</a> and gather your rows in a list and <a href="https://docs.python.org/3/library/stdtypes.html#str.join" rel="nofollow noreferrer">join</a> them after you got all of them: <code>table = ''.join(rows)</code>.</span>
+<span class="comment-copy">timing it on 100k concats, <code>+=</code> is is <code>.06ms</code> faster using python 2.7.8</span>
+<span class="comment-copy">Thanks @Matthias - I tried that as well (see also the linked question) but that made no performance difference, surprisingly.</span>
+<span class="comment-copy">@Wikis: see <a href="https://meta.stackoverflow.com/q/303045">10 Million Questions - Let's Share Some Stories That the Number Doesn't Convey</a></span>
+<span class="comment-copy">Huh. So it <i>was</i> the string concatenation optimization causing the difference, and the code was just originally written in such a way that the optimization couldn't trigger.</span>

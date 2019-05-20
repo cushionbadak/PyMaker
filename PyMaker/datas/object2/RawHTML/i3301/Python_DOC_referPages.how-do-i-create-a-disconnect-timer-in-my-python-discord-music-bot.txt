@@ -1,0 +1,324 @@
+<div class="post-text" itemprop="text">
+<p>I have tinkered around a discord music bot cog I got from github. I am stuck at trying to create a timer for the bot to leave a voice channel if the /play command hasn't been executed for 5 minutes. The long code is blow or the pastebin: <a href="https://pastebin.com/HPqxW2Nk" rel="nofollow noreferrer">https://pastebin.com/HPqxW2Nk</a></p>
+<p>Commands are removed. The problem is at line 229.
+I tried asyncio.sleep(20) but it leaves 20 secs after even if /play has been executed 15 seconds into the timer.</p>
+<p>Please help me solve this problem! Thank you very much!</p>
+<p>EDIT: is something like this, Patrick?</p>
+<pre><code>async def on_command_completion(self, ctx):
+        futuretime = datetime.datetime.now() + datetime.timedelta(minutes=5)
+        await asyncio.sleep(300)
+        if ctx.invoke(ctx.play):
+            pass
+        elif datetime.datetime.now() &gt; futuretime:
+                await ctx.music_state.stop()
+
+
+
+import asyncio
+import functools
+import logging
+import os
+import pathlib
+import shutil
+from asyncio import Queue
+import discord
+import discord.ext.commands as commands
+import youtube_dl
+from random import shuffle
+
+def setup(bot):
+    bot.add_cog(Music(bot))
+    #bot.loop.create_task(MusicDelete(bot).background_loop())
+
+
+def duration_to_str(duration):
+    # Extract minutes, hours and days
+    minutes, seconds = divmod(duration, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+
+    # Create a fancy string
+    duration = []
+    if days &gt; 0: duration.append(f'**{days}** day(s)')
+    if hours &gt; 0: duration.append(f'**{hours}** hr(s)')
+    if minutes &gt; 0: duration.append(f'**{minutes}** min(s)')
+    if seconds &gt; 0 or len(duration) == 0: duration.append(f'**{seconds}** sec(s)')
+
+    return ', '.join(duration)
+
+
+class MusicError(commands.UserInputError):
+    pass
+
+
+class Song(discord.PCMVolumeTransformer):
+    def __init__(self, song_info):
+        self.info = song_info.info
+        self.requester = song_info.requester
+        self.channel = song_info.channel
+        self.filename = song_info.filename
+        super().__init__(discord.FFmpegPCMAudio(self.filename, before_options='-nostdin', options='-vn'))
+    def __str__(self):
+        return self.info['title']
+
+
+class SongInfo:
+    ytdl_opts = {
+        'default_search': 'auto',
+        'format': 'bestaudio/best',
+        'ignoreerrors': True,
+        'source_address': '0.0.0.0', # Make all connections via IPv4
+        'nocheckcertificate': True,
+        'restrictfilenames': True,
+        'logger': logging.getLogger(__name__),
+        'logtostderr': False,
+        'no_warnings': True,
+        'quiet': True,
+        'outtmpl': 'C:/Users/MSI/Desktop/GruppBot/musicfiles/%(title)s.%(ext)s',
+        'noplaylist': True
+    }
+    ytdl = youtube_dl.YoutubeDL(ytdl_opts)
+
+    def __init__(self, info, requester, channel):
+        self.info = info
+        self.requester = requester
+        self.channel = channel
+        self.filename = info.get('_filename', self.ytdl.prepare_filename(self.info))
+        self.downloaded = asyncio.Event()
+        self.local_file = '_filename' in info
+
+    @classmethod
+    async def create(cls, query, requester, channel, loop=None):
+        try:
+            # Path.is_file() can throw a OSError on syntactically incorrect paths, like urls.
+            if pathlib.Path(query).is_file():
+                return cls.from_file(query, requester, channel)
+        except OSError:
+            pass
+
+        return await cls.from_ytdl(query, requester, channel, loop=loop)
+
+    @classmethod
+    def from_file(cls, file, requester, channel):
+        path = pathlib.Path(file)
+        if not path.exists():
+            raise MusicError(f'File {file} not found.')
+
+        info = {
+            '_filename': file,
+            'title': path.stem,
+            'creator': 'local file',
+        }
+        return cls(info, requester, channel)
+
+    @classmethod
+    async def from_ytdl(cls, request, requester, channel, loop=None):
+        loop = loop or asyncio.get_event_loop()
+
+        # Get sparse info about our query
+        partial = functools.partial(cls.ytdl.extract_info, request, download=False, process=False)
+        sparse_info = await loop.run_in_executor(None, partial)
+
+        if sparse_info is None:
+            raise MusicError(f'Could not retrieve info from input : {request}')
+
+        # If we get a playlist, select its first valid entry
+        if "entries" not in sparse_info:
+            info_to_process = sparse_info
+        else:
+            info_to_process = None
+            for entry in sparse_info['entries']:
+                if entry is not None:
+                    info_to_process = entry
+                    break
+            if info_to_process is None:
+                raise MusicError(f'Could not retrieve info from input : {request}')
+
+        # Process full video info
+        url = info_to_process.get('url', info_to_process.get('webpage_url', info_to_process.get('id')))
+        partial = functools.partial(cls.ytdl.extract_info, url, download=False)
+        processed_info = await loop.run_in_executor(None, partial)
+
+        if processed_info is None:
+            raise MusicError(f'Could not retrieve info from input : {request}')
+
+        # Select the first search result if any
+        if "entries" not in processed_info:
+            info = processed_info
+        else:
+            info = None
+            while info is None:
+                try:
+                    info = processed_info['entries'].pop(0)
+                except IndexError:
+                    raise MusicError(f'Could not retrieve info from url : {info_to_process["url"]}')
+
+        return cls(info, requester, channel)
+
+    async def download(self, loop):
+        if not pathlib.Path(self.filename).exists():
+            partial = functools.partial(self.ytdl.extract_info, self.info['webpage_url'], download=True)
+            self.info = await loop.run_in_executor(None, partial)
+        self.downloaded.set()
+
+    async def wait_until_downloaded(self):
+        await self.downloaded.wait()
+
+    def __str__(self):
+        title = f"**{self.info['title']}**"
+        creator = f"**{self.info.get('creator') or self.info['uploader']}**"
+        duration = f" [ Duration: {duration_to_str(self.info['duration'])} ]" if 'duration' in self.info else ''
+        return f'{title} from {creator}{duration}'
+
+
+class Playlist(asyncio.Queue):
+    def __iter__(self):
+        return self._queue.__iter__()
+
+    def clear(self):
+        for song in self._queue:
+            try:
+                os.remove(song.filename)
+            except:
+                pass
+        self._queue.clear()
+
+    def get_song(self):
+        return self.get_nowait()
+
+    def add_song(self, song):
+        self.put_nowait(song)
+
+    def __str__(self):
+        info = '__**Queued**__:\n'
+        info_len = len(info)
+        for song in self:
+
+            s = str(song)
+            l = len(s) + 1 # Counting the extra \n
+            if info_len + l &gt; 1995:
+                info += '[...]'
+                break
+            info += f'**-** [{s}]({song.info["webpage_url"]})\n'
+            info_len += l
+        return info
+
+
+class GuildMusicState:
+    def __init__(self, loop):
+        self.playlist = Playlist(maxsize=10)
+        self.voice_client = None
+        self.loop = loop
+        self.player_volume = 0.5
+        self.skips = set()
+        self.min_skips = 3
+    @property
+    def current_song(self):
+        return self.voice_client.source
+
+    @property
+    def volume(self):
+        return self.player_volume
+
+    @volume.setter
+    def volume(self, value):
+        self.player_volume = value
+        if self.voice_client:
+            self.voice_client.source.volume = value
+
+    async def stop(self):
+        self.playlist.clear()
+        if self.voice_client:
+            await self.voice_client.disconnect()
+            self.voice_client = None
+
+    def is_playing(self):
+        return self.voice_client and self.voice_client.is_playing()    
+
+    async def play_next_song(self, song=None, error=None):
+        if error:
+            await self.current_song.channel.send(f'An error has occurred while playing {self.current_song}: {error}')
+
+        if song and not song.local_file and song.filename not in [s.filename for s in self.playlist]:
+            os.remove(song.filename)
+
+        if self.playlist.empty():
+            await self.stop()
+        else:
+            next_song_info = self.playlist.get_song()
+            await next_song_info.wait_until_downloaded()
+            source = Song(next_song_info)
+            source.volume = self.player_volume
+            self.voice_client.play(source, after=lambda e: asyncio.run_coroutine_threadsafe(self.play_next_song(next_song_info, e), self.loop).result())
+            embed = discord.Embed(color=0x003366)
+            embed.set_author(name ="Music", icon_url = 'http://howtodrawdat.com/wp-content/uploads/2014/05/Sebastian-Michaelis-black-butler.png')
+            embed.add_field(name="Now Playing:", value=f":notes: [{next_song_info}]({self.current_song.info['webpage_url']})", inline=False)
+            embed.add_field(name="Requested by:", value= self.current_song.requester.mention, inline=False)
+            #embed.set_thumbnail(url= f"{self.current_song.info['thumbnail']}")
+            embed.set_footer(text="Type /playlist to see songs in queue.")
+            await next_song_info.channel.send(embed=embed)
+
+
+
+
+class Music:
+    def __init__(self, bot):
+        self.bot = bot
+        self.music_states = {}
+
+    def __unload(self):
+        for state in self.music_states.values():
+            self.bot.loop.create_task(state.stop())
+
+    def __local_check(self, ctx):
+        if not ctx.guild:
+            raise commands.NoPrivateMessage('This command cannot be used in a private message.')
+        return True
+
+    async def __before_invoke(self, ctx):
+        ctx.music_state = self.get_music_state(ctx.guild.id)
+
+    async def __error(self, ctx, error):
+        if not isinstance(error, commands.UserInputError):
+            raise error
+
+        try:
+            print(error)
+        except discord.Forbidden:
+            pass # /shrug
+
+    def get_music_state(self, guild_id):
+        return self.music_states.setdefault(guild_id, GuildMusicState(self.bot.loop))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's a basic example of one approach to this problem. We keep a global reference to some unique value every time the <code>play</code> command is received.  The <code>play</code> coroutine will sleep after executing, and then disconnect only if the global value has not changed while it is sleeping.</p>
+<pre><code>from discord.ext import commands
+
+bot = Bot('/')
+
+last_play = None
+
+@bot.command()
+async def play(ctx):
+    global last_play
+
+    # Do the actual work
+
+    obj = object()
+    last_play = id(obj)
+
+    await asyncio.sleep(300)
+
+    if last_play == id(obj):
+        # disconnect logic
+
+bot.run("token")
+</code></pre>
+</div>
+<span class="comment-copy">Whenever someone uses the <code>\play</code> command, compute and store a time 5 minutes in the future.  Then <code>asyncio.sleep</code> for 5 minutes.  If someone invokes <code>\play</code> again in the interim, overwrite the time.  When each timer wakes up, have it chekc the stored time against the current time and act accordingly.</span>
+<span class="comment-copy">How would I store time and overwrite it?</span>
+<span class="comment-copy">Either as a global variabel, an attribute of your bot, an attribute of your cog, or in some mapping of servers/channels to times (if your bot is potentially in more than one voice client simultaneously.)</span>
+<span class="comment-copy">Is it like <code>time.clock_settime()</code>? How do I store time in the future?</span>
+<span class="comment-copy">The current time is <a href="https://docs.python.org/3/library/datetime.html#datetime.datetime.now" rel="nofollow noreferrer"><code>datetime.datetime.now</code></a> and five minutes from now would be <a href="https://docs.python.org/3/library/datetime.html#timedelta-objects" rel="nofollow noreferrer"><code>datetime.datetime.now() + datetime.timedelta(minutes=5)</code></a></span>
+<span class="comment-copy">I'm very confused as it leaves when audio is being played. The code in line 229 of the pastebin code leaves if playlist queue is 0. if i put an if statement about if not playing() the command runs since the player is downloading the music, leaving silence.</span>

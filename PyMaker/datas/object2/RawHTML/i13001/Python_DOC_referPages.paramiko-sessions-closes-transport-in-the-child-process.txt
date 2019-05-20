@@ -1,0 +1,102 @@
+<div class="post-text" itemprop="text">
+<p>We are using paramiko to make a connection library which heavily uses its <code>get_pty</code> or <code>invoke_shell</code> features. Our library uses these channels for interacting with the target device.</p>
+<p>But whenever we use <code>multiprocessing</code> library, we are not able to use paramiko connection handles in the child process. The <code>transport</code> gets closed in the child process.</p>
+<pre><code>Is there a way to tell paramiko not to close the connection/channel at fork. 
+</code></pre>
+<p>This is the sample program for reproducing the problem</p>
+<pre><code>from paramiko import SSHClient, AutoAddPolicy
+from multiprocessing import Process
+import logging
+log = logging.getLogger("paramiko.transport").setLevel(1)
+
+client = SSHClient()
+
+client.set_missing_host_key_policy(AutoAddPolicy())
+
+client.connect(hostname="localhost")
+
+def simple_work(handle):
+    print("==== ENTERED CHILD PROCESS =====")
+    stdin, stdout, stderr = handle.exec_command("ifconfig")
+    print(stdout.read())
+    print("==== EXITING CHILD PROCESS =====")
+
+p = Process(target=simple_work, args=(client,))
+p.start()
+p.join(2)
+print("==== MAIN PROCESS AFTER JOIN =====")
+stdin, stdout, stderr = client.exec_command("ls")
+print(stdout.read())
+</code></pre>
+<p>and this is the error</p>
+<pre><code>==== ENTERED CHILD PROCESS =====
+Success for unrequested channel! [??]
+==== MAIN PROCESS AFTER JOIN =====
+Traceback (most recent call last):
+  File "repro.py", line 22, in &lt;module&gt;
+    stdin, stdout, stderr = client.exec_command("ls")
+  File "/Users/vivejha/Projects/cisco/lib/python3.4/site-packages/paramiko/client.py", line 401, in exec_command
+    chan = self._transport.open_session(timeout=timeout)
+  File "/Users/vivejha/Projects/cisco/lib/python3.4/site-packages/paramiko/transport.py", line 702, in open_session
+    timeout=timeout)
+  File "/Users/vivejha/Projects/cisco/lib/python3.4/site-packages/paramiko/transport.py", line 823, in open_channel
+    raise e
+paramiko.ssh_exception.SSHException: Unable to open channel.
+</code></pre>
+<p>Few important things to note</p>
+<ol>
+<li><p>If I try to access the <code>client</code> in the child process. First of all it does't work at all.</p></li>
+<li><p>Secondly, the handle in the main process also dies out surprisingly. I don't how this child-to-parent communication is facilitated and why.</p></li>
+<li><p>And the biggest problem is program hangs in the end, exception is fine but hangs are least expected.</p></li>
+<li><p>If I don't use the <code>client</code> in the child process, and do some work other work then the <code>client</code> in the parent process is not impacted and works as usual.</p></li>
+</ol>
+<p>NOTE: There is something called <code>atfork</code> inside the transport.py which claims to control this behaviour. But surprisingly even commenting the code in that method has no impact. Also there are no references to <code>atfork</code> in the entire codebase of paramiko.</p>
+<p>PS: I am using latest paramiko and this program was run on Mac</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It is just a fundamental problem when sockets are involved with <code>fork</code>. Both processes share the same socket but only one can use it. Just imagine that two different processes are managing one socket. They both are in different states e.g. one might send and receive data to the remote side while the other one is in a totally different crypto state. Just think about nonces/initialization vectors, they'll just be invalid after forking when both processes diverge.</p>
+<p>The solution to your problem is obviously to switch from <code>MultiProcessing</code> to <code>MultiThreading</code>. This way you only have one ssh connection that is shared across all threads. If you really want to use fork you'll have to fork with creating one new connection per fork.</p>
+<p>see <a href="https://github.com/paramiko/paramiko/blob/2a99a8c9a4bde66720e9357963ce1896830528a1/paramiko/transport.py#L413" rel="nofollow">transport.py</a></p>
+<pre><code>def atfork(self):
+    """
+    Terminate this Transport without closing the session.  On posix
+    systems, if a Transport is open during process forking, both parent
+    and child will share the underlying socket, but only one process can
+    use the connection (without corrupting the session).  Use this method
+    to clean up a Transport object without disrupting the other process.
+</code></pre>
+<p>In paramiko log you'll see that your parent process receivs a SSH_DISCONNECT_MSG from the remote side with the error: <code>Packet corrupt</code>. Most likely due to the parent being in a different crypto state and sending a packet that the server could not understand.</p>
+<pre><code>DEBUG:lala:==== ENTERED CHILD PROCESS =====
+DEBUG:lala:&lt;paramiko.SSHClient object at 0xb74bf1ac&gt;
+DEBUG:lala:&lt;paramiko.Transport at 0xb6fed82cL (cipher aes128-ctr, 128 bits) (active; 0 open channel(s))&gt;
+DEBUG:paramiko.transport:[chan 1] Max packet in: 34816 bytes
+WARNING:paramiko.transport:Success for unrequested channel! [??]
+
+
+DEBUG:lala:==== MAIN PROCESS AFTER JOIN =====
+WARNING:lala:&lt;socket._socketobject object at 0xb706ef7c&gt;
+DEBUG:paramiko.transport:[chan 1] Max packet in: 34816 bytes
+INFO:paramiko.transport:Disconnect (code 2): Packet corrupt
+</code></pre>
+<p>Here's a basic MultiThreading example using <a href="https://docs.python.org/3/library/concurrent.futures.html" rel="nofollow">concurrent.futures</a>:</p>
+<pre><code>from concurrent.futures import ThreadPoolExecutor
+
+def simple_work(handle):
+    print("==== ENTERED CHILD PROCESS =====")
+    stdin, stdout, stderr = handle.exec_command("whoami")
+    print(stdout.read())
+    print("==== EXITING CHILD PROCESS =====")
+
+with ThreadPoolExecutor(max_workers=2) as executor:
+    future = executor.submit(simple_work, client)
+    print(future.result())
+
+print("==== MAIN PROCESS AFTER JOIN =====")
+stdin, stdout, stderr = client.exec_command("echo AFTER &amp;&amp; whoami")
+print(stdout.read())
+</code></pre>
+<p>Also note that in most cases you do not even need to introduce extra threading. Paramiko <code>exec_command</code> alread spawns a new thread and will not block until you try to read from any pseudofile <code>stdout</code>,<code>stderr</code>. That means, you could as well just execute a few commands and read from stdout lateron. But keep in mind that paramiko might stall due to buffers running full.</p>
+</div>
+<span class="comment-copy">please add at least a minimal example that triggers that issue including <code>logging.getLogger("paramiko.transport").setLevel(1)</code> being set.</span>
+<span class="comment-copy">I will do that shortly ...</span>
+<span class="comment-copy">@tintin I have updated the question with the code and the output.</span>

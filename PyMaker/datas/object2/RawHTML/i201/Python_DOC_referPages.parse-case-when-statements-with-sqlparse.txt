@@ -1,0 +1,105 @@
+<div class="post-text" itemprop="text">
+<p>I have the following SQL query and would like to parse it using <a href="https://github.com/andialbrecht/sqlparse" rel="nofollow noreferrer"><code>sqlparse</code></a></p>
+<pre><code>import sqlparse
+
+query =  """
+select SUM(case when(A.dt_unix&lt;=86400
+                     and B.flag="V") then 1
+           end) as TEST_COLUMN_1,
+       SUM(case when(A.Amt - B.Amt &gt; 0
+                     and B.Cat1 = "A"
+                     and (B.Cat2 = "M"
+                          or B.Cat3 = "C"
+                          or B.Cat4 = "B")
+                     and B.Cat5 is NULL) then 1
+           end) as TEST_COLUMN_2
+from test_table A
+left join test_table_2 as B on A.ID=B.ID
+where A.DT &gt;B.DT
+group by A.ID
+"""
+
+query_tokens = sqlparse.parse(query)[0].tokens
+print(query_tokens)
+</code></pre>
+<p>would give all the tokens included in the SQL statement:</p>
+<pre><code>[&lt;Newline ' ' at 0x7FAA62BD9F48&gt;, &lt;DML 'select' at 0x7FAA62BE7288&gt;, &lt;Whitespace ' ' at 0x7FAA62BE72E8&gt;, &lt;IdentifierList 'SUM(ca...' at 0x7FAA62BF7CF0&gt;, &lt;Newline ' ' at 0x7FAA62BF6288&gt;, &lt;Keyword 'from' at 0x7FAA62BF62E8&gt;, &lt;Whitespace ' ' at 0x7FAA62BF6348&gt;, &lt;Identifier 'test_t...' at 0x7FAA62BF7570&gt;, &lt;Newline ' ' at 0x7FAA62BF64C8&gt;, &lt;Keyword 'left j...' at 0x7FAA62BF6528&gt;, &lt;Whitespace ' ' at 0x7FAA62BF6588&gt;, &lt;Identifier 'test_t...' at 0x7FAA62BF7660&gt;, &lt;Whitespace ' ' at 0x7FAA62BF67C8&gt;, &lt;Keyword 'on' at 0x7FAA62BF6828&gt;, &lt;Whitespace ' ' at 0x7FAA62BF6888&gt;, &lt;Comparison 'A.ID=B...' at 0x7FAA62BF7B10&gt;, &lt;Newline ' ' at 0x7FAA62BF6B88&gt;, &lt;Where 'where ...' at 0x7FAA62BF28B8&gt;, &lt;Keyword 'group' at 0x7FAA62BD9E88&gt;, &lt;Whitespace ' ' at 0x7FAA62BD93A8&gt;, &lt;Keyword 'by' at 0x7FAA62BD9EE8&gt;, &lt;Whitespace ' ' at 0x7FAA62C1CEE8&gt;, &lt;Identifier 'A.ID' at 0x7FAA62BF2F48&gt;, &lt;Newline ' ' at 0x7FAA62BF6C48&gt;]
+</code></pre>
+<p>How can I parse these tokens in order to process <code>CASE WHEN</code> statements in a way that I can extract all the conditions and maintain their precedence as defined by the use of parentheses. I was not able to find any relevant examples in the documentation. </p>
+<p>Any thoughts on this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The project is indeed a little underdocumented. I looked at the <a href="https://github.com/andialbrecht/sqlparse/tree/master/examples" rel="nofollow noreferrer">examples</a> and scanned the source code a little. The documentation unfortunately doesn't include all methods on the <code>Token</code> and <code>TokenList</code> classes that are useful for this task.</p>
+<p>For example, an important but omitted method is the <a href="https://github.com/andialbrecht/sqlparse/blob/47768597924d88cec426e379b4afae8b58491956/sqlparse/sql.py#L201-L204" rel="nofollow noreferrer"><code>TokenList.get_sublists()</code> method</a>, which lets you traverse over nested token lists more easily than other methods do; the <a href="https://sqlparse.readthedocs.io/en/latest/analyzing/#sqlparse.sql.TokenList.flatten" rel="nofollow noreferrer"><code>TokenList.flatten()</code></a> method only yields <em>ungrouped</em> tokens in the tree, whereas <code>CASE</code> is a grouped token, so going purely by the documentation you might find it hard to do something useful with the parsed token tree.</p>
+<p>Another handy method that I noticed in the codebase is the <a href="https://github.com/andialbrecht/sqlparse/blob/master/sqlparse/sql.py#L162-L178" rel="nofollow noreferrer"><code>TokenList._pprint_tree()</code> method</a>, which dumps out the current token tree to stdout. This is very helpful when trying to write code that analyses the tree.</p>
+<p>All in all my overall impression of <code>sqlparse</code> is that it is less of a parsing library than a tool to re-format SQL. It includes a good parser but doesn't include the tools necessary to make <em>general use</em> of the tree it produces.</p>
+<p>What is really missing in the library is a base <em>node visitor class</em> such as that provided by the <a href="https://docs.python.org/3/library/ast.html#ast.NodeVisitor" rel="nofollow noreferrer">Python <code>ast</code> module</a>, or a tree node walker, again like the <a href="https://docs.python.org/3/library/ast.html#ast.walk" rel="nofollow noreferrer"><code>ast</code> module provides</a>. Either is easy enough to build yourself, luckily:</p>
+<pre><code>from collections import deque
+from sqlparse.sql import TokenList
+
+class SQLTokenVisitor:
+    def visit(self, token):
+        """Visit a token."""
+        method = 'visit_' + type(token).__name__
+        visitor = getattr(self, method, self.generic_visit)
+        return visitor(token)
+
+    def generic_visit(self, token):
+        """Called if no explicit visitor function exists for a node."""
+        if not isinstance(token, TokenList):
+            return
+        for tok in token:
+            self.visit(tok)
+
+def walk_tokens(token):
+    queue = deque([token])
+    while queue:
+        token = queue.popleft()
+        if isinstance(token, TokenList):
+            queue.extend(token)
+        yield token
+</code></pre>
+<p>Now you can use either to access the <code>Case</code> nodes:</p>
+<pre><code>statement, = sqlparse.parse(query)
+
+class CaseVisitor(SQLTokenVisitor):
+    """Build a list of SQL Case nodes
+
+      The .cases list is a list of (condition, value) tuples per CASE statement
+
+    """
+    def __init__(self):
+        self.cases = []
+
+    def visit_Case(self, token):
+        branches = []
+        for when, then_ in token.get_cases():
+            branches
+        self.cases.append(token.get_cases())
+
+visitor = CaseVisitor()
+visitor.visit(statement)
+cases = visitor.cases
+</code></pre>
+<p>or</p>
+<pre><code>statement, = sqlparse.parse(query)
+
+cases = []
+for token in walk_tokens(statement):
+    if isinstance(token, sqlparse.sql.Case):
+        cases.append(token.get_cases())
+</code></pre>
+<p>The difference between the <code>walk_tokens()</code> and <code>NodeVisitor</code> patterns is negligible in this example, but we are simply extracting the separated tokens for each of the <code>CASE</code> statements, with no processing of the <code>WHEN ... THEN ...</code> tokens. In the <code>NodeVisitor</code> pattern you'd set more attributes on the current visitor instance to 'switch gears' and capture further information about those subtree tokens in more <code>visit_....</code> methods, which may be easier to follow than a nested <code>for</code> loop over a generator.</p>
+<p>On the other hand, with the <code>walk_tokens()</code> generator, if you create a separate variable to reference the generator, you can hand over iteration to helper functions:</p>
+<pre><code>all_tokens = walk_tokens(stamement)
+for token in walk_tokens(statement):
+    if isinstance(token, sqlparse.sql.Case):
+        branches = extract_branches(all_tokens)
+</code></pre>
+<p>where <code>extract_branches</code> would further iterate until it came to the end of the case statement.</p>
+</div>
+<span class="comment-copy">Having written an answer, I now am looking at <a href="https://github.com/mozilla/moz-sql-parser" rel="nofollow noreferrer">this project instead</a>, which remarks that <i>sqlparse does not provide a tree, rather a list of tokens.</i>. While that statement is not entirely accurate, <code>sqlparse</code> doesn't make it easy to use the token tree.</span>
+<span class="comment-copy">@MartijnPieters I've had a look at mozzila's project but it raises recursion exceptions when more complex SQL statements are parsed.</span>
+<span class="comment-copy">Crumbs, <code>moz-sql-parser</code> actually raises a recursion exception when asked to parse your sample statement.</span>
+<span class="comment-copy">@MartijnPieters Exactly.</span>
+<span class="comment-copy">That's <a href="https://github.com/mozilla/moz-sql-parser/issues/41" rel="nofollow noreferrer">this bug report</a>.</span>

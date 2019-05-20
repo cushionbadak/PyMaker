@@ -1,0 +1,97 @@
+<div class="post-text" itemprop="text">
+<p>I made this <code>setInterval</code> kind of like in javascripts only for python and it's a little different, problem is I can't seem to figure out how to cancel it since when I cancel it, it just makes a new one and continues to run that one after I canceled the original thread </p>
+<pre><code>def setInterval(sec, func, *args, **kw):
+    def inner():
+        func(*args, **kw)
+        setInterval(sec, func, *args, **kw) # This is where it sends it again
+    task = threading.Timer(sec, inner)
+    task.daemon = True
+    task.start()
+    return task
+</code></pre>
+<p>As you can see, it works, however I have no way of canceling the thread because the original executes again and creates a new one before it can be canceled. How would I set this up so if the thread is canceled it won't create any copies of the same original thread? I've tried adding some keywords then sending the thread in it and have it cancel if it is a type of threading.Timer, but it doesn't seem to work since it already make a copy of the original before it could cancel, any ideas or suggestions? I'm just trying to think of a way so it knows that it's a copy of the original then not execute it but I'm not sure how I would actually do that. Is there anything I could do so it terminates/cancels the original thread and doesn't start a new copy of it before it has a chance to be canceled? Here is my attempt at doing it incase you want to tell me what I'm doing wrong.</p>
+<pre><code>def setInterval(sec = None, func = None, *args, **kw):
+    start = True if type(func) != threading.Timer else func.cancel() # doesn't work anyways
+    def inner():
+        func(*args, **kw)
+        setInterval(sec, func, *args, **kw)
+    if start == True: 
+        task = thrading.Timer(sec, inner)
+        task.daemon = True
+        task.start()
+        return task
+def clearInterval(task):
+    setInterval(func = task)
+myInterval = setInterval(10, print, "Hello, world!")
+clearInterval(myInterval) # cancels original, continues to make copies 
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Cancelling a <code>Timer</code> before it runs prevents it from calling its callback function. But if it's already woken up, it's too late to cancel it. And, since your code creates a <em>new</em> <code>Timer</code> inside the callback, that new Timer won't know it's supposed to be canceled.</p>
+<p>So, you need to cooperate with the callback function, by giving it access to some flag that lets it know it's been canceled (e.g., with a mutable global or closure variable, function attribute, or default parameter value). And of course that variable needs to be synchronized, meaning you read it under a <code>Lock</code>, or you've got a race condition. (In CPython, thanks to the GIL, the worst-case scenario of that race should be occasionally running one extra time, but in a different implementation, it's possible that the timer thread (where the callback is running) could never see the updated value.)</p>
+<hr/>
+<p>However, this is going to get complicated. You're probably better off first extending the <code>Timer</code> class to a <code>RepeatingTimer</code>. Then, if you really want to you can wrap that in trivial <code>setInterval</code>/<code>clearInterval</code> functions. </p>
+<p>There are plenty of recipes on ActiveState and packages on PyPI that add a <code>repeat</code> flag or equivalent, and also do other nice things like use a single thread instead of creating a new thread for every interval. But if you want to know how to do this yourself, it's pretty easy. In fact, the <a href="http://docs.python.org/3/library/threading.html" rel="nofollow"><code>threading</code> docs</a> have a link to the <a href="http://hg.python.org/cpython/file/3.3/Lib/threading.py" rel="nofollow"><code>threading.py</code> source</a> because it's meant to be useful as example code, and you can see how trivial <a href="http://hg.python.org/cpython/file/3.3/Lib/threading.py#l1118" rel="nofollow"><code>Timer</code></a> is, so you could even re-implement it yourself. </p>
+<hr/>
+<p>But let's do it with subclassing instead.</p>
+<pre><code>class RepeatableTimer(threading.Timer):
+    def __init__(self, interval, 
+                 function, args=None, kwargs=None, repeat=False):
+        super(RepeatableTimer, self).__init__(interval, function, args, kwargs)
+        self.repeat = repeat
+        self.lock = threading.Lock()
+    def cancel(self):
+        with self.lock:
+            self.repeat = False
+        super(RepeatableTimer, self).cancel()
+    def run(self):
+        while True:
+            self.finished.clear()
+            super(RepeatableTimer, self).run()
+            with self.lock:
+                if not self.repeat:
+                    break
+</code></pre>
+<p>I think it would actually be simpler to implement it from scratch, because then you don't have to worry about resetting the <code>Event</code>, but anyway, this works.</p>
+<hr/>
+<p>If you want to, e.g., extend this so instead of a <code>repeat</code> flag there's a <code>times</code> integer (which is <code>-1</code> for "repeat forever") as in JavaScript, that's trivial. </p>
+<hr/>
+<p>Anyway, now you can wrap this in <code>setInterval</code> and <code>clearInterval</code> functions:</p>
+<pre><code>def setInterval(sec=None, func=None, *args, **kw):
+    task = RepeatableTimer(sec, func, args, kw, repeat=True)
+    task.daemon = True
+    task.start()
+    return task
+
+def clearInterval(task):
+    task.cancel()
+</code></pre>
+<p>Although note that <code>clearInterval = RepeatableTimer.cancel</code> would work just as well. (In Python 2.x, this would be an unbound method vs. a function, but it would still work the same, other than giving different error messages if you called it with the wrong args. In 3.x, there is no difference at all.)</p>
+<p>If you really want to do the whole mess with making <code>clearInterval</code> call <code>setInterval</code>, you can, but let's at least clean it up a bit—use <code>isinstance</code> instead of <code>type</code>, and don't try to set a flag that you use in a second <code>if</code> when you can just do it all in a single <code>if</code>:</p>
+<pre><code>def setInterval(sec=None, func=None, *args, **kw):
+    if isinstance(func, RepeatableTimer):
+        task.cancel()
+    else:
+        task = RepeatableTimer(sec, func, args, kw, repeat=True)
+        task.daemon = True
+        task.start()
+        return task
+
+def clearInterval(task):
+    setInterval(func=task)
+</code></pre>
+<p>But I don't see what you think that's buying you.</p>
+<hr/>
+<p>Anyway, here's a test to verify that it works:</p>
+<pre><code>myInterval = setInterval(1, print, "Hello, world!")
+time.sleep(3)
+clearInterval(myInterval)
+time.sleep(5)
+</code></pre>
+<p>This should usually print "Hello, world!" 2 or 3 times, occasionally 4, but never 7 or 8 like an uncancellable timer would.</p>
+</div>
+<span class="comment-copy">@Iguananaut I will try that, though I don't think that is the problem either. <code>Edit</code>: Okay, just tried, it did not fix the problem but thank you for informing me that type would have always be false.</span>
+<span class="comment-copy">Ignore my previous comment; I misread your code.  That said you should generally use <code>isinstance</code> for type checking and not direct type comparison.</span>
+<span class="comment-copy">@Iguananaut Okay, I will keep that in mind.</span>
+<span class="comment-copy">Have you seen <a href="http://stackoverflow.com/questions/5179467/equivalent-of-setinterval-in-python" title="equivalent of setinterval in python">stackoverflow.com/questions/5179467/…</a></span>
+<span class="comment-copy">@Iguananaut I do not believe so, but if I did it would have been a long time ago.</span>

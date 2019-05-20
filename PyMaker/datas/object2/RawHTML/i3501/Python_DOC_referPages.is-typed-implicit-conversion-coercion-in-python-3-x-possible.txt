@@ -1,0 +1,93 @@
+<div class="post-text" itemprop="text">
+<p>Is it possible to implement custom automatic/implicit conversion (aka coercion) in Python 3.6+ that won't make <code>mypy</code> and other static analyzers sad? An example would be a <code>def(foo: A)</code>, and given <code>def b_to_a(b: B) -&gt; A</code>, is there a way I could potentially write <code>foo(some_b)</code> (where <code>some_b: B</code> ) instead of <code>foo(b_to_a(some_b))</code>? </p>
+<p>I think there are definitely some good ways to do this in the dynamics of Python (tacking on members to classes that include converters, for instance), or even tacking on such converters to the function object itself so that it can handle conversion for selected types, but my current understanding of Python types makes me thing it would not satisfy <code>mypy</code> and the like.</p>
+<p>For comparison, see Scala's <a href="https://stackoverflow.com/a/2861739/3096687">implicit conversions</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's an implementation of this feature I came up with.  We keep a dictionary of <a href="https://docs.python.org/3/library/functools.html#functools.singledispatch" rel="nofollow noreferrer">single-dispatch</a> converters for types we know the "implicit" conversions for.  We add converters to this using the <code>@implicit</code> decorator.</p>
+<p>We then have a <code>@coerce</code> decorator that can inspect the function annotations at runtime, get the appropriate converters and apply the conversions.  Below is the framework: </p>
+<pre><code>from functools import wraps, singledispatch
+from inspect import signature
+from collections import OrderedDict
+
+converters = {}
+
+def implicit(func):
+    ret = func.__annotations__.get('return', None)
+    if not ret or len(func.__annotations__) != 2:
+        raise ValueError("Function not annotated properly or too many params")
+    if ret not in converters:    
+        @singledispatch
+        def default(arg):
+            raise ValueError("No such converter {} -&gt; {}".format(type(arg).__name__, ret.__name__))    
+        converters[ret] = default
+    else:
+        default = converters[ret]
+    t = next(v for k, v in func.__annotations__.items() if k != 'return')
+    default.register(t)(func)
+    return wraps(func)(default)
+
+def convert(val, t):
+    if isinstance(val, t):
+        return t
+    else:
+        return converters[t](val)
+
+
+def coerce(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        sig = signature(func)
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        bound.arguments = OrderedDict(
+            (param, convert(val, sig.parameters[param].annotation)) 
+            for param, val in bound.arguments.items())
+        return func(*bound.args, **bound.kwargs)    
+    return wrapper
+</code></pre>
+<p>And an example:</p>
+<pre><code>from typing import Tuple, Type
+
+
+@implicit
+def str_to_int(a: str) -&gt;  int:
+    return int(a)
+
+@implicit
+def float_to_int(a: float) -&gt; int:
+    return int(a)
+
+@coerce
+def make_ints(a: int, b: int) -&gt; Tuple[Type, Type]:
+    return (type(a), type(b))
+
+print(make_ints("20", 5.0))
+# (&lt;class 'int'&gt;, &lt;class 'int'&gt;)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>It sounds like you may be looking for something like the Protocol types proposed in <a href="https://www.python.org/dev/peps/pep-0544/" rel="nofollow noreferrer">PEP 544</a>. That PEP isn't approved yet (and may not have a complete implementation yet either), so it may be a while before you get the feature you need (Python 3.8 at the earliest).</p>
+<p>Anyway, according to the PEP, Protocols would let you describe a kind of abstract type based on what methods and attributes it has, without the concrete types needing to know about the Protocol or do anything in particular (it doesn't need to inherit from an abstract base class, just have the required methods). It's similar to how you can customize how <code>isinstance</code> and <code>issubclass</code> work using metaclasses, but it works with static type checking, not only at runtime.</p>
+<p>For instance, iterators in Python are an existing protocol that many unrelated classes implement. If the PEP is approved and implemented, you won't need to declare a custom iterator type as inheriting from <code>typing.Iterator</code> any more, it would figure it out automatically, just because the class has <code>__iter__</code> and <code>__next__</code> methods.</p>
+<p>In your example, you could make an <code>A_Like</code> protocol that requires a <code>to_A</code> method:</p>
+<pre><code>class A_Like(typing.Protocol):
+    def to_A(self) -&gt; A:
+        ...
+</code></pre>
+<p>Then you'd implement <code>A.to_A</code> with a simple <code>return self</code>, while <code>B.to_A</code> does the appropriate conversion. Both classes will be seen as matching the <code>A_Like</code> protocol type, so <code>def foo(a: A_Like)</code> would satisfy type checkers (with the body of the class needing to do <code>a = a.to_A()</code> before calling any <code>A</code> specific methods).</p>
+<p>You can do this now with inheritance from a common abstract base class (which can be a simple mixin), but it's definitely not as elegant as it will be with Protocols. Another option if you don't have many classes you need to convert is to just use <code>Union</code> types declarations: <code>def foo(a: Union[A, B])</code></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I don't think this is a conversion problem. But it looks like a annotation problem.</p>
+<p>First, if <code>foo</code> can only handle <code>A</code>, how could it accept <code>B</code>? And if <code>foo</code> can handle <code>B</code> too, why it should only accpet <code>A</code>?</p>
+<p>Second, if you want to annotate that <code>foo</code> accept <code>A</code> or <code>B</code>, you can use <code>def(foo: Union[A, B])</code>.</p>
+<p>Finally, if you mean <code>B</code> should have some methods that make it can be handled by function which can only handle <code>A</code>. It is still an instance of <code>B</code>. Without right annotation, your static analyzers will still warn you.</p>
+</div>
+<span class="comment-copy">What sort of classes are <code>A</code> and <code>B</code>? How does the conversion work?  You might be able to do this by writing a decorator that sends all the inputs to the correct converter, maybe through some <a href="https://docs.python.org/3/library/functools.html#functools.singledispatch" rel="nofollow noreferrer">single dispatch generic function</a></span>
+<span class="comment-copy">Any type of class. The idea is the user of a supplied function that takes a value of type <code>A</code> could write an implicit converter for any type <code>T</code>  that would automatically be called as needed, as long as the converter is in scope (at least that's how it works in Scala)</span>
+<span class="comment-copy">No, python doesn't offer anything like that.  You could write something to achieve a similar effect, but it would produce way more code than a handful of <code>b_to_a</code> calls. Depending on what the operation you want to do with the object is, you might use duck typing to equip certain classes to perform that operation, and then use an <a href="https://docs.python.org/3/library/abc.html#abc.ABCMeta.__subclasshook__" rel="nofollow noreferrer">Abstract Base Class</a> to describe that group of classes.</span>
+<span class="comment-copy">This is amazing (reminds me of reflection in Java land though), will have to study this and try it out. (But if Protocols are realized, I may prefer them for my particular use case in the end).</span>
+<span class="comment-copy">"static duck typing" is actually sort of how I think of type classes anyway, though I'm not yet sure if they are an exact match. +1, great to see that on the way (hopefully). In fact, this is even better than what I was hoping for, since I was just looking for implicit coercion as a way to do static ducktyping/typeclasses!</span>
+<span class="comment-copy">It looks like I can go ahead and use the <code>typing_extensions</code> package from pypi (or just drop the file in your project from the typings github repo) in Python 3.6.5 without issue (so far). Of course, fair warning the standard may change, or even not be accepted, as you noted.</span>
+<span class="comment-copy">Basically, I'd like to use the notion of type classes from Haskell, which are more flexible than inheritance.</span>

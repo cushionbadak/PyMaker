@@ -1,0 +1,147 @@
+<div class="post-text" itemprop="text">
+<p>The problem is that I keep getting <code>RuntimeError: Event loop is closed</code> error even when I use <code>return_when=asyncio.FIRST_COMPLETED</code> inside <code>await asyncio.wait()</code>.</p>
+<p>My code:</p>
+<pre><code>async def task_manager():
+    tasks = [grab_proxy() for _ in range(10)]
+    finished, unfinished = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+    for x in finished:
+        result = x.result()
+
+        if result:
+            return result
+
+
+def get_proxy_loop():
+    loop = asyncio.new_event_loop()
+
+    proxy = loop.run_until_complete(task_manager())
+
+    loop.close()
+    return proxy
+
+
+if __name__ == '__main__':
+    p = get_proxy_loop()
+
+    print(type(p))
+    print(p)
+</code></pre>
+<p>Expected behaviour:</p>
+<p><code>return_when=asyncio.FIRST_COMPLETED</code> should kill all remaining tasks when first result is returned "under the hood". </p>
+<p>But in fact there still remain uncompleted tasks after first result returned. And after I close the loop in <code>get_proxy_loop()</code> and access result inside <code>__main__</code> those remaing tasks raise <code>RuntimeError: Event loop is closed</code>.</p>
+<p>Console output:</p>
+<pre><code>&lt;class 'str'&gt;
+78.32.35.21:55075
+Task was destroyed but it is pending!
+task: &lt;Task pending coro=&lt;grab_proxy() running at /home/pata/PycharmProjects/accs_farm/accs_farm/proxy_grabber.py:187&gt; wait_for=&lt;Future pending cb=[&lt;TaskWakeupMethWrapper object at 0x7fc5187a8798&gt;()]&gt;&gt;
+Exception ignored in: &lt;coroutine object grab_proxy at 0x7fc5150aae60&gt;
+Traceback (most recent call last):
+  File "/home/pata/proxy_grabber.py", line 187, in grab_proxy
+    proxy = await async_get_proxy()
+  File "/home/pata/proxy_grabber.py", line 138, in async_get_proxy
+    async with session.get(provider_url, timeout=5, params=params) as r:
+  File "/home/pata/venvs/test_celery/lib/python3.6/site-packages/aiohttp/client.py", line 855, in __aenter__
+    self._resp = await self._coro
+  File "/home/pata/venvs/test_celery/lib/python3.6/site-packages/aiohttp/client.py", line 396, in _request
+    conn.close()
+  File "/home/pata/venvs/test_celery/lib/python3.6/site-packages/aiohttp/connector.py", line 110, in close
+    self._key, self._protocol, should_close=True)
+  File "/home/pata/venvs/test_celery/lib/python3.6/site-packages/aiohttp/connector.py", line 547, in _release
+Event loop is closed
+    transport = protocol.close()
+  File "/home/pata/venvs/test_celery/lib/python3.6/site-packages/aiohttp/client_proto.py", line 54, in close
+    transport.close()
+  File "/usr/lib/python3.6/asyncio/selector_events.py", line 621, in close
+    self._loop.call_soon(self._call_connection_lost, None)
+  File "/usr/lib/python3.6/asyncio/base_events.py", line 580, in call_soon
+    self._check_closed()
+  File "/usr/lib/python3.6/asyncio/base_events.py", line 366, in _check_closed
+    raise RuntimeError('Event loop is closed')
+RuntimeError: Event loop is closed
+...
+...
+Task was destroyed but it is pending!
+task: &lt;Task pending coro=&lt;grab_proxy() done, defined at /home/pata/proxy_grabber.py:183&gt; wait_for=&lt;Future pending cb=[BaseSelectorEventLoop._sock_connect_done(11)(), &lt;TaskWakeupMethWrapper object at 0x7fc514d15e28&gt;()]&gt;&gt;
+Task was destroyed but it is pending!
+task: &lt;Task pending coro=&lt;grab_proxy() done, defined at /proxy_grabber.py:183&gt; wait_for=&lt;Future pending cb=[&lt;TaskWakeupMethWrapper object at 0x7fc5187a8588&gt;()]&gt;&gt;
+Event loop is closed
+Process finished with exit code 0
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <code>asyncio.wait(..., return_when=asyncio.FIRST_COMPLETED)</code> coroutine returns when <em>at least one</em> of the tasks has completed. Other tasks can still be active. It is <em>not</em> the job of <code>asyncio.wait()</code> to cancel those tasks for you. The use-case of <code>asyncio.wait(..., return_when=asyncio.FIRST_COMPLETED)</code> is to let you monitor tasks and act on their results <em>as they complete</em>; you usually would call it repeatedly until all your tasks are finished.</p>
+<p>From the <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.wait" rel="nofollow noreferrer"><code>asyncio.wait()</code> documentation</a>:</p>
+<blockquote>
+<p>Run awaitable objects in the <em>aws</em> set concurrently and block until the condition specified by <em>return_when</em>.</p>
+<p>[...]</p>
+<p><em>return_when</em> indicates when this function should return. It must be one of the following constants:</p>
+<p><code>FIRST_COMPLETED</code><br/>
+  The function will return when any future finishes or is cancelled.</p>
+<p>[...]</p>
+<p>Unlike <code>wait_for()</code>, <code>wait()</code> does not cancel the futures when a timeout occurs.</p>
+</blockquote>
+<p>The documentation explicitly states that it will not cancel futures, even when you set a timeout (if you do set a timeout, then the first <em>done</em> set is simply empty, the tasks are all still active and listed in the second <em>pending</em> set).</p>
+<p>If you need the unfinished tasks to be cancelled, do so explicitly:</p>
+<pre><code>while tasks:
+    finished, unfinished = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+    for x in finished:
+        result = x.result()
+
+        if result:
+            # cancel the other tasks, we have a result. We need to wait for the cancellations
+            # to propagate.
+            for task in unfinished:
+                task.cancel()
+            await asyncio.wait(unfinished)
+            return result
+
+    tasks = unfinished
+</code></pre>
+<p>Demo with some extra printing and randomised tasks:</p>
+<pre><code>&gt;&gt;&gt; import asyncio
+&gt;&gt;&gt; import random
+&gt;&gt;&gt; async def grab_proxy(taskid):
+...     await asyncio.sleep(random.uniform(0.1, 1))
+...     result = random.choice([None, None, None, 'result'])
+...     print(f'Task #{taskid} producing result {result!r}')
+...     return result
+...
+&gt;&gt;&gt; async def task_manager():
+...     tasks = [grab_proxy(i) for i in range(10)]
+...     while tasks:
+...         finished, unfinished = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+...         for x in finished:
+...             result = x.result()
+...             print(f"Finished task produced {result!r}")
+...             if result:
+...                 # cancel the other tasks, we have a result. We need to wait for the cancellations
+...                 # to propagate.
+...                 print(f"Cancelling {len(unfinished)} remaining tasks")
+...                 for task in unfinished:
+...                     task.cancel()
+...                 await asyncio.wait(unfinished)
+...                 return result
+...         tasks = unfinished
+...
+&gt;&gt;&gt;
+&gt;&gt;&gt; def get_proxy_loop():
+...     loop = asyncio.new_event_loop()
+...     proxy = loop.run_until_complete(task_manager())
+...     loop.close()
+...     return proxy
+...
+&gt;&gt;&gt; get_proxy_loop()
+Task #7 producing result None
+Finished task produced None
+Task #0 producing result 'result'
+Finished task produced 'result'
+Cancelling 8 remaining tasks
+'result'
+</code></pre>
+</div>
+<span class="comment-copy"><i><code>return_when=asyncio.FIRST_COMPLETED</code> should kill all remaining tasks when first result is returned "under the hood".</i>. Why should it do that? You are asking to gain control again in that coroutine when <b>one</b> of the tasks has completed. The other tasks are still active at that point.</span>
+<span class="comment-copy">@MartijnPieters so how I should to wait for those remaining tasks are finished before closing the loop?</span>
+<span class="comment-copy">Thank you for fast answer)  Can you please also provide name of <code>print(f"Cancelling {len(unfinished)} remaining tasks")</code> string formatting style?)</span>
+<span class="comment-copy">@PATAPOsha: That's a <a href="https://docs.python.org/3/whatsnew/3.6.html#whatsnew36-pep498" rel="nofollow noreferrer">formatted string literal</a>.</span>

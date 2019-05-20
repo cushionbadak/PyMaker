@@ -1,0 +1,107 @@
+<div class="post-text" itemprop="text">
+<p>Using <code>PyYAML</code>, with <code>CLoader</code> as the <code>YAML</code> parser, I am attempting to load the <code>YAML</code> file, parse it and then write it to a separate file.</p>
+<p>For testing purposes, I am using a very large <code>YAML</code> file, larger than <code>1GB</code>.</p>
+<p>I am trying to include a progress bar to be displayed in the command line to show that my Python script is running and estimate how long it takes.</p>
+<p>Here is my current code:</p>
+<pre><code>import yaml
+import argparse
+
+from tqdm import tqdm
+from yaml import CLoader as Loader
+
+def main():
+
+parser = argparse.ArgumentParser(description='Takes in YAML files and uploads straight to Neo4J database')
+parser.add_argument('-f', '--files', nargs='+', metavar='', required=True,
+                    help='&lt;Required&gt; One or more YAML files to upload')
+
+args = parser.parse_args()
+
+for file_name in args.files:
+
+    with open(file_name, 'r') as stream:
+        print("Reading input file...")
+        with open('test2.txt', 'w') as wf:
+            print("Writing to output file...")
+
+            try:
+                for data in tqdm(yaml.load(stream, Loader=Loader)):
+                    wf.write(data.get('primaryName') + '\n')
+                    wf.write('++++++++++\n')
+            except yaml.YAMLError as exc:
+                print(exc)
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<p>What happens now is that there is a <code>tqdm</code> progress bar displayed for the data writing loop but not for the <code>yaml.load()</code> process which is the process that is taking the most time. </p>
+<p>That is, for a long time, no progress bar is shown until the <code>YAML</code> file is fully loaded.</p>
+<p>I am hoping to find a solution such that I am able to wrap a progress bar around a function that I have no access to, in this case, <code>yaml.load()</code>.</p>
+<p>Am I doing something wrong? Any advice will be great and appreciated.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, there's no way to wrap a progress bar around code that you have no access to.</p>
+<p>Also, you can only use the <a href="https://github.com/tqdm/tqdm#iterable-based" rel="nofollow noreferrer">iterable-based</a> interface to tqdm when you're looping over an iterable, which you aren't here. So you have to use the <code>update</code>-based interface:</p>
+<pre><code>with tqdm(total=100) as pbar:
+    for i in range(10):
+        pbar.update(10)
+</code></pre>
+<p>The question is, how do you get PyYAML to call that <code>pbar.update</code>?</p>
+<p>Ideally, you want to find a place to hook the loading process where <em>you</em> can call <code>pbar.update</code>. If that isn't possible, you'll have to do something ugly (like fork <code>PyYAML</code> and add to its API, or do the same thing at runtime by monkeypatching it), or switch to a different library. But it ought to be possible.</p>
+<hr/>
+<p>The obvious option is to create your own subclass of <code>PyYAML.Loader</code>. The docs for PyYAML explain the API for this class, so you can override any of the methods there to emit some progress and then <code>super</code> to the base class.</p>
+<p>But unfortunately none of them look all that promising. Sure, you can get called once per token, once per event, or once per node, but without knowing how many tokens, events, or nodes there are, this doesn't let you show how far into the file you are. If you want an indeterminate progress spinner, that's fine, but if you can get the actual progress, with an estimate of how long there is to go, and so on, that's always better.</p>
+<p>One thing you <em>could</em> do is have your <code>Loader</code> subclass call <code>tell</code> on its <code>stream</code> to figure out how many bytes you've read so far.</p>
+<p>I don't have PyYAML on this computer, and the docs are pretty confusing, so you'll probably need to experiment a bit, but it should be something like this:</p>
+<pre><code>class ProgressLoader(yaml.CLoader):
+    def __init__(self, stream, callback):
+        super().__init__(stream)
+        # __ because who knows what names the base class is using?
+        self.__stream = stream
+        self.__pos = 0
+        self.__callback = callback
+    def get_token(self):
+        result = super().get_token()
+        pos = self.__stream.tell()
+        self.__callback(pos - self.__pos)
+        self.__pos = pos
+        return result
+</code></pre>
+<p>But then I'm not sure how to get PyYAML to pass your callback into the <code>ProgressLoader</code> constructor, so you'd have to do something like this:</p>
+<pre><code>with open(file_name, 'r') as stream:
+    size = os.stat(stream.fileno()).st_size
+    with tqdm(total=size) as progress:
+        factory = lambda stream: ProgressLoader(stream, progress.update)
+        data = yaml.load(stream, Loader=factory)
+</code></pre>
+<hr/>
+<p>But once we're just going to the file anyway, it's probably easier to not screw around with the confusingly-documented loader types and instead just write a file wrapper.</p>
+<p><a href="https://docs.python.org/3/library/io.html#class-hierarchy" rel="nofollow noreferrer">The docs for file objects</a> are pretty <em>dense</em>, but at least they're clear—and the actual work is pretty simple:</p>
+<pre><code>class ProgressFileWrapper(io.TextIOBase):
+    def __init__(self, file, callback):
+        self.file = file
+        self.callback = callback
+    def read(self, size=-1):
+        buf = self.file.read(size)
+        if buf:
+            self.callback(len(buf))
+        return buf
+    def readline(self, size=-1):
+        buf = self.file.readline(size)
+        if buf:
+            self.callback(len(buf))
+        return buf
+</code></pre>
+<p>Now:</p>
+<pre><code>with open(file_name, 'r') as stream:
+    size = os.stat(stream.fileno()).st_size
+    with tqdm(total=size) as progress:
+        wrapper = ProgressFileWrapper(stream, progress.update)
+        data = yaml.load(wrapper, Loader=Loader)
+</code></pre>
+<p>Of course this isn't perfect. We're assuming here that all of the work is reading the file from disk, not parsing it. That's probably close enough to true that we get away with it, but if it isn't, you'll have one of those progress bars that zips along to almost 100% and then just uselessly stays there for a long time.<sup>1</sup></p>
+<hr/>
+<p><sub>1. Not only is that horribly annoying, it's also so firmly associated with Windows and other Microsoft products that they could probably sue you for stealing their look and feel. :)</sub></p>
+</div>
+<span class="comment-copy">Thank you for your very comprehensive solution, it works! Indeed, my first mistake was using the iterable interface, but then I could not figure out when to use update().  Your wrapper class is really ingenious! I had thought of a wrapper but could not figure out how (I'm quite new to Python). Now, I have another question to better understand the process happening in the wrapper (which inherits from 'io.TextIOBase'):  Is it correct to say that you are overloading the 'read' functions such that the callback function (i.e. update) is injected as 'stream' is being read?</span>
+<span class="comment-copy">@JaronC. Yes. But notice that my class is not just a subclass of <code>TextIOBase</code>, it's also a proxy to <code>self.file</code>, which is another <code>TextIOBase</code>. That's why instead of the usual <code>super().read(size)</code> I have to do <code>self.file.read(size)</code>. This is a reasonably common idiom in Python, but it can be a bit hard to wrap your head around at first.</span>

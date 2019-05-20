@@ -1,0 +1,93 @@
+<div class="post-text" itemprop="text">
+<p>I'm attempting to use the new <a href="http://tornadokevinlee.readthedocs.org/en/latest/queues.html" rel="nofollow">Tornado queue</a> object along with <a href="https://docs.python.org/3/library/concurrent.futures.html" rel="nofollow"><code>concurrent.futures</code></a> to allow my webserver to pass off cpu-intensive tasks to other processes. I want to have access to the <code>Future</code> object that's returned from the <code>ProcessPoolExecutor</code> from the <code>concurrent.futures</code> module so that I can query its state to show on the front-end (e.g. show the process is currently running; show that it has finished).</p>
+<p>I seem to have two hurdles with this method:</p>
+<ol>
+<li>How can I submit multiple <code>q.get()</code> objects to the <code>ProcessPoolExecutor</code> while also having access to the returned <code>Future</code> objects?</li>
+<li>How can I let the <code>HomeHandler</code> get access to the <code>Future</code> object returned by the <code>ProcessPoolExecutor</code> so that I may show the state information on the front-end?</li>
+</ol>
+<p>Thanks for any help.</p>
+<pre><code>from tornado import gen
+from tornado.ioloop import IOLoop
+from tornado.queues import Queue
+
+from concurrent.futures import ProcessPoolExecutor
+
+define("port", default=8888, help="run on the given port", type=int)
+q = Queue(maxsize=2)
+
+
+def expensive_function(input_dict):
+    gen.sleep(1)
+
+
+@gen.coroutine
+def consumer():
+    while True:
+        input_dict = yield q.get()
+        try:
+            with ProcessPoolExecutor(max_workers=4) as executor:
+                future = executor.submit(expensive_function, input_dict)
+        finally:
+            q.task_done()
+
+
+@gen.coroutine
+def producer(input_dict):
+    yield q.put(input_dict)
+
+
+class Application(tornado.web.Application):
+def __init__(self):
+    handlers = [
+        (r"/", HomeHandler),
+    ]
+    settings = dict(
+        blog_title=u"test",
+        template_path=os.path.join(os.path.dirname(__file__), "templates"),
+        static_path=os.path.join(os.path.dirname(__file__), "static"),
+        debug=True,
+    )
+    super(Application, self).__init__(handlers, **settings)
+
+
+class HomeHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.render("home.html")
+
+    def post(self, *args, **kwargs):
+        input_dict = {'foo': 'bar'}
+
+        producer(input_dict)
+
+        self.redirect("/")
+
+
+def main():
+    tornado.options.parse_command_line()
+    http_server = tornado.httpserver.HTTPServer(Application())
+    http_server.listen(options.port)
+    tornado.ioloop.IOLoop.current().start()
+
+
+def start_consumer():
+    tornado.ioloop.IOLoop.current().spawn_callback(consumer)
+
+
+if __name__ == "__main__":
+    tornado.ioloop.IOLoop.current().run_sync(start_consumer)
+    main()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>What are you trying to accomplish by combining a <code>Queue</code> and a <code>ProcessPoolExecutor</code>? The executor already has it's own internal queue. All you need to do is make the <code>ProcessPoolExecutor</code> a global (it doesn't have to be a global, but you'll want to do something similar to a global even if you keep the queue; it doesn't make sense to create a new <code>ProcessPoolExecutor</code> each time through <code>consumer</code>'s loop) and submit things to it directly from the handler.</p>
+<pre><code>@gen.coroutine
+def post(self):
+    input_dict = ...
+    result = yield executor.submit(expensive_function, input_dict)
+</code></pre>
+</div>
+<span class="comment-copy">The idea was that I cannot have more than N instances of <code>expensive_function</code> running on the server machine at a time, so I wanted some management in place that would control how many <code>expensive_calculation</code>s are running. Then, of course, the <code>ProcessPoolExecutor</code> would deal with doling out the processes to the workers. Does <code>ProcessPoolExecutor</code> define an internal maximum queue size? I just don't want 100 users submitting a job at the same time and having the server croak.</span>
+<span class="comment-copy">The <code>max_workers</code> parameter to <code>ProcessPoolExecutor</code> governs how many copies of <code>expensive_calculation</code> can be running at a time. The rest of the requests will wait their turn in the queue. This queue is unbounded, unlike the <code>Queue(maxsize=2)</code> you create here, but it makes not difference: whether the requests are in the queue or waiting for their chance to enter the queue, the effect and cost is the same.</span>
+<span class="comment-copy">Ah, I see. I was thinking of the <code>max_workers</code> as a "number of cores" analog (i.e. 100 jobs would simply be parceled out to e.g. 4 cores at once). This makes a lot more sense. Thanks for the help.</span>
+<span class="comment-copy">@BenDarnell, since v3.3, <code>executor.submit()</code> may raise <code>BrokenProcessPool</code>, which means the <code>ProcessPoolExecutor</code> need to be recreated. I do have global <code>ProcessPoolExecutor</code>, but I can't simply recreate it during request because of race against assigning <code>executor = ProcessPoolExecutor()</code>. So either I need to synchronize the recreating <code>ProcessPoolExecutor</code> or create a global <code>Queue</code> in a thread that will wait for a task, <code>submit()</code> and maintain <code>executor</code>. What is your thought?</span>
+<span class="comment-copy">I think if your process pools are becoming broken then you'll have more problems than synchronizing the recreation of the pool. You need to prevent the subprocesses from becoming broken in the first place.</span>

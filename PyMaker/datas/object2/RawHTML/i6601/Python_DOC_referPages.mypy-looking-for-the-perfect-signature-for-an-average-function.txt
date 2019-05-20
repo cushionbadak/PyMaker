@@ -1,0 +1,86 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to come up with the perfect function signature for the following function (Python 3.6, mypy 0.521):</p>
+<pre><code>def avg(xs):
+    it = iter(xs)
+    try:
+        s = next(it)
+        i = 1
+    except StopIteration:
+        raise ValueError("Cannot average empty sequence")
+    for x in it:
+        s += x
+        i += 1
+    return s / i
+</code></pre>
+<p>The nice thing about this code, is that it works with, and produces the correct result for iterables of <code>int</code>, <code>float</code>, <code>complex</code>, but also for <code>datetime.timedelta</code>. Problems pop up when trying to add a signature. I've tried the following:</p>
+<pre><code>def avg(xs: t.Iterable[t.Any]) -&gt; t.Any: ...
+</code></pre>
+<p>But now, caller needs to cast the result.</p>
+<pre><code>def avg(xs: t.Iterable[T]) -&gt; T: ...
+</code></pre>
+<p>This fails because <code>T</code> does not support addition nor division.</p>
+<pre><code>N = TypeVar("N", int, float, complex, datetime.timedelta)
+def avg(xs: t.Iterable[N]) -&gt; N: ...
+</code></pre>
+<p>Fails because <code>int / int</code> is a <code>float</code>; using <code>//</code> gives the wrong result for almost everything else. Also sucks, because the code should work for other types, as long as addition and division are supported.</p>
+<pre><code>N = TypeVar("N", float, complex, datetime.timedelta)
+def avg(xs: t.Iterable[N]) -&gt; N: ...
+</code></pre>
+<p>This is almost perfect, but again, if someone later decides to throw quaternions at it, mypy will complain.</p>
+<p>...then I was also trying something with <code>abc</code> and <code>typing.overload</code> but that got me nowhere.</p>
+<p>What would be the most elegant solution that would pass under <code>mypy --strict</code>?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>So, unfortunately, the numerics system in Python/PEP 484 is currently a bit of a mess.</p>
+<p>We technically have a <a href="https://docs.python.org/3/library/numbers.html" rel="nofollow noreferrer">"numeric tower"</a> that's supposed to represent a set of ABCs that all "number-like" entities in Python are supposed to obey.</p>
+<p>Furthermore, many of the built-in types in Python (such as <code>int</code>, <code>float</code>, <code>complex</code>, and <code>timedelta</code>) don't inherit from these ABCs in typeshed -- this means that those ABCs are basically unusable (except in cases where you define custom types that explicitly inherit from those ABCs).</p>
+<p>And to compound the problem, the <a href="https://github.com/python/typeshed/blob/master/stdlib/2and3/numbers.pyi" rel="nofollow noreferrer">numbers module is largely dynamically typed</a> in typeshed -- I took a swing at fixing the numbers module about a year or so ago, and my recollection was that mypy at the time wasn't powerful enough to accurately type the numeric tower.</p>
+<p>That situation might be fixed today, but that's all more or less moot, because mypy recently implemented experimental support for Protocols (e.g. structural typing)! It turns out this is exactly what we need to address your problem and eventually fix the numeric tower (once Protocols are added to PEP 484 and the typing module).</p>
+<p>For now, what you need to do is:</p>
+<ol>
+<li>Install the <code>typing_extensions</code> module (<code>python3 -m pip install typing_extensions</code>)</li>
+<li>Install the latest version of mypy from Github (run <code>python3 -m pip install -U git+git://github.com/python/mypy.git</code>)</li>
+</ol>
+<p>We can then define a protocol for a "supports add or divide" type like so:</p>
+<pre><code>from datetime import timedelta
+
+from typing import TypeVar, Iterable
+from typing_extensions import Protocol
+
+T = TypeVar('T')
+S = TypeVar('S', covariant=True)
+
+class SupportsAddAndDivide(Protocol[S]):
+    def __add__(self: T, other: T) -&gt; T: ...
+
+    def __truediv__(self, other: int) -&gt; S: ...
+
+def avg(xs: Iterable[SupportsAddAndDivide[S]]) -&gt; S:
+    it = iter(xs)
+    try:
+        s = next(it)
+        i = 1
+    except StopIteration:
+        raise ValueError("Cannot average empty sequence")
+    for x in it:
+        s += x
+        i += 1
+    return s / i
+
+reveal_type(avg([1, 2, 3]))
+reveal_type(avg([3.24, 4.22, 5.33]))
+reveal_type(avg([3 + 2j, 3j]))
+reveal_type(avg([timedelta(1), timedelta(2), timedelta(3)]))
+</code></pre>
+<p>Running this using mypy produces the following output, as desired:</p>
+<pre><code>test.py:27: error: Revealed type is 'builtins.float*'
+test.py:28: error: Revealed type is 'builtins.float*'
+test.py:29: error: Revealed type is 'builtins.complex*'
+test.py:30: error: Revealed type is 'datetime.timedelta*'
+</code></pre>
+</div>
+<span class="comment-copy">It seems like the float/int asymmetry means you can't really create a consistent signature for this.  It produces "the correct result", in a numeric sense, for ints and floats, but <code>avg([list of ints])</code> produces a float, while <code>avg([list of floats])</code> also produces a float.  This means your function sometimes returns the same type it's given, and sometimes another type, so it has no return type that's consistently definable in terms of its input type.  Does mypy allow for types like "number" (as in <code>numbers.Number</code>)?</span>
+<span class="comment-copy">Crazily enough, <code>numbers.Number</code> does not define <code>__add__</code> or other standard arithmetic operations, so I'm getting <code>Unsupported left operand type for + ("Number")</code>, <code>Unsupported operand types for / ("Number" and "int")</code>, etc.</span>
+<span class="comment-copy">It works with mypy <code>4fc4ae24</code>, but <code>6c409b4e</code> seems to have introduced a breaking change (it can no longer find <code>__builtins__</code>). Thanks!</span>
+<span class="comment-copy">@rollcat -- that sounds like a temporary bug, so hopefully it'll be fixed sometime today or tomorrow.</span>
+<span class="comment-copy">@Michael0x2a, thank you for your implementation efforts. This is a terrific answer!</span>

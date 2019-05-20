@@ -1,0 +1,86 @@
+<div class="post-text" itemprop="text">
+<p>I have custom list and dictionary classes that no longer work while unpickling in Python 3.7. </p>
+<pre><code>import pickle
+
+class A(dict):
+    pass
+
+class MyList(list): 
+
+    def __init__(self, iterable=None, option=A):
+        self.option=option
+        if iterable:
+            for x in iterable:
+                self.append(x)
+
+    def append(self, obj):
+        if isinstance(obj, dict):
+            obj = self.option(obj)
+        super(MyList, self).append(obj)
+
+    def extend(self, iterable): 
+        for item in iterable:
+            self.append(item)
+
+
+if __name__ == '__main__':
+    pickle_file = 'test_pickle'
+    my_list = MyList([{'a': 1}])
+    pickle.dump(my_list, open(pickle_file, 'wb'))
+    loaded = pickle.load(open(pickle_file, 'rb'))
+    print(isinstance(loaded[0], A))
+</code></pre>
+<p>Works fine on Python 2.6 through 3.6: </p>
+<pre><code>"C:\Program Files\Python36\python.exe" issue.py
+True
+</code></pre>
+<p>But is no longer setting the <code>self.option</code> properly in 3.7.</p>
+<pre><code>"C:\Program Files\Python37\python.exe" issue.py
+
+Traceback (most recent call last):
+  File "issue.py", line 28, in &lt;module&gt;
+    loaded = pickle.load(open(pickle_file, 'rb'))
+  File "issue.py", line 21, in extend
+    self.append(item)
+  File "issue.py", line 16, in append
+    obj = self.option(obj)
+AttributeError: 'MyList' object has no attribute 'option'
+</code></pre>
+<p>If I were to remove the <code>extend</code> function, it works as expected though.</p>
+<p>I have tried adding <code>__setstate__</code> as well, but it is not called before <code>extend</code> so the <code>option</code> is still undefined at that point. </p>
+<p>I do have to inherit directly from <code>dict</code> and <code>list</code>, and I do need to overwrite both the <code>append</code> and <code>extend</code> function in my code. Is there a way to set <code>option</code> beforehand or another fix?  Is this change in behavior documented and the rational for it? </p>
+<p>Thank you for your time</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Unpickling list objects <a href="https://github.com/python/cpython/commit/f89fdc29937139b55dd68587759cadb8468d0190" rel="nofollow noreferrer">switched from using <code>list.update()</code> to <code>list.extend()</code></a>, because that can be way faster for some <code>list</code> subclasses.</p>
+<p>However, <em>with that change</em>, the way that the unpickling code tested for list objects also changed, from</p>
+<pre class="lang-c prettyprint-override"><code>if (PyList_Check(list)) {
+</code></pre>
+<p>to </p>
+<pre class="lang-c prettyprint-override"><code>if (PyList_CheckExact(list)) {
+</code></pre>
+<p>It is that change that affects your code. The above test looks for a fast path, saying <em>if we have a list class, then use <code>PyList_SetSlice()</code> to load the data, rather than a slower path of explicitly calling either the <code>.extend()</code> or <code>.append()</code> method on the new instance</em>. The old version (Python 3.6 and older) accepted lists <strong>and subclasses</strong>, the new version only accepts <code>list</code> itself, not subclasses!</p>
+<p>So for Python 3.6 and older, <strong>when unpickling your custom <code>MyList.append()</code> method is not called</strong>. In Python 3.7, when unpickling your custom <code>MyList.extend()</code> method <strong>is</strong> called. This is very much intentional, subclasses <em>should</em> be allowed to provide a custom <code>.extend()</code> method that gets to be called when unpickling.</p>
+<p>And the work-around is simple. Your data is <em>already</em> wrapped when unpickling, you don't need to re-apply that wrapper. When you do not have <code>self.option</code> set, <strong>simply skip applying it</strong>:</p>
+<pre><code>def append(self, obj):
+    if isinstance(obj, dict):
+        try:
+            obj = self.option(obj)
+        except AttributeError:
+            # something's wrong, are we unpickling on Python 3.7 or newer?
+            if 'option' in self.__dict__:
+                # no, we are not, because 'option' has been set, this must
+                # be an error in the option() call, so re-raise
+                raise
+            # yes, we are, just ignore this, obj is already wrapped
+    super(MyList, self).append(obj)
+</code></pre>
+<p>This all does mean you can't rely on any instance attributes having been restored yet. If that's a big problem (you still need to consult instance state while unpickling), then you'll have to provide a different <a href="https://docs.python.org/3/library/pickle.html#object.__reduce_ex__" rel="nofollow noreferrer"><code>__reduce_ex__</code> method</a>, one that doesn't return the data as an iterator in index 3 of the resulting tuple. <code>list().__reduce_ex__()</code> for protocol versions 2, 3 and 4 returns <code>(copyreg.__newobj__, type(self), self.__dict__, iter(self), None)</code>.</p>
+<p>A custom version would have to use <code>(type(self), (tuple(self), self.option), None, None, None)</code>, for example. That does come with some additional overhead (that <code>tuple(self)</code> there will take additional memory when pickling and unpickling).</p>
+</div>
+<span class="comment-copy">You can't <code>print()</code> an assertion, can you please fix that?</span>
+<span class="comment-copy">whoops, fixed, thanks. @MartijnPieters</span>
+<span class="comment-copy">It's clear that <code>list.extend()</code> is now used to restore the pickled data, before any other attributes are set. I'm looking into <i>why</i> that is and what a good workaround would be. Worst-case: detect that <code>options</code> is not yet set in <code>append</code> or <code>extend</code> and store that data for <code>__init__</code> to pick up later on.</span>
+<span class="comment-copy">Found the issue where this change was made: <a href="https://bugs.python.org/issue29368" rel="nofollow noreferrer">bugs.python.org/issue29368</a></span>
+<span class="comment-copy">@JETM: that's not quite it though. Switching from append to extend is fine, there must be <i>another</i> change that switched when <code>__dict__</code> is restored.</span>
+<span class="comment-copy">Beautiful find and fix. Thank you so much!</span>

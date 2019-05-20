@@ -1,0 +1,121 @@
+<div class="post-text" itemprop="text">
+<p>I have a <code>log.py</code> module, that is used in at least two other modules (<code>server.py</code> and <code>device.py</code>).  </p>
+<p>It has these globals:</p>
+<pre><code>fileLogger = logging.getLogger()
+fileLogger.setLevel(logging.DEBUG)
+consoleLogger = logging.getLogger()
+consoleLogger.setLevel(logging.DEBUG)
+
+file_logging_level_switch = {
+    'debug':    fileLogger.debug,
+    'info':     fileLogger.info,
+    'warning':  fileLogger.warning,
+    'error':    fileLogger.error,
+    'critical': fileLogger.critical
+}
+
+console_logging_level_switch = {
+    'debug':    consoleLogger.debug,
+    'info':     consoleLogger.info,
+    'warning':  consoleLogger.warning,
+    'error':    consoleLogger.error,
+    'critical': consoleLogger.critical
+}
+</code></pre>
+<p>It has two functions:</p>
+<pre><code>def LoggingInit( logPath, logFile, html=True ):
+    global fileLogger
+    global consoleLogger
+
+    logFormatStr = "[%(asctime)s %(threadName)s, %(levelname)s] %(message)s"
+    consoleFormatStr = "[%(threadName)s, %(levelname)s] %(message)s"
+
+    if html:
+        logFormatStr = "&lt;p&gt;" + logFormatStr + "&lt;/p&gt;"
+
+    # File Handler for log file
+    logFormatter = logging.Formatter(logFormatStr)
+    fileHandler = logging.FileHandler( 
+        "{0}{1}.html".format( logPath, logFile ))
+    fileHandler.setFormatter( logFormatter )
+    fileLogger.addHandler( fileHandler )
+
+    # Stream Handler for stdout, stderr
+    consoleFormatter = logging.Formatter(consoleFormatStr)
+    consoleHandler = logging.StreamHandler() 
+    consoleHandler.setFormatter( consoleFormatter )
+    consoleLogger.addHandler( consoleHandler )
+</code></pre>
+<p>And: </p>
+<pre><code>def WriteLog( string, print_screen=True, remove_newlines=True, 
+        level='debug' ):
+
+    if remove_newlines:
+        string = string.replace('\r', '').replace('\n', ' ')
+
+    if print_screen:
+        console_logging_level_switch[level](string)
+
+    file_logging_level_switch[level](string)
+</code></pre>
+<p>I call <code>LoggingInit</code> from <code>server.py</code>, which initializes the file and console loggers. I then call <code>WriteLog</code> from all over the place, so multiple threads are accessing <code>fileLogger</code> and <code>consoleLogger</code>.  </p>
+<p>Do I need any further protection for my log file? The documentation states that thread locks are handled by the handler.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The good news is that you don't need to do anything extra for thread safety, and you either need nothing extra or something almost trivial for clean shutdown. I'll get to the details later.</p>
+<p>The bad news is that your code has a serious problem even before you get to that point: <code>fileLogger</code> and <code>consoleLogger</code> are the same object. From <a href="http://docs.python.org/3/library/logging.html#logging.getLogger" rel="noreferrer">the documentation for <code>getLogger()</code></a>:</p>
+<blockquote>
+<p>Return a logger with the specified name or, if no name is specified, return a logger which is the root logger of the hierarchy.</p>
+</blockquote>
+<p>So, you're getting the root logger and storing it as <code>fileLogger</code>, and then you're getting the root logger and storing it as <code>consoleLogger</code>. So, in <code>LoggingInit</code>, you initialize <code>fileLogger</code>, then re-initialize the same object under a different name with different values.</p>
+<p>You <em>can</em> add multiple handlers to the same logger—and, since the only initialization you actually do for each is <code>addHandler</code>, your code will sort of work as intended, but only by accident. And only sort of. You will get two copies of each message in both logs if you pass <code>print_screen=True</code>, and you will get copies in the console even if you pass <code>print_screen=False</code>.</p>
+<p>There's actually no reason for global variables at all; the whole point of <code>getLogger()</code> is that you can call it every time you need it and get the global root logger, so you don't need to store it anywhere.</p>
+<hr/>
+<p>A more minor problem is that you're not escaping the text you insert into HTML. At some point you're going to try to log the string <code>"a &lt; b"</code> and end up in trouble.</p>
+<p>Less seriously, a sequence of <code>&lt;p&gt;</code> tags that isn't inside a <code>&lt;body&gt;</code> inside an <code>&lt;html&gt;</code> is not a valid HTML document. But plenty of viewers will take care of that automatically, or you can post-process your logs trivially before displaying them. But if you really want this to be correct, you need to subclass <code>FileHandler</code> and have your <code>__init__</code> add a header if given an empty file and remove a footer if present, then have your <code>close</code> add a footer.</p>
+<hr/>
+<p>Getting back to your actual question:</p>
+<p>You do not need any additional locking. If a handler correctly implements <code>createLock</code>, <code>acquire</code>, and <code>release</code> (and it's called on a platform with threads), the logging machinery will automatically make sure to acquire the lock when needed to make sure each message is logged atomically.</p>
+<p>As far as I know, the documentation doesn't <em>directly</em> say that <code>StreamHandler</code> and <code>FileHandler</code> implement these methods, it does strongly imply it (<a href="http://docs.python.org/3/library/logging.html#thread-safety" rel="noreferrer">the text you mentioned in the question</a> says "The logging module is intended to be thread-safe without any special work needing to be done by its clients", etc.). And you can look at the source for your implementation (e.g., <a href="http://hg.python.org/cpython/file/3.3/Lib/logging/__init__.py#l684" rel="noreferrer">CPython 3.3</a>) and see that they both inherit correctly-implemented methods from <code>logging.Handler</code>.</p>
+<hr/>
+<p>Likewise, if a handler correctly implements <code>flush</code> and <code>close</code>, the logging machinery will make sure it's finalized correctly during normal shutdown.</p>
+<p>Here, the documentation does explain what <code>StreamHandler.flush()</code>, <code>FileHandler.flush()</code>, and <code>FileHandler.close()</code>. They're mostly what you'd expect, except that <code>StreamHandler.close()</code> is a no-op, meaning it's possible that final log messages to the console may get lost. From the docs:</p>
+<blockquote>
+<p>Note that the <code>close()</code> method is inherited from <code>Handler</code> and so does no output, so an explicit <code>flush()</code> call may be needed at times.</p>
+</blockquote>
+<p>If this matters to you, and you want to fix it, you need to do something like this:</p>
+<pre><code>class ClosingStreamHandler(logging.StreamHandler):
+    def close(self):
+        self.flush()
+        super().close()
+</code></pre>
+<p>And then use <code>ClosingStreamHandler()</code> instead of <code>StreamHandler()</code>.</p>
+<p><code>FileHandler</code> has no such problem.</p>
+<hr/>
+<p>The normal way to send logs to two places is to just use the root logger with two handlers, each with their own formatter.</p>
+<p>Also, even if you do want two loggers, you don't need the separate <code>console_logging_level_switch</code> and <code>file_logging_level_switch</code> maps; calling <code>Logger.debug(msg)</code> is exactly the same thing as calling <code>Logger.log(DEBUG, msg)</code>. You'll still need some way to map your custom level names <code>debug</code>, etc. to the standard names <code>DEBUG</code>, etc., but you can just do one lookup, instead of doing it once per logger (plus, if your names are just the standard names with different cast, you can cheat).</p>
+<p>This is all described pretty well in the `<a href="http://docs.python.org/3/howto/logging-cookbook.html#multiple-handlers-and-formatters" rel="noreferrer">Multiple handlers and formatters</a> section, and the rest of the logging cookbook.</p>
+<p>The only problem with the standard way of doing this is that you can't easily turn off console logging on a message-by-message basis. That's because it's not a normal thing to do. Usually, you just log by levels, and set the log level higher on the file log. </p>
+<p>But, if you want more control, you can use filters. For example, give your <code>FileHandler</code> a filter that accepts everything, and your <code>ConsoleHandler</code> a filter that requires something starting with <code>console</code>, then use the filter <code>'console' if print_screen else ''</code>. That reduces <code>WriteLog</code> to almost a one-liner.</p>
+<p>You still need the extra two lines to remove newlines—but you can even do <em>that</em> in the filter, or via an adapter, if you want. (Again, see the cookbook.) And then <code>WriteLog</code> really <em>is</em> a one-liner.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Python logging is thread safe:</p>
+<ul>
+<li><p><a href="https://stackoverflow.com/questions/2973900/is-pythons-logging-module-thread-safe">Is Python's logging module thread safe?</a></p></li>
+<li><p><a href="http://docs.python.org/2/library/logging.html#thread-safety" rel="nofollow noreferrer">http://docs.python.org/2/library/logging.html#thread-safety</a></p></li>
+</ul>
+<p>So you have no problem in the Python (library) code.</p>
+<p>The routine that you call from multiple threads (<code>WriteLog</code>) does not write to any shared state.  So you have no problem in your code.</p>
+<p>So you are OK.</p>
+</div>
+<span class="comment-copy">If you don't put lock when you want to write, your log records might mix and make an unreadable log.</span>
+<span class="comment-copy">@AliBZ - what log records?  at the logging level?  aren't they covered by the python logging service?  <a href="http://stackoverflow.com/questions/2973900/is-pythons-logging-module-thread-safe" title="is pythons logging module thread safe">stackoverflow.com/questions/2973900/…</a></span>
+<span class="comment-copy">when you use "fileLogger.info('1 2 3 4')" in two different threads, your final log could be a mix of them, something like this "1 2 1 2 3 3 4 4"</span>
+<span class="comment-copy">I faced the same problem today, you should put lock before and after logging to prevent this.</span>
+<span class="comment-copy">doesn't that directly contradict the python docs (see my answer)?  have you raised a bug?  or am i mis-understanding?</span>
+<span class="comment-copy">Thanks for the additional tips.  Does this mean all I need to do is specify names in <code>getLogger()</code> and it will work as intended?</span>
+<span class="comment-copy">and, @abarnert if I do want to continue logging to two different places (by specifying names in <code>getLogger()</code>, I will still need the globals, correct?</span>
+<span class="comment-copy">@Raskol: Well, it depends on what "intended" means, but that likely isn't what you really want. The idea behind <code>getLogger</code> is that you're supposed to use it for some kind of hierarchical log structuring; notice that the documentation for "Logger Objects" talks about "the recommended construction <code>logging.getLogger(__name__)</code> to make your logging hierarchy match your module hierarchy. You <i>can</i> subvert that to have two loggers side by side, but it's a weird thing to do.</span>
+<span class="comment-copy">@rbp: Post your separate question. (And which platform you're using, and how you're configuring <code>logging</code> and <code>gunicorn</code>.) Most likely, the problem is that <code>gunicorn</code> is a forked server, meaning you have multiple separate <i>processes</i>, so a <code>threading.RLock</code> doesn't do any good. But the greenlets could also be related.</span>
+<span class="comment-copy">@rbp: For the benefit of anyone coming by in the future who doesn't understand why that was enough to solve your problem: I assume you just subclassed your <code>Handler</code>, and overrode its <code>createLock</code> to <code>self.lock = multiprocessing.RLock()</code>,right?</span>

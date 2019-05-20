@@ -1,0 +1,321 @@
+<div class="post-text" itemprop="text">
+<p>The standard library in 3.7 can recursively convert a dataclass into a dict (example from the docs):</p>
+<pre><code>from dataclasses import dataclass, asdict
+from typing import List
+
+@dataclass
+class Point:
+     x: int
+     y: int
+
+@dataclass
+class C:
+     mylist: List[Point]
+
+p = Point(10, 20)
+assert asdict(p) == {'x': 10, 'y': 20}
+
+c = C([Point(0, 0), Point(10, 4)])
+tmp = {'mylist': [{'x': 0, 'y': 0}, {'x': 10, 'y': 4}]}
+assert asdict(c) == tmp
+</code></pre>
+<p>I am looking for a way to turn a dict back into a dataclass when there is nesting. Something like <code>C(**tmp)</code> only works if the fields of the data class are simple types and not themselves dataclasses. I am familiar with <a href="https://jsonpickle.github.io/" rel="noreferrer">jsonpickle</a>, which however comes with a prominent security warning. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Below is the CPython implementation of <code>asdict</code>
+– or specifically, the internal recursive helper function <code>_asdict_inner</code> that it uses:</p>
+<pre><code># Source: https://github.com/python/cpython/blob/master/Lib/dataclasses.py
+
+def _asdict_inner(obj, dict_factory):
+    if _is_dataclass_instance(obj):
+        result = []
+        for f in fields(obj):
+            value = _asdict_inner(getattr(obj, f.name), dict_factory)
+            result.append((f.name, value))
+        return dict_factory(result)
+    elif isinstance(obj, tuple) and hasattr(obj, '_fields'):
+        # [large block of author comments]
+        return type(obj)(*[_asdict_inner(v, dict_factory) for v in obj])
+    elif isinstance(obj, (list, tuple)):
+        # [ditto]
+        return type(obj)(_asdict_inner(v, dict_factory) for v in obj)
+    elif isinstance(obj, dict):
+        return type(obj)((_asdict_inner(k, dict_factory),
+                          _asdict_inner(v, dict_factory))
+                         for k, v in obj.items())
+    else:
+        return copy.deepcopy(obj)
+</code></pre>
+<p><code>asdict</code> simply calls the above with some assertions, and <code>dict_factory=dict</code> by default.</p>
+<blockquote>
+<p>How can this be adapted to create an output dictionary with the required type-tagging, as mentioned in the comments?</p>
+</blockquote>
+<hr/>
+<p><strong>1. Adding type information</strong></p>
+<p>My attempt involved creating a custom return wrapper inheriting from <code>dict</code>:</p>
+<pre><code>class TypeDict(dict):
+    def __init__(self, t, *args, **kwargs):
+        super(TypeDict, self).__init__(*args, **kwargs)
+
+        if not isinstance(t, type):
+            raise TypeError("t must be a type")
+
+        self._type = t
+
+    @property
+    def type(self):
+        return self._type
+</code></pre>
+<p>Looking at the original code, only the first clause needs to be modified to use this wrapper, as the other clauses only handle <em>containers</em> of <code>dataclass</code>-es:</p>
+<pre><code># only use dict for now; easy to add back later
+def _todict_inner(obj):
+    if is_dataclass_instance(obj):
+        result = []
+        for f in fields(obj):
+            value = _todict_inner(getattr(obj, f.name))
+            result.append((f.name, value))
+        return TypeDict(type(obj), result)
+
+    elif isinstance(obj, tuple) and hasattr(obj, '_fields'):
+        return type(obj)(*[_todict_inner(v) for v in obj])
+    elif isinstance(obj, (list, tuple)):
+        return type(obj)(_todict_inner(v) for v in obj)
+    elif isinstance(obj, dict):
+        return type(obj)((_todict_inner(k), _todict_inner(v))
+                         for k, v in obj.items())
+    else:
+        return copy.deepcopy(obj)
+</code></pre>
+<p>Imports:</p>
+<pre><code>from dataclasses import dataclass, fields, is_dataclass
+
+# thanks to Patrick Haugh
+from typing import *
+
+# deepcopy 
+import copy
+</code></pre>
+<p>Functions used:</p>
+<pre><code># copy of the internal function _is_dataclass_instance
+def is_dataclass_instance(obj):
+    return is_dataclass(obj) and not is_dataclass(obj.type)
+
+# the adapted version of asdict
+def todict(obj):
+    if not is_dataclass_instance(obj):
+         raise TypeError("todict() should be called on dataclass instances")
+    return _todict_inner(obj)
+</code></pre>
+<p>Tests with the example dataclasses:</p>
+<pre><code>c = C([Point(0, 0), Point(10, 4)])
+
+print(c)
+cd = todict(c)
+
+print(cd)
+# {'mylist': [{'x': 0, 'y': 0}, {'x': 10, 'y': 4}]}
+
+print(cd.type)
+# &lt;class '__main__.C'&gt;
+</code></pre>
+<p>Results are as expected.</p>
+<hr/>
+<p><strong>2. Converting back to a <code>dataclass</code></strong></p>
+<p>The recursive routine used by <code>asdict</code> can be re-used for the reverse process, with some relatively minor changes:</p>
+<pre><code>def _fromdict_inner(obj):
+    # reconstruct the dataclass using the type tag
+    if is_dataclass_dict(obj):
+        result = {}
+        for name, data in obj.items():
+            result[name] = _fromdict_inner(data)
+        return obj.type(**result)
+
+    # exactly the same as before (without the tuple clause)
+    elif isinstance(obj, (list, tuple)):
+        return type(obj)(_fromdict_inner(v) for v in obj)
+    elif isinstance(obj, dict):
+        return type(obj)((_fromdict_inner(k), _fromdict_inner(v))
+                         for k, v in obj.items())
+    else:
+        return copy.deepcopy(obj)
+</code></pre>
+<p>Functions used:</p>
+<pre><code>def is_dataclass_dict(obj):
+    return isinstance(obj, TypeDict)
+
+def fromdict(obj):
+    if not is_dataclass_dict(obj):
+        raise TypeError("fromdict() should be called on TypeDict instances")
+    return _fromdict_inner(obj)
+</code></pre>
+<p>Test:</p>
+<pre><code>c = C([Point(0, 0), Point(10, 4)])
+cd = todict(c)
+cf = fromdict(cd)
+
+print(c)
+# C(mylist=[Point(x=0, y=0), Point(x=10, y=4)])
+
+print(cf)
+# C(mylist=[Point(x=0, y=0), Point(x=10, y=4)])
+</code></pre>
+<p>Again as expected.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'm the author of <a href="https://github.com/konradhalas/dacite" rel="noreferrer"><code>dacite</code></a> - the tool that simplifies creation of data classes from dictionaries.</p>
+<p>This library has only one function <code>from_dict</code> - this is a quick example of usage:</p>
+<pre class="lang-py prettyprint-override"><code>from dataclasses import dataclass
+from dacite import from_dict
+
+@dataclass
+class User:
+    name: str
+    age: int
+    is_active: bool
+
+data = {
+    'name': 'john',
+    'age': 30,
+    'is_active': True,
+}
+
+user = from_dict(data_class=User, data=data)
+
+assert user == User(name='john', age=30, is_active=True)
+</code></pre>
+<p>Moreover <code>dacite</code> supports following features:</p>
+<ul>
+<li>nested structures</li>
+<li>(basic) types checking</li>
+<li>optional fields (i.e. typing.Optional)</li>
+<li>unions</li>
+<li>collections</li>
+<li>values casting and transformation</li>
+<li>remapping of fields names</li>
+</ul>
+<p>... and it's well tested - 100% code coverage!</p>
+<p>To install dacite, simply use pip (or pipenv):</p>
+<pre><code>$ pip install dacite
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can use <a href="https://github.com/Fatal1ty/mashumaro" rel="nofollow noreferrer">mashumaro</a> for creating dataclass object from a dict according to the scheme. Mixin from this library adds convenient <code>from_dict</code> and <code>to_dict</code> methods to dataclasses:</p>
+<pre><code>from dataclasses import dataclass
+from typing import List
+from mashumaro import DataClassDictMixin
+
+@dataclass
+class Point(DataClassDictMixin):
+     x: int
+     y: int
+
+@dataclass
+class C(DataClassDictMixin):
+     mylist: List[Point]
+
+p = Point(10, 20)
+tmp = {'x': 10, 'y': 20}
+assert p.to_dict() == tmp
+assert Point.from_dict(tmp) == p
+
+c = C([Point(0, 0), Point(10, 4)])
+tmp = {'mylist': [{'x': 0, 'y': 0}, {'x': 10, 'y': 4}]}
+assert c.to_dict() == tmp
+assert C.from_dict(tmp) == c
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If your goal is to produce <em>JSON</em> from and to <strong>existing, predefined</strong> dataclasses, then just write custom encoder and decoder hooks. Do not use <code>dataclasses.asdict()</code> here, instead record <em>in JSON</em> a (safe) reference to the original dataclass.</p>
+<p><code>jsonpickle</code> is not safe because it stores references to <em>arbitrary</em> Python objects and passes in data to their constructors. With such references I can get jsonpickle to reference internal Python data structures and create and execute functions, classes and modules at will. But that doesn't mean you can't handle such references unsafely. Just verify that you only import (not call) and then verify that the object is an actual dataclass type, before you use it.</p>
+<p>The framework can be made generic enough but still limited only to JSON-serialisable types <em>plus <code>dataclass</code>-based instances</em>:</p>
+<pre><code>import dataclasses
+import importlib
+import sys
+
+def dataclass_object_dump(ob):
+    datacls = type(ob)
+    if not dataclasses.is_dataclass(datacls):
+        raise TypeError(f"Expected dataclass instance, got '{datacls!r}' object")
+    mod = sys.modules.get(datacls.__module__)
+    if mod is None or not hasattr(mod, datacls.__qualname__):
+        raise ValueError(f"Can't resolve '{datacls!r}' reference")
+    ref = f"{datacls.__module__}.{datacls.__qualname__}"
+    fields = (f.name for f in dataclasses.fields(ob))
+    return {**{f: getattr(ob, f) for f in fields}, '__dataclass__': ref}
+
+def dataclass_object_load(d):
+    ref = d.pop('__dataclass__', None)
+    if ref is None:
+        return d
+    try:
+        modname, hasdot, qualname = ref.rpartition('.')
+        module = importlib.import_module(modname)
+        datacls = getattr(module, qualname)
+        if not dataclasses.is_dataclass(datacls) or not isinstance(datacls, type):
+            raise ValueError
+        return datacls(**d)
+    except (ModuleNotFoundError, ValueError, AttributeError, TypeError):
+        raise ValueError(f"Invalid dataclass reference {ref!r}") from None
+</code></pre>
+<p>This uses <a href="https://www.jsonrpc.org/specification_v1#a3.JSONClasshinting" rel="nofollow noreferrer">JSON-RPC-style class hints</a> to name the dataclass, and on loading this is verified to still be a data class with the same fields. No type checking is done on the values of the fields (as that's a whole different kettle of fish).</p>
+<p>Use these as the <code>default</code> and <code>object_hook</code> arguments to <code>json.dump[s]()</code> and <code>json.dump[s]()</code>:</p>
+<pre><code>&gt;&gt;&gt; print(json.dumps(c, default=dataclass_object_dump, indent=4))
+{
+    "mylist": [
+        {
+            "x": 0,
+            "y": 0,
+            "__dataclass__": "__main__.Point"
+        },
+        {
+            "x": 10,
+            "y": 4,
+            "__dataclass__": "__main__.Point"
+        }
+    ],
+    "__dataclass__": "__main__.C"
+}
+&gt;&gt;&gt; json.loads(json.dumps(c, default=dataclass_object_dump), object_hook=dataclass_object_load)
+C(mylist=[Point(x=0, y=0), Point(x=10, y=4)])
+&gt;&gt;&gt; json.loads(json.dumps(c, default=dataclass_object_dump), object_hook=dataclass_object_load) == c
+True
+</code></pre>
+<p>or create instances of the <a href="https://docs.python.org/3/library/json.html#json.JSONEncoder" rel="nofollow noreferrer"><code>JSONEncoder</code></a> and <a href="https://docs.python.org/3/library/json.html#json.JSONDecoder" rel="nofollow noreferrer"><code>JSONDecoder</code></a> classes with those same hooks.</p>
+<p>Instead of using fully qualifying module and class names, you could also use a separate registry to map permissible type names; check against the registry on encoding, and again on decoding to ensure you don't forget to register dataclasses as you develop.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>All it takes is a five-liner:</p>
+<pre><code>def dataclass_from_dict(klass, d):
+    try:
+        fieldtypes = {f.name:f.type for f in dataclasses.fields(klass)}
+        return klass(**{f:dataclass_from_dict(fieldtypes[f],d[f]) for f in d})
+    except:
+        return d # Not a dataclass field
+</code></pre>
+<p>Sample usage:</p>
+<pre><code>from dataclasses import dataclass, asdict
+
+@dataclass
+class Point:
+    x: float
+    y: float
+
+@dataclass
+class Line:
+    a: Point
+    b: Point
+
+line = Line(Point(1,2), Point(3,4))
+assert line == dataclass_from_dict(Line, asdict(line))
+</code></pre>
+<p>Full code, including to/from json, here at gist: <a href="https://gist.github.com/gatopeich/1efd3e1e4269e1e98fae9983bb914f22" rel="nofollow noreferrer">https://gist.github.com/gatopeich/1efd3e1e4269e1e98fae9983bb914f22</a></p>
+</div>
+<span class="comment-copy">The question this is marked as a duplicate of is indeed asking the same, but the answer given there does not work for this particular example. I've left a comment there and still looking for a more general answer.</span>
+<span class="comment-copy">Could you make that difference explicit here?  It looks like you may have to add an <code>elif</code> to that <code>if</code> that checks for various hints.  I'm not sure how you would generalize it to arbitrary type hints though (<code>Dict</code> and <code>Tuple</code> in addition to <code>List</code>, for example)</span>
+<span class="comment-copy"><code>asdict</code> is losing information. It would not be possible to do this in the general case.</span>
+<span class="comment-copy">Specifically, <code>asdict</code> doesn't store any information about what class the dict was produced from. Given <code>class A: x: int</code> and <code>class B: x: int</code>, should <code>{'x': 5}</code> be used to create an instance of <code>A</code> or <code>B</code>? You seem to be making the assumption that the list of attribute names uniquely defines a list, and that there is an existing mapping of names to data classes that could be used to select the correct class.</span>
+<span class="comment-copy">I would recommend you to check out this <a href="https://github.com/konradhalas/dacite#dacite" rel="nofollow noreferrer">library</a>.</span>
+<span class="comment-copy">TL;DR, +1 for the comprehensiveness for the answer.</span>
+<span class="comment-copy">+0: +1 for trying it, but -1 because it's basically a bad idea in the first place.</span>
+<span class="comment-copy">@wim I'd agree tbh - can't see it as much more than a theoretical exercise (which at least shows that <code>dataclass</code> plays well with existing object types).</span>
+<span class="comment-copy">I'm going to accept this as it's the most comprehensive answer that helps future users understand the core of the issue. I ended up with something closer to @Martijn's suggestion as I did indeed want JSON. Thank you everyone for your answers</span>

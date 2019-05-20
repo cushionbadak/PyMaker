@@ -1,0 +1,104 @@
+<div class="post-text" itemprop="text">
+<p>I'm developing packages and uploading development/testing/etc versions of my packages to a local devpi server.  </p>
+<p>In order to prevent an accidental upload to PyPi, I'm adopted the common practice of:</p>
+<pre><code>setup(...,
+      classifiers=[
+        "Programming Language :: Python",
+        "Programming Language :: Python :: 2",
+        "Programming Language :: Python :: 2.7",
+        "Private :: Do not Upload"
+     ],
+     ...)
+</code></pre>
+<p>which works great, but what about when I'm finally ready to upload the package to PyPi?</p>
+<p>I've come up with a totally ugly, but simple hack which requires that I define the classifiers as a global variable outside of the setup() call which looks like:</p>
+<pre><code>CLASSIFIERS = [
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 2",
+    "Programming Language :: Python :: 2.7"
+]
+
+
+if "--public" not in sys.argv:
+     CLASSIFIERS.append("Private :: Do Not Upload")
+else:
+     sys.argv.remove("--public")
+
+setup(...
+      classifiers=CLASSIFIERS,
+      ...)
+</code></pre>
+<p>Another, and perhaps simpler option is to merely comment out the "Private :: Do not Upload", but that doesn't seem any more professional than my hack.</p>
+<p>What I'd <em>like</em> to do is create a proper subclass of the upload command called <code>SafeUpload</code> and have it check for the <code>--public</code> cmd-line option. Perhaps, as a build may exist prior to uploading, <code>SafeBuild</code> might be a better option.</p>
+<p>Unfortunately, I'm having trouble understanding the setuptools documentation on creating custom commands.</p>
+<p>Does anyone have any idea how to implement this?  It's not clear to me if a custom command has access to the parameters passed to <code>setup()</code>, i.e. could it directly manipulate the <code>classifiers</code> passed to <code>setup()</code>, or would if it require that a user of the command follow the convention of defining of CLASSIFIERS as a global variable <em>yuck</em>?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Going backwards on your questions; while it's really broad, the topic is still constrained enough.</p>
+<p>I can tell you that the classifiers are not manipulated, but rather read from the  and then written to <code>PKG-INFO</code> file by the <code>egg_info</code> command, which in turn looks for all <code>egg_info.writers</code> entry_points which the <a href="https://github.com/pypa/setuptools/blob/master/setuptools/command/egg_info.py#L394" rel="nofollow"><code>setuptools.command.egg_info:write_pkg_info</code></a> function will do the actual writing.  As far as I can tell, trying to leverage that Classifier outside will not be a great way, however you can override <em>everything</em> and <em>anything</em> you want through <code>setuptools</code> so you can make your own <code>write_pkg_info</code> function, figure out how to <a href="https://docs.python.org/3/distutils/examples.html#reading-the-metadata" rel="nofollow">read the metadata</a> (which you can see in the main <a href="https://github.com/python/cpython/blob/master/Lib/distutils/command/upload.py#L116" rel="nofollow"><code>distutils.command.upload:upload.upload_file</code></a> method) and manipulate that further before upload_file finally reads it.  At this point you probably are thinking that manipulating and working with this system is going to be rather annoying.</p>
+<p>As I mentioned though, everything can be overridden.  You can make an upload command that take the public flag, like so:</p>
+<pre><code>from distutils.log import warn
+from distutils.command.upload import upload as orig
+# alternatively, for later versions of setuptools:
+# from setuptools.command.upload import upload as orig
+
+class upload(orig):
+    description = "customized upload command"
+
+    user_options = orig.user_options + [
+        ('public', None,
+         'make package public on pypi'),
+    ]
+
+    def initialize_options(self):
+        orig.initialize_options(self)
+        self.public = False
+
+    def run(self):
+        if not self.public:
+            warn('not public, not uploading')
+            return
+        return orig.run(self)
+</code></pre>
+<p>The accompanied <code>setup.py</code> might look something like this.</p>
+<pre><code>from setuptools import setup
+
+setup(
+    name='my_pypi_uploader',
+    version='0.0',
+    description='"safer" pypi uploader',
+    py_modules=['my_pypi_uploader'],  # assuming above file is my_py_uploader.py
+    entry_points={
+        'distutils.commands': [
+            'upload = my_pypi_uploader:upload',
+        ],
+    },
+)
+</code></pre>
+<p>Install that as a package into your environment and the upload command will be replaced by your version.  Example run:</p>
+<pre><code>$ python setup.py upload
+running upload
+not public, not uploading
+</code></pre>
+<p>Try again with the public flag</p>
+<pre><code>$ python setup.py upload --public
+running upload
+error: No dist file created in earlier command
+</code></pre>
+<p>Which is fine, since I didn't create any dist files at all.  You could of course further extend that command by rewriting the <a href="https://github.com/python/cpython/blob/master/Lib/distutils/command/upload.py#L116" rel="nofollow"><code>upload_file</code></a> method (make a copy in your code) and change the parts to do what you want in your subclass (like injecting the private classifier there), up to you.</p>
+<p>You might also be wondering why the class names are in lower case (violation of pep8), this is due to legacy stuff and how the help for a given command is generated.</p>
+<pre><code>$ python setup.py upload --help
+...
+Options for 'upload' command:
+</code></pre>
+<p>Using a "properly" named class (e.g. <code>SafeUpload</code>; remember to also update the <code>entry_point</code> in the <code>setup.py</code> to point to this new class name)</p>
+<pre><code>$ python setup.py upload --help
+...
+Options for 'SafeUpload' command:
+</code></pre>
+<p>of course if this output is the intent, the standard class naming convention can be used instead.</p>
+<p>Though to be perfectly honest, you should not specify upload at all on your production, but rather do this on your build servers as part of post-push hook, so when the project is pushed (or tagged), build is done and the file is loaded onto your private servers, and then only further manual intervention (or automatic if specific tags are pushed) will then get the package up to pypi.  However the above example should get you started in what you originally set out to do.</p>
+<p>One last thing: you <em>can</em> just change <code>self.repository</code> to your private devpi location, if the <code>--public</code> flag is not set.  You could either override this before calling the <code>orig.upload_file</code> method (through your customized version), or do it in <code>run</code>; so rather than quitting, your code could just verify that the repository url is not the public PyPI instance.  Or alternatively, manipulate the distribution metadata (i.e. the classifiers) via <code>self.distribution.metadata</code> (<code>self</code> being the <code>upload</code> instance).  You can of course create a completely new command to play with this to your hearts content (by creating a new <code>Command</code> subclass, and add a new entry_point for that).</p>
+</div>
+<span class="comment-copy">Just trying to make sure I'm understanding this clearly.  Does installing the package my_pypi_uploader into my environment override the default setuptools upload command for all packages I may be developing in that environment? I would of thought I'd have to import it or something.  I'm note sure if that's cool or scary...</span>
+<span class="comment-copy">This is exactly how the <code>entry_point</code> system works, so if the package is in the environment (i.e. <code>sys.path</code>) its entry points will be picked up and setuptools will make use of that (in fact, in recent versions of <code>setuptools</code>, the <code>upload</code> command is actually an overridden version of the <code>distutils</code> one, hence I had the alternative import in the comment). Of course this means installation of packages that provide malformed <code>distutils</code> entry_points can result in bad things happening.</span>

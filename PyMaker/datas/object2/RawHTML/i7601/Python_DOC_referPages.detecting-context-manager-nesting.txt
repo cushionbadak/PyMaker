@@ -1,0 +1,174 @@
+<div class="post-text" itemprop="text">
+<p>I've been wondering recently if there's a way to detect whether a context manager is nested.</p>
+<p>I've created Timer and TimerGroup classes:</p>
+<pre><code>class Timer:
+    def __init__(self, name="Timer"):
+        self.name = name
+        self.start_time = clock()
+
+    @staticmethod
+    def seconds_to_str(t):
+        return str(timedelta(seconds=t))
+
+    def end(self):
+        return clock() - self.start_time
+
+    def print(self, t):
+        print(("{0:&lt;" + str(line_width - 18) + "} &gt;&gt; {1}").format(self.name, self.seconds_to_str(t)))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, value, traceback):
+        self.print(self.end())
+
+
+class TimerGroup(Timer):
+    def __enter__(self):
+        print(('= ' + self.name + ' ').ljust(line_width, '='))
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        total_time = self.seconds_to_str(self.end())
+        print(" Total: {0}".format(total_time).rjust(line_width, '='))
+        print()
+</code></pre>
+<p>This code prints timings in a readable format:</p>
+<pre><code>with TimerGroup("Collecting child documents for %s context" % context_name):
+    with Timer("Collecting context features"):
+        # some code...
+    with Timer("Collecting child documents"):
+        # some code...
+
+
+= Collecting child documents for Global context ============
+Collecting context features                &gt;&gt; 0:00:00.001063
+Collecting child documents                 &gt;&gt; 0:00:10.611130
+====================================== Total: 0:00:10.612292
+</code></pre>
+<p>However, when I nest TimerGroups, it messed things up:</p>
+<pre><code>with TimerGroup("Choosing the best classifier for %s context" % context_name):
+    with Timer("Splitting datasets"):
+        # some code...
+    for cname, cparams in classifiers.items():
+        with TimerGroup("%s classifier" % cname):
+            with Timer("Training"):
+                # some code...
+            with Timer("Calculating accuracy on testing set"):
+                # some code
+
+
+= Choosing the best classifier for Global context ==========
+Splitting datasets                         &gt;&gt; 0:00:00.002054
+= Naive Bayes classifier ===================================
+Training                                   &gt;&gt; 0:00:34.184903
+Calculating accuracy on testing set        &gt;&gt; 0:05:08.481904
+====================================== Total: 0:05:42.666949
+
+====================================== Total: 0:05:42.669078
+</code></pre>
+<p>All I need is to do is to indent the nested Timers and TimerGroups somehow. Should I pass any parameters to their constructors? Or can I detect that from inside the class?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If all you need to do is adjust an indentation level based on how many nested context managers you're executing in, then have a class attribute called <code>indent_level</code> and adjust it each time you enter and exit a context manager.  Something like the following:</p>
+<pre><code>class Context:
+    indent_level = 0
+
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        print(' '*4*self.indent_level + 'Entering ' + self.name)
+        self.adjust_indent_level(1)
+        return self
+
+    def __exit__(self, *a, **k):
+        self.adjust_indent_level(-1)
+        print(' '*4*self.indent_level + 'Exiting ' + self.name)
+
+    @classmethod
+    def adjust_indent_level(cls, val):
+        cls.indent_level += val
+</code></pre>
+<p>And use it as:</p>
+<pre><code>&gt;&gt;&gt; with Context('Outer') as outer_context:
+        with Context('Inner') as inner_context:
+            print(' '*inner_context.indent_level*4 + 'In the inner context')
+
+
+Entering Outer
+    Entering Inner
+        In the inner context
+    Exiting Inner
+Exiting Outer
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>There are no special facilities to detect nested context managers, no. You'd have to handle this on your own. You could do this within your own context manager:</p>
+<pre><code>import threading
+
+
+class TimerGroup(Timer):
+    _active_group = threading.local()
+
+    def __enter__(self):
+        if getattr(TimerGroup._active_group, 'current', False):
+            raise RuntimeError("Can't nest TimerGroup context managers")
+        TimerGroup._active_group.current = self
+        print(('= ' + self.name + ' ').ljust(line_width, '='))
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        TimerGroup._active_group.current = None
+        total_time = self.seconds_to_str(self.end())
+        print(" Total: {0}".format(total_time).rjust(line_width, '='))
+        print()
+</code></pre>
+<p>You can then use the <code>TimerGroup._active_group</code> attribute elsewhere to grab the currently active group. I used a <a href="https://docs.python.org/3/library/threading.html#thread-local-data" rel="nofollow noreferrer">thread-local object</a> to ensure that this can be used across multiple threads of execution.</p>
+<p>Alternatively, you could make that a stack counter and just increment and decrement in nested <code>__enter__</code> calls, or a stack <em>list</em> and push <code>self</code> onto that stack, popping it again when you <code>__exit__</code>:</p>
+<pre><code>import threading
+
+
+class TimerGroup(Timer):
+    _active_group = threading.local()
+
+    def __enter__(self):
+        if not hasattr(TimerGroup._active_group, 'current'):
+            TimerGroup._active_group.current = []
+        stack = TimerGroup._active_group.current
+        if stack:
+            # nested context manager.
+            # do something with stack[-1] or stack[0]
+        TimerGroup._active_group.current.append(self)
+
+        print(('= ' + self.name + ' ').ljust(line_width, '='))
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        last = TimerGroup._active_group.current.pop()
+        assert last == self, "Context managers being exited out of order"
+        total_time = self.seconds_to_str(self.end())
+        print(" Total: {0}".format(total_time).rjust(line_width, '='))
+        print()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://www.python.org/dev/peps/pep-0020/#id3" rel="nofollow noreferrer"><code>import this</code></a>:</p>
+<blockquote>
+<p>Explicit is better than implicit</p>
+</blockquote>
+<p>A cleaner design would explicitly allow to specify a group:</p>
+<pre><code>with TimerGroup('Doing big task') as big_task_tg:
+    with Timer('Foo', big_task_tg):
+      foo_result = foo()
+    with Timer('Bar', big_task_tg):
+      bar(baz(foo_result))
+</code></pre>
+<p>On the other hand, you can always use <a href="https://docs.python.org/3/library/traceback.html#traceback.extract_stack" rel="nofollow noreferrer"><code>traceback.extract_stack</code></a> and look for invocations of a particular function upstream. It is very useful for logging and error reporting, and can be moderately useful to ensure that particular functions are only invoked in a certain context. But it tends to create dependencies that are very hard to track. </p>
+<p>I would avoid it for grouping timers, though you can try. If you badly need automatic grouping, @Martijn-Pieters's approach is far superior.</p>
+</div>
+<span class="comment-copy">You can change <code>TimerGroup</code> to accept another timer group as a "parent timer group", and in each <code>TimeGroup</code> instance, store the indentation (Being 0 if no parent, and <code>parent.indentation + 1</code> if there is one)</span>
+<span class="comment-copy">Your code seems to work only for a single timer class. However, I have <code>Timer</code> and <code>TimerGroup(Timer)</code> here, and indent counter seems to be created for each independently. Is there a way to create a field that is shared among all classes in the hierarchy?  My idea was to modify<code>Timer.indent_level</code> in the <code>adjust_indent_level()</code> method and call it only inside TimerGroup's <code>__enter__</code> and <code>__exit__</code> methods.</span>
+<span class="comment-copy">If you're always single-threaded, this will work. For multi-threaded approach, see Martijn-Pieters's answer for the use of <code>threading.local</code>.</span>
+<span class="comment-copy">It's natural to make groups nestable, too, and make <code>_active_group</code> a <code>list</code>, that is, a stack.</span>
+<span class="comment-copy">Your idea is pretty good for basic usage, however I need sometimes to call timers from different methods (one method calling another, and using Timers that need to be nested). So @Billy's answer is more appropriate for my problem, I think.</span>

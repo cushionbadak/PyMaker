@@ -1,0 +1,205 @@
+<div class="post-text" itemprop="text">
+<p>I have a few model inheritance levels in Django:</p>
+<pre><code>class WorkAttachment(models.Model):
+    """ Abstract class that holds all fields that are required in each attachment """
+    work            = models.ForeignKey(Work)
+    added           = models.DateTimeField(default=datetime.datetime.now)
+    views           = models.IntegerField(default=0)
+
+    class Meta:
+        abstract = True
+
+
+class WorkAttachmentFileBased(WorkAttachment):
+    """ Another base class, but for file based attachments """
+    description     = models.CharField(max_length=500, blank=True)
+    size            = models.IntegerField(verbose_name=_('size in bytes'))
+
+    class Meta:
+        abstract = True
+
+
+class WorkAttachmentPicture(WorkAttachmentFileBased):
+    """ Picture attached to work """
+    image           = models.ImageField(upload_to='works/images', width_field='width', height_field='height')
+    width           = models.IntegerField()
+    height          = models.IntegerField()
+</code></pre>
+<p>There are many different models inherited from <code>WorkAttachmentFileBased</code> and <code>WorkAttachment</code>. I want to create a signal, which would update an <code>attachment_count</code> field for parent work, when attachment is created. It would be logical, to think that signal made for parent sender (<code>WorkAttachment</code>) would run for all inherited models too, but it does not. Here is my code:</p>
+<pre><code>@receiver(post_save, sender=WorkAttachment, dispatch_uid="att_post_save")
+def update_attachment_count_on_save(sender, instance, **kwargs):
+    """ Update file count for work when attachment was saved."""
+    instance.work.attachment_count += 1
+    instance.work.save()
+</code></pre>
+<p>Is there a way to make this signal work for all models inherited from <code>WorkAttachment</code>?</p>
+<p>Python 2.7, Django 1.4 pre-alpha</p>
+<p>P.S. I've tried <a href="http://groups.google.com/group/django-users/browse_thread/thread/13fbbda47224888d" rel="noreferrer">one of the solutions I found on the net</a>, but it did not work for me.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You could try something like:</p>
+<pre><code>model_classes = [WorkAttachment, WorkAttachmentFileBased, WorkAttachmentPicture, ...]
+
+def update_attachment_count_on_save(sender, instance, **kwargs):
+    instance.work.attachment_count += 1
+    instance.work.save()
+
+for model_class in model_classes:
+    post_save.connect(update_attachment_count_on_save, 
+                      sender=model_class, 
+                      dispatch_uid="att_post_save_"+model_class.__name__)
+</code></pre>
+<p>(Disclaimer: I have not tested the above)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You could register the connection handler without <code>sender</code> specified. And filter the needed models inside it.</p>
+<pre><code>from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+
+@receiver(post_save)
+def my_handler(sender, **kwargs):
+    # Returns false if 'sender' is NOT a subclass of AbstractModel
+    if not issubclass(sender, AbstractModel):
+       return
+    ...
+</code></pre>
+<p>Ref: <a href="https://groups.google.com/d/msg/django-users/E_u9pHIkiI0/YgzA1p8XaSMJ">https://groups.google.com/d/msg/django-users/E_u9pHIkiI0/YgzA1p8XaSMJ</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The simplest solution is to not restrict on the <code>sender</code>, but to check in the signal handler whether the respective instance is a subclass:</p>
+<pre><code>@receiver(post_save)
+def update_attachment_count_on_save(sender, instance, **kwargs):
+    if isinstance(instance, WorkAttachment):
+        ...
+</code></pre>
+<p>However, this may incur a significant performance overhead as <em>every</em> time <em>any</em> model is saved, the above function is called.</p>
+<p>I think I've found the most Django-way of doing this: Recent versions of Django suggest to connect signal handlers in a file called <code>signals.py</code>. Here's the necessary wiring code:</p>
+<p><strong>your_app/__init__.py:</strong></p>
+<pre><code>default_app_config = 'your_app.apps.YourAppConfig'
+</code></pre>
+<p><strong>your_app/apps.py:</strong></p>
+<pre><code>import django.apps
+
+class YourAppConfig(django.apps.AppConfig):
+    name = 'your_app'
+    def ready(self):
+        import your_app.signals
+</code></pre>
+<p><strong>your_app/signals.py:</strong></p>
+<pre><code>def get_subclasses(cls):
+    result = [cls]
+    classes_to_inspect = [cls]
+    while classes_to_inspect:
+        class_to_inspect = classes_to_inspect.pop()
+        for subclass in class_to_inspect.__subclasses__():
+            if subclass not in result:
+                result.append(subclass)
+                classes_to_inspect.append(subclass)
+    return result
+
+def update_attachment_count_on_save(sender, instance, **kwargs):
+    instance.work.attachment_count += 1
+    instance.work.save()
+
+for subclass in get_subclasses(WorkAttachment):
+    post_save.connect(update_attachment_count_on_save, subclass)
+</code></pre>
+<p>I <em>think</em> this works for all subclasses, because they will all be loaded by the time <code>YourAppConfig.ready</code> is called (and thus <code>signals</code> is imported).</p>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>post_save.connect(my_handler, ParentClass)
+# connect all subclasses of base content item too
+for subclass in ParentClass.__subclasses__():
+    post_save.connect(my_handler, subclass)
+</code></pre>
+<p>have a nice day!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Michael Herrmann's solution is definitively the most Django-way of doing this.
+And yes it works for all subclasses as they are loaded at the ready() call.</p>
+<p>I would like to contribute with the documentation references : </p>
+<blockquote>
+<p>In practice, signal handlers are usually defined in a signals submodule of the application they relate to. Signal receivers are connected in the ready() method of your application configuration class. If you’re using the receiver() decorator, simply import the signals submodule inside ready().</p>
+</blockquote>
+<p><a href="https://docs.djangoproject.com/en/dev/topics/signals/#connecting-receiver-functions" rel="nofollow">https://docs.djangoproject.com/en/dev/topics/signals/#connecting-receiver-functions</a></p>
+<p>And add a warning :</p>
+<blockquote>
+<p>The ready() method may be executed more than once during testing, so you may want to guard your signals from duplication, especially if you’re planning to send them within tests.</p>
+</blockquote>
+<p><a href="https://docs.djangoproject.com/en/dev/topics/signals/#connecting-receiver-functions" rel="nofollow">https://docs.djangoproject.com/en/dev/topics/signals/#connecting-receiver-functions</a></p>
+<p>So you might want to prevent duplicate signals with a dispatch_uid parameter on the connect function.</p>
+<pre><code>post_save.connect(my_callback, dispatch_uid="my_unique_identifier")
+</code></pre>
+<p>In this context I'll do : </p>
+<pre><code>for subclass in get_subclasses(WorkAttachment):
+    post_save.connect(update_attachment_count_on_save, subclass, dispatch_uid=subclass.__name__)
+</code></pre>
+<p><a href="https://docs.djangoproject.com/en/dev/topics/signals/#preventing-duplicate-signals" rel="nofollow">https://docs.djangoproject.com/en/dev/topics/signals/#preventing-duplicate-signals</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This solution resolves the problem when not all modules imported into memory.  </p>
+<pre><code>def inherited_receiver(signal, sender, **kwargs):
+    """
+    Decorator connect receivers and all receiver's subclasses to signals.
+
+        @inherited_receiver(post_save, sender=MyModel)
+        def signal_receiver(sender, **kwargs):
+            ...
+
+    """
+    parent_cls = sender
+
+    def wrapper(func):
+        def childs_receiver(sender, **kw):
+            """
+            the receiver detect that func will execute for child 
+            (and same parent) classes only.
+            """
+            child_cls = sender
+            if issubclass(child_cls, parent_cls):
+                func(sender=child_cls, **kw)
+
+        signal.connect(childs_receiver, **kwargs)
+        return childs_receiver
+    return wrapper
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>It's also possible to use content types to discover subclasses - assuming you have the base class and subclasses packaged in the same app. Something like this would work:</p>
+<pre><code>from django.contrib.contenttypes.models import ContentType
+content_types = ContentType.objects.filter(app_label="your_app")
+for content_type in content_types:
+    model = content_type.model_class()
+    post_save.connect(update_attachment_count_on_save, sender=model)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I just did this using python's (relatively) new <a href="https://docs.python.org/3/reference/datamodel.html#customizing-class-creation" rel="nofollow noreferrer"><code>__init_subclass__</code> method</a>:</p>
+<pre><code>from django.db import models
+
+def perform_on_save(*args, **kw):
+    print("Doing something important after saving.")
+
+class ParentClass(models.Model):
+    class Meta:
+        abstract = True
+
+    @classmethod
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        models.signals.post_save.connect(perform_on_save, sender=cls)
+
+class MySubclass(ParentClass):
+    pass  # signal automatically gets connected.
+</code></pre>
+<p>This requires django 2.1 and python 3.6 or better. Note that the <code>@classmethod</code> line seems to be required when working with the django model and associated metaclass even though it's not required according to the official python docs.</p>
+</div>
+<span class="comment-copy">Solution link is broken</span>
+<span class="comment-copy">I've found <a href="http://web.archive.org/web/20120715042306/http://codeblogging.net/blogs/1/14" rel="nofollow noreferrer">the solution page in web archives</a>. There's one drawback of the solution - you should declare signal after all subclasses, otherwise it won't find them.</span>
+<span class="comment-copy">Just FYI, you can find blog post by @SilverLight at: <a href="https://web.archive.org/web/20120715042306/http://codeblogging.net/blogs/1/14" rel="nofollow noreferrer">web.archive.org/web/20120715042306/http://codeblogging.net/…</a></span>
+<span class="comment-copy">This works but has a slight drawback in that the receiver function gets called for every model that calls <code>save()</code>.</span>
+<span class="comment-copy">good answer. Note that <code>result</code> in <code>get_subclassed</code> contains the parent class, which matches this question. If your parent class is an abstract Model, you would want <code>result</code> to be an empty list initially.</span>
+<span class="comment-copy">You need to make sure this is run after all possible subclasses have been defined or else they'll get skipped (though, I haven't tested that assertion, I think that's what would happen).</span>
+<span class="comment-copy">this is built on the <a href="http://stackoverflow.com/a/17173716/433570">stackoverflow.com/a/17173716/433570</a> and without the defects which SilverLight mentioned in the accepted answer.</span>
+<span class="comment-copy">It's <code>__init_subclass__</code>.</span>

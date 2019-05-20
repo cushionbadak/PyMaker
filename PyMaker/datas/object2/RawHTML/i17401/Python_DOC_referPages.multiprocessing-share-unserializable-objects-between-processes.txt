@@ -1,0 +1,169 @@
+<div class="post-text" itemprop="text">
+<p>There are three questions as possible duplicates (but too specific):  </p>
+<ul>
+<li><a href="https://stackoverflow.com/questions/19468885/how-to-properly-set-up-multiprocessing-proxy-objects-for-objects-that-already-ex">How to properly set up multiprocessing proxy objects for objects that already exist</a></li>
+<li><a href="https://stackoverflow.com/questions/15764035/share-object-with-process-multiprocess">Share object with process (multiprocess)</a></li>
+<li><a href="https://stackoverflow.com/questions/21960514/can-i-use-a-processpoolexecutor-from-within-a-future">Can I use a ProcessPoolExecutor from within a Future?</a></li>
+</ul>
+<p>By answering this question all three other questions can be answered.
+Hopefully I make myself clear:</p>
+<p>Once I created an object in some process created by multiprocessing:</p>
+<ol>
+<li>How do I pass a <strong>reference</strong> to that object to an other process?</li>
+<li>(not so important) How do I make sure that this process does not die while I hold a reference?</li>
+</ol>
+<p><strong>Example 1 (solved)</strong></p>
+<pre><code>from concurrent.futures import *
+
+def f(v):
+    return lambda: v * v
+
+if __name__ == '__main__':
+    with ThreadPoolExecutor(1) as e: # works with ThreadPoolExecutor
+        l = list(e.map(f, [1,2,3,4]))
+    print([g() for g in l]) # [1, 4, 9, 16]
+</code></pre>
+<p><strong>Example 2</strong></p>
+<p>Suppose <code>f</code> returns an object with mutable state. This identical object should be accessible from other processes. </p>
+<p><strong>Example 3</strong></p>
+<p>I have an object which has an open file and a lock - how do I grant access to other processes?</p>
+<p><strong>Reminder</strong></p>
+<p>I do not want this specific error to not appear. Or a solution to this specific usecase. The solution should be general enough to just share unmovable objects between processes. The objects can potentially be created in any process. A solution that makes all objects movable and preserves identity can be good, too.</p>
+<p>Any hints are welcome, any partial solution or code fragments that point at how to implement a solution are worth something. So we can create a solution together.</p>
+<p>Here is an <strong>attempt</strong> to solve this but without multiprocessing: <a href="https://github.com/niccokunzmann/pynet/blob/master/documentation/done/tools.rst" rel="nofollow noreferrer">https://github.com/niccokunzmann/pynet/blob/master/documentation/done/tools.rst</a></p>
+<p><strong>Questions</strong></p>
+<blockquote>
+<p>What you want the other processes to do with the references?</p>
+</blockquote>
+<p>The references can be passed to any other process created with multiprocessing(duplicate 3). One can access attributes, call the reference. Accessed attibutes may or may not be proxies.</p>
+<blockquote>
+<p>What's the problem with just using a proxy?</p>
+</blockquote>
+<p>Maybe there is no problem but a challenge. My impression was that a proxy has a manager and that a manager has its own process and so the unserializable object must be serialized and transfered (partially solved with StacklessPython/fork).
+Also there exist proxies for special objects - it is hard but not impossible to build a proxy for all objects (solvable).</p>
+<p><strong>Solution? - Proxy + Manager?</strong></p>
+<p>Eric Urban showed that serialization is not the problem. The real challenge is in Example2&amp;3: the synchronization of state. My idea of a solution would be to create a special proxy class for a manager. This proxy class</p>
+<ol>
+<li>takes a constuctor for unserializable objects</li>
+<li>takes a serializable object and transfers it to the manager process.</li>
+<li>(problem) according to 1. the unserializable object must be created in the manager process.</li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<p>Most of the time it's not really desirable to pass the reference of an existing object to another process. Instead you create your class you want to share between processes:</p>
+<pre><code>class MySharedClass:
+    # stuff...
+</code></pre>
+<p>Then you make a proxy manager like this:</p>
+<pre><code>import multiprocessing.managers as m
+class MyManager(m.BaseManager):
+    pass # Pass is really enough. Nothing needs to be done here.
+</code></pre>
+<p>Then you register your class on that Manager, like this:</p>
+<pre><code>MyManager.register("MySharedClass", MySharedClass)
+</code></pre>
+<p>Then once the manager is instanciated and started, with <code>manager.start()</code> you can create shared instances of your class with <code>manager.MySharedClass</code>. This should work for all needs. The returned proxy works exactly like the original objects, except for some exceptions described in the <a href="http://docs.python.org/3/library/multiprocessing.html#proxy-objects">documentation</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Before reading this answer, please note that the solution explained in it is terrible. Please note the warning at the end of the answer.</p>
+<p>I found a way to share the state of an object through <code>multiprocessing.Array</code>.
+So I made this class that transparently shares it's state through all processes:</p>
+<pre><code>import multiprocessing as m
+import pickle
+
+class Store:
+    pass
+
+class Shareable:
+    def __init__(self, size = 2**10):
+        object.__setattr__(self, 'store', m.Array('B', size))
+        o = Store() # This object will hold all shared values
+        s = pickle.dumps(o)
+        store(object.__getattribute__(self, 'store'), s)
+
+    def __getattr__(self, name):
+        s = load(object.__getattribute__(self, 'store'))
+        o = pickle.loads(s)
+        return getattr(o, name)
+
+    def __setattr__(self, name, value):
+        s = load(object.__getattribute__(self, 'store'))
+        o = pickle.loads(s)
+        setattr(o, name, value)
+        s = pickle.dumps(o)
+        store(object.__getattribute__(self, 'store'), s)
+
+def store(arr, s):
+    for i, ch in enumerate(s):
+        arr[i] = ch
+
+def load(arr):
+    l = arr[:]
+    return bytes(arr)
+</code></pre>
+<p>You can pass instances of this class (and it's subclasses) to any other process and it will synchronize it's state through all processes.
+This was tested with this code:</p>
+<pre><code>class Foo(Shareable):
+    def __init__(self):
+        super().__init__()
+        self.f = 1
+
+    def foo(self):
+        self.f += 1
+
+def f(s):
+    s.f += 1
+
+if __name__ == '__main__':
+    import multiprocessing as m
+    import time
+    s = Foo()
+    print(s.f)
+    p = m.Process(target=f, args=(s,))
+    p.start()
+    time.sleep(1)
+    print(s.f)
+</code></pre>
+<p>The "magic" of this class is that it stores all of it attributes in another instance of the class <code>Store</code>. This class isn't very special. It's just some class that can have arbitrary attributes. (A dict would have done as well.)</p>
+<p>However, this class has some really nasty quirks. I found two.</p>
+<p>The first quirk is that you have to specify how much space the <code>Store</code> instance will take at most. This is because <code>multiprocessing.Array</code> has a static size. So the object that can be pickled in it can only be as large as the array.</p>
+<p>The second quirk is that you can't use this class with ProcessPoolExecutors or simple Pools. If you try to do this, you get an error:</p>
+<pre><code>&gt;&gt;&gt; s = Foo()
+&gt;&gt;&gt; with ProcessPoolExecutor(1) as e:
+...     e.submit(f, args=(s,))
+... 
+&lt;Future at 0xb70fe20c state=running&gt;
+Traceback (most recent call last):
+&lt;omitted&gt;
+RuntimeError: SynchronizedArray objects should only be shared between processes through inheritance
+</code></pre>
+<p><strong>warning</strong><br/>
+You should probably not use this approach, as it uses an uncontrollable amount of memory, is overly complicated compared to using a proxy (see my other answer) and might crash in spectacular ways.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Just use stackless python. You can serialize almost anything with <code>pickle</code>, including functions. Here I serialize and deserialize a <code>lambda</code> using the <code>pickle</code> module. This is similar to what you are trying to do in your example.</p>
+<p>Here is the download link for Stackless Python <a href="http://www.stackless.com/wiki/Download" rel="nofollow">http://www.stackless.com/wiki/Download</a></p>
+<pre><code>Python 2.7.5 Stackless 3.1b3 060516 (default, Sep 23 2013, 20:17:03) 
+[GCC 4.6.3] on linux2
+Type "help", "copyright", "credits" or "license" for more information.
+&gt;&gt;&gt; f = 5
+&gt;&gt;&gt; g = lambda : f * f
+&gt;&gt;&gt; g()
+25
+&gt;&gt;&gt; import pickle
+&gt;&gt;&gt; p = pickle.dumps(g)
+&gt;&gt;&gt; m = pickle.loads(p)
+&gt;&gt;&gt; m()
+25
+&gt;&gt;&gt; 
+</code></pre>
+</div>
+<span class="comment-copy">The question should be edited to explain what you want the other processes to do with the references.  Only pass them back to the original process?</span>
+<span class="comment-copy">Edited it. Tell me if this does not answer the qustion, thanks.</span>
+<span class="comment-copy">What's the problem with just using a proxy?</span>
+<span class="comment-copy">I edited the question. Thanks for your answer, very insightful.</span>
+<span class="comment-copy">So what I want to say with my last post is that I don't see any example where it is really better to transfer an object to the manager instead of creating it there in the first place.</span>
+<span class="comment-copy">This is great! I tested it and it works quite well. <a href="http://codepad.org/zW2LU6XV" rel="nofollow noreferrer">codepad.org/zW2LU6XV</a> There are still concurrency issues. But these are ok.</span>
+<span class="comment-copy">This doesn't solve the problem though. Ive used this code as a template for a MySharedClass which has a (mock) database cursor. If i try to return it in a MySharedClass method, I get the Unserializable Message error.</span>
+<span class="comment-copy">@sinwav As I understand it, sharing a databse cursor between processes is just not possible. No matter what kind of transfer mechanism you use between processes, at some point the object needs to be serialized in some way. Python uses pickling for that purpose. If you can't pickle something there's a reason for it. With database cursors the problem is, that the cursor is only valid on the connection it was created on, but that connection is only open in one process. This concludes that a database cursor is only valid in the process that created it. No sharing possible here.</span>
+<span class="comment-copy">+1 This is nice but 1. does is preserve identity m is g and 2. if I serialize the function and deserialize it in an other process, will it be called in the original process? - no. But this is definitively a nice solution if you need to save the function if the process is shut down.</span>

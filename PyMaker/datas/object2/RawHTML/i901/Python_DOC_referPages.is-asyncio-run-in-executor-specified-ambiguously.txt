@@ -1,0 +1,53 @@
+<div class="post-text" itemprop="text">
+<p>I have a server application and when requested by the client I schedule some work, like</p>
+<pre><code>def work():
+    time.sleep(5)
+
+fut = asyncio.get_event_loop().run_in_executor(None, work)
+</code></pre>
+<p>I <code>await fut</code> later when it is requested explicitly. My use case requires that <code>run_in_executor</code> submit the <code>work</code> function immediately, and that behaves as expected in my environment (Ubuntu 16.04, Python 3.7.1).</p>
+<p>Since my application depends on this behavior I wanted to verify that it is not something likely to change, so I checked several resources:</p>
+<ol>
+<li>The <a href="https://github.com/python/cpython/blob/2cf1ddaff4c869780d9e796b21ef3e506f8ad321/Doc/library/asyncio-eventloop.rst#executing-code-in-thread-or-process-pools" rel="noreferrer">documentation</a> seems kind of vague. <em>awaitable</em> seems like it may apply to the method or the return value - though the body of the text does say it returns an <code>asyncio.Future</code> explicitly.</li>
+<li><a href="https://www.python.org/dev/peps/pep-3156/#thread-interaction" rel="noreferrer">PEP 3156</a> that specifies asyncio - here it says nothing close to <code>run_in_executor</code> being a coroutine.</li>
+<li>In a few issues whether <code>run_in_executor</code> is a function that returns an awaitable or a coroutine itself seems to be considered an implementation detail. See <a href="https://bugs.python.org/issue25675" rel="noreferrer">25675</a> and <a href="https://bugs.python.org/issue32327" rel="noreferrer">32327</a>.</li>
+<li><a href="https://github.com/python/cpython/blob/2cf1ddaff4c869780d9e796b21ef3e506f8ad321/Lib/asyncio/events.py#L281" rel="noreferrer"><code>AbstractEventLoop.run_in_executor</code></a> is specified as a coroutine, but the implementation in <a href="https://github.com/python/cpython/blob/2cf1ddaff4c869780d9e796b21ef3e506f8ad321/Lib/asyncio/base_events.py#L746" rel="noreferrer"><code>BaseEventLoop.run_in_executor</code></a> is a plain function.</li>
+</ol>
+<p>1 and 2 mostly seem to indicate that the current behavior is correct, but 3 and 4 are concerning. This seems like a very important part of the interface because if the function itself is a coroutine then it will not begin executing (therefore will not schedule the work) until it is awaited.</p>
+<p>Is it safe to rely on the current behavior? If so, is it reasonable to change the interface of <code>AbstractEventLoop.run_in_executor</code> to a plain function instead of a coroutine?</p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>My use case requires that <code>run_in_executor</code> submit the work function immediately, and that behaves as expected in my environment</p>
+</blockquote>
+<p>The current behavior is <strong>not</strong> guaranteed by the <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.run_in_executor" rel="nofollow noreferrer">documentation</a>, which only specifies that the function <em>arranges</em> for <code>func</code> to be called, and that it returns an <em>awaitable</em>. If it were implemented with a coroutine, it would not submit until run by the event loop.</p>
+<p>However, this behavior was present since <a href="https://github.com/python/asyncio/commit/ad2c49f5c99e5088e24ef94797977fa523e54ff6#diff-3c0ebae4c5e02876fbed6851e2075d60R374" rel="nofollow noreferrer">the beginning</a> and it is extremely unlikely to change in the future. Delaying submitting, though technically allowed by the docs, would break many real-world asyncio applications and constitute a serious backwards-incompatible change.</p>
+<p>If you wanted to ensure that the task starts without depending on undocumented behavior, you could create your own function equivalent to <code>run_in_executor</code>. It really <a href="https://github.com/python/cpython/blob/master/Lib/asyncio/base_events.py#L746" rel="nofollow noreferrer">boils down</a> to combining <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Executor.submit" rel="nofollow noreferrer"><code>executor.submit</code></a> and <a href="https://docs.python.org/3/library/asyncio-future.html#asyncio.wrap_future" rel="nofollow noreferrer"><code>asyncio.wrap_future</code></a>. Without frills, it could be as simple as:</p>
+<pre><code>def my_run_in_executor(executor, f, *args):
+    return asyncio.wrap_future(executor.submit(f, *args))
+</code></pre>
+<p>Because <code>executor.submit</code> is called directly in the function, this version guarantees that the worker function is started without waiting for the event loop to run.</p>
+<p><a href="https://www.python.org/dev/peps/pep-3156/" rel="nofollow noreferrer">PEP 3156</a> explicitly states that <code>run_in_executor</code> is "equivalent to <code>wrap_future(executor.submit(callback, *args))</code>", thus providing the needed guarantee - but the PEP is not the official documentation, and the final implementation and specification often diverge from the initial PEP.</p>
+<p>If one insisted on sticking to the documented interface of <code>run_in_executor</code>, it is also possible to use explicit synchronization to force the coroutine to wait for the worker to start:</p>
+<pre><code>async def run_now(f, *args):
+    loop = asyncio.get_event_loop()
+    started = asyncio.Event()
+    def wrapped_f():
+        loop.call_soon_threadsafe(started.set)
+        return f(*args)
+    fut = loop.run_in_executor(None, wrapped_f)
+    await started.wait()
+    return fut
+
+fut = await run_now(work)
+# here the worker has started, but not (necessarily) finished
+result = await fut
+# here the worker has finished and we have its return value
+</code></pre>
+<p>This approach introduces unnecessary implementation and interface complexity, particularly jarring being the need to use <code>await</code> to obtain a <em>future</em>, which runs counter to how asyncio normally works. <code>run_now</code> is only included for completeness and I would not recommend using it in production.</p>
+</div>
+<span class="comment-copy">A simple way to resolve questions like "Is it guaranteed that this API will work this way on all platforms?" is to create unit tests and run them on all your target platforms.  Then you don't have to wonder, you will know for sure.</span>
+<span class="comment-copy">@JohnZwinck: Unit tests don't give guarantees.</span>
+<span class="comment-copy">@JohnZwinck, that's a good reminder that as long as the project has unit tests that run on every target platform/version then at least that helps reduce risk of a breaking change going unnoticed.</span>
+<span class="comment-copy">Thanks. I have lodged this as <a href="https://bugs.python.org/issue35792" rel="nofollow noreferrer">bpo-35792</a> and for now will call <code>asyncio.wrap_future</code> directly as you suggested.</span>
+<span class="comment-copy">@ChrisHunt Thanks, I had a mind to do the same. Note that "will not actually be scheduled until the coroutine is <b>awaited</b>" is perhaps a bit too strong - one doesn't need to await a coroutine, but only schedule it and wait for it to start running. But it doesn't affect the point of the bug report.</span>

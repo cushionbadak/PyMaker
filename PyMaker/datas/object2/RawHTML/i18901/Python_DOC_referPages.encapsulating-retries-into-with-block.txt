@@ -1,0 +1,147 @@
+<div class="post-text" itemprop="text">
+<p>I'm looking to encapsulate logic for database transactions into a <code>with</code> block; wrapping the code in a transaction and handling various exceptions (locking issues). This is simple enough, however I'd like to also have the block encapsulate the retrying of the code block following certain exceptions. I can't see a way to package this up neatly into the context manager.</p>
+<p><em>Is it possible to repeat the code within a <code>with</code> statement?</em></p>
+<p>I'd like to use it as simply as this, which is really neat.</p>
+<pre><code>def do_work():
+    ...
+    # This is ideal!
+    with transaction(retries=3):
+        # Atomic DB statements
+        ...
+    ...
+</code></pre>
+<p>I'm currently handling this with a decorator, but I'd prefer to offer the context manager (or in fact both), so I can choose to wrap a few lines of code in the <code>with</code> block instead of an inline function wrapped in a decorator, which is what I do at the moment:</p>
+<pre><code>def do_work():
+    ...
+    # This is not ideal!
+    @transaction(retries=3)
+    def _perform_in_transaction():
+        # Atomic DB statements
+        ...
+    _perform_in_transaction()
+    ...
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>Is it possible to repeat the code within a <code>with</code> statement?</p>
+</blockquote>
+<p><a href="http://mail.python.org/pipermail/python-ideas/2013-May/020633.html" rel="noreferrer">No.</a></p>
+<p>As pointed out earlier in that mailing list thread, you can reduce a bit of duplication by making the decorator call the passed function:</p>
+<pre><code>def do_work():
+    ...
+    # This is not ideal!
+    @transaction(retries=3)
+    def _perform_in_transaction():
+        # Atomic DB statements
+        ...
+    # called implicitly
+    ...
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The way that occurs to me to do this is just to implement a standard database transaction <a href="http://docs.python.org/3/library/stdtypes.html#context-manager-types" rel="noreferrer">context manager</a>, but allow it to take a <code>retries</code> argument in the constructor. Then I'd just wrap that up in your method implementations. Something like this:</p>
+<pre><code>class transaction(object):
+    def __init__(self, retries=0):
+        self.retries = retries
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc_val, traceback):
+        pass
+
+    # Implementation...
+    def execute(self, query):
+        err = None
+        for _ in range(self.retries):
+            try:
+                return self._cursor.execute(query)
+            except Exception as e:
+                err = e # probably ought to save all errors, but hey
+        raise err
+
+with transaction(retries=3) as cursor:
+    cursor.execute('BLAH')
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>As decorators are just functions themselves, you could do the following:</p>
+<pre><code>with transaction(_perform_in_transaction, retries=3) as _perf:
+    _perf()
+</code></pre>
+<p>For the details, you'd need to implement <code>transaction()</code> as a factory method that returns an object with <code>__callable__()</code> set to call the original method and repeat it up to <code>retries</code> number of times on failure; <code>__enter__()</code> and <code>__exit__()</code> would be defined as normal for database transaction context managers.</p>
+<p>You could alternatively set up <code>transaction()</code> such that it itself executes the passed method up to <code>retries</code> number of times, which would probably require about the same amount of work as implementing the context manager but would mean actual usage would be reduced to just <code>transaction(_perform_in_transaction, retries=3)</code> (which is, in fact, equivalent to the decorator example delnan provided).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>While I agree it can't be done with a context manager... it can be done with <em>two</em> context managers!</p>
+<p>The result is a little awkward, and I am not sure whether I approve of my own code yet, but this is what it looks like as the client:</p>
+<pre><code>with RetryManager(retries=3) as rm:
+    while rm:
+        with rm.protect:
+            print("Attempt #%d of %d" % (rm.attempt_count, rm.max_retries))
+             # Atomic DB statements
+</code></pre>
+<p>There is an explicit <code>while</code> loop still, and not one, but two, <code>with</code> statements, which leaves a little too much opportunity for mistakes for my liking.</p>
+<p>Here's the code:</p>
+<pre><code>class RetryManager(object):
+    """ Context manager that counts attempts to run statements without
+        exceptions being raised.
+        - returns True when there should be more attempts
+    """
+
+    class _RetryProtector(object):
+        """ Context manager that only raises exceptions if its parent
+            RetryManager has given up."""
+        def __init__(self, retry_manager):
+            self._retry_manager = retry_manager
+
+        def __enter__(self):
+            self._retry_manager._note_try()
+            return self
+
+        def __exit__(self, exc_type, exc_val, traceback):
+            if exc_type is None:
+                self._retry_manager._note_success()
+            else:
+                # This would be a good place to implement sleep between
+                # retries.
+                pass
+
+            # Suppress exception if the retry manager is still alive.
+            return self._retry_manager.is_still_trying()
+
+    def __init__(self, retries=1):
+
+        self.max_retries = retries
+        self.attempt_count = 0 # Note: 1-based.
+        self._success = False
+
+        self.protect = RetryManager._RetryProtector(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, traceback):
+        pass
+
+    def _note_try(self):
+        self.attempt_count += 1
+
+    def _note_success(self):
+        self._success = True
+
+    def is_still_trying(self):
+        return not self._success and self.attempt_count &lt; self.max_retries
+
+    def __bool__(self):
+        return self.is_still_trying()
+</code></pre>
+<hr/>
+<p>Bonus: I know you don't want to separate your work off into separate functions wrapped with decorators... but if you <em>were</em> happy with that, the <a href="https://github.com/mozilla-releng/redo" rel="nofollow noreferrer">redo</a> package from Mozilla offers the decorators to do that, so you don't have to roll your own. There is even a Context Manager that effective acts as temporary decorator for your function, but it still relies on your retrievable code to be factored out into a single function.</p>
+</div>
+<span class="comment-copy"><a href="http://docs.python.org/release/2.5/whatsnew/pep-343.html" rel="nofollow noreferrer">docs.python.org/release/2.5/whatsnew/pep-343.html</a> looks like it has examples on how to implement a context manager.</span>
+<span class="comment-copy">Ah, shame it's not supported. Thanks for the link to the thread. I like the idea of having the call implicit to make it cleaner. If I want to set/modify vars within <code>_perform_in_transaction</code>, I guess I'll have to call it manually anyway and return what I need to continue the rest of the <code>do_work</code> function.</span>
+<span class="comment-copy">Can you elaborate where <code>_cursor</code> in <code>self._cursor</code> comes from?</span>
+<span class="comment-copy">@MikeMüller I'm trying to draw on some common database API customs without getting bogged down in implementation details. <code>_cursor</code> is meant to be a <a href="http://www.python.org/dev/peps/pep-0249/#cursor-objects" rel="nofollow noreferrer"><code>Cursor</code></a> object, as appropriate for the particular database connection involved. A full implementation would need to create and contain a <code>Connection</code> object of some kind, in order to actually carry out the database transactions.</span>
+<span class="comment-copy">@HenryKeller I would have done something like this <code>def __init__(self, cursor, retries=0):</code> and inside the <code>__init__</code> this <code>self._cursor = cursor'. Usage: </code>with transaction(cursor, retries=3) as cursor:`. Does this make sense?</span>
+<span class="comment-copy">@MikeMüller Certainly. That's what I mean by my comment regarding "a full implementation": to do this fully, it would probably be best either to make a space in the constructor for a <code>Connection</code> or <code>Cursor</code>, or else make the constructor something like <code>def __init__(self, dbhost, dbname, user, password):</code> and create a <code>Connection</code> object from there. I'm not including that stuff in the answer because it's not really relevant to the OP's question, which is specifically about repeating code automatically with a context manager, not creating a DB context manager in the first place.</span>
+<span class="comment-copy">@Oddthinking You're right that that's equivalent. The reason (in my mind) for making it a transaction parameter is just so that you don't have to specify <code>retries</code> for every query you might want to execute within that transaction.</span>

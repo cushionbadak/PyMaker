@@ -1,0 +1,141 @@
+<div class="post-text" itemprop="text">
+<p>Imagine I have a set of functions like this:</p>
+<pre><code>def func1():
+    func2()
+
+def func2():
+    time.sleep(1)  # simulate I/O operation
+    print('done')
+</code></pre>
+<p>I want these to be usable synchronously:</p>
+<pre><code># this would take two seconds to complete
+func1()
+func1()
+</code></pre>
+<p>as well as asynchronously, for example like this:</p>
+<pre><code># this would take 1 second to complete
+future = asyncio.gather(func1.run_async(), func1.run_async())
+loop = asyncio.get_event_loop()
+loop.run_until_complete(future)
+</code></pre>
+<p>The problem is, of course, that <code>func1</code> somehow has to propagate the "context" it's running in (synchronously vs. asynchronously) to <code>func2</code>.</p>
+<p>I want to avoid writing an asynchronous variant of each of my functions because that would result in a lot of duplicate code:</p>
+<pre><code>def func1():
+    func2()
+
+def func2():
+    time.sleep(1)  # simulate I/O operation
+    print('done')
+
+# duplicate code below...
+async def func1_async():
+    await func2_async()
+
+async def func2_async():
+    await asyncio.sleep(1)  # simulate I/O operation
+    print('done')
+</code></pre>
+<p>Is there any way to do this without having to implement an asynchronous copy of all my functions?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's my "not-an-answer-answer," which I know that Stack Overflow loves...</p>
+<blockquote>
+<p>Is there any way to do this without having to implement an asynchronous copy of all my functions?</p>
+</blockquote>
+<p>I don't think that there is.  Making a "blanket translator" to convert functions to native coroutines seems next-to-impossible.   That's because <strong>making a synchronous function asynchronous is about more than throwing an <code>async</code> keyword in front of it and a couple of <code>await</code> statements within it.</strong>  Keep in mind that anything that you <code>await</code> must be <a href="https://docs.python.org/3/glossary.html#term-awaitable" rel="nofollow noreferrer">awaitable</a>.</p>
+<p>Your <code>def func2(): time.sleep(1)</code> illustrates that point.  Synchronous functions will make blocking calls, such as <code>time.sleep()</code>; asynchronous (native coroutines) will await non-blocking coroutines.  Making this function asynchronous, as you point out, requires not just using <code>async def func()</code>, but awaiting <code>asyncio.sleep()</code>.  Now let's say instead of <code>time.sleep()</code>, you're calling a more complex, blocking function.  You build some sort of fancy decorator that slaps a <a href="https://stackoverflow.com/q/338101/7954504">function attribute</a> called <code>run_async</code>, which is a callable, onto the decorated function.  But how does that decorator know how to "translate" the blocking calls within <code>func2()</code> into their coroutine equivalents, if those are even defined?  I can't think of any magic that would be smart enough to convert all of the calls in a synchronous function to their <code>await</code>able counterparts.</p>
+<p>In your comments, you mention that this is for HTTP requests.  For a real-world example the differences in call signatures and APIs between the <code>requests</code> and <code>aiohttp</code> packages.  In <code>aiohttp</code>, <code>.text()</code> is an instance <a href="https://github.com/aio-libs/aiohttp/blob/76268e31630bb8615999ec40984706745f7f82d1/aiohttp/client_reqrep.py#L974" rel="nofollow noreferrer">method</a>; in <code>requests</code>, <code>.text</code> is a <a href="https://github.com/requests/requests/blob/75bdc998e2d430a35d869b2abf1779bd0d34890e/requests/models.py#L835" rel="nofollow noreferrer">property</a>.  How could you build something smart enough to know differences such as that?</p>
+<p>I don't mean to be discouraging--but I think that using threading would be more realistic.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>So I found a way to achieve this, but since this is literally the first time I've done anything with <code>async</code> I can't guarantee that this doesn't have any bugs or that it's not a terrible idea.</p>
+<p>The concept is actually pretty simple: Define your functions like normal asynchronous functions using <code>async def</code> and <code>await</code> where necessary, and then add a wrapper around them that automatically awaits the function <em>if</em> no event loop is running. Proof of concept:</p>
+<pre><code>import asyncio
+import functools
+import time
+
+
+class Hybrid:
+    def __init__(self, func):
+        self._func = func
+
+        functools.update_wrapper(self, func)
+
+    def __call__(self, *args, **kwargs):
+        coro = self._func(*args, **kwargs)
+
+        loop = asyncio.get_event_loop()
+
+        if loop.is_running():
+            # if the loop is running, we must've been called from a
+            # coroutine - so we'll return a future
+            return loop.create_task(coro)
+        else:
+            # if the loop isn't running, we must've been called synchronously,
+            # so we'll start the loop and let it execute the coroutine
+            return loop.run_until_complete(coro)
+
+    def run_async(self, *args, **kwargs):
+        return self._func(*args, **kwargs)
+
+
+@Hybrid
+async def func1():
+    await func2()
+
+@Hybrid
+async def func2():
+    await asyncio.sleep(0.1)
+
+
+def twice_sync():
+    func1()
+    func1()
+
+def twice_async():
+    future = asyncio.gather(func1.run_async(), func1.run_async())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(future)
+
+
+for func in [twice_sync, twice_async]:
+    start = time.time()
+    func()
+    end = time.time()
+    print('{:&gt;11}: {} sec'.format(func.__name__, end-start))
+
+# output:
+#  twice_sync: 0.20142340660095215 sec
+# twice_async: 0.10088586807250977 sec
+</code></pre>
+<p>However, this approach does have its limitations. If you have a synchronous function calling a hybrid function, calling the synchronous function from an asynchronous function will change its behavior:</p>
+<pre><code>@hybrid
+async def hybrid_function():
+    return "Success!"
+
+def sync_function():
+    print('hybrid returned:', hybrid_function())
+
+async def async_function():
+    sync_function()
+
+sync_function()  # this prints "Success!" as expected
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(async_function())  # but this prints a coroutine
+</code></pre>
+<p>Take care to account for this!</p>
+</div>
+<span class="comment-copy">Depends on what the functions are actually doing, rather than dummy functions for the purpose of asking the question. But usually, you'd call upon <code>multiprocessing</code> or <code>threading</code> to execute calls in parallel with your other code. And you could use it interchangeably, meaning you won't have to thread a function every time. Pretty basic use of threads/processes.</span>
+<span class="comment-copy">@Torxed If it matters, the functions would be doing asynchronous HTTP requests. I <i>could</i> parallelize the whole thing with multithreading, but I'd really rather not. async has a number of advantages compared to multiprocessing and multithreading. The goal is to end up with good code, not to parallelize at all costs.</span>
+<span class="comment-copy">I don't know your use case, but rather than requiring <code>func1()</code> to always use <code>func2()</code>, could you give it some sort of logic in the input args to run <code>func2()</code> if given it (and/or by default), or use another static input if not given it?</span>
+<span class="comment-copy">@Torxed When I say <code>async</code> I mean python's <code>async</code> keyword, and when I say async (without the code formatting) I mean asynchronous execution (:</span>
+<span class="comment-copy">@Torxed: <code>multiprocessing</code> isn't intrinsically bad, but it is relatively fundamentally broken on some platforms (e.g. recent versions of macOS). <code>threading</code> isn't intrinsically bad, but as a programming paradigm, threads are difficult to get right, and CPython doesn't handle multiple threads optimally. Asynchrony isn't the same thing as concurrency, and for operations that are latency-sensitive but IO-bound, asynchronous operations can outperform naively concurrent ones, especially by reducing the CPU and memory overhead of each operation. The <code>async</code> keyword was added for a good reason!</span>
+<span class="comment-copy">It's very true that automagically making a synchronous function asynchronous is next to impossible, but what if we do it the other way round? If I define <code>func1</code> and <code>func2</code> with <code>async def</code>, surely there must be a way to turn them into synchronous functions? (Or at least make them <i>appear</i> synchronous to the caller?)</span>
+<span class="comment-copy">I won't say it's impossible.  A coroutine is just a <a href="https://docs.python.org/3/library/asyncio-task.html#generator-based-coroutines" rel="nofollow noreferrer">repurposed generator</a>; perhaps that property would be workable for simple cases.  But again, it's not just a syntactic difference; it's a behavioral one.  I'd be interested to see the same thing if somehow it did exist, but nothing comes to mind immediately.</span>
+<span class="comment-copy">Good explanation, I would just like to leave the <a href="https://docs.python.org/3/library/select.html" rel="nofollow noreferrer">select</a> library. Al tho it's not a generic solution to the question which was put as a overall question about blocking operations, it might solve the very specific problem of network calls being a blocking operation. Other than that, great descriptive answer.</span>
+<span class="comment-copy">I'm not the downvoter here, and I think the wrapper + <code>__call__</code> is a cool idea, but this isn't going to do what you are hoping, I don't think</span>
+<span class="comment-copy">@BradSolomon Could you elaborate? Judging from the timings, it seems to be doing exactly what I want.</span>
+<span class="comment-copy">Again at the risk of sounding purely critical (I am actually intrigued by this question and attempt): I think you may be confusing asynchronicity with concurrency.  <code>loop.run_until_complete(coro)</code> in the "synchronous" <code>__call__</code> is running a coroutine, not a native function.  It's the same reason that <code>async for</code> does <i>not</i> schedule concurrent execution, it just makes <code>for</code> work with coroutines</span>
+<span class="comment-copy">Here's a demonstration of my first point: <a href="https://gist.github.com/bsolomon1124/d9320c6b7cf9c8ab0dc3abb23a7541a9" rel="nofollow noreferrer">gist.github.com/bsolomon1124/d9320c6b7cf9c8ab0dc3abb23a7541a9</a>.  Notice the time difference between <code>bar()</code> and <code>foobar()</code>.  A doubling of time does not imply that that the coroutines were somehow converted to "native" <code>def</code> functions.  So, what's happening is that while remaining async in nature, the coroutines are no longer scheduled to run concurrently.  Coroutines (generators) can suspend execution while maintaining state; functions can't.  I don't know if you can overcome that fundamental difference.</span>
+<span class="comment-copy">Okay, you make a fair point--what you've been able to do here is provide an "API-like" way, via a wrapper, to await a coroutine without <code>await</code>.  I think that's cool, but the only thing I would point out is that <code>async</code>/<code>await</code> were introduced for a reason: to be explicit.  You can write a coroutine as a "generator-based coroutine" without them, but that made it ambiguous what was a coroutine in the first place.  I can't say what side effects you might see with your approach, but it's something to be wary of.</span>

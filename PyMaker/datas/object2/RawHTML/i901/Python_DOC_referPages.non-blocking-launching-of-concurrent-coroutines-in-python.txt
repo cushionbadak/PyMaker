@@ -1,0 +1,152 @@
+<div class="post-text" itemprop="text">
+<p>I want to execute tasks asynchronously and concurrently. If <code>task1</code> is running when <code>task2</code> arrives, <code>task2</code> is started right away, without waiting for <code>task2</code> to complete. Also, I would like to avoid callbacks with the help of coroutines.</p>
+<p>Here's a concurrent solution with callbacks:</p>
+<pre><code>def fibonacci(n):
+    if n &lt;= 1:
+        return 1
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+
+class FibonacciCalculatorFuture:
+
+    def __init__(self):
+        self.pool = ThreadPoolExecutor(max_workers=2)
+
+    @staticmethod
+    def calculate(n):
+        print(f"started n={n}")
+        return fibonacci(n)
+
+    def run(self, n):
+        future = self.pool.submit(self.calculate, n)
+        future.add_done_callback(lambda f: print(f.result()))
+
+
+if __name__ == '__main__':
+    calculator = FibonacciCalculatorFuture()
+    calculator.run(35)
+    calculator.run(32)
+    print("initial thread can continue its work")
+</code></pre>
+<p>Its output:</p>
+<pre><code>started n=35
+started n=32
+initial thread can continue its work
+3524578
+14930352
+</code></pre>
+<p>And here's my effort to get rid of callbacks:</p>
+<pre><code>class FibonacciCalculatorAsync:
+
+    def __init__(self):
+        self.pool = ThreadPoolExecutor(max_workers=2)
+        self.loop = asyncio.get_event_loop()
+
+    @staticmethod
+    def calculate_sync(n):
+        print(f"started n={n}")
+        return fibonacci(n)
+
+    async def calculate(self, n):
+        result = await self.loop.run_in_executor(self.pool, self.calculate_sync, n)
+        print(result)
+
+    def run(self, n):
+        asyncio.ensure_future(self.calculate(n))
+
+
+if __name__ == '__main__':
+    calculator = FibonacciCalculatorAsync()
+    calculator.run(35)
+    calculator.run(32)
+    calculator.loop.run_forever()
+    print("initial thread can continue its work")
+</code></pre>
+<p>Output:</p>
+<pre><code>started n=35
+started n=32
+3524578
+14930352
+</code></pre>
+<p>In this case initial thread won't be able to go further than <code>loop.run_forever()</code> and hence won't be able to accept new tasks. </p>
+<p><strong>So, here's my question</strong>: is there a way to simultaneously:</p>
+<ul>
+<li>execute tasks concurrently;</li>
+<li>be able to accept new tasks and schedule them for execution right away (along with already running taks);</li>
+<li>use coroutines and code without callbacks.</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>The second bullet from your question can be met by running asyncio in a dedicated thread and using <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.run_coroutine_threadsafe" rel="nofollow noreferrer"><code>asyncio.run_coroutine_threadsafe</code></a> to schedule coroutines. For example:</p>
+<pre><code>class FibonacciCalculatorAsync:
+    def __init__(self):
+        self.pool = ThreadPoolExecutor(max_workers=2)
+        self.loop = asyncio.get_event_loop()
+
+    @staticmethod
+    def calculate_sync(n):
+        print(f"started n={n}")
+        return fibonacci(n)
+
+    async def calculate(self, n):
+        result = await self.loop.run_in_executor(self.pool, self.calculate_sync, n)
+        print(result)
+
+    def run(self, n):
+        asyncio.run_coroutine_threadsafe(self.calculate(n), self.loop)
+
+    def start_loop(self):
+        thr = threading.Thread(target=self.loop.run_forever)
+        thr.daemon = True
+        thr.start()
+
+
+if __name__ == '__main__':
+    calculator = FibonacciCalculatorAsync()
+    calculator.start_loop()
+    calculator.run(35)
+    calculator.run(32)
+    print("initial thread can continue its work")
+    calculator.run(10)
+    time.sleep(1)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>loop.run_forever()</code> will indeed run forever, even if there are no tasks inside. Good news is that you don't need this function. In order to wait for your computations to complete, use <code>asyncio.gather</code>:</p>
+<pre><code>class FibonacciCalculatorAsync:
+
+    def __init__(self):
+        self.pool = ThreadPoolExecutor(max_workers=2)
+        # self.loop = asyncio.get_event_loop()
+
+    ...
+
+    async def calculate(self, n):
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(self.pool, self.calculate_sync, n)
+        print(result)
+
+
+async def main():
+    calculator = FibonacciCalculatorAsync()
+    fib_35 = asyncio.ensure_future(calculator.run(35))
+    fib_32 = asyncio.ensure_future(calculator.run(32))
+
+    print("initial thread can continue its work")
+    ...
+
+    # demand fibonaccy computation has ended
+    await asyncio.gather(fib_35, fib_32)
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
+</code></pre>
+<p>Please note how the loop is handled here - I changed a few things. If you start using asyncio, I'd actually recommend to have one loop for all the things instead of creating loops for more granular task. With this approach, you get all asyncio <a href="https://docs.python.org/3/library/asyncio-task.html" rel="nofollow noreferrer">bells and whistles</a> for handling and synchronizing tasks.</p>
+<p>Also, it is not possible to parallelize pure Python non-IO code in <code>ThreadPoolExecutor</code> due to GIL. Keep that in mind and prefer a process pool executor in such cases.</p>
+</div>
+<span class="comment-copy">How can we call <code>await</code> not from a coroutine?</span>
+<span class="comment-copy">You need to create an <code>async def main()</code> function and use <code>asyncio.run()</code> instead.</span>
+<span class="comment-copy">Yes, indeed, I missed that this happens outside of any loop. I'll amend the answer.</span>
+<span class="comment-copy">@MaximBlumental I've updated the answer.</span>
+<span class="comment-copy">So, do I get it right, that if I want to use coroutines in my code, I have to wrap the entry point of my project in a coroutine? I cannot restrict their scope to the place of usage.</span>

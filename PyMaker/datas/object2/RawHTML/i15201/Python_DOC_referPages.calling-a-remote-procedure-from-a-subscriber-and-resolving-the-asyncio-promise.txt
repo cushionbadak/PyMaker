@@ -1,0 +1,83 @@
+<div class="post-text" itemprop="text">
+<p>I'm having problems getting asyncio based autobahn RPCs to work in an event handler:</p>
+<pre><code>from autobahn.asyncio import wamp
+from autobahn.wamp import register, subscribe
+
+class Foo(wamp.ApplicationSession):
+    @subscribe('wamp.metaevent.session.on_join')
+    def bar(self):
+        baz = yield from self.call('baz')
+
+    @register('baz')
+    def baz(self):
+        return 'baz'
+</code></pre>
+<p>Reading the documentation, I'm under the impression that this <em>should</em> work. However, if I'm using <code>yield</code> inside <code>Foo.bar</code> none of its code is being executed at all. I've tried decorating with <code>asyncio.coroutine</code> in various patterns, but can't get it to run at all.</p>
+<p>The only way I've found to make it work is by resolving the returned future "manually":</p>
+<pre><code>@subscribe('wamp.metaevent.session.on_join')
+def bar(self):
+    def do_something(f):
+        print(f.result())
+
+    f = self.call('baz')
+    f.add_done_callback(do_something)
+</code></pre>
+<p>I'm sure I'm just not understanding asyncio programming correctly yet, so what do I have to do to be able to write <code>baz = self.call('baz')</code> and get the result immediately (meaning without additional explicitly stated callbacks)?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The presence of <a href="https://docs.python.org/3/reference/expressions.html#yield-expressions" rel="nofollow">the <code>yield</code> keyword</a> in the body of a <code>def</code> statement makes the defined function into a <a href="https://docs.python.org/3/glossary.html#term-generator" rel="nofollow"><em>generator function</em></a>.</p>
+<p>When you call a generator function (as <code>autobahn</code> would), <em>the body of the function is not executed</em>. Instead, a <em>generator object</em> is created. When you call <code>next</code> on the generator, control advances to the next <code>yield</code> statement. Generators have been discussed extensively in other Stack Overflow posts, as well as in the docs and elsewhere on the web.</p>
+<p>The API of <code>asyncio</code> makes extensive use of <a href="https://docs.python.org/3/library/asyncio-task.html#coroutines" rel="nofollow">coroutines</a> and <code>yield from</code>. (For most purposes, you can consider 'coroutine' and 'generator' to be synonymous.) The <a href="https://docs.python.org/3/library/asyncio-eventloop.html" rel="nofollow">event loop</a> tracks a collection of generators and calls <code>next</code>, <code>send</code> and <code>throw</code> on them as appropriate.*</p>
+<p>It looks like <code>autobahn.subscribe</code> expects a regular callback function, not a coroutine, and that's why your code is not getting executed. One way to work around this is to write a callback function that <em>schedules</em> your coroutine, using <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.async" rel="nofollow"><code>asyncio.async</code></a>.</p>
+<pre><code>class Foo(wamp.ApplicationSession):
+    @subscribe('wamp.metaevent.session.on_join')
+    def schedule_bar(self):
+        coro = self.bar()  # create the coroutine object
+
+        # wrap the coroutine in a Task and register it with the event loop.
+        # the loop argument is optional and defaults to asyncio.get_event_loop()
+        asyncio.async(coro, loop=my_event_loop)  
+
+    @coroutine
+    def bar(self):
+        baz = yield from self.call('baz')
+
+    @register('baz')
+    def baz(self):
+        return 'baz'
+</code></pre>
+<p>In the absence of a function in <code>autobahn</code> to do this, you can write your own reusable decorator to subscribe coroutines to WAMP topics.</p>
+<pre><code>from functools import wraps
+
+def subscribe_coro(uri, loop=None):
+    def decorator(f):
+        @subscribe(uri)
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            coro = f(*args, **kwargs)
+            asyncio.async(coro, loop=loop)
+        return wrapper
+    return decorator
+</code></pre>
+<p>Now your class will look like this:</p>
+<pre><code>class Foo(wamp.ApplicationSession):
+    @subscribe_coro('wamp.metaevent.session.on_join')
+    @coroutine
+    def bar(self):
+        baz = yield from self.call('baz')
+
+    @register('baz')
+    def baz(self):
+        return 'baz'
+</code></pre>
+<p><sub>* This is a simplification. The event loop in fact tracks <a href="https://docs.python.org/3/library/asyncio-task.html#future" rel="nofollow"><code>Future</code></a>s, not coroutines. The algorithm to call the appropriate methods on a generator is implemented by <a href="https://docs.python.org/3/library/asyncio-task.html#task" rel="nofollow"><code>Task</code></a>, which wraps a coroutine up into a <code>Future</code>.</sub></p>
+</div>
+<span class="comment-copy">Have you tried marking <code>bar</code> with <code>@coroutine</code>?</span>
+<span class="comment-copy">Because <code>bar</code> uses <code>yield from</code>, it's not a regular function. When you call <code>bar()</code>, a <i>generator object</i> is created. The body of <code>bar</code> is not executed until you start driving the generator object using <code>next()</code>. The <code>asyncio</code> event loop should take care of calling <code>next</code> for you, but it expects generators to be marked with <code>@coroutine</code>. I'm not familiar with the <code>autobahn</code> API, so I don't know whether you're using <code>subscribe</code> correctly, but my guess is that you're missing an <code>@coroutine</code> decorator somewhere.</span>
+<span class="comment-copy">Sorry, scratch my previous comment, I got mixed up. Yes, I tried decorating <code>bar</code> with <code>@coroutine</code>, which didn't help at all.</span>
+<span class="comment-copy">Your second version of <code>bar</code> does not feature any <code>yield</code> statements, so it works as a regular function, and <code>subscribe</code> handles it as that. Consult <a href="https://docs.python.org/3/glossary.html#term-generator" rel="nofollow noreferrer">the docs</a> for more information about generators.</span>
+<span class="comment-copy">My advice would be to look around the autobahn docs for a version of <code>subscribe</code> which expects a coroutine. You could also explicitly register your coroutine with the <code>asyncio</code> event loop using <code>asyncio.async(my_generator_function())</code>.</span>
+<span class="comment-copy">I haven't had the chance to test that example code so I may have made a few minor mistakes ;)</span>
+<span class="comment-copy">Awesome stuff! I'll play around with this a bit. At least the issue makes a lot of sense to me now.</span>
+<span class="comment-copy">@deceze I've updated my post with links to the docs and corrected a few typos</span>
+<span class="comment-copy">Works great! Just a minor quibble in the <code>asyncio.async</code> call which I corrected above.</span>

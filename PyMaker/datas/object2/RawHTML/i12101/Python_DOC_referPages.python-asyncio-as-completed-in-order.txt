@@ -1,0 +1,172 @@
+<div class="post-text" itemprop="text">
+<h2>TL;DR</h2>
+<p>Is there a way to wait on multiple futures, and yield from them as they are completed in a given order?</p>
+<h2>Long story</h2>
+<p>Imagine you have two data sources. One gives you <code>id -&gt; name</code> mapping, the other gives you <code>id -&gt; age</code> mapping. You want to compute <code>(name, age) -&gt; number_of_ids_with_that_name_and_age</code>.</p>
+<p>There is too much data to just load it, but both data sources support paging/iterating and <strong>ordering by <code>id</code></strong>.</p>
+<p>So you write something like</p>
+<pre><code>def iterate_names():
+    for page in get_name_page_numbers():
+        yield from iterate_name_page(page)  # yields (id, name) pairs
+</code></pre>
+<p>and the same for age, and then you iterate over <code>iterate_names()</code> and <code>iterate_ages()</code>.</p>
+<p>What is wrong with that? What happens is:</p>
+<ul>
+<li>you request one page of names and ages</li>
+<li>you get them</li>
+<li>you process the data until you reach the end of a page, let's say, ages</li>
+<li>you request another page of ages</li>
+<li>you process the data until ...</li>
+</ul>
+<p>Basically, you are not waiting for any requests while you process data.</p>
+<p>You could use <code>asyncio.gather</code> to send all requests and wait for all data, but then:</p>
+<ul>
+<li>when the first pages arrives, you still wait for others</li>
+<li>you run out of memory</li>
+</ul>
+<p>There is <code>asyncio.as_completed</code> which allows you to send all requests and process pages as you get results, but you will get pages out of order, so you will not be able to do the processing.</p>
+<p>Ideally, there would be a function that would make the first request, and as the response comes, make the second request and yield results from the first at the same moment.</p>
+<p>Is that possible?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There are a lot of things going on in your question; I'll try to get to all of them.</p>
+<blockquote>
+<p>Is there a way to wait on multiple futures, and yield from them as they are completed in a given order?</p>
+</blockquote>
+<p>Yes. Your code can <code>yield from</code> or <code>await</code> any number of futures in sequence. If you are talking about <code>Task</code>s specifically and you want these tasks to be executing concurrently, they simply need to be assigned to the loop (done when you <code>asyncio.ensure_future()</code> or <code>loop.create_task()</code>) and the loop needs to be running.</p>
+<p>As for yielding from them in sequence, you can establish what that sequence is in the first place as you create the tasks. In a simple example where you have created all of the tasks/futures before you start to process their results, you could use a <code>list</code> to store the task futures and finally pull from the list:
+</p>
+<pre><code>loop = asyncio.get_event_loop()
+tasks_im_waiting_for = []
+for thing in things_to_get:
+    task = loop.create_task(get_a_thing_coroutine(thing))
+    tasks_im_waiting_for.append(task)
+
+@asyncio.coroutine
+def process_gotten_things(getter_tasks):
+    for task in getter_tasks:
+        result = yield from task
+        print("We got {}".format(result))
+
+loop.run_until_complete(process_gotten_things(tasks_im_waiting_for))
+</code></pre>
+<p>That example will only process one result at a time, but will still allow any of the scheduled getter tasks to continue doing their thing while it's waiting for the next one in the sequence to complete. If the processing order didn't matter as much and we wanted to process more than one potentially-ready result at a time, then we could use a <code>deque</code> instead of a <code>list</code>, with more than one <code>process_gotten_things</code> task <code>.pop()</code>ing the getter tasks from the <code>deque</code>. If we wanted to get even more advanced, we can do <a href="https://stackoverflow.com/questions/35699601/python-asyncio-as-completed-in-order#comment59080719_35699601">as Vincent suggests in a comment to your question</a> and use an <code>asyncio.Queue</code> instead of a <code>deque</code>. With such a queue, you can have a producer adding tasks to the queue running concurrently with the task-processing consumers.</p>
+<p>Using a <code>deque</code>, or <code>Queue</code> for sequencing futures for processing has a disadvantage though, and that's that you are only processing as many futures concurrently as you have running processor tasks. You could create a new processor task every single time you queued up a new future to be processed, but at that point, this queue becomes a completely redundant data structure because <strong>asyncio already gives you a queue-like object where every thing added gets processed concurrently: the event loop.</strong> For every task we schedule, we can also schedule its processing. Revising the above example:
+</p>
+<pre><code>for thing in things_to_get:
+    getter_task = loop.create_task(get_a_thing_coroutine(thing))
+    processor_task = loop.create_task(process_gotten_thing(getter_task))
+    # Tasks are futures; the processor can await the result once started
+</code></pre>
+<p>Now let's say that our getter might return multiple things (kind of like your scenario) and each of those things needs some processing. That brings me to a different asyncio design pattern: <em>sub-tasks</em>. Your tasks can schedule other tasks on the event loop. As the event loop is run, the order of your first tasks will still be maintained, but if any one of them ends up waiting on something, there's a chance one of your sub-tasks will get started in the midst of things. Revising the above scenario, we might pass the loop to our coroutine so the coroutine can schedule the tasks that processes its results:
+</p>
+<pre><code>for thing in things_to_get:
+    task = loop.create_task(get_a_thing_coroutine(thing, loop))
+
+@asyncio.coroutine
+def get_a_thing_coroutine(thing, loop):
+    results = yield from long_time_database_call(thing)
+    subtasks = []
+    for result in results:
+        subtasks.append(loop.create_task(process_result(result)))
+    # With subtasks scheduled in the order we like, wait for them
+    # to finish before we consider THIS task complete.
+    yield from asyncio.wait(subtasks)
+</code></pre>
+<p>All these advanced patterns start tasks in the order you want, but might finish processing them in any order. If you truly need to process the results in the exact same order that you started getting those results, then stick to a single processor pulling result futures from a sequence or yielding from an <code>asyncio.Queue</code>.</p>
+<p>You'll also notice that to ensure tasks starting in a predictable order, I explicitly schedule them with <code>loop.create_task()</code>. While <code>asyncio.gather()</code> and <code>asyncio.wait()</code> will happily take coroutine objects and schedule/wrap them as <code>Task</code>s, they have problems with scheduling them in a predictable order as of me writing this. <a href="https://github.com/python/asyncio/issues/432" rel="nofollow noreferrer">See asyncio issue #432</a>.</p>
+<p>OK, let's get back to your specific case. You have two separate sources of results, and those results need to be joined together by a common key, an <code>id</code>. The patterns I mentioned for getting things and processing those things don't account for such a problem, and I don't know the perfect pattern for it off the top of my head. I'll go through what I might do to attempt this though.</p>
+<ol>
+<li><p>We need some objects to maintain the state of what we know and what we've done so far for the sake of correlating that knowledge as it grows.
+</p>
+<pre><code># defaultdicts are great for representing knowledge that an interested
+# party might want whether or not we have any knowledge to begin with:
+from collections import defaultdict
+# Let's start with a place to store our end goal:
+name_and_age_to_id_count = defaultdict(int)
+
+# Given we're correlating info from two sources, let's make two places to
+# store that info, keyed by what we're joining on: id
+# When we join correlate this info, only one side might be known, so use a
+# Future on both sides to represent data we may or may not have yet.
+id_to_age_future = defaultdict(loop.create_future)
+id_to_name_future = defaultdict(loop.create_future)
+
+# As soon as we learn the name or age for an id, we can begin processing
+# the joint information, but because this information is coming from
+# multiple sources we want to process concurrently we need to keep track
+# of what ids we've started processing the joint info for.
+ids_scheduled_for_processing = set()
+</code></pre></li>
+<li><p>We know we'll be getting this information in "pages" via the iterators you mentioned, so let's start there in designing our tasks:
+</p>
+<pre><code>@asyncio.coroutine
+def process_name_page(page_number):
+    subtasks = []
+    for id, name in iterate_name_page(page_number):
+        name_future = id_to_name_future[id]
+        name_future.set_result(name)
+        if id not in ids_scheduled_for_processing:
+            age_future = id_to_age_future[id]
+            task = loop.create_task(increment_name_age_pair(id, name_future, age_future))
+            subtasks.append(task)
+            ids_scheduled_for_processing.add(id)
+    yield from asyncio.wait(subtasks)
+
+@asyncio.coroutine
+def process_age_page(page_number):
+    subtasks = []
+    for id, age in iterate_age_page(page_number):
+        age_future = id_to_age_future[id]
+        age_future.set_result(age)
+        if id not in ids_scheduled_for_processing:
+            name_future = id_to_name_future[id]
+            task = loop.create_task(increment_name_age_pair(id, name_future, age_future))
+            subtasks.append(task)
+            ids_scheduled_for_processing.add(id)
+    yield from asyncio.wait(subtasks)
+</code></pre></li>
+<li><p>Those coroutines schedule the name/age pair of an id to be processed—more specifically, the name and age futures for an id. Once started, the processor will await both futures' results (joining them, in a sense).
+</p>
+<pre><code>@asyncio.coroutine
+def increment_name_age_pair(id, name_future, age_future):
+    # This will wait until both futures are resolved and let other tasks work in the meantime:
+    pair = ((yield from name_future), (yield from age_future))
+
+    name_and_age_to_id_count[pair] += 1
+
+    # If memory is a concern:
+    ids_scheduled_for_processing.discard(id)
+    del id_to_age_future[id]
+    del id_to_name_future[id]
+</code></pre></li>
+<li><p>OK, we've got tasks for getting/iterating the pages and subtasks for processing what's in those pages. Now we need to actually schedule the getting of those pages. Back to your problem, we've got two datasources we want to pull from, and we want to pull from them in parallel. We assume the order of information from one closely correlates to the order of information from another, so we interleave the processing of both in the event loop.
+</p>
+<pre><code>page_processing_tasks = []
+# Interleave name and age pages:
+for name_page_number, age_page_number in zip_longest(
+    get_name_page_numbers(),
+    get_age_page_numbers()
+):
+    # Explicitly schedule it as a task in the order we want because gather
+    # and wait have non-deterministic scheduling order:
+    if name_page_number is not None:
+        page_processing_tasks.append(loop.create_task(process_name_page(name_page_number)))
+    if age_page_number is not None:
+        page_processing_tasks.append(loop.create_task(process_age_page(age_page_number)))
+</code></pre></li>
+<li><p>Now that we have scheduled the top level tasks, we can finally actually do the things:
+</p>
+<pre><code>loop.run_until_complete(asyncio.wait(page_processing_tasks))
+print(name_and_age_to_id_count)
+</code></pre></li>
+</ol>
+<p><code>asyncio</code> may not solve all of your parallel processing woes. You mentioned that the "processing" each page to iterate takes forever. If it takes forever because it's awaiting responses from a server, then this architecture is a neat lightweight approach to do what you need (just make sure the i/o is being done with asyncio loop-aware tools).</p>
+<p>If it takes forever because Python is crunching numbers or moving things around with CPU and memory, asyncio's single-threaded event loop doesn't help you much because only one Python operation is happening at a time. In this scenario, you may want to look into using <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.AbstractEventLoop.run_in_executor" rel="nofollow noreferrer"><code>loop.run_in_executor</code></a> with a pool of Python interpreter processes if you'd like to stick with asyncio and the sub-task pattern. You could also develop a solution using the <a href="https://docs.python.org/3/library/concurrent.futures.html" rel="nofollow noreferrer"><code>concurrent.futures</code> library</a> with a process pool instead of using asyncio.</p>
+<p>Note: The example generator you gave might be confusing to some because it uses <code>yield from</code> to delegate generation to an inner generator. It just so happens that asyncio coroutines use the same expression to await a future result and tell the loop it can run other coroutines' code if it wants.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>asyncio has no such functionality but you may write a simple wrapper around <code>as_completed</code> for yielding data in-order.</p>
+<p>It may be built using small sliding window buffer for storing newer completed data while older result is not available yet.</p>
+</div>
+<span class="comment-copy">What about using a producer task to fetch and put the data in a <a href="https://docs.python.org/3/library/asyncio-queue.html#queue" rel="nofollow noreferrer">Queue</a>, along with a consumer task to process it? You could use the <code>maxsize</code> argument to control the size of the queue.</span>

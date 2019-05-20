@@ -1,0 +1,494 @@
+<div class="post-text" itemprop="text">
+<p>I've got a large amount of data (a couple gigs) I need to write to a zip file in Python.  I can't load it all into memory at once to pass to the .writestr method of ZipFile, and I really don't want to feed it all out to disk using temporary files and then read it back.</p>
+<p>Is there a way to feed a generator or a file-like object to the ZipFile library?  Or is there some reason this capability doesn't seem to be supported?</p>
+<p>By zip file, I mean zip file.  As supported in the Python zipfile package.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The only solution is to rewrite the method it uses for zipping files to read from a buffer.  It would be trivial to add this to the standard libraries; I'm kind of amazed it hasn't been done yet.  I gather there's a lot of agreement the entire interface needs to be overhauled, and that seems to be blocking any incremental improvements.</p>
+<pre><code>import zipfile, zlib, binascii, struct
+class BufferedZipFile(zipfile.ZipFile):
+    def writebuffered(self, zipinfo, buffer):
+        zinfo = zipinfo
+
+        zinfo.file_size = file_size = 0
+        zinfo.flag_bits = 0x00
+        zinfo.header_offset = self.fp.tell()
+
+        self._writecheck(zinfo)
+        self._didModify = True
+
+        zinfo.CRC = CRC = 0
+        zinfo.compress_size = compress_size = 0
+        self.fp.write(zinfo.FileHeader())
+        if zinfo.compress_type == zipfile.ZIP_DEFLATED:
+            cmpr = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15)
+        else:
+            cmpr = None
+
+        while True:
+            buf = buffer.read(1024 * 8)
+            if not buf:
+                break
+
+            file_size = file_size + len(buf)
+            CRC = binascii.crc32(buf, CRC) &amp; 0xffffffff
+            if cmpr:
+                buf = cmpr.compress(buf)
+                compress_size = compress_size + len(buf)
+
+            self.fp.write(buf)
+
+        if cmpr:
+            buf = cmpr.flush()
+            compress_size = compress_size + len(buf)
+            self.fp.write(buf)
+            zinfo.compress_size = compress_size
+        else:
+            zinfo.compress_size = file_size
+
+        zinfo.CRC = CRC
+        zinfo.file_size = file_size
+
+        position = self.fp.tell()
+        self.fp.seek(zinfo.header_offset + 14, 0)
+        self.fp.write(struct.pack("&lt;LLL", zinfo.CRC, zinfo.compress_size, zinfo.file_size))
+        self.fp.seek(position, 0)
+        self.filelist.append(zinfo)
+        self.NameToInfo[zinfo.filename] = zinfo
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I took <a href="https://stackoverflow.com/questions/297345/create-a-zip-file-from-a-generator-in-python/299830#299830">Chris B.'s answer</a> and created a complete solution. Here it is in case anyone else is interested:</p>
+<pre><code>import os
+import threading
+from zipfile import *
+import zlib, binascii, struct
+
+class ZipEntryWriter(threading.Thread):
+    def __init__(self, zf, zinfo, fileobj):
+        self.zf = zf
+        self.zinfo = zinfo
+        self.fileobj = fileobj
+
+        zinfo.file_size = 0
+        zinfo.flag_bits = 0x00
+        zinfo.header_offset = zf.fp.tell()
+
+        zf._writecheck(zinfo)
+        zf._didModify = True
+
+        zinfo.CRC = 0
+        zinfo.compress_size = compress_size = 0
+        zf.fp.write(zinfo.FileHeader())
+
+        super(ZipEntryWriter, self).__init__()
+
+    def run(self):
+        zinfo = self.zinfo
+        zf = self.zf
+        file_size = 0
+        CRC = 0
+
+        if zinfo.compress_type == ZIP_DEFLATED:
+            cmpr = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15)
+        else:
+            cmpr = None
+        while True:
+            buf = self.fileobj.read(1024 * 8)
+            if not buf:
+                self.fileobj.close()
+                break
+
+            file_size = file_size + len(buf)
+            CRC = binascii.crc32(buf, CRC)
+            if cmpr:
+                buf = cmpr.compress(buf)
+                compress_size = compress_size + len(buf)
+
+            zf.fp.write(buf)
+
+        if cmpr:
+            buf = cmpr.flush()
+            compress_size = compress_size + len(buf)
+            zf.fp.write(buf)
+            zinfo.compress_size = compress_size
+        else:
+            zinfo.compress_size = file_size
+
+        zinfo.CRC = CRC
+        zinfo.file_size = file_size
+
+        position = zf.fp.tell()
+        zf.fp.seek(zinfo.header_offset + 14, 0)
+        zf.fp.write(struct.pack("&lt;lLL", zinfo.CRC, zinfo.compress_size, zinfo.file_size))
+        zf.fp.seek(position, 0)
+        zf.filelist.append(zinfo)
+        zf.NameToInfo[zinfo.filename] = zinfo
+
+class EnhZipFile(ZipFile, object):
+
+    def _current_writer(self):
+        return hasattr(self, 'cur_writer') and self.cur_writer or None
+
+    def assert_no_current_writer(self):
+        cur_writer = self._current_writer()
+        if cur_writer and cur_writer.isAlive():
+            raise ValueError('An entry is already started for name: %s' % cur_write.zinfo.filename)
+
+    def write(self, filename, arcname=None, compress_type=None):
+        self.assert_no_current_writer()
+        super(EnhZipFile, self).write(filename, arcname, compress_type)
+
+    def writestr(self, zinfo_or_arcname, bytes):
+        self.assert_no_current_writer()
+        super(EnhZipFile, self).writestr(zinfo_or_arcname, bytes)
+
+    def close(self):
+        self.finish_entry()
+        super(EnhZipFile, self).close()
+
+    def start_entry(self, zipinfo):
+        """
+        Start writing a new entry with the specified ZipInfo and return a
+        file like object. Any data written to the file like object is
+        read by a background thread and written directly to the zip file.
+        Make sure to close the returned file object, before closing the
+        zipfile, or the close() would end up hanging indefinitely.
+
+        Only one entry can be open at any time. If multiple entries need to
+        be written, make sure to call finish_entry() before calling any of
+        these methods:
+        - start_entry
+        - write
+        - writestr
+        It is not necessary to explicitly call finish_entry() before closing
+        zipfile.
+
+        Example:
+            zf = EnhZipFile('tmp.zip', 'w')
+            w = zf.start_entry(ZipInfo('t.txt'))
+            w.write("some text")
+            w.close()
+            zf.close()
+        """
+        self.assert_no_current_writer()
+        r, w = os.pipe()
+        self.cur_writer = ZipEntryWriter(self, zipinfo, os.fdopen(r, 'r'))
+        self.cur_writer.start()
+        return os.fdopen(w, 'w')
+
+    def finish_entry(self, timeout=None):
+        """
+        Ensure that the ZipEntry that is currently being written is finished.
+        Joins on any background thread to exit. It is safe to call this method
+        multiple times.
+        """
+        cur_writer = self._current_writer()
+        if not cur_writer or not cur_writer.isAlive():
+            return
+        cur_writer.join(timeout)
+
+if __name__ == "__main__":
+    zf = EnhZipFile('c:/tmp/t.zip', 'w')
+    import time
+    w = zf.start_entry(ZipInfo('t.txt', time.localtime()[:6]))
+    w.write("Line1\n")
+    w.write("Line2\n")
+    w.close()
+    zf.finish_entry()
+    w = zf.start_entry(ZipInfo('p.txt', time.localtime()[:6]))
+    w.write("Some text\n")
+    w.close()
+    zf.close()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>gzip.GzipFile writes the data in gzipped chunks , which you can set the size of your chunks according to the numbers of lines read from the files.</p>
+<p>an example: </p>
+<pre><code>file = gzip.GzipFile('blah.gz', 'wb')
+sourcefile = open('source', 'rb')
+chunks = []
+for line in sourcefile:
+  chunks.append(line)
+  if len(chunks) &gt;= X: 
+      file.write("".join(chunks))
+      file.flush()
+      chunks = []
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The essential compression is done by zlib.compressobj.  ZipFile (under Python 2.5 on MacOSX appears to be compiled).  The Python 2.3 version is as follows.</p>
+<p>You can see that it builds the compressed file in 8k chunks.  Taking out the source file information is complex because a lot of source file attributes (like uncompressed size) is recorded in the zip file header.  </p>
+<pre><code>def write(self, filename, arcname=None, compress_type=None):
+    """Put the bytes from filename into the archive under the name
+    arcname."""
+
+    st = os.stat(filename)
+    mtime = time.localtime(st.st_mtime)
+    date_time = mtime[0:6]
+    # Create ZipInfo instance to store file information
+    if arcname is None:
+        zinfo = ZipInfo(filename, date_time)
+    else:
+        zinfo = ZipInfo(arcname, date_time)
+    zinfo.external_attr = st[0] &lt;&lt; 16L      # Unix attributes
+    if compress_type is None:
+        zinfo.compress_type = self.compression
+    else:
+        zinfo.compress_type = compress_type
+    self._writecheck(zinfo)
+    fp = open(filename, "rb")
+
+    zinfo.flag_bits = 0x00
+    zinfo.header_offset = self.fp.tell()    # Start of header bytes
+    # Must overwrite CRC and sizes with correct data later
+    zinfo.CRC = CRC = 0
+    zinfo.compress_size = compress_size = 0
+    zinfo.file_size = file_size = 0
+    self.fp.write(zinfo.FileHeader())
+    zinfo.file_offset = self.fp.tell()      # Start of file bytes
+    if zinfo.compress_type == ZIP_DEFLATED:
+        cmpr = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION,
+             zlib.DEFLATED, -15)
+    else:
+        cmpr = None
+    while 1:
+        buf = fp.read(1024 * 8)
+        if not buf:
+            break
+        file_size = file_size + len(buf)
+        CRC = binascii.crc32(buf, CRC)
+        if cmpr:
+            buf = cmpr.compress(buf)
+            compress_size = compress_size + len(buf)
+        self.fp.write(buf)
+    fp.close()
+    if cmpr:
+        buf = cmpr.flush()
+        compress_size = compress_size + len(buf)
+        self.fp.write(buf)
+        zinfo.compress_size = compress_size
+    else:
+        zinfo.compress_size = file_size
+    zinfo.CRC = CRC
+    zinfo.file_size = file_size
+    # Seek backwards and write CRC and file sizes
+    position = self.fp.tell()       # Preserve current position in file
+    self.fp.seek(zinfo.header_offset + 14, 0)
+    self.fp.write(struct.pack("&lt;lLL", zinfo.CRC, zinfo.compress_size,
+          zinfo.file_size))
+    self.fp.seek(position, 0)
+    self.filelist.append(zinfo)
+    self.NameToInfo[zinfo.filename] = zinfo
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Some (many? most?) compression algorithms are based on looking at redundancies across the <em>entire</em>  file.</p>
+<p>Some compression libraries will choose between several compression algorithms based on which works best on the file.</p>
+<p>I believe the ZipFile module does this, so it wants to see the entire file, not just pieces at a time.</p>
+<p>Hence, it won't work with generators or files to big to load in memory. That would explain the limitation of the Zipfile library.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Changed in <strong>Python 3.5</strong> (from official docs): Added <a href="https://docs.python.org/3/library/zipfile.html#zipfile-objects" rel="nofollow noreferrer">support</a> for writing to <strong>unseekable</strong> streams.</p>
+<p>This means that now for <code>zipfile.ZipFile</code> we can use streams which do not store the entire file in memory. Such streams <a href="https://docs.python.org/3/library/io.html?highlight=io#io.IOBase.seekable" rel="nofollow noreferrer">do not support</a> movement over the entire data volume.</p>
+<p>So this is simple generator:</p>
+<pre><code>from zipfile import ZipFile, ZipInfo
+
+def zipfile_generator(path, stream):
+    with ZipFile(stream, mode='w') as zf:
+        z_info = ZipInfo.from_file(path)
+        with open(path, 'rb') as entry, zf.open(z_info, mode='w') as dest:
+            for chunk in iter(lambda: entry.read(16384), b''):
+                dest.write(chunk)
+                # Yield chunk of the zip file stream in bytes.
+                yield stream.get()
+    # ZipFile was closed.
+    yield stream.get()
+</code></pre>
+<p><code>path</code> is a string path of the large file or directory or <code>pathlike</code> object. </p>
+<p><code>stream</code> is the <strong>unseekable</strong> stream instance of the class like this (designed according to <a href="https://docs.python.org/3/library/io.html?highlight=io" rel="nofollow noreferrer">official docs</a>):</p>
+<pre><code>from io import RawIOBase
+
+class UnseekableStream(RawIOBase):
+    def __init__(self):
+        self._buffer = b''
+
+    def writable(self):
+        return True
+
+    def write(self, b):
+        if self.closed:
+            raise ValueError('Stream was closed!')
+        self._buffer += b
+        return len(b)
+
+    def get(self):
+        chunk = self._buffer
+        self._buffer = b''
+        return chunk
+</code></pre>
+<p>You can try this code online: <a href="https://repl.it/@IvanErgunov/zipfilegenerator" rel="nofollow noreferrer">https://repl.it/@IvanErgunov/zipfilegenerator</a></p>
+<hr/>
+<p>There is also another way to create a generator without <code>ZipInfo</code> and manually reading and dividing your large file. You can pass the <code>queue.Queue()</code> object to your <code>UnseekableStream()</code> object and write to this queue in another thread. Then in current thread you can simply read chunks from this queue in iterable way. See <a href="https://docs.python.org/3/library/queue.html#queue-objects" rel="nofollow noreferrer">docs</a></p>
+<p><strong>P.S.</strong>
+<a href="https://github.com/allanlei/python-zipstream" rel="nofollow noreferrer">Python Zipstream by allanlei</a> is outdated and unreliable way. It was an attempt to add support for unseekable streams before it was done officially.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The gzip library will take a file-like object for compression.</p>
+<pre><code>class GzipFile([filename [,mode [,compresslevel [,fileobj]]]])
+</code></pre>
+<p>You still need to provide a nominal filename for inclusion in the zip file, but you can pass your data-source to the fileobj.</p>
+<p><em>(This answer differs from that of Damnsweet, in that the focus should be on the data-source being incrementally read, not the compressed file being incrementally written.)</em></p>
+<p><em>And I see now the original questioner won't accept Gzip :-(</em></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Now with python 2.7 you can add data to the zipfile insted of the file :</p>
+<p><a href="http://docs.python.org/2/library/zipfile#zipfile.ZipFile.writestr" rel="nofollow">http://docs.python.org/2/library/zipfile#zipfile.ZipFile.writestr</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is 2017. If you are still looking to do this elegantly, use <a href="https://github.com/allanlei/python-zipstream" rel="nofollow noreferrer">Python Zipstream by allanlei</a>. 
+So far, it is probably the only well written library to accomplish that.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>In case anyone stumbles upon this question, which is still relevant in 2017 for Python 2.7, here's a working solution for a true streaming zip file, with no requirement for the output to be seekable as in the other cases. The secret is to set bit 3 of the general purpose bit flag (see <a href="https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT" rel="nofollow noreferrer">https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT</a> section 4.3.9.1).</p>
+<p>Note that this implementation will always create a ZIP64-style file, allowing the streaming to work for arbitrarily large files. It includes an ugly hack to force the zip64 end of central directory record, so be aware it will cause all zipfiles written by your process to become ZIP64-style.</p>
+<pre><code>import io
+import zipfile
+import zlib
+import binascii
+import struct
+
+class ByteStreamer(io.BytesIO):
+    '''
+    Variant on BytesIO which lets you write and consume data while
+    keeping track of the total filesize written. When data is consumed
+    it is removed from memory, keeping the memory requirements low.
+    '''
+    def __init__(self):
+        super(ByteStreamer, self).__init__()
+        self._tellall = 0
+
+    def tell(self):
+        return self._tellall
+
+    def write(self, b):
+        orig_size = super(ByteStreamer, self).tell()
+        super(ByteStreamer, self).write(b)
+        new_size = super(ByteStreamer, self).tell()
+        self._tellall += (new_size - orig_size)
+
+    def consume(self):
+        bytes = self.getvalue()
+        self.seek(0)
+        self.truncate(0)
+        return bytes
+
+class BufferedZipFileWriter(zipfile.ZipFile):
+    '''
+    ZipFile writer with true streaming (input and output).
+    Created zip files are always ZIP64-style because it is the only safe way to stream
+    potentially large zip files without knowing the full size ahead of time.
+
+    Example usage:
+    &gt;&gt;&gt; def stream():
+    &gt;&gt;&gt;     bzfw = BufferedZip64FileWriter()
+    &gt;&gt;&gt;     for arc_path, buffer in inputs:  # buffer is a file-like object which supports read(size)
+    &gt;&gt;&gt;         for chunk in bzfw.streambuffer(arc_path, buffer):
+    &gt;&gt;&gt;             yield chunk
+    &gt;&gt;&gt;     yield bzfw.close()
+    '''
+    def __init__(self, compression=zipfile.ZIP_DEFLATED):
+        self._buffer = ByteStreamer()
+        super(BufferedZipFileWriter, self).__init__(self._buffer, mode='w', compression=compression, allowZip64=True)
+
+    def streambuffer(self, zinfo_or_arcname, buffer, chunksize=2**16):
+        if not isinstance(zinfo_or_arcname, zipfile.ZipInfo):
+            zinfo = zipfile.ZipInfo(filename=zinfo_or_arcname,
+                                    date_time=time.localtime(time.time())[:6])
+            zinfo.compress_type = self.compression
+            zinfo.external_attr = 0o600 &lt;&lt; 16     # ?rw-------
+        else:
+            zinfo = zinfo_or_arcname
+
+        zinfo.file_size = file_size = 0
+        zinfo.flag_bits = 0x08  # Streaming mode: crc and size come after the data
+        zinfo.header_offset = self.fp.tell()
+
+        self._writecheck(zinfo)
+        self._didModify = True
+
+        zinfo.CRC = CRC = 0
+        zinfo.compress_size = compress_size = 0
+        self.fp.write(zinfo.FileHeader())
+        if zinfo.compress_type == zipfile.ZIP_DEFLATED:
+            cmpr = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15)
+        else:
+            cmpr = None
+
+        while True:
+            buf = buffer.read(chunksize)
+            if not buf:
+                break
+
+            file_size += len(buf)
+            CRC = binascii.crc32(buf, CRC) &amp; 0xffffffff
+            if cmpr:
+                buf = cmpr.compress(buf)
+                compress_size += len(buf)
+
+            self.fp.write(buf)
+            compressed_bytes = self._buffer.consume()
+            if compressed_bytes:
+                yield compressed_bytes
+
+        if cmpr:
+            buf = cmpr.flush()
+            compress_size += len(buf)
+            self.fp.write(buf)
+            zinfo.compress_size = compress_size
+            compressed_bytes = self._buffer.consume()
+            if compressed_bytes:
+                yield compressed_bytes
+        else:
+            zinfo.compress_size = file_size
+
+        zinfo.CRC = CRC
+        zinfo.file_size = file_size
+
+        # Write CRC and file sizes after the file data
+        # Always write as zip64 -- only safe way to stream what might become a large zipfile
+        fmt = '&lt;LQQ'
+        self.fp.write(struct.pack(fmt, zinfo.CRC, zinfo.compress_size, zinfo.file_size))
+
+        self.fp.flush()
+        self.filelist.append(zinfo)
+        self.NameToInfo[zinfo.filename] = zinfo
+        yield self._buffer.consume()
+
+    # The close method needs to be patched to force writing a ZIP64 file
+    # We'll hack ZIP_FILECOUNT_LIMIT to do the forcing
+    def close(self):
+        tmp = zipfile.ZIP_FILECOUNT_LIMIT
+        zipfile.ZIP_FILECOUNT_LIMIT = 0
+        super(BufferedZipFileWriter, self).close()
+        zipfile.ZIP_FILECOUNT_LIMIT = tmp
+        return self._buffer.consume()
+</code></pre>
+</div>
+<span class="comment-copy">I did say that, both in the title and the first sentence.  I've added a clarification, although I'm mystified as to why it was needed.  If I just needed any generic compression algorithm, I would have said that in the first place.</span>
+<span class="comment-copy">It appears that ZIP means GZIP to most of the world.  So, when you mean ZIP (as in PKWare ZIP), you have to clarify the distinction.  Yes, it's mystifying why people thing GZip when you meant PKWare Zip.</span>
+<span class="comment-copy">I guess, winzip, pkware zip and 7zip which are most known zipper(?) applizations' "gzip support" might have driven people to think that gzip implementation might be painless.</span>
+<span class="comment-copy">Yes, the rewrite is a bummer.  Thank goodness for open source.</span>
+<span class="comment-copy">See my answer that takes this approach one step further: <a href="http://stackoverflow.com/questions/297345/create-a-zip-file-from-a-generator-in-python/2734156#2734156" title="create a zip file from a generator in python">stackoverflow.com/questions/297345/…</a></span>
+<span class="comment-copy">There is a bug in the provided code; the <code>fmt</code> argument to <code>struck.pack</code> should be <code>"&lt;LLL"</code>, and the line that has <code>CRC = binascii.crc32(buf, CRC)</code> should be <code>CRC = binascii.crc32(buf, CRC) &amp; 0xffffffff</code>. I'm saying this based on the <code>zipfile.py</code> module contents on Python 2.7. What lead me to this is that I was running into <code>struct.error</code> exceptions.  Also, it would make sense to use <code>zlib</code>.</span>
+<span class="comment-copy">You can convert any iterator (including a generator) into a stream (the type of the <code>buffer</code> 3rd arg) using the recipe at <a href="http://stackoverflow.com/a/6658949/108518">stackoverflow.com/a/6658949/108518</a>.</span>
+<span class="comment-copy">For some reason I had trouble making this work with Python 2.7.9, I didn't dig to deep into why since it works as expected with 2.7.10 and 2.7.8.</span>
+<span class="comment-copy">how about a non-threaded version? threads in Python won't add performance if that's what you intended.</span>
+<span class="comment-copy">This is nice but when I try to use it like BytesIO (for creating XML documents with XMLGenerator) I get an exception when I try and close the file. <code>Traceback (most recent call last):   File "/opt/local/Library/Frameworks/Python.framework/Versions/2.7/lib/python2.7/threading.py", line 810, in __bootstrap_inner     self.run()   File "bufzip.py", line 62, in run     zf.fp.write(struct.pack("&lt;LLL", zinfo.CRC, zinfo.compress_size, zinfo.file_size)) error: integer out of range for 'L' format code</code></span>
+<span class="comment-copy">As Erik noted above there is a typo in the format string must be <code>"&lt;LLL"</code> and CRC needs to be <code>CRC = binascii.crc32(buf, CRC) &amp; 0xffffffff</code></span>
+<span class="comment-copy">Other than exposing the write stream the rest of the code was from Python built-in classes, so perhaps the bug exists there also?</span>
+<span class="comment-copy">For obscure reasons the result must be a ZIP file, not a GZIP file or any other compressions.  [The comments was insulting, so I deleted them.]</span>
+<span class="comment-copy">Unspecified is not the same as obscure.  The archive files I produce need to be opened by office workers in a Windows environment.  They all have zip utilities.  None have GZIP.</span>
+<span class="comment-copy">Yes, after I posted the question I looked at the source code.  You're right that it uses the file info for the heading, but there's no need for it to do that--in fact, it overwrites some of the information afterwards anyway.  I've posted a rewrite of the method which does what I need.</span>
+<span class="comment-copy">I was hoping to avoid the rewrite, since it relies on the internals of the Python library to work, but there really doesn't seem to be any other way.</span>
+<span class="comment-copy">+1 agreed. Its not impossible (see Chris B.s answer), but I think it may make more sense to give the compression algorithm the whole thing. The analysis, needed to generate a good huffman coding tree, is then more accurate and with respect to the whole file. Therefore the result could be much smaller/better-compressed.</span>

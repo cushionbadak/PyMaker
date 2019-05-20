@@ -1,0 +1,166 @@
+<div class="post-text" itemprop="text">
+<p>In Python, I would like to quickly compute an order-invariant hash for the lines of a file as a way to identify "uniquely" its content.  These files are for example the output of a <code>select ... from table</code> and thus the order of the lines is random.</p>
+<p>Here is an example that achieves what I want (using one of the hashers in hashlib), but at the expense of having to sort the lines.  <em>Note that sorting the lines is just a way to achieve the goal, i.e. to get a hash that doesn't depend on the ordering of the lines in the file. But clearly, I'd like to avoid the O(n*log(n)) cost, esp. when the files are much longer.</em></p>
+<pre><code>def get_hexdigest(filename, hasher, blocksize=65536, order_invariant=False):
+    if not os.path.isfile(filename):
+        return None
+    if order_invariant:
+        with open(filename, 'r') as f:
+            for line in sorted(f):
+                hasher.update(line.encode())
+    else:
+        with open(filename, 'rb') as f:
+            while True:
+                buf = f.read(blocksize)
+                hasher.update(buf)
+                if len(buf) &lt; blocksize:
+                    break
+    return hasher.hexdigest()
+</code></pre>
+<p>So, for e.g. 1MB, 50K rows file:</p>
+<pre><code>%%time
+get_hexdigest('some_file', hashlib.sha1())
+# Wall time: 1.71 ms
+</code></pre>
+<p>But:</p>
+<pre><code>%%time
+get_hexdigest('some_file', hashlib.sha1(), order_invariant=True)
+# Wall time: 77.4 ms
+</code></pre>
+<p>What is a better/faster way to do that?</p>
+<p>As noted <a href="https://stackoverflow.com/a/30735385/758174">in this answer</a>, Scala has an order-invariant hash based on Murmurhash, but I assume it is the 32-bit version of mmh3 (too collision-prone for my usage), and also I would rather use some standard library available in Python rather than implementing something in C or in Cython. Murmurhash3 has a 128bit version, but its output is different on x64 vs x86. I would like to have machine independent results.</p>
+<p>So, in summary, I would like:</p>
+<ul>
+<li>consistent results across machine architectures</li>
+<li>low collision rate, i.e. at least 128 bits with good dispersion (but I don't need the hash to be cryptographic)</li>
+<li>reasonably fast, i.e. at least under 5ms for 1MB, 50K lines file.</li>
+<li>readily available, if possible, as a library on PyPi or Conda.</li>
+<li>amenable to files with repeated lines (so just XORing per-line hashes is a non-starter, as any pair of identical lines would cancel each other).</li>
+</ul>
+<hr/>
+<p><strong>Edits and notes:</strong>
+Thanks to several comments, the code above is updated to sort lines in memory.  The original version for <code>order_invariant is True</code> was:</p>
+<pre><code>    with os.popen('sort {}'.format(filename)) as f:
+        for line in f:
+            hasher.update(line.encode(encoding='utf-8'))
+    return hasher.hexdigest()
+</code></pre>
+<p>The associated wall time (for the file used above) was then 238 ms.  This is now reduced to 77 ms, but still way slower than not sorting the lines. Sorting will add a n*log(n) cost for n lines.</p>
+<p>The encoding (to UTF-8) and reading in mode <code>'r'</code> nor <code>'rb'</code> is necessary when reading lines, as then we get strings not bytes.  I don't want to rely on assuming that the files contain only ASCII data; reading in <code>'rb'</code> could lead to lines not properly split. I don't have the same concern when <code>order_invariant</code> is False, because then I don't have to split the file, and thus the fastest way is to slurp chunks of binary data to update the hasher.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think you should sort the file before (<code>select ... from table order by ...</code>) or come up with another solution for your actual problem.</p>
+<p>Anyways, a possible approach in Python using a <a href="https://docs.python.org/3/library/stdtypes.html#frozenset" rel="nofollow noreferrer">frozenset</a>:</p>
+<pre><code>#!/usr/bin/python
+
+lines1 = ['line1', 'line2', 'line3', 'line4']
+lines2 = ['line2', 'line1', 'line3', 'line4']  # same as lines1 but different order
+lines3 = ['line1', 'line1', 'line3', 'line4', 'line5']
+
+
+for lines in [lines1, lines2, lines3]:
+    print(lines)
+    print(hash(frozenset(lines)))
+    print('')
+</code></pre>
+<p>Output</p>
+<pre><code>['line1', 'line2', 'line3', 'line4']
+8013284786872469720
+
+['line2', 'line1', 'line3', 'line4']
+8013284786872469720
+
+['line1', 'line1', 'line3', 'line4', 'line5']
+7430298023231386903
+</code></pre>
+<p>I doubt it will match your performance constrains. I don't know the time complexity (Big O) of the frozenset(). <strong>It also assumes lines are unique.</strong> Again, I highly suggest to tackle the underlying problem differently.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>How about this <em>merkle-style</em> map-reduce (hash concatenated mapped hashes, optional sort for invariant after hash map step):</p>
+<pre><code>import hashlib
+
+def hasher(data):
+    hasher = hashlib.sha1()
+    hasher.update(data.encode('utf-8'))
+    return hasher.hexdigest()
+
+
+def get_digest_by_line(filename, line_invariant=False, hasher=hasher):
+    with open(filename, 'r') as f:
+        hashes = (hasher(line) for line in f)
+        if line_invariant:
+            hashes = sorted(hashes)
+        return hasher(''.join(hashes))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Thank you all for the interesting comments and answers so far.</p>
+<p>At this time, the best answer for large files (&gt;350K lines) is <strong>(a)</strong> below. It is based on <a href="https://github.com/aappleby/smhasher/wiki/MurmurHash3" rel="nofollow noreferrer">Murmurhash3</a>, adding the <code>mmh3.hash128()</code> of each line. For smaller files, it is <strong>(b)</strong> below: a variant of <a href="https://stackoverflow.com/a/42391438/758174">the frozenset approach proposed by Rolf</a>, which I adapted to produce 128 bits hash (although I wouldn't vouch for the quality of those 128 bits).</p>
+<p><strong>a) <code>mmh3.hash128()</code> for each line and add</strong></p>
+<pre><code>import mmh3
+def get_digest_mmh3_128_add(filename):
+    a = 0
+    with open(filename, 'rb') as f:
+        for line in f:
+            a += mmh3.hash128(line)
+    return '{:032x}'.format(a &amp; 0xffffffffffffffffffffffffffffffff)
+</code></pre>
+<p><em>In my setting: constant 0.4 second per million lines.</em></p>
+<p><strong>b) two frozenset hash</strong></p>
+<pre><code>def get_digest_hash_frozenset128(filename):
+    with open(filename, 'rb') as f:
+        frz = frozenset(f.readlines())
+    return '{:032x}'.format(((hash(frz) &lt;&lt; 64) + hash(frz.union('not a line'))) &amp; 0xffffffffffffffffffffffffffffffff)
+</code></pre>
+<p><em>In my setting: between 0.2 and 0.6 second per million lines.</em></p>
+<p><strong>Notes</strong></p>
+<ol>
+<li><p>After consideration, I decided it was ok to read the lines of the file in binary mode, even if they potentially contain UTF-8 text.  The reason is, if some Unicode character contains a <code>'\n'</code>, the line would be accidentally split at that point. The file would then get the same digest as another, where the two parts of that line were arranged differently (or even split apart and put at some other place through the file), but the probability of this is extremely slow and I can live with it.</p></li>
+<li><p>Adding all the 128-bit hashes in (a) is done using Python's arbitrary precision ints. At first, I tried to keep the sum in 128 bits (by repeatingly and-ing with the <code>0xfff...fff</code> constant).  But it turns out to be slower than letting Python use arbitrary precision and do the masking once at the end.</p></li>
+<li><p>I am trying to get 128 bits from the regular hash of a frozenset by taking two hashes: that of the frozenset, and another one from the frozenset augmented with a line that is unlikely to appear in any file (kind of the same as using different seed for the hash, I guess).</p></li>
+</ol>
+<p><strong>Complete results</strong></p>
+<p>A full notebook is available <a href="https://gist.github.com/pdemarti/dc394c53ae83816a64d45950cd1b086a" rel="nofollow noreferrer">here</a>.  It creates pseudo-random files of arbitrary sizes, and tries several digest approaches while measuring the time taken by each of them.  This is run on an EC2 instance (r3.4xlarge, using an EBS volume for the storage of the pseudo-random file) and Jupyter iPython notebook, and Python 3.6.</p>
+<p>For 46341 lines, we get</p>
+<pre><code>fun                              lines millis
+get_digest_xxh64_order_sensitive 46341    0.4 *
+get_digest_sha1                  46341    1.7 *
+get_digest_hash_frozenset64      46341    8.7
+get_digest_hash_frozenset128     46341   10.8
+get_digest_sha1_by_lines         46341   14.1 *
+get_digest_mmh3_128_add_cy       46341   18.6
+get_digest_mmh3_128_add          46341   19.7
+get_digest_sha1_sort_binary      46341   44.3
+get_digest_sha1_sort             46341   65.9
+</code></pre>
+<p><code>*</code>: These are order-dependent, just here for comparison.</p>
+<p><code>get_digest_hash_frozenset64</code> isn't really suitable as it gives only 64 bits.</p>
+<p><code>get_digest_mmh3_128_add_cy</code> is a cythonized version of the function given above in (a), but there is little difference.</p>
+<p><code>get_digest_xxh64_order_sensitive</code> is extremely fast, but it is order dependent.  My attempts (not listed here) to derive an order-invariant version all gave some pretty slow results. The reason, I think, is the apparently high cost of initializing and finalizing the hash.</p>
+<p>For larger files, the <code>get_digest_mmh3_128_add_cy</code> wins. Here is for 11.8M lines:</p>
+<pre><code>fun                                 lines    millis
+get_digest_xxh64_order_sensitive 11863283      97.8 *
+get_digest_sha1                  11863283     429.3 *
+get_digest_sha1_by_lines         11863283    3453.0 *
+get_digest_mmh3_128_add_cy       11863283    4692.8
+get_digest_mmh3_128_add          11863283    4956.6
+get_digest_hash_frozenset64      11863283    6418.2
+get_digest_hash_frozenset128     11863283    7663.6
+get_digest_sha1_sort_binary      11863283   27851.3
+get_digest_sha1_sort             11863283   34806.4
+</code></pre>
+<p>Focusing on the two leading contenders (order invariant, not the others), here is how much time they take in function of size (number of lines). The y-axis is microseconds/line and the x-axis is number of lines of the file. Note how the <code>get_digest_mmh3_128_add_cy</code> spends a constant time (0.4 us) per line.</p>
+<p><a href="https://gist.github.com/pdemarti/dc394c53ae83816a64d45950cd1b086a" rel="nofollow noreferrer"><img alt="time of two order-invariant digests in function of size" src="https://i.stack.imgur.com/EY2rw.png"/></a></p>
+<p><strong>Next steps</strong></p>
+<p>Sorry for the long-winded answer. This is only an interim answer, as I might (time permitting) try later further experimentation with either numba or Cython (or C++) of a direct implementation of Murmurhash3.</p>
+</div>
+<span class="comment-copy">first improvement: you could probably <code>sort</code> the python lines using <code>for lines in sorted(f)</code> instead of calling an external process...</span>
+<span class="comment-copy">As a side note, if you're working with lines (based on <i>'order-invariant hash for the lines of a file'</i> ) why are you using a buffer in the 'ordersensitive' case? Just pump the <code>hasher</code> with <code>.readline()</code> output.</span>
+<span class="comment-copy">Also: it's probably much faster to encode the whole file and <i>then</i> split the lines, then calling <code>.encode</code> on every line: <code>with open(...) as f: for line in sorted(f.read().encode('utf-8').split('\n')): hasher.update(line)</code> (yes, it loads the whole file into memory, but sorting <i>requires</i> this).</span>
+<span class="comment-copy">Or even better, open the file in binary mode, so no decoding/reencoding will take place</span>
+<span class="comment-copy">@ThierryLathuille - his minimal unit for hashing are lines so reading the whole file into a buffer is a moot point. Then again, he's opening the file in binary mode for some reason, too, pretty much guaranteeing that the above will not return the same hash for two exact same files with turned line ordering - in the first case he's not even hashing it line by line.</span>
+<span class="comment-copy">Frozenset is a good fit for this task.  And since duplicate lines are eliminated while building the frozenset, there is no risk of two duplicate lines cancelling each other out.</span>
+<span class="comment-copy">The downside is that the hash value is only 32 or 64 bits.</span>
+<span class="comment-copy">Cool, +1 for thinking of the frozenset. However, I did some measurement for increasing sizes and found that the time taken by this approach is more than linear with the number of lines.  That said, the overall constants are low. For example, it takes 15ms for 65536 lines, best I've seen so far. But then it takes 7.6s for 11.8M lines, not the best.</span>
+<span class="comment-copy">BTW, the files come as is from a different system over which I have little or no control; there are <i>many</i> of them, and I cannot affect the way they are produced. I wish they were always sorted. Often they are not.</span>
+<span class="comment-copy">Hey, good idea. In fact, with some minor mods it could also be distributed for very large files, e.g. in a map-reduce scheme with some binning on hash prefix.</span>

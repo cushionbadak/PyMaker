@@ -1,0 +1,29 @@
+<div class="post-text" itemprop="text">
+<p>I am working on a python extension that does some specialized tree things on a large (5GB+) in-memory data structure.</p>
+<p>The underlying data structure is already thread-safe (it uses RW locks), and I've written a wrapper around it that exposes it to python. It supports multiple simultaneous readers, only one writer, and I'm using a <code>pthread_rwlock</code> for access synchronization. Since the application is very read-heavy, multiple readers should provide a decent performance improvement (I hope).</p>
+<p>However, I cannot determine what the proper solution is to allow the extension data-store to be shared across multiple python processes accessed via the <code>multiprocessing</code> module.</p>
+<p>Basically, I'd like something that looks like the current <code>multiprocessing.Value</code>/<code>multiprocessing.Array</code> system, but the caveat here is that my extension is allocating all it's own memory in C++.</p>
+<p>How can I allow multiple processes to access my shared data structure?</p>
+<p>Sources are <a href="https://github.com/fake-name/IntraArchiveDeduplicator/blob/master/deduplicator/bktree.hpp" rel="nofollow">here</a> (C++ Header-only library), and <a href="https://github.com/fake-name/IntraArchiveDeduplicator/blob/master/deduplicator/cyHamDb.pyx#L16-L126" rel="nofollow">here</a> (Cython wrapper).</p>
+<p>Right now, if I build a instance of the tree, and then pass references out to multiple processes, it fails with a serialization error:</p>
+<pre><code>Traceback (most recent call last):
+  File "/usr/lib/python3.4/multiprocessing/queues.py", line 242, in _feed
+    obj = ForkingPickler.dumps(obj)
+  File "/usr/lib/python3.4/multiprocessing/reduction.py", line 50, in dumps
+    cls(buf, protocol).dump(obj)
+TypeError: cannot serialize '_io.TextIOWrapper' object
+</code></pre>
+<p>(<a href="https://github.com/fake-name/IntraArchiveDeduplicator/blob/master/Tests/Test_BKTree_Concurrency.py#L69-L73" rel="nofollow">failing test-case</a>)</p>
+<p>I'm currently releasing the GIL in my library, but there are some future tasks that would greatly benefit from independent processes, and I'd like to avoid having to implement a RPC system for talking to the BK tree.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If the extension data is going to exist as a single logical mutable object across multiple processes (so a change in Process A will be reflected in the view in Process B), you can't avoid some sort of IPC mechanism. The memory spaces of two processes are separate; Python can't magically share unshared data.</p>
+<p>The closest you could get (without explicitly using shared memory at the C layer that could be used to allow mapping the same memory into each process) would be to use a custom subclass of <code>multiprocessing.BaseManager</code>, which would just hide the IPC from you (the actual object would live in a single process, with other processes proxying to that original object).  You can see <a href="https://docs.python.org/3/library/multiprocessing.html#customized-managers" rel="nofollow">a really simple example in the <code>multiprocessing</code> docs</a>.</p>
+<p>The manager approach is simple, but performance-wise it's probably not going to do so hot; shared memory at the C layer avoids a lot of overhead that the proxying mechanism can't avoid. You'd need to test to verify anything. Making C++ STL use shared memory would be a royal pain to my knowledge, probably not worth the trouble, so unless the manager approach is shown to be too slow, I'd avoid even attempting the optimization.</p>
+</div>
+<span class="comment-copy">FYI, the actual problem is that your class seems to include a file object, which isn't picklable (a custom <code>__reduce__</code> or <code>__getstate__</code>/<code>__setstate__</code> pairing could be used to send only the file name across and have it reopened on the other side). That said, even if it was picklable, as soon as it was sent to the other process, it would lose the linkage to the object in the original process; modifying one wouldn't affect the other, which doesn't appear to be what you need.</span>
+<span class="comment-copy">@ShadowRanger - It has no file anything anywhere, look at the source. I have no idea what that's coming from. Could something be treating the RW_lock mutex as a file-like object?</span>
+<span class="comment-copy">Looks like <code>CPPBkHammingTree</code> has a logger as member <code>self.log</code>. Whether its attached to <code>stdout</code> or a file, the text wrapper (to convert from Unicode to native encoding bytes) is going to be involved. That's a likely cause of problems.</span>
+<span class="comment-copy">@ShadowRanger - Arrrgh, doh. I completely forgot about the logging interface. There's a custom handler behind it that does write to a file for errors.</span>
+<span class="comment-copy">I wasn't aware that sharing STL objects (which is what the entire tree is composed of) was so troublesome. That's annoying. I guess I'll just use threads, and eat the annoyance of having to work around the GIL in non-library function calls.</span>
+<span class="comment-copy">If you do end up wanting to try using shared memory STL, I'd suggest taking a look at <a href="http://www.drdobbs.com/creating-stl-containers-in-shared-memory/184401639" rel="nofollow noreferrer">this article</a>. Covers the basics.</span>

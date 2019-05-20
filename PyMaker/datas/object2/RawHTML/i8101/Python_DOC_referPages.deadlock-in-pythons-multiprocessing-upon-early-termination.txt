@@ -1,0 +1,189 @@
+<div class="post-text" itemprop="text">
+<p>I'm creating a <code>multiprocessing.Queue</code> in Python and adding <code>multiprocessing.Process</code> instances to this <code>Queue</code>.</p>
+<p>I would like to add a function call that is executed after every <code>job</code>, which checks if a specific task has succeeded. If so, I would like to empty the <code>Queue</code> and terminate execution.</p>
+<p>My <code>Process</code> class is:</p>
+<pre><code>class Worker(multiprocessing.Process):
+
+    def __init__(self, queue, check_success=None, directory=None, permit_nonzero=False):
+        super(Worker, self).__init__()
+        self.check_success = check_success
+        self.directory = directory
+        self.permit_nonzero = permit_nonzero
+        self.queue = queue
+
+    def run(self):
+        for job in iter(self.queue.get, None):
+            stdout = mbkit.dispatch.cexectools.cexec([job], directory=self.directory, permit_nonzero=self.permit_nonzero)
+            with open(job.rsplit('.', 1)[0] + '.log', 'w') as f_out:
+                f_out.write(stdout)
+            if callable(self.check_success) and self.check_success(job):
+                # Terminate all remaining jobs here
+                pass
+</code></pre>
+<p>And my <code>Queue</code> is setup here:</p>
+<pre><code>class LocalJobServer(object):
+
+    @staticmethod
+    def sub(command, check_success=None, directory=None, nproc=1, permit_nonzero=False, time=None, *args, **kwargs):
+        if check_success and not callable(check_success):
+            msg = "check_success option requires a callable function/object: {0}".format(check_success)
+            raise ValueError(msg)
+
+        # Create a new queue
+        queue = multiprocessing.Queue()
+        # Create workers equivalent to the number of jobs
+        workers = []
+        for _ in range(nproc):
+            wp = Worker(queue, check_success=check_success, directory=directory, permit_nonzero=permit_nonzero)
+            wp.start()
+            workers.append(wp)
+        # Add each command to the queue
+        for cmd in command:
+            queue.put(cmd, timeout=time)
+        # Stop workers from exiting without completion
+        for _ in range(nproc):
+            queue.put(None)
+        for wp in workers:
+            wp.join()
+</code></pre>
+<p>The function call <code>mbkit.dispatch.cexectools.cexec()</code> is a wrapper around <code>subprocess.Popen</code> and returns <code>p.stdout</code>.</p>
+<p>In the <code>Worker</code> class, I've written the conditional to check if a job succeeded, and tried emptying the remaining jobs in the <code>Queue</code> using a <code>while</code> loop, i.e. my <code>Worker.run()</code> function looked like this:</p>
+<pre><code>def run(self):
+    for job in iter(self.queue.get, None):
+        stdout = mbkit.dispatch.cexectools.cexec([job], directory=self.directory, permit_nonzero=self.permit_nonzero)
+        with open(job.rsplit('.', 1)[0] + '.log', 'w') as f_out:
+            f_out.write(stdout)
+        if callable(self.check_success) and self.check_success(job):
+            break
+    while not self.queue.empty():
+        self.queue.get()
+</code></pre>
+<p>Although this works sometimes, it usually deadlocks and my only option is to <code>Ctrl-C</code>. I am aware that <code>.empty()</code> is unreliable, thus my question.</p>
+<p>Any advice on how I can implement such an early termination functionality?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You do not have a deadlock here. It is just linked to the behavior of <code>multiprocessing.Queue</code>, as the <code>get</code> method is blocking by default. Thus when you call <code>get</code> on an empty queue, the call stall, waiting for the next element to be ready. You can see that some of your workers will stall because when you use your loop <code>while not self.queue.empty()</code> to empty it, you remove all the <code>None</code> sentinel and some of your workers will block on the empty <code>Queue</code>, like in this code:</p>
+<pre><code>from multiprocessing import Queue
+q = Queue()
+for e in iter(q.get, None):
+    print(e)
+</code></pre>
+<p>To be notified when the queue is empty, you need to use non blocking call. You can for instance use <code>q.get_nowait</code>, or use a timeout in <code>q.get(timeout=1)</code>. Both throw a <code>multiprocessing.queues.Empty</code> exception when the queue is empty. So you should replace your <code>Worker</code> <code>for job in iter(...):</code> loop by something like:</p>
+<pre><code>while not queue.empty():
+    try:
+        job = queue.get(timeout=.1)
+    except multiprocessing.queues.Empty:
+        continue
+    # Do stuff with your job
+</code></pre>
+<p>If you do not want to be stuck at any point.</p>
+<p>For the synchronization part, I would recommend using a synchronization primitive such as <a href="https://docs.python.org/2/library/multiprocessing.html#multiprocessing.Condition" rel="nofollow noreferrer"><code>multiprocessing.Condition</code></a> or an <a href="https://docs.python.org/2/library/multiprocessing.html#multiprocessing.Event" rel="nofollow noreferrer"><code>multiprocessing.Event</code></a>. This is cleaner than the Value are they are design for this purpose. Something like this should help</p>
+<pre><code>def run(self):
+    while not queue.empty():
+        try:
+            job = queue.get(timeout=.1)
+        except multiprocessing.queues.Empty:
+            continue
+        if self.event.is_set():
+            continue
+        stdout = mbkit.dispatch.cexectools.cexec([job], directory=self.directory, permit_nonzero=self.permit_nonzero)
+        with open(job.rsplit('.', 1)[0] + '.log', 'w') as f_out:
+            f_out.write(stdout)
+        if callable(self.check_success) and self.check_success(job):
+            self.event.set()
+    print("Worker {} terminated cleanly".format(self.name))
+</code></pre>
+<p>with <code>event = multiprocessing.Event()</code>.</p>
+<p>Note that it is also possible to use a <code>multiprocessing.Pool</code> to get avoid dealing with the queue and the workers. But as you need some synchronization primitive, it might be a bit more complicated to set up. Something like this should work:</p>
+<pre><code> def worker(job, success, check_success=None, directory=None, permit_nonzero=False):
+      if sucess.is_set():
+          return False
+      stdout = mbkit.dispatch.cexectools.cexec([job], directory=self.directory, permit_nonzero=self.permit_nonzero)
+      with open(job.rsplit('.', 1)[0] + '.log', 'w') as f_out:
+          f_out.write(stdout)
+      if callable(self.check_success) and self.check_success(job):
+          success.set()
+      return True
+
+# ......
+# In the class LocalJobServer
+# .....
+
+def sub(command, check_success=None, directory=None, nproc=1, permit_nonzero=False):
+
+    mgr = multiprocessing.Manager()
+    success = mgr.Event()
+
+    pool = multiprocessing.Pool(nproc)
+    run_args = [(cmd, success, check_success, directory, permit_nonzero)]
+    result = pool.starmap(worker, run_args)
+
+    pool.close()
+    pool.join()
+</code></pre>
+<p>Note here that I use a Manager as you cannot pass <code>multiprocessing.Event</code> directly as arguments. You could also use the arguments <code>initializer</code> and <code>initargs</code> of the <code>Pool</code> to initiate global <code>success</code> event in each worker and avoid relying on the <code>Manager</code> but it is slightly more complicated.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This might not be the optimal solution, and any other suggestion is much appreciated, but I managed to solve the problem as such:</p>
+<pre><code>class Worker(multiprocessing.Process):
+    """Simple manual worker class to execute jobs in the queue"""
+
+    def __init__(self, queue, success, check_success=None, directory=None, permit_nonzero=False):
+        super(Worker, self).__init__()
+        self.check_success = check_success
+        self.directory = directory
+        self.permit_nonzero = permit_nonzero
+        self.success = success
+        self.queue = queue
+
+    def run(self):
+        """Method representing the process's activity"""
+        for job in iter(self.queue.get, None):
+            if self.success.value:
+                continue
+            stdout = mbkit.dispatch.cexectools.cexec([job], directory=self.directory, permit_nonzero=self.permit_nonzero)
+            with open(job.rsplit('.', 1)[0] + '.log', 'w') as f_out:
+                f_out.write(stdout)
+            if callable(self.check_success) and self.check_success(job):
+                self.success.value = int(True)
+            time.sleep(1)
+
+
+class LocalJobServer(object):
+    """A local server to execute jobs via the multiprocessing module"""
+
+    @staticmethod
+    def sub(command, check_success=None, directory=None, nproc=1, permit_nonzero=False, time=None, *args, **kwargs):
+        if check_success and not callable(check_success):
+            msg = "check_success option requires a callable function/object: {0}".format(check_success)
+            raise ValueError(msg)
+
+        # Create a new queue
+        queue = multiprocessing.Queue()
+        success = multiprocessing.Value('i', int(False))
+        # Create workers equivalent to the number of jobs
+        workers = []
+        for _ in range(nproc):
+            wp = Worker(queue, success, check_success=check_success, directory=directory, permit_nonzero=permit_nonzero)
+            wp.start()
+            workers.append(wp)
+        # Add each command to the queue
+        for cmd in command:
+            queue.put(cmd)
+        # Stop workers from exiting without completion
+        for _ in range(nproc):
+            queue.put(None)
+        # Start the workers
+        for wp in workers:
+            wp.join(time)
+</code></pre>
+<p>Basically I'm creating a <a href="https://docs.python.org/2/library/multiprocessing.html#multiprocessing.Value" rel="nofollow noreferrer"><code>Value</code></a> and providing that to each <a href="https://docs.python.org/2/library/multiprocessing.html#multiprocessing.Process" rel="nofollow noreferrer"><code>Process</code></a>. Once a job is marked as successful, this variable gets updated. Each <a href="https://docs.python.org/2/library/multiprocessing.html#multiprocessing.Process" rel="nofollow noreferrer"><code>Process</code></a> checks in <code>if self.success.value: continue</code> whether we have a success and if so, just iterates over the remaining jobs in the <a href="https://docs.python.org/2/library/multiprocessing.html#multiprocessing.Queue" rel="nofollow noreferrer"><code>Queue</code></a> until empty.</p>
+<p>The <code>time.sleep(1)</code> call is required to account for potential syncing delays amongst the processes. This is certainly not the most efficient approach but it works.</p>
+</div>
+<span class="comment-copy">Great response, thanks for that. A rather basic question, would you recommend the <code>multiprocessing.Pool</code> over my current approach?</span>
+<span class="comment-copy"><code>multiprocessing.Pool</code> is a good approach when you complexify your code, as it manages most of the communication and avoid some headaches in the design for your application. Also, if you need to pass a second set of jobs, you can reuse the same <code>pool</code>. This avoid the time of launching a new set of <code>Process</code>. However, I am not a big fan of the <code>multiprocessing.Pool</code> design and I would recommend learning more about <a href="https://docs.python.org/3/library/concurrent.futures.html" rel="nofollow noreferrer"><code>concurrent.futures.ProcessPoolExecutor</code></a> if you are using python3 as it is more robust and the API is nicer!</span>
+<span class="comment-copy">This is the possible culprit of your ` deadlock<code>: </code>for job in iter(self.queue.get, None):`</span>
+<span class="comment-copy">@stovfl thanks for your response but the answer posted here works fine. I believe the issue to have been with <code>while not self.queue.empty()</code> and <code>self.queue.get()</code>, i.e the <code>queue</code> was not empty, went in the loop but upon <code>get()</code> it was empty and deadlocked.</span>
+<span class="comment-copy">Didn't see any <code>while ...</code>? BTW: Are you aware of <code>module multiprocessing.Pool</code>? Seems you reimplemented <code>Pool</code>.</span>
+<span class="comment-copy">@stovfl I did use it in the original question. As mentioned in this post, this implementation solves my problem and works fine. How would I implement it using <code>multiprocessing.Pool</code>?</span>
+<span class="comment-copy">Read <code>Pool</code> examples, if suited your needs: <a href="https://docs.python.org/2/library/multiprocessing.html#using-a-pool-of-workers" rel="nofollow noreferrer">docs.python.org/2/library/…</a></span>

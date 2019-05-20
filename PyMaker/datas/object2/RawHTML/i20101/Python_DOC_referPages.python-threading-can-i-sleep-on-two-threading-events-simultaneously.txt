@@ -1,0 +1,405 @@
+<div class="post-text" itemprop="text">
+<p>If I have two <code>threading.Event()</code> objects, and wish to sleep until either one of them is set, is there an efficient way to do that in python?  Clearly I could do something with polling/timeouts, but I would like to really have the thread sleep until one is set, akin to how <code>select</code> is used for file descriptors.</p>
+<p>So in the following implementation, what would an efficient non-polling implementation of <code>wait_for_either</code> look like?</p>
+<pre><code>a = threading.Event()
+b = threading.Event()
+
+wait_for_either(a, b)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here is a non-polling non-excessive thread solution: modify the existing <code>Event</code>s to fire a callback whenever they change, and handle setting a new event in that callback:</p>
+<pre><code>import threading
+
+def or_set(self):
+    self._set()
+    self.changed()
+
+def or_clear(self):
+    self._clear()
+    self.changed()
+
+def orify(e, changed_callback):
+    e._set = e.set
+    e._clear = e.clear
+    e.changed = changed_callback
+    e.set = lambda: or_set(e)
+    e.clear = lambda: or_clear(e)
+
+def OrEvent(*events):
+    or_event = threading.Event()
+    def changed():
+        bools = [e.is_set() for e in events]
+        if any(bools):
+            or_event.set()
+        else:
+            or_event.clear()
+    for e in events:
+        orify(e, changed)
+    changed()
+    return or_event
+</code></pre>
+<p>Sample usage:</p>
+<pre><code>def wait_on(name, e):
+    print "Waiting on %s..." % (name,)
+    e.wait()
+    print "%s fired!" % (name,)
+
+def test():
+    import time
+
+    e1 = threading.Event()
+    e2 = threading.Event()
+
+    or_e = OrEvent(e1, e2)
+
+    threading.Thread(target=wait_on, args=('e1', e1)).start()
+    time.sleep(0.05)
+    threading.Thread(target=wait_on, args=('e2', e2)).start()
+    time.sleep(0.05)
+    threading.Thread(target=wait_on, args=('or_e', or_e)).start()
+    time.sleep(0.05)
+
+    print "Firing e1 in 2 seconds..."
+    time.sleep(2)
+    e1.set()
+    time.sleep(0.05)
+
+    print "Firing e2 in 2 seconds..."
+    time.sleep(2)
+    e2.set()
+    time.sleep(0.05)
+</code></pre>
+<p>The result of which was:</p>
+<pre><code>Waiting on e1...
+Waiting on e2...
+Waiting on or_e...
+Firing e1 in 2 seconds...
+e1 fired!or_e fired!
+
+Firing e2 in 2 seconds...
+e2 fired!
+</code></pre>
+<p>This should be thread-safe. Any comments are welcome.</p>
+<p>EDIT: Oh and here is your <code>wait_for_either</code> function, though the way I wrote the code, it's best to make and pass around an <code>or_event</code>. Note that the <code>or_event</code> shouldn't be set or cleared manually.</p>
+<pre><code>def wait_for_either(e1, e2):
+    OrEvent(e1, e2).wait()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>One solution (<em>with polling</em>) would be to do sequential waits on each <code>Event</code> in a loop</p>
+<pre><code>def wait_for_either(a, b):
+    while True:
+        if a.wait(tunable_timeout):
+            break
+        if b.wait(tunable_timeout):
+            break
+</code></pre>
+<p>I think that if you tune the timeout well enough the results would be OK.</p>
+<hr/>
+<p>The best non-polling I can think of is to wait for each one in a different thread and set a shared <code>Event</code> whom you will wait after in the main thread.</p>
+<pre><code>def repeat_trigger(waiter, trigger):
+    waiter.wait()
+    trigger.set()
+
+def wait_for_either(a, b):
+    trigger = threading.Event()
+    ta = threading.Thread(target=repeat_trigger, args=(a, trigger))
+    tb = threading.Thread(target=repeat_trigger, args=(b, trigger))
+    ta.start()
+    tb.start()
+    # Now do the union waiting
+    trigger.wait()
+</code></pre>
+<hr/>
+<p>Pretty interesting, so I wrote an OOP version of the previous solution:</p>
+<pre><code>class EventUnion(object):
+    """Register Event objects and wait for release when any of them is set"""
+    def __init__(self, ev_list=None):
+        self._trigger = Event()
+        if ev_list:
+            # Make a list of threads, one for each Event
+            self._t_list = [
+                Thread(target=self._triggerer, args=(ev, ))
+                for ev in ev_list
+            ]
+        else:
+            self._t_list = []
+
+    def register(self, ev):
+        """Register a new Event"""
+        self._t_list.append(Thread(target=self._triggerer, args=(ev, )))
+
+    def wait(self, timeout=None):
+        """Start waiting until any one of the registred Event is set"""
+        # Start all the threads
+        map(lambda t: t.start(), self._t_list)
+        # Now do the union waiting
+        return self._trigger.wait(timeout)
+
+    def _triggerer(self, ev):
+        ev.wait()
+        self._trigger.set()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Starting extra threads seems a clear solution, not very effecient though.
+Function wait_events will block util any one of events is set.</p>
+<pre><code>def wait_events(*events):
+    event_share = Event()
+
+    def set_event_share(event):
+        event.wait()
+        event.clear()
+        event_share.set()
+    for event in events:
+        Thread(target=set_event_share(event)).start()
+
+    event_share.wait()
+
+wait_events(event1, event2, event3)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Extending <a href="https://stackoverflow.com/a/12320352/1760875">Claudiu's</a> answer where you can either wait for:</p>
+<ol>
+<li>event 1 OR event 2</li>
+<li>event 1 AND even 2</li>
+</ol>
+<hr/>
+<pre><code>from threading import Thread, Event, _Event
+
+class ConditionalEvent(_Event):
+    def __init__(self, events_list, condition):
+        _Event.__init__(self)
+
+        self.event_list = events_list
+        self.condition = condition
+
+        for e in events_list:
+            self._setup(e, self._state_changed)
+
+        self._state_changed()
+
+    def _state_changed(self):
+        bools = [e.is_set() for e in self.event_list]
+        if self.condition == 'or':                
+            if any(bools):
+                self.set()
+            else:
+                self.clear()
+
+        elif self.condition == 'and':                 
+            if all(bools):
+                self.set()
+            else:
+                self.clear()
+
+    def _custom_set(self,e):
+        e._set()
+        e._state_changed()
+
+    def _custom_clear(self,e):
+        e._clear()
+        e._state_changed()
+
+    def _setup(self, e, changed_callback):
+        e._set = e.set
+        e._clear = e.clear
+        e._state_changed = changed_callback
+        e.set = lambda: self._custom_set(e)
+        e.clear = lambda: self._custom_clear(e)
+</code></pre>
+<p>Example usage will be very similar as before</p>
+<pre><code>import time
+
+e1 = Event()
+e2 = Event()
+
+# Example to wait for triggering of event 1 OR event 2
+or_e = ConditionalEvent([e1, e2], 'or')
+
+# Example to wait for triggering of event 1 AND event 2
+and_e = ConditionalEvent([e1, e2], 'and')
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is an old question, but I hope this helps someone coming from Google.<br/>
+The accepted answer is fairly old and will cause an infinite loop for twice-"orified" events.  </p>
+<p>Here is an implementation using <code>concurrent.futures</code></p>
+<pre><code>import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+
+def wait_for_either(events, timeout=None, t_pool=None):
+    '''blocks untils one of the events gets set
+
+    PARAMETERS
+    events (list): list of threading.Event objects
+    timeout (float): timeout for events (used for polling)
+    t_pool (concurrent.futures.ThreadPoolExecutor): optional
+    '''
+
+    if any(event.is_set() for event in events):
+        # sanity check
+        pass
+    else:
+        t_pool = t_pool or ThreadPoolExecutor(max_workers=len(events))
+        tasks = []
+        for event in events:
+            tasks.append(t_pool.submit(event.wait))
+
+        concurrent.futures.wait(tasks, timeout=timeout, return_when='FIRST_COMPLETED')
+        # cleanup
+        for task in tasks:
+            try:
+                task.result(timeout=0)
+            except concurrent.futures.TimeoutError:
+                pass
+</code></pre>
+<p>Testing the function</p>
+<pre><code>import threading
+import time
+from datetime import datetime, timedelta
+
+def bomb(myevent, sleep_s):
+    '''set event after sleep_s seconds'''
+    with lock:
+        print('explodes in ', datetime.now() + timedelta(seconds=sleep_s))
+    time.sleep(sleep_s)
+    myevent.set()
+    with lock:
+        print('BOOM!')
+
+lock = threading.RLock()  # so prints don't get jumbled
+a = threading.Event()
+b = threading.Event()
+
+t_pool = ThreadPoolExecutor(max_workers=2)
+
+threading.Thread(target=bomb, args=(event1, 5), daemon=True).start()
+threading.Thread(target=bomb, args=(event2, 120), daemon=True).start()
+
+with lock:
+    print('1 second timeout, no ThreadPool', datetime.now())
+
+wait_for_either([a, b], timeout=1)
+
+with lock:
+    print('wait_event_or done', datetime.now())
+    print('=' * 15)
+
+with lock:
+    print('wait for event1', datetime.now())
+
+wait_for_either([a, b], t_pool=t_pool)
+
+with lock:
+    print('wait_event_or done', datetime.now())
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Not pretty, but you can use two additional threads to multiplex the events...</p>
+<pre><code>def wait_for_either(a, b):
+  flag = False #some condition variable, event, or similar
+
+  class Event_Waiter(threading.Thread):
+    def __init__(self, event):
+        self.e = event
+    def run(self):
+        self.e.wait()
+        flag.set()
+
+  a_thread = Event_Waiter(a)
+  b_thread = Event_Waiter(b)
+  a.start()
+  b.start()
+  flag.wait()
+</code></pre>
+<p>Note, you may have to worry about accidentally getting both events if they arrive too quickly. The helper threads (a_thread and b_thread) should lock synchronize around trying to set flag and then should kill the other thread (possibly resetting that thread's event if it was consumed). </p>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>def wait_for_event_timeout(*events):
+    while not all([e.isSet() for e in events]):
+        #Check to see if the event is set. Timeout 1 sec.
+        ev_wait_bool=[e.wait(1) for e in events]
+        # Process if all events are set. Change all to any to process if any event set
+        if all(ev_wait_bool):
+            logging.debug('processing event')
+        else:
+            logging.debug('doing other work')
+
+
+e1 = threading.Event()
+e2 = threading.Event()
+
+t3 = threading.Thread(name='non-block-multi',
+                      target=wait_for_event_timeout,
+                      args=(e1,e2))
+t3.start()
+
+logging.debug('Waiting before calling Event.set()')
+time.sleep(5)
+e1.set()
+time.sleep(10)
+e2.set()
+logging.debug('Event is set')
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think the standard library provides a pretty canonical solution to this problem that I don't see brought up in this question: <a href="https://docs.python.org/3/library/threading.html#threading.Condition" rel="nofollow noreferrer">condition variables</a>. You have your main thread wait on a condition variable, and poll the set of events each time it is notified. It is only notified when one of the events is updated, so there is no wasteful polling. Here is a Python 3 example:</p>
+<pre class="lang-py prettyprint-override"><code>from threading import Thread, Event, Condition
+from time import sleep
+from random import random
+
+event1 = Event()
+event2 = Event()
+cond = Condition()
+
+def thread_func(event, i):
+    delay = random()
+    print("Thread {} sleeping for {}s".format(i, delay))
+    sleep(delay)
+
+    event.set()
+    with cond:
+        cond.notify()
+
+    print("Thread {} done".format(i))
+
+with cond:
+    Thread(target=thread_func, args=(event1, 1)).start()
+    Thread(target=thread_func, args=(event2, 2)).start()
+    print("Threads started")
+
+    while not (event1.is_set() or event2.is_set()):
+        print("Entering cond.wait")
+        cond.wait()
+        print("Exited cond.wait ({}, {})".format(event1.is_set(), event2.is_set()))
+
+    print("Main thread done")
+</code></pre>
+<p>Example output:</p>
+<pre><code>Thread 1 sleeping for 0.31569427100177794s
+Thread 2 sleeping for 0.486548134317051s
+Threads started
+Entering cond.wait
+Thread 1 done
+Exited cond.wait (True, False)
+Main thread done
+Thread 2 done
+</code></pre>
+<p>Note that wit no extra threads or unnecessary polling, you can wait for an arbitrary predicate to become true (e.g. for any particular subset of the events to be set). There's also a <code>wait_for</code> wrapper for the <code>while (pred): cond.wait()</code> pattern, which can make your code a bit easier to read.</p>
+</div>
+<span class="comment-copy">Is there a good reason for using 2 different events and not use the same one?</span>
+<span class="comment-copy">@Iulius you have a single thread that you want to be event driven, but has 2 queues ... so you need to wake up when either q gets an item</span>
+<span class="comment-copy">I'm surprised Python does not have this built-in.</span>
+<span class="comment-copy">This is nice! However, I see one problem: if you <code>orify</code> the same event twice, you'll get a infinite loop whenever you set or clear it.</span>
+<span class="comment-copy">That's a good point! Will modify soon</span>
+<span class="comment-copy">Thanks very much for this!  It's exactly what I was looking for.  Would you agree to let the code in this answer to be used under open source licensing terms?  BSD or MIT would be ideal, since they are compatible with Numpy, Pandas, Scipy, etc.</span>
+<span class="comment-copy">@naitsirhc: sure no problem :) do with it what you will</span>
+<span class="comment-copy">@Claudiu: awesome, thanks!</span>
+<span class="comment-copy">you could make repeat_trigger also check for trigger (with timeout = 0 for trigger and timeout &gt; 0 for waiter) so that all threads eventually end</span>
+<span class="comment-copy">i was thinking the same but there's gotta be a better way than starting 2 threads...</span>
+<span class="comment-copy">It would be nice to know which one has been triggered</span>
+<span class="comment-copy">I think this might be unreliable if you wait on a largish number of events (tens), since the max_workers argument to ThreadPoolExecutor specifies the maximum number of threads to launch - you may get fewer, in which case some events won't be waited on.</span>
+<span class="comment-copy">Also, the Executor will not end until all its threads have exited. Executors should be used in a 'with' statement, and if you try that you will find that it deadlocks until ALL events have been triggered. Your code will "leak" running threads every time it is called.</span>

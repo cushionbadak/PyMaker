@@ -1,0 +1,260 @@
+<div class="post-text" itemprop="text">
+<p>I currently am trying to create a client-server application in which the client can send multiple files to the server using TCP protocol. The server will eventually create a hash-algorithm and send it back to the client but I am running into issues sending multiple files from the client to the server. In it's current form, the first file sends correctly but the files after encounter an error where the information is merged together. IE the file size is listed as the second file's name. I am a javascript dude and very new to python so an explanation to how I can make this happen would be much appreciated. I believe threading is the answer but with my limited understanding of python, I do not know how to make this work. Currently I can send one file at a time and the server stays open. However, I would like to enter several file names from my current directory and have them processed. I eventually will convert the entire client side into C but I am struggling to get the server to work correctly in python. Any advice would be much appreciated!</p>
+<p>Server.py</p>
+<pre><code>import socket
+import hashlib
+import threading
+import struct
+
+HOST = '127.0.0.1'
+PORT = 2345
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind((HOST, PORT))
+s.listen(10)
+print("Waiting for a connection.....")
+
+conn, addr = s.accept()
+print("Got a connection from ", addr)
+
+while True:
+
+hash_type = conn.recv(1024)
+print('hash type: ', hash_type)
+if not hash_type:
+    break
+
+file_name = conn.recv(1024)
+print('file name: ', file_name)
+
+file_size = conn.recv(1024)
+file_size = int(file_size, 2)
+print('file size: ', file_size )
+
+f = open(file_name, 'wb')
+chunk_size = 4096
+while file_size &gt; 0:
+    if file_size &lt; chunk_size:
+        chuk_size = file_size
+    data = conn.recv(chunk_size)
+f.write(data)
+
+file_size -= len(data)
+f.close()
+print('File received successfully')
+s.close()
+</code></pre>
+<p>Client.py</p>
+<pre><code>import socket
+import threading
+import os
+
+HOST = '127.0.0.1'
+PORT = 2345
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect((HOST, PORT))
+
+hash_type = input('Enter hash type: ')
+
+files = input('Enter file(s) to send: ')
+files_to_send = files.split()
+
+for file_name in files_to_send:
+s.send(hash_type.encode())
+
+print(file_name)
+s.send(file_name.encode())
+
+file_size = os.path.getsize(file_name)
+file_size = bin(file_size)
+print(file_size)
+s.send(file_size.encode())
+
+f = open(file_name, 'rb')
+l = f.read()
+while(l):
+    s.send(l)
+    l = f.read()
+f.close()
+print('File Sent')
+
+s.close()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>One way to handle what you're doing is to buffer your socket data.  Below is a class the buffers data and knows how to send and receive null-terminated, UTF-8-encoded strings, and raw chunks of bytes:</p>
+<p>buffer.py:</p>
+<pre><code>class Buffer:
+    def __init__(self,s):
+        '''Buffer a pre-created socket.
+        '''
+        self.sock = s
+        self.buffer = b''
+
+    def get_bytes(self,n):
+        '''Read exactly n bytes from the buffered socket.
+           Return remaining buffer if &lt;n bytes remain and socket closes.
+        '''
+        while len(self.buffer) &lt; n:
+            data = self.sock.recv(1024)
+            if not data:
+                data = self.buffer
+                self.buffer = b''
+                return data
+            self.buffer += data
+        # split off the message bytes from the buffer.
+        data,self.buffer = self.buffer[:n],self.buffer[n:]
+        return data
+
+    def put_bytes(self,data):
+        self.sock.sendall(data)
+
+    def get_utf8(self):
+        '''Read a null-terminated UTF8 data string and decode it.
+           Return an empty string if the socket closes before receiving a null.
+        '''
+        while b'\x00' not in self.buffer:
+            data = self.sock.recv(1024)
+            if not data:
+                return ''
+            self.buffer += data
+        # split off the string from the buffer.
+        data,_,self.buffer = self.buffer.partition(b'\x00')
+        return data.decode()
+
+    def put_utf8(self,s):
+        if '\x00' in s:
+            raise ValueError('string contains delimiter(null)')
+        self.sock.sendall(s.encode() + b'\x00')
+</code></pre>
+<p>With this class, your client and server become:</p>
+<p>client.py:</p>
+<pre><code>import socket
+import threading
+import os
+
+import buffer
+
+HOST = '127.0.0.1'
+PORT = 2345
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect((HOST, PORT))
+
+with s:
+    sbuf = buffer.Buffer(s)
+
+    hash_type = input('Enter hash type: ')
+
+    files = input('Enter file(s) to send: ')
+    files_to_send = files.split()
+
+    for file_name in files_to_send:
+        print(file_name)
+        sbuf.put_utf8(hash_type)
+        sbuf.put_utf8(file_name)
+
+        file_size = os.path.getsize(file_name)
+        sbuf.put_utf8(str(file_size))
+
+        with open(file_name, 'rb') as f:
+            sbuf.put_bytes(f.read())
+        print('File Sent')
+</code></pre>
+<p>server.py:</p>
+<pre><code>import socket
+import os
+
+import buffer
+
+HOST = ''
+PORT = 2345
+
+# If server and client run in same local directory,
+# need a separate place to store the uploads.
+try:
+    os.mkdir('uploads')
+except FileExistsError:
+    pass
+
+s = socket.socket()
+s.bind((HOST, PORT))
+s.listen(10)
+print("Waiting for a connection.....")
+
+while True:
+    conn, addr = s.accept()
+    print("Got a connection from ", addr)
+    connbuf = buffer.Buffer(conn)
+
+    while True:
+        hash_type = connbuf.get_utf8()
+        if not hash_type:
+            break
+        print('hash type: ', hash_type)
+
+        file_name = connbuf.get_utf8()
+        if not file_name:
+            break
+        file_name = os.path.join('uploads',file_name)
+        print('file name: ', file_name)
+
+        file_size = int(connbuf.get_utf8())
+        print('file size: ', file_size )
+
+        with open(file_name, 'wb') as f:
+            remaining = file_size
+            while remaining:
+                chunk_size = 4096 if remaining &gt;= 4096 else remaining
+                chunk = connbuf.get_bytes(chunk_size)
+                if not chunk: break
+                f.write(chunk)
+                remaining -= len(chunk)
+            if remaining:
+                print('File incomplete.  Missing',remaining,'bytes.')
+            else:
+                print('File received successfully.')
+    print('Connection closed.')
+    conn.close()
+</code></pre>
+<p><strong>Demo</strong></p>
+<p>client:</p>
+<pre><code>Enter hash type: abc
+Enter file(s) to send: demo1.dat demo2.dat
+demo1.dat
+File Sent
+demo2.dat
+File Sent
+</code></pre>
+<p>server:</p>
+<pre><code>Waiting for a connection.....
+Got a connection from  ('127.0.0.1', 22126)
+hash type:  abc
+file name:  uploads\demo1.dat
+file size:  488892
+File received successfully.
+hash type:  abc
+file name:  uploads\demo2.dat
+file size:  212992
+File received successfully.
+Connection closed.
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>1.
+<code>file_size = conn.recv(1024)</code>
+In your server code you read 1024 bytes as your file_size, file_size is only 4 or 8 bytes long</p>
+<p>2.
+<code>file_name = conn.recv(1024)</code> Your server don't know how long the filename/hashtype is.</p>
+<p>-&gt; Use a long for both sizes and read only sizeof(long) bytes from the stream.</p>
+<p>You can use <a href="https://docs.python.org/2/library/struct.html" rel="nofollow noreferrer">https://docs.python.org/2/library/struct.html</a> for packing/encoding of these numbers</p>
+<p>-&gt; Or just go the easy way and use <a href="https://docs.python.org/3/library/pickle.html" rel="nofollow noreferrer">https://docs.python.org/3/library/pickle.html</a> for serialization</p>
+</div>
+<span class="comment-copy">You are using sockets wrongly. TCP is a stream protocol. You have to built some protocol on top of it, to get the files separated correctly. Use a well known protocol, like HTTP, FTP, etc. with a library.</span>
+<span class="comment-copy">Oh sorry, that's the twist. I only want to use a TCP protocol</span>
+<span class="comment-copy">HTTP and FTP do only use TCP. They are protocols to separate the items sent properly. You can invent your own, but why bother?</span>
+<span class="comment-copy">thanks! i appreciate the advice, way easier with FTP!</span>
+<span class="comment-copy">Ha thanks! You can see I was thinking of using struct (i imported it) but I appreciate the pickle method. I think that is the easier way... Do i need to import json in order to send that or can I just pickle load/unload?</span>
+<span class="comment-copy"><code>conn.recv</code> read up to 1024. You must always think, it is reading only 1 byte each time. <code>pickle</code> is dangerous. One can hack the server with it.</span>
+<span class="comment-copy">Thanks Daniel for the advice. I will avoid pickle for security purposes</span>

@@ -1,0 +1,160 @@
+<div class="post-text" itemprop="text">
+<p>I've been trying to get some dynamically created types (i.e. ones created by calling 3-arg <code>type()</code>) to pickle and unpickle nicely. I've been using <a href="https://stackoverflow.com/a/7668273/168175">this module switching trick</a> to hide the details from users of the module and give clean semantics.</p>
+<p>I've learned several things already:</p>
+<ol>
+<li>The type must be findable with <code>getattr</code> on the module itself</li>
+<li>The type must be consistent with what <code>getattr</code> finds, that is to say if we call <code>pickle.dumps(o)</code> then it must be true that <code>type(o) == getattr(module, 'name of type')</code></li>
+</ol>
+<p>Where I'm stuck though is that there still seems to be something odd going on - it seems to be calling <code>__getstate__</code> on something unexpected. </p>
+<p>Here's the simplest setup I've got that reproduces the issue, testing with Python 3.5, but I'd like to target back to 3.3 if possible:</p>
+<pre><code># module.py
+import sys
+import functools
+
+def dump(self):
+    return b'Some data' # Dummy for testing
+
+def undump(self, data):
+    print('Undump: %r' % data) # Do nothing for testing
+
+# Cheaty demo way to make this consistent
+@functools.lru_cache(maxsize=None)
+def make_type(name):
+    return type(name, (), {
+        '__getstate__': dump,
+        '__setstate__': undump,
+    })
+
+class Magic(object):
+    def __init__(self, path):
+        self.path = path
+
+    def __getattr__(self, name):
+        print('Getting thing: %s (from: %s)' % (name, self.path))
+        # for simple testing all calls to make_type must end in last x.y.z.last
+        if name != 'last':
+            if self.path:
+                return Magic(self.path + '.' + name)
+            else:
+                return Magic(name)
+        return make_type(self.path + '.' + name)
+
+# Make the switch
+sys.modules[__name__] = Magic('')
+</code></pre>
+<p>And then a quick way to exercise that:</p>
+<pre><code>import module
+import pickle
+
+f=module.foo.bar.woof.last()
+print(f.__getstate__()) # See, *this* works
+print('Pickle starts here')
+print(pickle.dumps(f))
+</code></pre>
+<p>Which then gives:</p>
+<pre class="lang-none prettyprint-override"><code>Getting thing: foo (from: )
+Getting thing: bar (from: foo)
+Getting thing: woof (from: foo.bar)
+Getting thing: last (from: foo.bar.woof)
+b'Some data'
+Pickle starts here
+Getting thing: __spec__ (from: )
+Getting thing: _initializing (from: __spec__)
+Getting thing: foo (from: )
+Getting thing: bar (from: foo)
+Getting thing: woof (from: foo.bar)
+Getting thing: last (from: foo.bar.woof)
+Getting thing: __getstate__ (from: foo.bar.woof)
+Traceback (most recent call last):
+  File "test.py", line 7, in &lt;module&gt;
+    print(pickle.dumps(f))
+TypeError: 'Magic' object is not callable
+</code></pre>
+<p>I wasn't expecting to see anything looking up <code>__getstate__</code> on <code>module.foo.bar.woof</code>, but even if we force that lookup to fail by adding:</p>
+<pre><code>if name == '__getstate__': raise AttributeError()
+</code></pre>
+<p>into our <code>__getattr__</code> it still fails with:</p>
+<pre class="lang-none prettyprint-override"><code>Traceback (most recent call last):
+  File "test.py", line 7, in &lt;module&gt;
+    print(pickle.dumps(f))
+_pickle.PicklingError: Can't pickle &lt;class 'module.Magic'&gt;: it's not the same object as module.Magic
+</code></pre>
+<p>What gives? Am I missing something with <code>__spec__</code>? The <a href="https://docs.python.org/3/reference/import.html#__spec__" rel="nofollow noreferrer">docs for <code>__spec__</code></a> pretty much just stress setting it appropriately, but don't seem to actually explain much.</p>
+<p>More importantly the bigger question is how am I supposed to go about making types I programatically generated via a pseudo module's <code>__getattr__</code> implementation pickle properly?</p>
+<p>(And obviously once I've managed to get <code>pickle.dumps</code> to produce something I expect <code>pickle.loads</code> to call <code>undump</code> with the same thing)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>To pickle <code>f</code>, <code>pickle</code> needs to pickle <code>f</code>'s class, <code>module.foo.bar.woof.last</code>.</p>
+<p>The docs don't claim support for pickling arbitrary classes. <a href="https://docs.python.org/3/library/pickle.html#what-can-be-pickled-and-unpickled" rel="nofollow noreferrer">They claim the following</a>:</p>
+<blockquote>
+<p>The following types can be pickled:</p>
+<ul>
+<li>...</li>
+<li>classes that are defined at the top level of a module</li>
+</ul>
+</blockquote>
+<p><code>module.foo.bar.woof.last</code> isn't defined at the top level of a module, even a pretend module like <code>module</code>. In this not-officially-supported case, the pickle logic ends up trying to pickle <code>module.foo.bar.woof</code>, either <a href="https://github.com/python/cpython/blob/3410c01d83d70ceef48b735c247aebd2d5bd3411/Lib/pickle.py#L948-L949" rel="nofollow noreferrer">here</a>:</p>
+<pre><code>    elif parent is not module:
+        self.save_reduce(getattr, (parent, lastname))
+</code></pre>
+<p>or <a href="https://github.com/python/cpython/blob/2ebc5ce42a8a9e047e790aefbf9a94811569b2b6/Modules/_pickle.c#L3279" rel="nofollow noreferrer">here</a></p>
+<pre><code>    else if (parent != module) {
+        PickleState *st = _Pickle_GetGlobalState();
+        PyObject *reduce_value = Py_BuildValue("(O(OO))",
+                                    st-&gt;getattr, parent, lastname);
+        status = save_reduce(self, reduce_value, NULL);
+</code></pre>
+<p><code>module.foo.bar.woof</code> can't be pickled for multiple reasons. It returns a non-callable <code>Magic</code> instance for all unsupported method lookups, like <code>__getstate__</code>, which is where your first error comes from. The module-switching thing prevents finding the <code>Magic</code> class to pickle it, which is where your second error comes from. There are probably more incompatibilities.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As it seems, and is already proven that making the class <code>callable</code> is just a drifting out another wrong direction, thankfully to <a href="https://stackoverflow.com/a/8512365/4571206">this hack</a>, I could find a getaround to make the class reiterable by its TYPE. following the context of the error <code>&lt;class 'module.Magic'&gt;: it's not the same object as module.Magic</code> the pickler doesn't iterate through the same call that renders a different type from the other one, this is a major common problem with pickling self instanciating classes, for this instance, an object by its class, there for the solution is patching the class with its type <code>@mock.patch('module.Magic', type(module.Magic))</code> this is a short answer for a something.</p>
+<p><strong>Main.py</strong></p>
+<pre><code>import module
+import pickle
+import mock
+
+
+f=module1.foo.bar.woof.last
+print(f().__getstate__()) # See, *this* works
+print('Pickle starts here')
+@mock.patch('module1.Magic', type(module1.Magic))
+def pickleit():
+    return pickle.dumps(f())
+print(pickleit())
+</code></pre>
+<p><strong>Magic class</strong></p>
+<pre><code>class Magic(object):
+
+    def __init__(self, value):
+        self.path = value
+
+    __class__: lambda x:x
+
+    def __getstate__(self):
+        print ("Shoot me! i'm at " +  self.path )
+        return dump(self)
+
+   def __setstate__(self,value):
+        print ('something will never occur')
+        return undump(self,value)
+
+    def __spec__(self):
+        print ("Wrong side of the planet ")
+
+    def _initializing(self):
+        print ("Even farther lost ")
+
+     def __getattr__(self, name):
+        print('Getting thing: %s (from: %s)' % (name, self.path))
+        # for simple testing all calls to make_type must end in last x.y.z.last
+        if name != 'last':
+            if self.path:
+                return Magic(self.path + '.' + name)
+            else:
+                return Magic(name)
+        print('terminal stage' )
+        return make_type(self.path + '.' + name)
+</code></pre>
+<p>Even assuming this is not more of striking the ball by the edge of the bat, I could see the content dumped into my console.</p>
+</div>
+<span class="comment-copy">Is there a reason you need to use the module switching trick? I simplified your example a bit and it works fine with <code>module.Magic('').foo.bar.woof.last()</code>. The module switch causes the <code>it's not the same object</code> error. I'm still working out the details of what causes all these problems though.</span>

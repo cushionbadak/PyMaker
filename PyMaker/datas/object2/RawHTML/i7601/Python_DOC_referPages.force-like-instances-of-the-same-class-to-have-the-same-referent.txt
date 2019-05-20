@@ -1,0 +1,209 @@
+<div class="post-text" itemprop="text">
+<p>Is there a way to make a user defined class that operates like <code>int</code> in that any equal instances have the same referent?</p>
+<p>E.g:</p>
+<pre><code>&gt;&gt;&gt; a = 2
+&gt;&gt;&gt; b = 2
+&gt;&gt;&gt; a == b
+True
+&gt;&gt;&gt; a is b
+True
+</code></pre>
+<p>But with a user defined class like this one: </p>
+<pre><code>class Variable:
+def __init__(self, letter, index):
+    self.letter = letter
+    self.index = int(index)
+
+def __str__(self):
+    return self.letter + '_' + str(self.index)
+</code></pre>
+<p>we have the following:</p>
+<pre><code>&gt;&gt;&gt; a = Variable('x',1)
+&gt;&gt;&gt; b = Variable('x',1)
+&gt;&gt;&gt; a == b
+True
+&gt;&gt;&gt; a is b
+False
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>Is there a way to make a user defined class that operates like int in that any equal instances have the same referent?</p>
+</blockquote>
+<p>First of all, only a <em>limited number of integers</em> behave that way; small integers are interned for performance and memory efficiency reasons (see <a href="https://stackoverflow.com/questions/306313/is-operator-behaves-unexpectedly-with-integers">"is" operator behaves unexpectedly with integers</a>).</p>
+<p>What you are asking for is how to ensure your own instances are interned, in that there is only ever one copy of an instance for a given 'value'. You can do that by controlling when a new instance is created, by implementing your own <a href="https://docs.python.org/3/reference/datamodel.html#object.__new__" rel="nofollow noreferrer"><code>__new__</code> method</a>:</p>
+<pre><code>class Variable:
+    _instances = {}
+
+    def __new__(cls, letter, index):
+        index = int(index)
+        try:
+            # return existing instance
+            return cls._instances[letter, index]
+        except KeyError:
+            # no instance yet, create a new one
+            instance = super().__new__(cls)
+            instance._letter = letter
+            instance._index = index
+            cls._instances[letter, index] = instance
+            return instance
+
+    def __str__(self):
+        return self._letter + '_' + str(self._index)
+</code></pre>
+<p>For a given <code>letter</code> and <code>index</code> combo, just one instance is created:</p>
+<pre><code>&gt;&gt;&gt; a = Variable('a', 1)
+&gt;&gt;&gt; b = Variable('a', 1)
+&gt;&gt;&gt; a
+&lt;__main__.Variable object at 0x10858ceb8&gt;
+&gt;&gt;&gt; b
+&lt;__main__.Variable object at 0x10858ceb8&gt;
+&gt;&gt;&gt; a is b
+True
+</code></pre>
+<p>This is essentially how integer interning works too.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://stackoverflow.com/users/100297/martijn-pieters">Martijn Pieters</a>' answer is as close as you're going to get to an answer useful for practical purposes (got my upvote), but I was interested in <a href="https://stackoverflow.com/users/3001761/jonrsharpe">johnrsharpe</a>'s point about mutability. For instance, using Martijn's solution, the following fails:</p>
+<pre><code>a = Variable('x', 0)
+b = Variable('x', 0)
+c = Variable('y', 0)
+a.letter = c.letter
+assert(a is c)
+</code></pre>
+<p>We want equal instances to <em>always</em> refer to the same object in memory. This is <em>very</em> tricky, requires some black magic, and should <em>never ever ever</em> be used in a real application, but is in some sense possible. So, if you're in it for the laughs, come along for the ride.</p>
+<p>My first thought was that we need to overload __setattr__ for Variable so that when an attribute changes, a new instance with the appropriate attribute values is created and all references (Footnote 1) to the original instance are updated to point to this new instance. This is possible with <a href="https://pypi.python.org/pypi/pyjack" rel="nofollow noreferrer">pyjack</a>, but it turns out not to give us quite the right solution. If we do the following:</p>
+<pre><code>a = Variable('x', 0)
+b = Variable('x', 0)
+a.letter = 'y'
+</code></pre>
+<p>and in the process of that last assignment update <em>all</em> references to the object referred to as <code>a</code>, then <code>b</code> will also end up with <code>b.letter == 'y'</code> since <code>a</code> and <code>b</code> (obviously) refer to the same instance.</p>
+<p>So, it's not a matter of updating <em>all</em> references to the Variable instance. It's a matter of updating <em>the one reference we just changed</em>. That is to say, for the namespace in which the attribute assignment was called, we need to update the locals to point to the new instance. This is not straightforward, but here is a method that works with all tests I could come up with. Note that this code does not have so much of a code smell as a full-on corpse-in-the-closet-for-three-days code reek about it. Again, do <em>not</em> use it for anything serious:</p>
+<pre><code>import inspect
+import dis
+
+class MutableVariable(object):
+    __slots__ = ('letter', 'index')  # Prevent access through __dict__
+    previously_created = {}
+
+    def __new__(cls, letter, index):
+        if (letter, index) in cls.previously_created:
+            return cls.previously_created[(letter, index)]
+        else:
+            return super().__new__(cls)
+
+    def __setattr__(self, name, value):
+        letter = self.letter
+        index = self.index
+        if name == "letter":
+            letter = value
+        elif name == "index":
+            index = int(value)
+        # Get bytecode for frame in which attribute assignment occurred
+        frame = inspect.currentframe()
+        bcode = dis.Bytecode(frame.f_back.f_code)
+        # Get index of last executed instruction
+        last_inst = frame.f_back.f_lasti
+        # Get locals dictionary from namespace in which assignment occurred
+        call_locals = frame.f_back.f_locals
+        assign_name = []
+        attribute_name = []
+        for instr in bcode:
+            if instr.offset &gt; last_inst:  # Only go to last executed instruction
+                break
+            if instr.opname == "POP_TOP":  # Clear if popping stack
+                assign_name = []
+                attribute_name = []
+            elif instr.opname == "LOAD_NAME":  # Keep track of name loading on stack
+                assign_name.append(instr.argrepr)
+            elif instr.opname == "LOAD_ATTR":  # Keep track of attribute loading on stack
+                attribute_name.append(instr.argrepr)
+            last_instr = instr.opname  # Opname of last executed instruction
+        try:
+            name_index = assign_name.index('setattr') + 1  # Check for setattr call
+        except ValueError:
+            if last_instr == 'STORE_ATTR':  # Check for direct attr assignment
+                name_index = -1
+            else:  # __setattr__ called directly
+                name_index = 0
+        assign_name = assign_name[name_index]
+        # Handle case where we are assigning to attribute of an attribute
+
+        try:
+            attributes = attribute_name[attribute_name.index(name) + 1: -1]
+            attribute_name = attribute_name[-1]
+        except (IndexError, ValueError):
+            attributes = []
+        if len(attributes):
+            obj = call_locals[assign_name]
+            for attribute_ in attributes:
+                obj = getattr(obj, attribute_)
+            setattr(obj, attribute_name, MutableVariable(letter, index))
+        else:
+            call_locals[assign_name] = MutableVariable(letter, index)
+
+    def __init__(self, letter, index):
+        super().__setattr__("letter", letter)  # Use parent's setattr on instance initialization
+        super().__setattr__("index", index)
+        self.previously_created[(letter, index)] = self
+
+    def __str__(self):
+        return self.letter + '_' + str(self.index)
+
+# And now to test it all out...
+if __name__ == "__main__":
+    a = MutableVariable('x', 0)
+    b = MutableVariable('x', 0)
+    c = MutableVariable('y', 0)
+    assert(a == b)
+    assert(a is b)
+    assert(a != c)
+    assert(a is not c)
+
+    a.letter = c.letter
+    assert(a != b)
+    assert(a is not b)
+    assert(a == c)
+    assert(a is c)
+
+    setattr(a, 'letter', b.letter)
+    assert(a == b)
+    assert(a is b)
+    assert(a != c)
+    assert(a is not c)
+
+    a.__setattr__('letter', c.letter)
+    assert(a != b)
+    assert(a is not b)
+    assert(a == c)
+    assert(a is c)
+
+    def x():
+        pass
+
+    def y():
+        pass
+
+    def z():
+        pass
+
+    x.testz = z
+    x.testz.testy = y
+    x.testz.testy.testb = b
+    x.testz.testy.testb.letter = c.letter
+    assert(x.testz.testy.testb != b)
+    assert(x.testz.testy.testb is not b)
+    assert(x.testz.testy.testb == c)
+    assert(x.testz.testy.testb is c)
+</code></pre>
+<p>So, basically what we do here is use <a href="https://docs.python.org/3.6/library/dis.html" rel="nofollow noreferrer">dis</a> to analyze the bytecode for the frame in which the assignment occurred (as reported by <a href="https://docs.python.org/3.6/library/inspect.html" rel="nofollow noreferrer">inspect</a>). Using this, we extract the name of the variable referencing the MutableVariable instance undergoing attribute assignment, and update the locals dictionary for the corresponding namespace so that that variable references a new MutableVariable instance. None of this is a good idea.</p>
+<p>The code shown here is almost <em>certainly</em> implementation specific and may be the most fragile piece of code I've ever written, but it does work on standard CPython 3.5.2.</p>
+<p>Footnote 1: Note that here, I am not using reference in the formal (e.g. C++) sense (since <a href="https://jeffknupp.com/blog/2012/11/13/is-python-callbyvalue-or-callbyreference-neither/" rel="nofollow noreferrer">Python is not pass by reference</a>) but in the sense of a variable referring to a particular object in memory. i.e. in the sense of "reference counting" not "pointers vs. references."</p>
+</div>
+<span class="comment-copy">after reading this question <a href="https://stackoverflow.com/questions/11611750/under-which-circumstances-do-equal-strings-share-the-same-reference" title="under which circumstances do equal strings share the same reference">stackoverflow.com/questions/11611750/…</a> I  understand that this behavior is implementation dependent for strings. I don't believe that's the case for integers though.</span>
+<span class="comment-copy">You are being led astray by optimizations that are implementation details of CPython, that is, small-int caching and string interning.</span>
+<span class="comment-copy">It <i>is</i> implementation specific for <code>int</code>s. In fact, it only holds true for integers from <code>-5</code> to <code>256</code>. Again, it is an optimization. See <a href="https://stackoverflow.com/questions/306313/is-operator-behaves-unexpectedly-with-integers">this</a> question. There is also the peephole optimization at play with literals.</span>
+<span class="comment-copy">You want to implement <code>__new__</code>. See <a href="https://stackoverflow.com/questions/674304/pythons-use-of-new-and-init" title="pythons use of new and init">stackoverflow.com/questions/674304/pythons-use-of-new-and-init</a> for example.</span>
+<span class="comment-copy"><i>in that any equal instances have the same referent</i>: <code>x = 600; y = 601</code> then <code>x is (y - 1)</code> is <code>False</code>.  You are misunderstanding what is happening.</span>
+<span class="comment-copy">yikes! this answer is helpful if for no other reason than that it fully and utterly convinced me that this is something I do NOT want to do :D thanks</span>
+<span class="comment-copy">Just to make it a little scarier... After sleeping on it I realized one more thing I didn't cover in my tests that would almost certainly break this- if the reference being updated is from some other data structure. E.g. <code>mylist = [a]</code> and then <code>mylist[0].letter = b.letter</code>.</span>

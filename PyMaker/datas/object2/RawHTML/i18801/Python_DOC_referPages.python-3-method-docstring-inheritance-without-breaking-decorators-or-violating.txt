@@ -1,0 +1,193 @@
+<div class="post-text" itemprop="text">
+<p>This question seems to come up regularly both on StackOverflow and elsewhere, yet I wasn't able to find a completely satisfactory solution anywhere.</p>
+<p>There seem to be two types of common solutions. The first one (from e.g. <a href="http://article.gmane.org/gmane.comp.python.general/630549" rel="nofollow noreferrer">http://article.gmane.org/gmane.comp.python.general/630549</a>) uses a function decorator:</p>
+<pre><code>class SuperClass:
+    def my_method(self):
+        '''Has a docstring'''
+        pass
+
+class MyClass(SuperClass):
+    @copy_docstring_from(SuperClass)
+    def my_method(self):
+        pass
+
+assert SuperClass.my_method.__doc__ == MyClass.my_method._doc__
+</code></pre>
+<p>This is probably the most straightforward approach, but it requires repeating the parent class name at least once, and also becomes a lot more complicated if the docstring can not be found in the direct ancestor.</p>
+<p>The second approach uses a metaclass or class decorator (cf. <a href="https://stackoverflow.com/questions/8100166/inheriting-methods-docstrings-in-python">Inheriting methods' docstrings in Python</a>, <a href="https://stackoverflow.com/questions/13937500/inherit-a-parent-class-docstring-as-doc-attribute">Inherit a parent class docstring as __doc__ attribute</a>, <a href="http://mail.python.org/pipermail/python-list/2011-June/606043.html" rel="nofollow noreferrer">http://mail.python.org/pipermail/python-list/2011-June/606043.html</a>) and looks like this:</p>
+<pre><code>class MyClass1(SuperClass, metaclass=MagicHappeningHere):
+    def method(self):
+        pass
+
+# or 
+
+@frobnicate_docstrings
+class MyClass2(SuperClass):
+    def method(self):
+        pass
+
+assert SuperClass.my_method.__doc__ == MyClass1.my_method._doc__
+assert SuperClass.my_method.__doc__ == MyClass2.my_method._doc__
+</code></pre>
+<p>However, with this approach the docstring is only set after class creation and thus not accessible to decorators, so the following won't work:</p>
+<pre><code>def log_docstring(fn):
+    print('docstring for %s is %s' % (fn.__name__, fn.__doc__)
+    return fn
+
+class MyClass(SuperClass, metaclass=MagicHappeningHere):
+# or
+#@frobnicate_docstrings
+#class MyClass2(SuperClass): 
+    @log_docstring
+    def method(self):
+        pass
+</code></pre>
+<p>A third interesting idea has been discussed in <a href="https://stackoverflow.com/questions/2025562/inherit-docstrings-in-python-class-inheritance">Inherit docstrings in Python class inheritance</a>. Here, the function decorator actually wraps the method and turns it into a method descriptor rather than merely updating its docstring. However, this seems like  using sledgehammer to crack a nut because it turns the method into a method descriptor (which may have performance implications as well, though I did not check), and also does not make the docstring available to any other decorators (and in the above example will actually make them crash because the method descriptor doesn't have <code>__name__</code> attribute).</p>
+<p>Is there a solution that avoids all the above drawbacks, i.e. does not require me to repeat myself and assigns the docstring immediately using a decorator?</p>
+<p>I'm interested in a solution for Python 3.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Use a class decorator instead:</p>
+<pre><code>@inherit_docstrings
+class MyClass(SuperClass):
+    def method(self):
+        pass
+</code></pre>
+<p>where <code>inherit_docstrings()</code> is defined as:</p>
+<pre><code>from inspect import getmembers, isfunction
+
+def inherit_docstrings(cls):
+    for name, func in getmembers(cls, isfunction):
+        if func.__doc__: continue
+        for parent in cls.__mro__[1:]:
+            if hasattr(parent, name):
+                func.__doc__ = getattr(parent, name).__doc__
+    return cls
+</code></pre>
+<p>Demo:</p>
+<pre><code>&gt;&gt;&gt; class SuperClass:
+...     def method(self):
+...         '''Has a docstring'''
+...         pass
+... 
+&gt;&gt;&gt; @inherit_docstrings
+... class MyClass(SuperClass):
+...     def method(self):
+...         pass
+... 
+&gt;&gt;&gt; MyClass.method.__doc__
+'Has a docstring'
+</code></pre>
+<p>This sets the docstring <em>after</em> defining the whole class, without having to create an instance first.</p>
+<p>If you need the docstring available to method decorators, you are, unfortunately, wholly stuck with your decorator that duplicates the parent class.</p>
+<p>The reason for this is that you cannot introspect what the superclass is going to be while defining the class body. The local namespace during class definition does not have access to the arguments passed to the class factory.</p>
+<p>You <em>could</em> use a metaclass to add the base classes to the local namespace, then use a decorator to pull those out again, but in my opinion that gets ugly, fast:</p>
+<pre><code>import sys
+
+class InheritDocstringMeta(type):
+    _key = '__InheritDocstringMeta_bases'
+
+    def __prepare__(name, bases, **kw):
+        return {InheritDocstringMeta._key: bases}
+
+    def __call__(self, name, bases, namespace, **kw):
+        namespace.pop(self._key, None)
+
+def inherit_docstring(func):
+    bases = sys._getframe(1).f_locals.get(InheritDocstringMeta._key, ())
+    for base in bases:
+        for parent in base.mro():
+            if hasattr(parent, func.__name__):
+                func.__doc__ = getattr(parent, func.__name__).__doc__
+    return func
+</code></pre>
+<p>Demo usage:</p>
+<pre><code>&gt;&gt;&gt; class MyClass(SuperClass, metaclass=InheritDocstringMeta):
+...     @inherit_docstring
+...     def method(self):
+...         pass
+... 
+&gt;&gt;&gt; MyClass.method.__doc__
+'Has a docstring'
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think the metaclass' <code>__prepare__</code> method can be used for this by injecting a decorator that knows about the class hierarchy:</p>
+<pre><code>def log_docstring(fn):
+    print('docstring for %r is %r' % (fn, fn.__doc__))
+    return fn
+
+class InheritableDocstrings(type):
+    def __prepare__(name, bases):
+        classdict = dict()
+
+        # Construct temporary dummy class to figure out MRO
+        mro = type('K', bases, {}).__mro__[1:]
+        assert mro[-1] == object
+        mro = mro[:-1]
+
+        def inherit_docstring(fn):
+            if fn.__doc__ is not None:
+                raise RuntimeError('Function already has docstring')
+
+            # Search for docstring in superclass
+            for cls in mro:
+                super_fn = getattr(cls, fn.__name__, None)
+                if super_fn is None:
+                    continue
+                fn.__doc__ = super_fn.__doc__
+                break
+            else:
+                raise RuntimeError("Can't inherit docstring for %s: method does not "
+                                   "exist in superclass" % fn.__name__)
+
+            return fn
+
+        classdict['inherit_docstring'] = inherit_docstring
+        return classdict
+
+class Animal():
+    def move_to(self, dest):
+        '''Move to *dest*'''
+        pass
+
+class Bird(Animal, metaclass=InheritableDocstrings):
+    @log_docstring
+    @inherit_docstring
+    def move_to(self, dest):
+        self._fly_to(dest)
+
+assert Animal.move_to.__doc__ == Bird.move_to.__doc__
+</code></pre>
+<p>Prints:</p>
+<pre><code>docstring for &lt;function Bird.move_to at 0x7f6286b9a200&gt; is 'Move to *dest*'
+</code></pre>
+<p>Of course, this approach has some other issues:
+  - Some analysis tools (e.g. pyflakes) will complain about the use of the (apparently) undefined <code>inherit_docstring</code> name
+  - It doesn't work if the parent class already has a different metaclass (e.g. <code>ABCMeta</code>).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Starting in Python 3.5, <a href="https://docs.python.org/3/library/inspect.html#inspect.getdoc" rel="nofollow noreferrer"><code>inspect.getdoc</code></a> searches the inheritance tree for a docstring.  So if you leave the docstring for the child empty, it will retrieve it from the parent.  That avoids the need for code repetition, and automatic code generators like sphinx will do the right thing.</p>
+<pre><code>$ cat mwe.py
+import inspect
+
+class A:
+    def foo(self):
+        """Fool!"""
+        return 42
+
+class B(A):
+    def foo(self):
+        return super().foo()
+
+print(A.foo.__doc__, B.foo.__doc__, A().foo.__doc__, B().foo.__doc__,
+      inspect.getdoc(A.foo), inspect.getdoc(B.foo),
+      inspect.getdoc(A().foo), inspect.getdoc(B().foo))
+$ python mwe.py
+Fool! None Fool! None Fool! Fool! Fool! Fool!
+</code></pre>
+</div>
+<span class="comment-copy">The local namespace doesn't have access to the class factory arguments by default, true. But couldn't a metaclass be used to change that?</span>
+<span class="comment-copy">For Python 2, 'isfunction' needs to be 'ismethod' it seems.</span>
+<span class="comment-copy">@spookylukey: yes, in Python 2, members of a class are unbound methods.</span>
+<span class="comment-copy">I put a slightly more clever implementation of this and several examples on <a href="http://code.activestate.com/recipes/578587-inherit-method-docstrings-without-breaking-decorat/" rel="nofollow noreferrer">code.activestate.com/recipes/…</a></span>

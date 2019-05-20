@@ -1,0 +1,98 @@
+<div class="post-text" itemprop="text">
+<p>I'm writing a machine learning program with the following components:</p>
+<ol>
+<li><p>A shared "Experience Pool" with a binary-tree-like data structure.</p></li>
+<li><p><em>N</em> simulator processes. Each adds an "experience object" to the pool every once in a while. The pool is responsible for balancing its tree.</p></li>
+<li><p><em>M</em> learner processes that sample a batch of "experience objects" from the pool every few moments and perform whatever learning procedure. </p></li>
+</ol>
+<p>I don't know what's the best way to implement the above. I'm not using Tensorflow, so I cannot take advantage of its parallel capability. More concretely, </p>
+<ul>
+<li>I first think of Python3's built-in <code>multiprocessing</code> library. Unlike <code>multithreading</code>, however, <code>multiprocessing</code> module cannot have different processes update the same global object. My hunch is that I should use the server-proxy model. Could anyone please give me a rough skeleton code to start with? </li>
+<li>Is MPI4py a better solution?</li>
+<li>Any other libraries that would be a better fit? I've looked at <code>celery</code>, <code>disque</code>, etc. It's not obvious to me how to adapt them to my use case.</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>Based on the comments, what you're really looking for is a way to update a shared object from a set of processes that are carrying out a CPU-bound task. The CPU-bounding makes <code>multiprocessing</code> an obvious choice - if most of your work was IO-bound, <code>multithreading</code> would have been a simpler choice.  </p>
+<p>Your problem follows a simpler server-client model: the clients use the server as a simple stateful store, no communication between any child processes is needed, and no process needs to be synchronised.</p>
+<p>Thus, the simplest way to do this is to:</p>
+<ol>
+<li>Start a separate process that contains a server.</li>
+<li>Inside the server logic, provide methods to update and read from a single object.</li>
+<li>Treat both your simulator and learner processes as separate clients that can periodically read and update the global state. </li>
+</ol>
+<p>From the server's perspective, the identity of the clients doesn't matter - only their actions do. </p>
+<p>Thus, this can be accomplished by using a <a href="https://docs.python.org/3/library/multiprocessing.html#customized-managers" rel="nofollow noreferrer">customised manager</a> in <code>multiprocessing</code> as so:</p>
+<pre><code># server.py
+
+from multiprocessing.managers import BaseManager
+# this represents the data structure you've already implemented.
+from ... import ExperienceTree
+
+# An important note: the way proxy objects work is by shared weak reference to
+# the object. If all of your workers die, it takes your proxy object with
+# it. Thus, if you have an instance, the instance is garbage-collected
+# once all references to it have been erased. I have chosen to sidestep 
+# this in my code by using class variables and objects so that instances
+# are never used - you may define __init__, etc. if you so wish, but
+# just be aware of what will happen to your object once all workers are gone.
+class ExperiencePool(object):
+
+    tree = ExperienceTree()
+
+    @classmethod
+    def update(cls, experience_object):
+        ''' Implement methods to update the tree with an experience object. '''
+        cls.tree.update(experience_object)
+
+    @classmethod
+    def sample(cls):
+        ''' Implement methods to sample the tree's experience objects. '''
+        return cls.tree.sample()
+
+# subclass base manager
+class Server(BaseManager):
+    pass
+
+# register the class you just created - now you can access an instance of 
+# ExperiencePool using Server.Shared_Experience_Pool().
+Server.register('Shared_Experience_Pool', ExperiencePool)
+
+if __name__ == '__main__':
+     # run the server on port 8080 of your own machine
+     with Server(('localhost', 8080), authkey=b'none') as server_process:
+         server_process.get_server().serve_forever()
+</code></pre>
+<p>Now for all of your clients you can just do:</p>
+<pre><code># client.py - you can always have a separate client file for a learner and a simulator.
+
+from multiprocessing.managers import BaseManager
+from server import ExperiencePool
+
+class Server(BaseManager):
+     pass
+
+Server.register('Shared_Experience_Pool', ExperiencePool)
+
+if __name__ == '__main__':
+     # run the server on port 8080 of your own machine forever.
+     server_process = Server(('localhost', 8080), authkey=b'none')
+     server_process.connect()
+     experience_pool = server_process.Shared_Experience_Pool()
+     # now do your own thing and call `experience_call.sample()` or `update` whenever you want. 
+</code></pre>
+<p>You may then launch one <code>server.py</code> and as many <code>workers</code> as you want. </p>
+<h2>Is This The Best Design?</h2>
+<p>Not always. You may run into race conditions in that your learners may receive stale or old data if they are forced to compete with a simulator node writing at the same time. </p>
+<p>If you want to ensure a preference for latest writes, you may additionally use a <a href="https://docs.python.org/3/library/multiprocessing.html#synchronization-between-processes" rel="nofollow noreferrer">lock</a> whenever your simulators are trying to write something, preventing your other processes from getting a read until the write finishes. </p>
+</div>
+<span class="comment-copy">Do you really need access to global memory? Why not have a separate dedicated non-Python in-memory queue (Redis comes to mind, or a graph database if you can JSONify your features) your processes can all write to? This will be easier to scale horizontally and you can optimise that component for reads/writes/etc. along the line. Plus, random sampling isn't built into Python <code>multiprocessing</code> queue natively, so this frees you for other solutions.</span>
+<span class="comment-copy">It's not a simple queue. The global shared pool is actually a tree structure that needs dedicated code to add/sample stuff. I've implemented that logic in Python already, but it's single-threaded now.</span>
+<span class="comment-copy">Then just write it as a separate module and wrap a server process around it. That solves your <code>multiprocessing</code> problem, and still gives you horizontal scaling for free. Also, define 'better fit'. What variable are you trying to optimise? Throughput? Latency? Memory footprint? Low garbage collection? We can't give you solutions until you know what you're trying to improve. Your proposed model can be implemented using any tool; your constraints will define your final solution better than your requirements.</span>
+<span class="comment-copy">For now, I don't really care about latency, etc. I'm having trouble even implementing a working version of "wrap a server process around it". I've read the <a href="https://docs.python.org/3/library/multiprocessing.html#sharing-state-between-processes" rel="nofollow noreferrer">docs</a>. It tells me how to share <code>Array</code> or <code>Dict</code>, but doesn't show anything close to my use case. Should I use <a href="https://docs.python.org/3/library/multiprocessing.html#pipes-and-queues" rel="nofollow noreferrer">pipe</a>? Or <a href="https://docs.python.org/3/library/multiprocessing.html#customized-managers" rel="nofollow noreferrer">BaseManager</a>? A brief skeleton code would be very helpful. Thanks!</span>
+<span class="comment-copy">Titor: Using <code>BaseManager</code> will get you closer to what you need than <code>pipe</code>, as it provides a built-in server out of the box. I'll post some example code in a bit.</span>
+<span class="comment-copy">Thanks a lot for the skeleton code. It's very smart to use class variables to sidestep the garbage collection issue. Does that mean there's really no need for the <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.managers.BaseProxy._callmethod" rel="nofollow noreferrer">weakref methods here</a>? It looks like your code serves exactly that purpose without all the reference counting problems.</span>
+<span class="comment-copy">A proxy object is just an object. The docs use special objects that are subclassed from BaseProxy because those have better error-handling than just plain old objects, but it's not a crime to use regular objects without that machinery. All that happens under the hood is that a call is evaluated insider the <code>server</code>s object, and ferried as a response to the <code>client</code>s object - you don't need a special layer to do that.</span>
+<span class="comment-copy">I see. I'm getting <code>assert self._state.value == State.INITIAL AssertionError</code> when I run a barebone server script. The error occurs at the <code>get_server()</code> call. Port 8080 is available on my computer.</span>
+<span class="comment-copy">@Ainz Titor: Funny that that should happen. I had the same issue in my client.py, which is why I chose to omit the context manager. Might be worth poking around in the source to figure out what's happening.</span>
+<span class="comment-copy">Once you're on the same file system, there's little you can do outside of trying to compactify communication (serialize or compress your sent data) to reduce latency there. It's worth your time to profile your code and see what sort of bottlenecks there are. e.g. if CPU-bound, you can take advantage of Cython to reduce interpreter interference, or try using the GPU if you're doing a lot of parallel work that benefits from SIMD. Libraries won't help until you know your bottlenecks.</span>

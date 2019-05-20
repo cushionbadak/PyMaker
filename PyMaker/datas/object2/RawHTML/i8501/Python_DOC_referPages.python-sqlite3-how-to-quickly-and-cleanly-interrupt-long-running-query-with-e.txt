@@ -1,0 +1,179 @@
+<div class="post-text" itemprop="text">
+<p>Using the <a href="https://docs.python.org/3/library/sqlite3.html#module-sqlite3" rel="nofollow noreferrer"><code>sqlite3</code></a> module in Python a long running query is not quickly interrupted/canceled when a SIGINT (e.g. Control-C) is received.  There is an <a href="https://docs.python.org/3/library/sqlite3.html#sqlite3.Connection.interrupt" rel="nofollow noreferrer"><code>interrupt()</code></a> method provided by sqlite3, but there are no examples of how to use it.</p>
+<p><strong>Is there a simple way to interrupt/cancel a long running query running via Python/sqlite3?</strong></p>
+<p>To illustrate, first generate a test database &amp; table:</p>
+<pre><code>import sqlite3
+from random import randint
+
+conn = sqlite3.connect("randtable.db", 10.0)
+cursor = conn.cursor()
+
+cursor.execute("CREATE TABLE randint (id integer, rand integer)")
+
+for i in range(1000000):
+    if i % 1000 == 0:
+        print ("{0}...".format(i))
+    rand = randint(0,1000000)
+    cursor.execute("INSERT INTO randint VALUES ({0},{1})".format(i,rand))
+
+conn.commit()
+conn.close()
+</code></pre>
+<p>Then execute a long running Python/sqlite3 script in a terminal and try to interrupt it with Control-C:</p>
+<pre><code>from __future__ import print_function
+import sqlite3
+
+def main():
+    # Long running query (pathological by design)
+    statement ='''
+SELECT DISTINCT a.id,a.rand
+FROM randint a
+     JOIN randint b ON a.id=b.rand
+     JOIN randint c ON a.id=c.rand
+     JOIN randint d ON a.id=d.rand
+     JOIN randint e ON a.id=e.rand
+     JOIN randint f ON a.id=f.rand
+     JOIN randint g ON a.id=g.rand
+     JOIN randint h ON a.id=h.rand
+ORDER BY a.id limit 10'''
+
+    conn = sqlite3.connect('randtable.sqlite', 10.0)
+    cursor = conn.cursor()
+
+    print ("Executing query")
+
+    cursor.execute(statement)
+    rows = cursor.fetchall()
+
+    print ("ROWS:")
+    for row in rows:
+        print ("  ", row)
+
+    conn.close()
+
+    return
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<p>Running the above script in a terminal and then pressing Control-C (or sending SIGINT some other way) will <em>eventually</em> cancel the query and script but it can take quite a bit of time, many minutes.  The exact same query running in the <a href="http://sqlite.org/cli.html" rel="nofollow noreferrer"><code>sqlite3</code> command line tool</a> is near-instantly canceled when Control-C is pressed.</p>
+<p>Thanks in advance! </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your answer covers it, but (after letting it slip my mind yesterday - sorry!) I remembered I'd promised to write an answer, so here's another version that demonstrates you can do this without globals. I've also used a <code>threading.Event</code> here instead of a signal to demonstrate there's a few different ways of signalling a thread that it's time to do something (but for your purposes, stick with signal because that's perfect for reacting to a Ctrl+C):</p>
+<pre><code>import sqlite3
+import time
+import threading
+
+# Background thread that'll kill our long running query after 1 second
+def kill_it(connection, event):
+    event.wait()
+    time.sleep(1)
+    connection.interrupt()
+
+# Make some tables with lots of data so we can make a long running query
+def big_query(conn, kill_event):
+    print('Making big tables')
+    conn.execute(
+        "CREATE TABLE foo (i integer primary key, s text);")
+    conn.execute(
+        "CREATE TABLE bar (j integer primary key, s text);")
+    conn.execute(
+        "INSERT INTO foo VALUES %s" % ", ".join("(%d, 'foo')" % i for i in range(10000)))
+    conn.execute(
+        "INSERT INTO bar VALUES %s" % ", ".join("(%d, 'bar')" % i for i in range(10000)))
+    kill_event.set()
+    print('Running query')
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM foo, bar")
+    print(len(cur.fetchall()))
+
+def main():
+    conn = sqlite3.connect('foo.db')
+    kill_event = threading.Event()
+    kill_thread = threading.Thread(target=kill_it, args=(conn, kill_event))
+    kill_thread.start()
+    big_query(conn, kill_event)
+    kill_thread.join()
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Answering my own question since I think I've worked it out.  Below is what I've come up with, any comments on this code would be greatly appreciated.</p>
+<pre><code>#!/usr/bin/env python
+
+from __future__ import print_function
+import sqlite3
+import threading
+import signal
+import os
+import time
+
+conn = None
+shutdown = False
+
+def main():
+    global conn
+
+    # Long running query (pathological by design)
+    statement ='''
+SELECT DISTINCT a.id,a.rand
+FROM randint a
+     JOIN randint b ON a.id=b.rand
+     JOIN randint c ON a.id=c.rand
+     JOIN randint d ON a.id=d.rand
+     JOIN randint e ON a.id=e.rand
+     JOIN randint f ON a.id=f.rand
+     JOIN randint g ON a.id=g.rand
+     JOIN randint h ON a.id=h.rand
+ORDER BY a.id limit 10'''
+
+    conn = sqlite3.connect('randtable.sqlite', 10.0)
+    cursor = conn.cursor()
+
+    print ("Executing query")
+
+    try:
+        cursor.execute(statement)
+    except Exception as err:
+        if str(err) != "interrupted":
+            print ("Database error: {0}".format(str(err)))
+        return None
+
+    rows = cursor.fetchall()
+
+    print ("ROWS:")
+    for row in rows:
+        print ("  ", row)
+
+    conn.close()
+    conn = None
+
+    return
+
+def interrupt(signum, frame):
+    global conn
+    global shutdown
+
+    print ("Interrupt requested")
+
+    if conn:
+        conn.interrupt()
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, interrupt)
+
+    mainthread = threading.Thread(target=main)
+    mainthread.start()
+
+    while mainthread.isAlive():
+        time.sleep(0.2)
+</code></pre>
+</div>
+<span class="comment-copy">How about <a href="https://docs.python.org/3/library/sqlite3.html#sqlite3.Connection.interrupt" rel="nofollow noreferrer">sqlite3.Connection.interrupt</a>?</span>
+<span class="comment-copy">@DaveJones Yes, as mentioned at the very top of the question, that should be the way to do it.  But how, with real code?  I've tried without success and perhaps my lack of expertise in Python keeps me from seeing the obvious.</span>
+<span class="comment-copy">Sorry, missed that bit - I've got to go pick up my daughter now, but I'll write up an example in a bit (it'll be something like <code>threading.Thread(target=conn.interrupt).start()</code> if that's enough to get you started in the meantime).</span>
+<span class="comment-copy">Excellent, thanks for the alternative!</span>

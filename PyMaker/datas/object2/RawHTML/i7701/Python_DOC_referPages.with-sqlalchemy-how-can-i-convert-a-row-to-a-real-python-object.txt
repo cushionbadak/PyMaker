@@ -1,0 +1,154 @@
+<div class="post-text" itemprop="text">
+<p>I've been using SQLAlchemy with Alembic to simplify the database access I use, and any data structure changes I make to the tables.  This has been working out really well up until I started to notice more and more issues with SQLAlchemy "expiring" fields from my point of view nearly at random.</p>
+<p>A case in point would be this snippet,</p>
+<pre><code>class HRDecimal(Model):
+    dec_id = Column(String(50), index=True)
+
+    @staticmethod
+    def qfilter(*filters):
+        """
+        :rtype : list[HRDecimal]
+        """
+        return list(HRDecimal.query.filter(*filters))
+
+
+class Meta(Model):
+    dec_id = Column(String(50), index=True)
+
+    @staticmethod
+    def qfilter(*filters):
+        """
+        :rtype : list[Meta]
+        """
+        return list(Meta.query.filter(*filters))
+</code></pre>
+<p>Code:</p>
+<pre><code>ids = ['1', '2', '3']  # obviously fake list of ids
+
+decs = HRDecimal.qfilter(
+    HRDecimal.dec_id.in_(ids))
+metas = Meta.qfilter(
+    Meta.dec_id.in_(ids))
+combined = []
+
+for ident in ids:
+    combined.append((
+        ident,
+        [dec for dec in decs if dec.dec_id == ident],
+        [hm for hm in metas if hm.dec_id == ident]
+    ))
+</code></pre>
+<p>For the above, there wasn't a problem, but when I'm processing a list of ids that may contain a few thousand ids, this process started taking a huge amount of time, and if done from a web request in flask, the thread would often be killed.</p>
+<p>When I started poking around with <em>why</em> this was happening, the key area was </p>
+<pre><code>        [dec for dec in decs if dec.dec_id == ident],
+        [hm for hm in metas if hm.dec_id == ident]
+</code></pre>
+<p>At some point during the combining of these (what I thought were) Python objects, at some point calling <code>dec.dec_id</code> and <code>hm.dec_id</code>, in the SQLAlchemy code, <em>at best</em>, we go into,</p>
+<pre><code>def __get__(self, instance, owner):
+    if instance is None:
+        return self
+
+    dict_ = instance_dict(instance)
+    if self._supports_population and self.key in dict_:
+        return dict_[self.key]
+    else:
+        return self.impl.get(instance_state(instance), dict_)
+</code></pre>
+<p>Of <code>InstrumentedAttribute</code> in <code>sqlalchemy/orm/attributes.py</code> which seems to be very slow, but even worse than this, I've observed times when fields expired, and then we enter,</p>
+<pre><code>def get(self, state, dict_, passive=PASSIVE_OFF):
+    """Retrieve a value from the given object.
+    If a callable is assembled on this object's attribute, and
+    passive is False, the callable will be executed and the
+    resulting value will be set as the new value for this attribute.
+    """
+    if self.key in dict_:
+        return dict_[self.key]
+    else:
+        # if history present, don't load
+        key = self.key
+        if key not in state.committed_state or \
+                state.committed_state[key] is NEVER_SET:
+            if not passive &amp; CALLABLES_OK:
+                return PASSIVE_NO_RESULT
+
+            if key in state.expired_attributes:
+                value = state._load_expired(state, passive)
+</code></pre>
+<p>Of <code>AttributeImpl</code> in the same file.  Horrible issue here is that state._load_expired re-runs the <em>SQL Query</em> completely.  So in a situation like this, with a big list of idents, we end up running thousands of "small" SQL queries to the database, where I think we should have only been running two "large" ones at the top.</p>
+<p>Now, I've gotten around the expired issue by how I initialise the database for flask with <code>session-options</code>, changing </p>
+<pre><code>app = Flask(__name__)
+CsrfProtect(app)
+db = SQLAlchemy(app)
+</code></pre>
+<p>to</p>
+<pre><code>app = Flask(__name__)
+CsrfProtect(app)
+db = SQLAlchemy(
+    app,
+    session_options=dict(autoflush=False, autocommit=False, expire_on_commit=False))
+</code></pre>
+<p>This has definitely improved the above situation for when a rows fields just seemed to expire seemingly (from my observations) at random, but the "normal" slowness of accessing items to SQLAlchemy is still an issue for what we're currently running.</p>
+<p>Is there any way with SQLAlchemy, to get a "real" Python object returned from a query, instead of a proxied one like it is now, so it isn't being affected by this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your randomness is probably related to either explicitly committing or rolling back at an inconvenient time, or due to auto-commit of some kind. In its default configuration SQLAlchemy session <a href="http://docs.sqlalchemy.org/en/latest/orm/session_state_management.html#when-to-expire-or-refresh" rel="nofollow noreferrer">expires all ORM-managed state when a transaction ends</a>. This is usually a good thing, since when a transaction ends you've no idea what the current state of the DB is. This can be disabled, as you've done with <code>expire_on_commit=False</code>.</p>
+<p>The ORM is also ill suited for extremely large bulk operations in general, as explained <a href="http://docs.sqlalchemy.org/en/latest/faq/performance.html#i-m-inserting-400-000-rows-with-the-orm-and-it-s-really-slow" rel="nofollow noreferrer">here</a>. It is very well suited for handling complex object graphs and persisting those to a relational database with much less effort on your part, as it organizes the required inserts etc. for you. An important part of that is tracking changes to instance attributes. The <a href="http://docs.sqlalchemy.org/en/latest/core/" rel="nofollow noreferrer">SQLAlchemy Core</a> is better suited for bulk.</p>
+<p>It looks like you're performing 2 queries that produce a potentially large amount of results and then do a manual "group by" on the data, but in a rather unperforming way, because for each id you have you scan the entire list of results, or <em>O(nm)</em>, where n is the number of ids and m the results. Instead you should group the results to lists of objects by id first and then perform the "join". On some other database systems you could handle the grouping in SQL directly, but alas MySQL has no notion of arrays, other than JSON.</p>
+<p>A possibly more performant version of your grouping could be for example:</p>
+<pre><code>from itertools import groupby
+from operator import attrgetter
+
+ids = ['1', '2', '3']  # obviously fake list of ids
+
+# Order the results by `dec_id` for Python itertools.groupby. Cannot
+# use your `qfilter()` method as it produces lists, not queries.
+decs = HRDecimal.query.\
+    filter(HRDecimal.dec_id.in_(ids)).\
+    order_by(HRDecimal.dec_id).\
+    all()
+
+metas = Meta.query.\
+    filter(Meta.dec_id.in_(ids)).\
+    order_by(Meta.dec_id).\
+    all()
+
+key = attrgetter('dec_id')
+decs_lookup = {dec_id: list(g) for dec_id, g in groupby(decs, key)}
+metas_lookup = {dec_id: list(g) for dec_id, g in groupby(metas, key)}
+
+combined = [(ident,
+             decs_lookup.get(ident, []),
+             metas_lookup.get(ident, []))
+            for ident in ids]
+</code></pre>
+<p>Note that since in this version we iterate over the queries only once, <code>all()</code> is not strictly necessary, but it should not hurt much either. The grouping could also be done without sorting in SQL with <a href="https://docs.python.org/3/library/collections.html#collections.defaultdict" rel="nofollow noreferrer"><code>defaultdict(list)</code></a>:</p>
+<pre><code>from collections import defaultdict
+
+decs = HRDecimal.query.filter(HRDecimal.dec_id.in_(ids)).all()
+metas = Meta.query.filter(Meta.dec_id.in_(ids)).all()
+
+decs_lookup = defaultdict(list)
+metas_lookup = defaultdict(list)
+
+for d in decs:
+    decs_lookup[d.dec_id].append(d)
+
+for m in metas:
+    metas_lookup[m.dec_id].append(m)
+
+combined = [(ident, decs_lookup[ident], metas_lookup[ident])
+            for ident in ids]
+</code></pre>
+<p>And finally to answer your question, you can fetch "real" Python objects by querying for the Core table instead of the ORM entity:</p>
+<pre><code>decs = HRDecimal.query.\
+    filter(HRDecimal.dec_id.in_(ids)).\
+    with_entities(HRDecimal.__table__).\
+    all()
+</code></pre>
+<p>which will result in a list of <a href="http://docs.sqlalchemy.org/en/latest/orm/query.html#sqlalchemy.util.KeyedTuple" rel="nofollow noreferrer">namedtuple like objects</a> that can easily be converted to dict with <a href="http://docs.sqlalchemy.org/en/latest/orm/query.html#sqlalchemy.util.KeyedTuple._asdict" rel="nofollow noreferrer"><code>_asdict()</code></a>.</p>
+</div>
+<span class="comment-copy">I'm somewhat willing to bet that your "randomness" is related to committing, since with the default configuration objects in session are expired on commit. You've already turned the knob to disable that. Usually when performance becomes an issue it is related to using the wrong tool for the job. The ORM is for handling complex object graphs and persisting those to a relational DB. Tracking attribute changes is a crucial part. See <a href="http://docs.sqlalchemy.org/en/latest/faq/performance.html#i-m-inserting-400-000-rows-with-the-orm-and-it-s-really-slow" rel="nofollow noreferrer">docs.sqlalchemy.org/en/latest/faq/…</a>. It is ill suited for large bulk operations.</span>
+<span class="comment-copy">It'd be interesting to see actual profiling results of the overhead produced by attribute instrumentation in your case. Also looking at your queries and Python code it seems you're pretty much doing a grouping in Python. Depending on your DB in use you could perhaps move that to SQL and receive results as id, list-of-objects pairs. If this is impossible due to your DB, you could speed your grouping up quite a bit. Now you're filtering the lists time after time for each ident. Instead group the results once to a lookup, and then produce the combined list.</span>
+<span class="comment-copy">And finally if you want "plain" python data as a result, you can fall back to using SQLAlchemy Core. Could you btw. share what DB you are using?</span>
+<span class="comment-copy">Thanks for the comments @IljaEverilä, I'm using a MySQL instance in Amazon's Relational Database Service.</span>
+<span class="comment-copy">Are you also missing a call to <code>Query.all()</code> in your example only, or also in your real code? As you have it now you're repeatedly iterating over a <b>query objects</b> decs and metas, which perform their queries again and again each time.</span>

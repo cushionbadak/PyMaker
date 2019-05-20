@@ -1,0 +1,198 @@
+<div class="post-text" itemprop="text">
+<p>I have a python multi-threaded application. I want to run an asyncio loop in a thread and post calbacks and coroutines to it from another thread. Should be easy but I cannot get my head around the <a href="https://docs.python.org/3.4/library/asyncio.html" rel="noreferrer">asyncio</a> stuff.</p>
+<p>I came up to the following solution which does half of what I want, feel free to comment on anything:</p>
+<pre><code>import asyncio
+from threading import Thread
+
+class B(Thread):
+    def __init__(self):
+        Thread.__init__(self)
+        self.loop = None
+
+    def run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop) #why do I need that??
+        self.loop.run_forever()
+
+    def stop(self):
+        self.loop.call_soon_threadsafe(self.loop.stop)
+
+    def add_task(self, coro):
+        """this method should return a task object, that I
+          can cancel, not a handle"""
+        f = functools.partial(self.loop.create_task, coro)
+        return self.loop.call_soon_threadsafe(f)
+
+    def cancel_task(self, xx):
+        #no idea
+
+@asyncio.coroutine
+def test():
+    while True:
+        print("running")
+        yield from asyncio.sleep(1)
+
+b.start()
+time.sleep(1) #need to wait for loop to start
+t = b.add_task(test())
+time.sleep(10)
+#here the program runs fine but how can I cancel the task?
+
+b.stop()
+</code></pre>
+<p>So starting and stoping the loop works fine. I thought about creating task using create_task, but that method is not threadsafe so I wrapped it in call_soon_threadsafe. But I would like to be able to get the task object in order to be able to cancel the task. I could do a complicated stuff using Future and Condition, but there must be a simplier way, isnt'it?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think you may need to make your <code>add_task</code> method aware of whether or not its being called from a thread other than the event loop's. That way, if it's being called from the same thread, you can just call <code>asyncio.async</code> directly, otherwise, it can do some extra work to pass the task from the loop's thread to the calling thread. Here's an example:</p>
+<pre><code>import time
+import asyncio
+import functools
+from threading import Thread, current_thread, Event
+from concurrent.futures import Future
+
+class B(Thread):
+    def __init__(self, start_event):
+        Thread.__init__(self)
+        self.loop = None
+        self.tid = None
+        self.event = start_event
+
+    def run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.tid = current_thread()
+        self.loop.call_soon(self.event.set)
+        self.loop.run_forever()
+
+    def stop(self):
+        self.loop.call_soon_threadsafe(self.loop.stop)
+
+    def add_task(self, coro):
+        """this method should return a task object, that I
+          can cancel, not a handle"""
+        def _async_add(func, fut):
+            try:
+                ret = func()
+                fut.set_result(ret)
+            except Exception as e:
+                fut.set_exception(e)
+
+        f = functools.partial(asyncio.async, coro, loop=self.loop)
+        if current_thread() == self.tid:
+            return f() # We can call directly if we're not going between threads.
+        else:
+            # We're in a non-event loop thread so we use a Future
+            # to get the task from the event loop thread once
+            # it's ready.
+            fut = Future()
+            self.loop.call_soon_threadsafe(_async_add, f, fut)
+            return fut.result()
+
+    def cancel_task(self, task):
+        self.loop.call_soon_threadsafe(task.cancel)
+
+
+@asyncio.coroutine
+def test():
+    while True:
+        print("running")
+        yield from asyncio.sleep(1)
+
+event = Event()
+b = B(event)
+b.start()
+event.wait() # Let the loop's thread signal us, rather than sleeping
+t = b.add_task(test()) # This is a real task
+time.sleep(10)
+b.stop()
+</code></pre>
+<p>First, we save the thread id of the event loop in the <code>run</code> method, so we can figure out if calls to <code>add_task</code> are coming from other threads later. If <code>add_task</code> is called from a non-event loop thread, we use <code>call_soon_threadsafe</code> to call a function that will both schedule the coroutine, and then use a <code>concurrent.futures.Future</code> to pass the task back to the calling thread, which waits on the result of the <code>Future</code>.</p>
+<p>A note on cancelling a task: You when you call <code>cancel</code> on a <code>Task</code>, a <code>CancelledError</code> will be raised in the coroutine the next time the event loop runs. This means that the coroutine that the Task is wrapping will aborted due to the exception the next time it hit a yield point - unless the coroutine catches the <code>CancelledError</code> and prevents itself from aborting. Also note that this only works if the function being wrapped is actually an interruptible coroutine; an <code>asyncio.Future</code> returned by <code>BaseEventLoop.run_in_executor</code>, for example, can't really be cancelled, because it's actually wrapped around a <code>concurrent.futures.Future</code>, and those can't be cancelled once their underlying function actually starts executing. In those cases, the <code>asyncio.Future</code> will say its cancelled, but the function actually running in the executor will continue to run.</p>
+<p><strong>Edit:</strong> Updated the first example to use <code>concurrent.futures.Future</code>, instead of a <code>queue.Queue</code>, per Andrew Svetlov's suggestion.</p>
+<p>Note: <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.async" rel="noreferrer"><code>asyncio.async</code></a> is deprecated since version 3.4.4 use <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.ensure_future" rel="noreferrer"><code>asyncio.ensure_future</code></a> instead.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You do everything right.
+For task stopping make method</p>
+<pre><code>class B(Thread):
+    # ...
+    def cancel(self, task):
+        self.loop.call_soon_threadsafe(task.cancel)
+</code></pre>
+<p>BTW you <em>have</em> to setup an event loop for the created thread explicitly by </p>
+<pre><code>self.loop = asyncio.new_event_loop()
+asyncio.set_event_loop(self.loop)
+</code></pre>
+<p>because <code>asyncio</code> creates implicit event loop only for main thread.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>just for reference here it the code I finally implemented based on the the help I got on this site, it is simpler since I did not need all features. thanks again!</p>
+<pre><code>import asyncio
+from threading import Thread
+from concurrent.futures import Future
+import functools
+
+class B(Thread):
+    def __init__(self):
+        Thread.__init__(self)
+        self.loop = None
+
+    def run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def stop(self):
+        self.loop.call_soon_threadsafe(self.loop.stop)
+
+    def _add_task(self, future, coro):
+        task = self.loop.create_task(coro)
+        future.set_result(task)
+
+    def add_task(self, coro):
+        future = Future()
+        p = functools.partial(self._add_task, future, coro)
+        self.loop.call_soon_threadsafe(p)
+        return future.result() #block until result is available
+
+    def cancel(self, task):
+        self.loop.call_soon_threadsafe(task.cancel)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since version 3.4.4 <code>asyncio</code> provides a function called <a href="https://docs.python.org/3.5/library/asyncio-task.html#asyncio.run_coroutine_threadsafe" rel="nofollow">run_coroutine_threadsafe</a> to submit a coroutine object from a thread to an event loop. It returns a <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Future" rel="nofollow">concurrent.futures.Future</a> to access the result or cancel the task.</p>
+<p>Using your example:</p>
+<pre><code>@asyncio.coroutine
+def test(loop):
+    try:
+        while True:
+            print("Running")
+            yield from asyncio.sleep(1, loop=loop)
+    except asyncio.CancelledError:
+        print("Cancelled")
+        loop.stop()
+        raise
+
+loop = asyncio.new_event_loop()
+thread = threading.Thread(target=loop.run_forever)
+future = asyncio.run_coroutine_threadsafe(test(loop), loop)
+
+thread.start()
+time.sleep(5)
+future.cancel()
+thread.join()
+</code></pre>
+</div>
+<span class="comment-copy">Thanks for the example it helped me fix several issues I had. Btw I also hadd to instanciate Future with Future(loop=self.loop), otherwise in some cases future would take wrong loop</span>
+<span class="comment-copy">@OlivierRD You should be using <code>concurrent.futures.Future</code>, not <code>asyncio.Future</code>. <code>concurrent.futures.Future</code> doesn't take a <code>loop</code> keyword arugment.</span>
+<span class="comment-copy">the documentation seems to say that it does: <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.Future" rel="nofollow noreferrer">docs.python.org/3/library/asyncio-task.html#asyncio.Future</a></span>
+<span class="comment-copy">btw task.cancel really seems to cancel the running task. I just ran a few tests. the task seems to stop at the first yield statement</span>
+<span class="comment-copy">@OlivierRD That's the docs for <code>asyncio.Future</code>, not <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Future" rel="nofollow noreferrer"><code>concurrent.futures.Future</code></a></span>
+<span class="comment-copy">The missing piece here is how to get the handle to the <code>task</code> in the first place. Because the OP needs to use <code>call_soon_threadsafe(self.loop.create_task)</code> in the <code>add_task</code> method, he doesn't actually have a handle to the task after adding it to the loop.</span>
+<span class="comment-copy">Got it. You are right.  @dano BTW you may use concurrent.futures.Future instead of Queue in your answer. I think it's cleaner.</span>
+<span class="comment-copy">Yes, I agree that using a <code>Future</code> is nicer than a <code>Queue</code>. I've updated my answer to reflect that. Thanks!</span>
+<span class="comment-copy">Does this still work with the async/await coroutines in Python 3.5?  The docs for future.result() don't seem to indicate that result() blocks (rather times out, see <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Future.result" rel="nofollow noreferrer">docs.python.org/3/library/…</a> ), and in the caller of add_task the value I get back appears to be a Task rather than the concrete value returned from the coroutine.  Furthermore <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Future.set_result" rel="nofollow noreferrer">docs.python.org/3/library/…</a> seems to indicate that set_result shouldn't be used</span>
+<span class="comment-copy">Gist of what I tried with this: <a href="https://gist.github.com/pzelnip/7230b32dc9a27f6e78d9cd78b619245a" rel="nofollow noreferrer">gist.github.com/pzelnip/7230b32dc9a27f6e78d9cd78b619245a</a>  The return from add_task when the cororoutine appears to be a Task, and also never appears to terminate.</span>
+<span class="comment-copy">To preventing from a race condition or deadlock, don't call <code>future.cancel()</code> directly. Use <code>loop.call_soon_threadsafe(future.cancel)</code> instead. See <a href="https://docs.python.org/3.4/library/asyncio-dev.html#concurrency-and-multithreading" rel="nofollow noreferrer">here</a>.</span>
+<span class="comment-copy">@ChangYu-heng This is true for <a href="https://docs.python.org/3.4/library/asyncio-task.html#asyncio.Future" rel="nofollow noreferrer">asyncio.Future</a> futures, but <a href="https://docs.python.org/3.4/library/asyncio-task.html#asyncio.run_coroutine_threadsafe" rel="nofollow noreferrer">run_coroutine_threadsafe</a> returns a <a href="https://docs.python.org/3.4/library/concurrent.futures.html#concurrent.futures.Future" rel="nofollow noreferrer">concurrent.futures.Future</a> which is thread-safe and doesn't depend on any event loop.</span>
+<span class="comment-copy">@Vicent Sorry I didn't read the original question carefully. So an additional comment for that would be: use <code>loop.call_soon_threadsafe(future.cancel)</code> if you are going to execute <code>future.cancel()</code> from the thread which is not the event loop living in.</span>

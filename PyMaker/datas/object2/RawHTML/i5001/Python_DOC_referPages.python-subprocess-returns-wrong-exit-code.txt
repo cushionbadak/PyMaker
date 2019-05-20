@@ -1,0 +1,84 @@
+<div class="post-text" itemprop="text">
+<p>I wrote a script to launch a number of processes (simple unit tests) to run in parallel. It will do <code>N</code> jobs with <code>num_workers</code> parallel processes at a time. </p>
+<p>My first implementation ran the processes in batches of <code>num_workers</code> and seemed to be working fine (I used the <code>false</code> command here to test the behavior)</p>
+<pre><code>import subprocess
+
+errors = 0
+num_workers = 10
+N = 100
+i = 0
+
+while i &lt; N:
+    processes = []
+    for j in range(i, min(i+num_workers, N)):
+        p = subprocess.Popen(['false'])
+        processes.append(p)
+
+    [p.wait() for p in processes]
+    exit_codes = [p.returncode for p in processes]
+
+    errors += sum(int(e != 0) for e in exit_codes)
+    i += num_workers
+
+print(f"There were {errors}/{N} errors")
+</code></pre>
+<p>However, the tests do not take equal amounts of time so I was sometimes waiting for a slow test to finish. Thus I rewrote it to keep assigning tasks as they finished</p>
+<pre><code>import subprocess
+import os
+
+
+errors = 0
+num_workers = 40
+N = 100
+assigned = 0
+completed = 0
+processes = set()
+
+while completed &lt; N:
+    if assigned &lt; N:
+        p = subprocess.Popen(['false'])
+        processes.add((assigned, p))
+        assigned += 1
+    if len(processes) &gt;= num_workers or assigned == N:
+        os.wait()
+
+    for i, p in frozenset(processes):
+        if p.poll() is not None:
+            completed += 1
+            processes.remove((i, p))
+            err = p.returncode
+            print(i, err)
+            if err != 0:
+                errors += 1
+
+print(f"There were {errors}/{N} errors")
+</code></pre>
+<p>However this produces wrong results for the last few processes. For instance, in the example above it produces 98/100 errors instead of 100. I checked and this has nothing to do with concurrency; the 2 latest jobs were returning with exit code 0 for some reason.</p>
+<p>Why does this happen?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem is with <code>os.wait()</code>. It doesn't only wait for a child process to exit: it also returns the pid and "exit status indication" of that child, as <a href="https://docs.python.org/3/library/os.html#os.wait" rel="nofollow noreferrer">the documentation</a> says. This requires waiting until the child process has terminated; but once the child has terminated, its return code is no longer available for <code>poll</code>. Here's a simple test to reproduce the problem:</p>
+<h3>false_runner.py</h3>
+<pre><code>import os
+import subprocess
+p = subprocess.Popen(['false'], stderr=subprocess.DEVNULL)
+pid, retcode = os.wait()
+print("From os.wait: {}".format(retcode))
+print("From popen object before poll: {}".format(p.returncode))
+p.poll()
+print("From popen object after poll: {}".format(p.returncode))
+</code></pre>
+<h3>output</h3>
+<pre><code>njv@organon:~/tmp$ python false_runner.py
+From os.wait: 256
+From Popen object before poll: None
+From Popen object after poll: 0
+</code></pre>
+<p><a href="https://github.com/python/cpython/blob/3.6/Lib/subprocess.py#L1366" rel="nofollow noreferrer">The source code for <code>_internal_poll</code>, called by <code>Popen.poll</code></a>, makes it clear what's happening here: when <code>Popen</code> tries to call <code>_waitpid</code> on its child process's pid, it gets <code>ChildProcessError: [Errno 10] No child processes</code>, and assigns itself a <code>returncode</code> of 0, because there's no way to determine the child process's return code at this point.</p>
+<p>The reason this happens only for the last couple of subprocesses in your example is because <code>os.wait</code> is only getting called for the <code>or assigned == N</code> case, and only once or twice, because your subprocess is so fast. If you slow it down a bit, you'll get more random behavior.</p>
+<p>As for a fix: I'd probably just replace <code>os.wait()</code> with a sleep.</p>
+</div>
+<span class="comment-copy">Consider using <a href="https://docs.python.org/3/library/multiprocessing.html" rel="nofollow noreferrer">multiprocessing</a> instead of managing your own parallel processes.</span>
+<span class="comment-copy">@ndmeiri What race condition? Only the main thread reads/writes the <code>errors</code> variable.</span>
+<span class="comment-copy">Not a race condition; <code>os.wait()</code> clobbers the return code for <code>poll()</code>.</span>
+<span class="comment-copy">@NathanVērzemnieks Good eye!</span>

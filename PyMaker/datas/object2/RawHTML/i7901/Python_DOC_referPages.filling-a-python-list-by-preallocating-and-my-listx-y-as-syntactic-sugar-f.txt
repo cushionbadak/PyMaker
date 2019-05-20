@@ -1,0 +1,89 @@
+<div class="post-text" itemprop="text">
+<p>In working on some optimizations for my code in Python 2.7, I stumbled upon the following phenomenon:</p>
+<pre><code>&gt;&gt;&gt; from timeit import timeit
+&gt;&gt;&gt; def fill_by_appending():
+...     my_list = []
+...     for x in xrange(1000000):
+...             my_list.append(x)
+...     return my_list
+...
+&gt;&gt;&gt; def fill_preallocated_1():
+...     my_list = [0]*1000000
+...     for x in xrange(1000000):
+...             my_list[x] = x
+...     return my_list
+...
+&gt;&gt;&gt; def fill_preallocated_2():
+...     my_list = [0]*1000000
+...     for x in xrange(1000000):
+...             my_list.__setitem__(x,x)
+...     return my_list
+...
+&gt;&gt;&gt; def fill_by_comprehension():
+...     my_list = [x for x in xrange(1000000)]
+...     return my_list
+...
+&gt;&gt;&gt; assert fill_by_appending() == fill_preallocated_1() == fill_preallocated_2() == fill_by_comprehension()
+&gt;&gt;&gt; timeit("fill_by_appending()", setup="from __main__ import fill_by_appending", number=100)
+5.877948999404907
+&gt;&gt;&gt; timeit("fill_preallocated_1()", setup="from __main__ import fill_preallocated_1", number=100)
+3.964423894882202
+&gt;&gt;&gt; timeit("fill_preallocated_2()", setup="from __main__ import fill_preallocated_2", number=100)
+12.38241720199585
+&gt;&gt;&gt; timeit("fill_by_comprehension()", setup="from __main__ import fill_by_comprehension", number=100)
+2.742932081222534
+</code></pre>
+<p>It's no surprise to me that preallocating is faster than appending, or that comprehension is faster than anything else, but why is using <code>__setitem__</code> <em>three times slower</em> than using <code>[]</code>?</p>
+<p>Initially, I had a theory that using <code>my_list[x] = x</code> either merely reassigned the reference stored in <code>my_list[x]</code> to the address of the new object, or maybe that the interpreter even noticed that both were of the same type and used an overloaded assignment operator, whereas a <code>setitem</code> call actually copied the memory over, BUT some experimenting proved me wrong: </p>
+<pre><code>&gt;&gt;&gt; class MyList(list):
+...     def __setitem__(self, x,y):
+...             super(MyList, self).__setitem__(x,y**2)
+...
+&gt;&gt;&gt; ml = MyList([1,2,3,4,5])
+&gt;&gt;&gt; ml[2]=10
+&gt;&gt;&gt; ml
+[1, 2, 100, 4, 5]
+</code></pre>
+<p>Does someone know what's going on under the hood? </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Generic method dispatch has extra overhead over syntax based dispatch; the latter <a href="https://github.com/python/cpython/blob/2.7/Python/ceval.c#L1906" rel="nofollow noreferrer">can directly call the C level equivalent of the <code>__setitem__</code> method</a>, while the former must repeatedly look up and create a bound method, and dispatch the call through the generic method dispatch mechanism (more general == slower). Generic dispatch also means constructing a <code>tuple</code> of arguments to pass (where syntax based calls just read the values off the Python stack without constructing a <code>tuple</code>).</p>
+<p>In addition, the Python level name is actually a thin wrapper, so calling <code>__setitem__</code> means one additional layer of calling before it reaches the C API, as it has to traverse one additional layer before it reaches <code>sq_ass_item</code> (the C layer slot that is the ultimate call that implements the assignment). <a href="https://docs.python.org/3/c-api/structures.html#METH_COEXIST" rel="nofollow noreferrer"><code>METH_COEXIST</code> can be used to limit the slot wrapper overhead</a> according to the docs, but it looks like <a href="https://github.com/python/cpython/blob/3.6/Objects/listobject.c#L2371" rel="nofollow noreferrer">that was only used for <code>__getitem__</code> on <code>list</code></a>.</p>
+<p>You can eliminate the method lookup and binding overhead by storing off the bound method, which might save a little work, but fundamentally, for CPython, syntax beats method calls; if the syntax is equally clear and not error prone, use syntax.  A prebinding example that might reduce some of the discrepancy would be:</p>
+<pre><code>def fill_preallocated_3():
+    my_list = [0]*1000000
+    set = my_list.__setitem__
+    for x in xrange(1000000):
+        set(x,x)
+    return my_list
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You have extra property lookup + a function call in the second function:</p>
+<p><code>def fill_preallocated_1():</code></p>
+<pre><code>         ...
+         32 LOAD_FAST                1 (x)
+         35 LOAD_FAST                0 (my_list)
+         38 LOAD_FAST                1 (x)
+         41 STORE_SUBSCR         
+         ...
+</code></pre>
+<p><code>def fill_preallocated_2():</code></p>
+<pre><code>         ...
+         32 LOAD_FAST                0 (my_list)
+         35 LOAD_ATTR                1 (__setitem__)
+         38 LOAD_FAST                1 (x)
+         41 LOAD_FAST                1 (x)
+         44 CALL_FUNCTION            2
+         ...
+</code></pre>
+</div>
+<span class="comment-copy">I'd guess <code>__setitem__</code> is a function call, when <code>[x] =</code> has a special meaning for the interpreter. Same reason why <code>[]</code> is faster than <code>list()</code> for creating new lists.</span>
+<span class="comment-copy">Side-note: For this specific case, the real answer is "just call <code>range(1000000)</code>" (or on Py3, <code>list(range(1000000))</code> if you really need a <code>list</code>), but I assume you're considering slightly more complicated fill patterns.</span>
+<span class="comment-copy">@ShadowRanger slightly :)</span>
+<span class="comment-copy">Thank you, and for the links to the CPython source especially! Do you know anything about why the choice to put <code>__setitem__</code> behind the extra layer was made? Does it have to do with inheritance?</span>
+<span class="comment-copy">@gmoss: No. They have a generic wrapper used for each of the defined C level slots; the C level slots take their arguments already parsed so that a C -&gt; C call doesn't need to pack up arguments that will only be unpacked immediately; the wrappers provide the conversion layer from Python level generic calling conventions to slot specific call prototypes. It's all part of the cost of generic "varargs-like" function dispatch vs. specific C level function prototypes.</span>
+<span class="comment-copy">For the record, the reason not to do <code>METH_COEXIST</code> all the time is that it's not commonly needed (<code>__setitem__</code> isn't called directly often; it's usually bypassed to go straight for the C level slot through the syntax dispatch path), and the only way to make it meaningfully faster than the wrapper that parses and passes along to the C slot is to reproduce most of the code of the C level function in the coexisting Python exposed function (basically, copy pasting a ton of code). Not worth the maintenance hassle for a fairly minor gain.</span>
+<span class="comment-copy">Note: The property lookup cost is likely a fraction of the overhead of the generic <code>CALL_FUNCTION</code> vs. the specific <code>STORE_SUBSCR</code>. <a href="https://stackoverflow.com/a/44191990/364696">My answer</a> includes a variant test that would eliminate the property lookup expense to help isolate the components of the slowdown.</span>
+<span class="comment-copy">The function call is the main culprit - caching the <code>__setitem__</code> property gives an improvement of around 30% on my system. Not something to throw away, but optimized list assignment is more than three times faster. btw. on my system, same tests:  <code>fill_preallocated_1: 4.73s; fill_preallocated_2: 13.41s; fill_preallocated_3: 10.8s</code></span>
+<span class="comment-copy">Thanks for the confirmation!</span>

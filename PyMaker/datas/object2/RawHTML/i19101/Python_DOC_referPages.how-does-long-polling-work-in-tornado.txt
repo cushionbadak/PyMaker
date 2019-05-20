@@ -1,0 +1,127 @@
+<div class="post-text" itemprop="text">
+<p>In Tornado's <a href="https://github.com/facebook/tornado/blob/master/demos/chat/chatdemo.py" rel="nofollow">chat demo</a>,  it has a method like this:</p>
+<pre><code>@tornado.web.asynchronous
+def post(self):
+    cursor = self.get_argument("cursor", None)
+    global_message_buffer.wait_for_messages(self.on_new_messages,
+                                            cursor=cursor)
+</code></pre>
+<p>I'm fairly new to this long polling thing, and I don't really understand exactly how the threading stuff works, though it states:</p>
+<blockquote>
+<p>By using non-blocking network I/O, Tornado can scale to tens of thousands of open connections...</p>
+</blockquote>
+<p>My theory was that by making a simple app:</p>
+<pre><code>import tornado.ioloop
+import tornado.web
+import time
+
+class MainHandler(tornado.web.RequestHandler):
+    @tornado.web.asynchronous
+    def get(self):
+        print("Start request")
+        time.sleep(4)
+        print("Okay done now")
+        self.write("Howdy howdy howdy")
+        self.finish()
+
+application =  tornado.web.Application([
+    (r'/', MainHandler),
+])
+</code></pre>
+<p>That if I made two requests in a row (i.e. I opened two browser windows and quickly refreshed both) I would see this:</p>
+<pre><code>Start request
+Start request
+Okay done now
+Okay done now
+</code></pre>
+<p>Instead, I see</p>
+<pre><code>Start request
+Okay done now
+Start request
+Okay done now
+</code></pre>
+<p>Which leads me to believe that it is, in fact, blocking in this case. Why is it that my code is blocking, and how do I get some code to do what I expect? I get the same output on Windows 7 with a core i7, and a linux Mint 13 box with I think two cores.</p>
+<h2>Edit:</h2>
+<p>I found one method - if someone can provide a method that works cross-platform (I'm not too worried about performance, only that it's non-blocking), I'll accept that answer.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The right way to convert your test app into a form that won't block the IOLoop is like this:</p>
+<pre><code>from tornado.ioloop import IOLoop
+import tornado.web
+from tornado import gen
+import time
+
+@gen.coroutine
+def async_sleep(timeout):
+    """ Sleep without blocking the IOLoop. """
+    yield gen.Task(IOLoop.instance().add_timeout, time.time() + timeout)
+
+class MainHandler(tornado.web.RequestHandler):
+    @gen.coroutine
+    def get(self):
+        print("Start request")
+        yield async_sleep(4)
+        print("Okay done now")
+        self.write("Howdy howdy howdy")
+        self.finish()
+
+if __name__ == "__main__":
+    application =  tornado.web.Application([
+        (r'/', MainHandler),
+    ])
+    application.listen(8888)
+    IOLoop.instance().start()
+</code></pre>
+<p>The difference is replacing the call to <code>time.sleep</code> with one which won't block the IOLoop. Tornado is designed to handle lots of concurrent I/O without needing multiple threads/subprocesses, but it will still block if you use synchronous APIs. In order for your long-polling solution to handle concurrency the way you'd like, you have to make sure that no long-running calls block.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem with the code in original question is that when you call <code>time.sleep(4)</code> you are effectively blocking the execution of event loop for 4 seconds. And accepted answer doesn't solve the problem either (IMHO).</p>
+<p>Asynchronous serving in Tornado works on trust. Tornado will call your functions whenever something happens, but it trusts you that you will return control to it as soon as possible. If you block with <code>time.sleep()</code> then this trust is breached - Tornado can't handle new connections.</p>
+<p>Using multiple threads only hides the mistake; running Tornado with thousands of threads (so you can serve 1000s of connections simultaneously) would be very inefficient. The appropriate way is running a single thread which only blocks inside Tornado (on <code>select</code> or whatever Tornado's way of listening for events is) - not on your code (to be exact: <strong>never</strong> on your code).</p>
+<p>The proper solution is to just return from <code>get(self)</code> right before <code>time.sleep()</code> (without calling <code>self.finish()</code>), like this:</p>
+<pre><code>class MainHandler(tornado.web.RequestHandler):
+    @tornado.web.asynchronous
+    def get(self):
+        print("Starting")
+</code></pre>
+<p>You must of course remember that this request is still open and call <code>write()</code> and <code>finish()</code> on it later. </p>
+<p>I suggest you take a look at <a href="https://github.com/facebook/tornado/blob/stable/demos/chat/chatdemo.py">chat demo</a>. Once you strip out the authentication you get a very nice example of async long polling server.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since Tornado 5.0, asyncio is enabled automatically, so pretty much just changing <code>time.sleep(4)</code> to <code>await asyncio.sleep(4)</code> and <code>@tornado.web.asynchronous def get(self):</code> to <code>async def get(self):</code> solves the problem.</p>
+<p>Example:</p>
+<pre><code>import tornado.ioloop
+import tornado.web
+import asyncio
+
+class MainHandler(tornado.web.RequestHandler):
+    async def get(self):
+        print("Start request")
+        await asyncio.sleep(4)
+        print("Okay done now")
+        self.write("Howdy howdy howdy")
+        self.finish()
+
+app =  tornado.web.Application([
+    (r'/', MainHandler),
+])
+app.listen(8888)
+tornado.ioloop.IOLoop.current().start()
+</code></pre>
+<p>Output:</p>
+<pre><code>Start request
+Start request
+Okay done now
+Okay done now
+</code></pre>
+<p>Sources:</p>
+<ul>
+<li><a href="http://www.tornadoweb.org/en/stable/asyncio.html" rel="nofollow noreferrer">Tornado on asyncio</a></li>
+<li><a href="https://docs.python.org/3/library/asyncio-task.html#example-coroutine-displaying-the-current-date" rel="nofollow noreferrer">asyncio usage example</a></li>
+</ul>
+</div>
+<span class="comment-copy"><code>time.sleep</code> blocks the Tornado IOLoop, which stops all processing. You don't need multiple threads at all (although you'd probably want them in production), just don't sleep. Instead, add a timeout to the IOLoop: <a href="http://www.tornadoweb.org/en/stable/ioloop.html#tornado.ioloop.IOLoop.add_timeout" rel="nofollow noreferrer">tornadoweb.org/en/stable/…</a></span>
+<span class="comment-copy">Please choose correct answers provided by dano and john.</span>
+<span class="comment-copy">I did take a look at the chat demo, which has <i>way</i> more "real life" code than I'm looking for - even paring it down. I realize (now) that sleep isn't the right way to get it to work...</span>
+<span class="comment-copy">Unfortunately, doing <i>this</i> still produces the "Starting" and then blocks until that first request is entirely finished (at least as far as I can tell)</span>
+<span class="comment-copy">I agree that the chat demo is a bit bloated. :) What I did is that I removed all authentication stuff and I was left with a quite small app that shows the concepts clearly (I did rename some of the functions too -<code>wait_for_messages</code> to <code>add_to_waiters</code> and similar). About the 2nd comment: no it doesn't, that's the beauty of it. It accepts new connections all the time while keeping the old connections open (until some other event - for instance another request - closes them). The <a href="http://krondo.com/?p=1209" rel="nofollow noreferrer">first part of this Twisted tutorial</a> explains async mode very nicely.</span>

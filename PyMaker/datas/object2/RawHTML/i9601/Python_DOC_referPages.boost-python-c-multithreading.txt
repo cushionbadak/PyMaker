@@ -1,0 +1,255 @@
+<div class="post-text" itemprop="text">
+<p>I'm writing a python program that includes a c++ module (<code>.so</code>, using <code>boost.python</code>).<br/>
+I'm starting several python threads that run a c++ function. </p>
+<p>This is how the C++ code looks like:</p>
+<pre><code>#include &lt;boost/python.hpp&gt;
+using namespace boost;
+void f(){
+    // long calculation
+
+    // call python function
+
+    // long calculation
+}
+
+BOOST_PYTHON_MODULE(test)
+{
+    python::def("f", &amp;f);
+}
+</code></pre>
+<p>And the python code:</p>
+<pre><code>from test import f
+t1 = threading.Thread(target=f)
+t1.setDaemon(True)
+t1.start()
+print "Still running!"
+</code></pre>
+<p>I encounter a problem: the "Still running!" message isn't shown, and I found out that the c++ thread is holding the GIL.</p>
+<p>What is the best method of handling the GIL in my case of running c++ code from python code?</p>
+<p>Thanks!
+Gal</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I often find that using <a href="http://en.wikipedia.org/wiki/Resource_Acquisition_Is_Initialization" rel="nofollow noreferrer">RAII-style</a> classes to manage the <a href="https://docs.python.org/3/glossary.html#term-global-interpreter-lock" rel="nofollow noreferrer">Global Interpreter Lock</a> (GIL) provides an elegant exception-safe solution.</p>
+<p>For example, with the following <code>with_gil</code> class, when a <code>with_gil</code> object is created, the calling thread acquires the GIL.   When the <code>with_gil</code> object is destructed, it restores the GIL state.</p>
+<pre class="lang-cpp prettyprint-override"><code>/// @brief Guard that will acquire the GIL upon construction, and
+///        restore its state upon destruction.
+class with_gil
+{
+public:
+  with_gil()  { state_ = PyGILState_Ensure(); }
+  ~with_gil() { PyGILState_Release(state_);   }
+
+  with_gil(const with_gil&amp;)            = delete;
+  with_gil&amp; operator=(const with_gil&amp;) = delete;
+private:
+  PyGILState_STATE state_;
+};
+</code></pre>
+<p>And the complementary <code>without_gil</code> class does the opposite:</p>
+<pre class="lang-cpp prettyprint-override"><code>/// @brief Guard that will unlock the GIL upon construction, and
+///        restore its staet upon destruction.
+class without_gil
+{
+public:
+  without_gil()  { state_ = PyEval_SaveThread(); }
+  ~without_gil() { PyEval_RestoreThread(state_); }
+
+  without_gil(const without_gil&amp;)            = delete;
+  without_gil&amp; operator=(const without_gil&amp;) = delete;
+private:
+  PyThreadState* state_;
+};
+</code></pre>
+<p>Their usage within a function could be as follows:</p>
+<pre class="lang-cpp prettyprint-override"><code>void f()
+{
+  without_gil no_gil;       // release gil
+  // long calculation
+  ...
+
+  {
+    with_gil gil;           // acquire gil
+    // call python function
+    ...
+  }                         // restore gil (release)
+
+  // long calculation
+  ...
+}                           // restore gil (acquire)
+</code></pre>
+<p>One can also use a higher level convenient class to provide a <code>std::lock_guard</code> like experience.  The GIL acquisition and release, save and restore semantics are slightly different than a normal mutex.  Hence, the <code>gil_guard</code> interface is different:</p>
+<ul>
+<li><code>gil_guard.acquire()</code> will acquire the GIL</li>
+<li><code>gil_guard.release()</code> will release the GIL</li>
+<li><code>gil_guard_restore()</code> will restore the previous state</li>
+</ul>
+<pre class="lang-cpp prettyprint-override"><code>/// @brief Guard that provides higher-level GIL controls.
+class gil_guard
+{
+public:
+  struct no_acquire_t {} // tag type used for gil acquire strategy
+  static no_acquire;
+
+  gil_guard()             { acquire(); }
+  gil_guard(no_acquire_t) { release(); }
+  ~gil_guard()            { while (!stack_.empty()) { restore(); } }
+
+  void acquire()          { stack_.emplace(new with_gil); }
+  void release()          { stack_.emplace(new without_gil); }
+  void restore()          { stack_.pop(); }
+
+  static bool owns_gil()
+  {
+    // For Python 3.4+, one can use `PyGILState_Check()`.
+    return _PyThreadState_Current == PyGILState_GetThisThreadState();
+  }
+
+  gil_guard(const gil_guard&amp;)            = delete;
+  gil_guard&amp; operator=(const gil_guard&amp;) = delete;
+
+private:
+  // Use std::shared_ptr&lt;void&gt; for type erasure.
+  std::stack&lt;std::shared_ptr&lt;void&gt;&gt; stack_;
+};
+</code></pre>
+<p>And its usage would be:</p>
+<pre class="lang-cpp prettyprint-override"><code>void f()
+{
+  gil_guard gil(gil_guard::no_acquire); // release gil
+  // long calculation
+  ...
+
+  gil.acquire();                        // acquire gil
+  // call python function
+  ...
+  gil.restore();                        // restore gil (release)
+
+  // long calculation
+  ...
+}                                       // restore gil (acquire)
+</code></pre>
+<hr/>
+<p>Here is a complete example <a href="http://coliru.stacked-crooked.com/a/427bbd8b0cf98938" rel="nofollow noreferrer">demonstrating</a> GIL management with these auxiliary classes:</p>
+<pre class="lang-cpp prettyprint-override"><code>#include &lt;cassert&gt;
+#include &lt;iostream&gt; // std::cout, std::endl
+#include &lt;memory&gt;   // std::shared_ptr
+#include &lt;thread&gt;   // std::this_thread
+#include &lt;stack&gt;    // std::stack
+#include &lt;boost/python.hpp&gt;
+
+/// @brief Guard that will acquire the GIL upon construction, and
+///        restore its state upon destruction.
+class with_gil
+{
+public:
+  with_gil()  { state_ = PyGILState_Ensure(); }
+  ~with_gil() { PyGILState_Release(state_);   }
+
+  with_gil(const with_gil&amp;)            = delete;
+  with_gil&amp; operator=(const with_gil&amp;) = delete;
+private:
+  PyGILState_STATE state_;
+};
+
+/// @brief Guard that will unlock the GIL upon construction, and
+///        restore its staet upon destruction.
+class without_gil
+{
+public:
+  without_gil()  { state_ = PyEval_SaveThread(); }
+  ~without_gil() { PyEval_RestoreThread(state_); }
+
+  without_gil(const without_gil&amp;)            = delete;
+  without_gil&amp; operator=(const without_gil&amp;) = delete;
+private:
+  PyThreadState* state_;
+};
+
+/// @brief Guard that provides higher-level GIL controls.
+class gil_guard
+{
+public:
+  struct no_acquire_t {} // tag type used for gil acquire strategy
+  static no_acquire;
+
+  gil_guard()             { acquire(); }
+  gil_guard(no_acquire_t) { release(); }
+  ~gil_guard()            { while (!stack_.empty()) { restore(); } }
+
+  void acquire()          { stack_.emplace(new with_gil); }
+  void release()          { stack_.emplace(new without_gil); }
+  void restore()          { stack_.pop(); }
+
+  static bool owns_gil()
+  {
+    // For Python 3.4+, one can use `PyGILState_Check()`.
+    return _PyThreadState_Current == PyGILState_GetThisThreadState();
+  }
+
+  gil_guard(const gil_guard&amp;)            = delete;
+  gil_guard&amp; operator=(const gil_guard&amp;) = delete;
+
+private:
+  // Use std::shared_ptr&lt;void&gt; for type erasure.
+  std::stack&lt;std::shared_ptr&lt;void&gt;&gt; stack_;
+};
+
+void f()
+{
+  std::cout &lt;&lt; "in f()" &lt;&lt; std::endl;
+
+  // long calculation
+  gil_guard gil(gil_guard::no_acquire);
+  assert(!gil.owns_gil());
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  std::cout &lt;&lt; "calculating without gil..." &lt;&lt; std::endl;
+
+  // call python function
+  gil.acquire();
+  assert(gil.owns_gil());
+  namespace python = boost::python;
+  python::object print =
+  python::import("__main__").attr("__builtins__").attr("print");
+    print(python::str("calling a python function"));
+  gil.restore();
+
+  // long calculation
+  assert(!gil.owns_gil());
+  std::cout &lt;&lt; "calculating without gil..." &lt;&lt; std::endl;
+}
+
+BOOST_PYTHON_MODULE(example)
+{
+  // Force the GIL to be created and initialized.  The current caller will
+  // own the GIL.
+  PyEval_InitThreads();
+
+  namespace python = boost::python;
+  python::def("f", +[] {
+    // For exposition, assert caller owns GIL before and after
+    // invoking function `f()`.
+    assert(gil_guard::owns_gil());
+    f();
+    assert(gil_guard::owns_gil());
+  });
+}
+</code></pre>
+<p>Interactive usage:</p>
+<pre class="lang-python prettyprint-override"><code>&gt;&gt;&gt; import threading
+&gt;&gt;&gt; import example
+&gt;&gt;&gt; t1 = threading.Thread(target=example.f)
+&gt;&gt;&gt; t1.start(); print "Still running"
+in f()
+Still running
+calculating without gil...
+calling a python function
+calculating without gil...
+&gt;&gt;&gt; t1.join()
+</code></pre>
+</div>
+<span class="comment-copy">I don't know boost::python (but thanks for mentioning the name, it looks very interesting), but this answer looks like it might solve your question: <a href="http://stackoverflow.com/a/18648366/416224"><code>struct no_gil</code></a>.</span>
+<span class="comment-copy">Thanks. I saw those saveThread/ restoreThread methods, but I still need to reaquire the Gil inside my function to call some Python code.</span>
+<span class="comment-copy">Are you sure about <code>std::shared_ptr&lt;void&gt;</code>? If I'm not mistaken, then the correct d'tor won't be called. Wouldn't <code>boost::variant&lt;with_gil, without_gil&gt;</code> be a more easy to understand solution?</span>
+<span class="comment-copy">@Kay <code>std::shared_ptr&lt;void&gt;</code> will call the appropriate destructor.  The constructor is also a template, taking the form of<code>std::shared_ptr&lt;T&gt;::shared_ptr&lt;Y&gt;(Y* p)</code>.  The standard requires that <code>p</code> is convertible to <code>T*</code>, and that the expression <code>delete p</code> be well formed.  I agree that <code>boost::variant</code> may be easier to understand at glance.  However, performing type erasure dissuades anyone from manipulating the elements.</span>
+<span class="comment-copy">Detailed code + explanations.   Thanks.  Should be listed in the FAQ as an example of a good SO answer.  This comment, however, is not.</span>

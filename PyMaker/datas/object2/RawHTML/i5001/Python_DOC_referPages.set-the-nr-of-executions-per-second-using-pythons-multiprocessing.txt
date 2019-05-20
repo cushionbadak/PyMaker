@@ -1,0 +1,127 @@
+<div class="post-text" itemprop="text">
+<p>I wrote a script in Python 3.6 initially using a <code>for loop</code> which called an API, then putting all results into a <code>pandas</code> dataframe and writing them to a SQL database. (approximately 9,000 calls are made to that API every time the script runs).</p>
+<p>Realising the calls inside the <code>for loop</code> were processed one-by-one, I decided to use the <code>multiprocessing</code> module to speed things up.
+Therefore, I created a module level function called <code>parallel_requests</code> and now I call that instead of having the <code>for loop</code>:</p>
+<pre><code>list_of_lists = multiprocessing.Pool(processes=4).starmap(parallel_requests, zip(....))
+</code></pre>
+<p>Side note: I use <code>starmap</code> instead of <code>map</code> only because my <code>parallel_requests</code> function takes multiple arguments which I need to <code>zip</code>.</p>
+<p>The good: this approach works and is much faster.<br/>
+ The bad: this approach works but is <em>too</em> fast. By using 4 processes (I tried that because I have 4 cores), <code>parallel_requests</code> is getting executed too fast. More than 15 calls per second are made to the API, and I'm getting blocked by the API itself.<br/>
+ In fact, it only works if I use 1 or 2 processes, otherwise it's too damn fast.</p>
+<p>Essentially what I want is to keep using 4 processes, but also to <em>limit the execution</em> of my <code>parallel_requests</code> function to only 15 times per second overall.
+Is there any parameter of <code>multiprocessing.Pool</code> that would help with this, or it's more complicated than that?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>For this case I'd use a <a href="https://en.wikipedia.org/wiki/Leaky_bucket" rel="nofollow noreferrer">leaky bucket</a>. You can have one process that fills a queue at the proscribed rate, with a maximum size that indicates how many requests you can "bank" if you don't make them at the maximum rate; the worker processes then just need to get from the queue before doing its work.</p>
+<pre><code>import time
+
+def make_api_request(this, that, rate_queue):
+    rate_queue.get()
+    print("DEBUG: doing some work at {}".format(time.time()))
+    return this * that
+
+def throttler(rate_queue, interval):
+    try:
+        while True:
+            if not rate_queue.full(): # avoid blocking
+                rate_queue.put(0)
+            time.sleep(interval)
+    except BrokenPipeError:
+        # main process is done
+        return
+
+if __name__ == '__main__':
+    from multiprocessing import Pool, Manager, Process
+    from itertools import repeat
+    rq = Manager().Queue(maxsize=15) # conservative; no banking
+    pool = Pool(4)
+    Process(target=throttler, args=(rq, 1/15.)).start()
+    pool.starmap(make_api_request, zip(range(100), range(100, 200), repeat(rq)))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'll look at the ideas posted here, but in the meantime I've just used a simple approach of opening and closing a Pool of 4 processes for every 15 requests and appending all the results in a <code>list_of_lists</code>.</p>
+<p>Admittedly, not the best approach, since it takes time/resources to open/close a Pool, but it was the most handy solution for now.</p>
+<pre><code># define a generator for use below
+def chunks(l, n):
+    """Yield successive n-sized chunks from l."""
+    for i in range(0, len(l), n):
+        yield l[i:i + n]
+
+list_of_lists = []
+
+for current_chunk in chunks(all_data, 15):  # 15 is the API's limit of requests per second
+    pool = multiprocessing.Pool(processes=4)
+    res = pool.starmap(parallel_requests, zip(current_chunk, [to_symbol]*len(current_chunk), [query]*len(current_chunk), [start]*len(current_chunk), [stop]*len(current_chunk)) )
+    sleep(1) # Sleep for 1 second after every 15 API requests
+    list_of_lists.extend(res)
+    pool.close()
+
+flatten_list = [item for sublist in list_of_lists for item in sublist]  # use this to construct a `pandas` dataframe
+</code></pre>
+<p>PS: This solution is really not at all that fast due to the multiple opening/closing of pools. Thanks Nathan Vērzemnieks for suggesting to open just one pool, it's much faster, plus your processor won't look like it's running a stress test.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>One way to do is to use <a href="https://docs.python.org/3/library/queue.html#queue-objects" rel="nofollow noreferrer">Queue</a>, which can share details about api-call timestamps with other processes. </p>
+<p>Below is an example how this could work. It takes the oldest entry in queue, and if it is younger than one second, sleep functions is called for the duration of the difference. </p>
+<pre><code>from multiprocessing import Pool, Manager, queues
+from random import randint
+import time
+
+
+MAX_CONNECTIONS = 10
+PROCESS_COUNT = 4
+
+
+def api_request(a, b):
+    time.sleep(randint(1, 9) * 0.03)  # simulate request
+    return a, b, time.time()
+
+
+def parallel_requests(a, b, the_queue):
+
+    try:
+        oldest = the_queue.get()
+        time_difference = time.time() - oldest
+    except queues.Empty:
+        time_difference = float("-inf")
+
+    if 0 &lt; time_difference &lt; 1:
+        time.sleep(1-time_difference)
+    else:
+        time_difference = 0
+    print("Current time: ", time.time(), "...after sleeping:", time_difference)
+    the_queue.put(time.time())
+    return api_request(a, b)
+
+
+if __name__ == "__main__":
+
+    m = Manager()
+    q = m.Queue(maxsize=MAX_CONNECTIONS)
+    for _ in range(0, MAX_CONNECTIONS):  # Fill the queue with zeroes
+        q.put(0)
+    p = Pool(PROCESS_COUNT)
+
+    # Create example data
+    data_length = 100
+    data1 = range(0, data_length)  # Just some dummy-data
+    data2 = range(100, data_length+100)  # Just some dummy-data
+    queue_iterable = [q] * (data_length+1)  # required for starmap -function
+
+    list_of_lists = p.starmap(parallel_requests, zip(data1, data2, queue_iterable))
+    print(list_of_lists)
+</code></pre>
+</div>
+<span class="comment-copy">Side note: have you considered using async? This way you could call API while you are waiting for SQL to respond and vice versa - still making sure that simultaneous connections to API and SQL remain limited.</span>
+<span class="comment-copy"><code>parallel_requests</code> only takes care of gathering all the data from the API. Pushing it to SQL is done afterwards. All I want is to know if I can execute it on 4 cores, but not as fast as the computer can do it, only 15 times a second.</span>
+<span class="comment-copy">Two notes on this: you can reuse the same pool for each iteration. And since <code>starmap</code> is synchronous, you'll get less than 15 calls per second with this approach, possibly much less, depending on how long your <code>parallel_requests</code> function takes.</span>
+<span class="comment-copy">I like the idea of using the same Pool for each iteration. How would I go about changing the code I posted, please?</span>
+<span class="comment-copy">Just move <code>pool = multiprocessing.Pool(processes=4)</code> outside the <code>for</code> loop and don't call <code>pool.close()</code>.</span>
+<span class="comment-copy">Oh, I tried that before @NathanVērzemnieks, and I get a long error: <code>RuntimeError:          An attempt has been made to start a new process before the         current process has finished its bootstrapping phase.          This probably means that you are not using fork to start your         child processes and you have forgotten to use the proper idiom         in the main module:              if __name__ == '__main__':                 freeze_support()           The "freeze_support()" line can be omitted if the program         is not going to be frozen to produce an executable. </code></span>
+<span class="comment-copy">You're right @NathanVērzemnieks, it does work! I had made a mistake trying to put that open and close as top level declarations in the script, outside of any function, that's why I was getting that nasty error. Thanks for making me stick to it and solve it. Now it's faster than in my original code where I was opening and closing Pools like I was mining for Bitcoins.</span>
+<span class="comment-copy">I'm not sure what the intended behavior here is, but when I run this the function is called between 6 and 12 times per second. What is the intended rate limit here?</span>
+<span class="comment-copy">If I replace the 1 second maximum sleep with 1/15. and remove the random sleep from the <code>api_request</code> function, the entire script runs in .7 seconds.</span>
+<span class="comment-copy">@NathanVērzemnieks between 6 - 12 times is ok. The maximum nr of times to run the function is 15 times per second.</span>
+<span class="comment-copy">Ah, I assumed you'd want to run as fast as allowed.</span>
+<span class="comment-copy">This code doesn't do what you want at all, though: before every call, it sleeps however long it's been since the last call! That's why the results seem random: they are.</span>

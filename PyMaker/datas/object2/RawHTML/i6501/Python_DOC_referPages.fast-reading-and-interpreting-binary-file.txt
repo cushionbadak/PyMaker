@@ -1,0 +1,100 @@
+<div class="post-text" itemprop="text">
+<p>I have a huge binary file(several GB) that has the following dataformat:</p>
+<p>4 subsequent bytes form one composite datapoint(32 bits) which consists of:</p>
+<pre><code>b0-b3    4 flag bits
+b4-b17  14 bit signed integer
+b18-b32 14 bit signed integer
+</code></pre>
+<p>I need to access both signed integers and the flag bits separately and append to a list or some smarter datastructure (not yet decided). At the moment I'm using the following code to read it in:</p>
+<pre><code>from collections import namedtuple
+DataPackage = namedtuple('DataPackage', ['ie', 'if1', 'if2', 'if3', 'quad2', 'quad1'])
+def _unpack_integer(bits):
+    value = int(bits, 2)
+    if bits[0] == '1':
+        value -= (1 &lt;&lt; len(bits))
+    return value
+
+
+def unpack(data):
+    bits = ''.join(['{0:08b}'.format(b) for b in bytearray(data)])
+    flags = [bool(bits[i]) for i in range(4)]
+    quad2 = _unpack_integer(bits[4:18])
+    quad1 = _unpack_integer(bits[18:])
+    return DataPackage(flags[0], flags[1], flags[2], flags[3], quad2, quad1)
+
+def read_file(filename, datapoints=None):
+    data = []
+    i = 0
+    with open(filename, 'rb') as fh:
+        value = fh.read(4)
+        while value:
+            dp = unpack(value)
+            data.append(dp)
+            value = fh.read(4)
+            i += 1
+            if i % 10000 == 0:
+                print('Read: %d kB' % (float(i) * 4.0 / 1000.0))
+            if datapoints:
+                if i == datapoints:
+                    break
+    return data
+
+if __name__ == '__main__':
+    data = read_heterodyne_file('test.dat')
+</code></pre>
+<p>This code works but it's too slow for my purposes (2s for 100k datapoints with 4byte each). I would need a factor of 10 in speed at least. </p>
+<p>The profiler says that the code spends it's time mostly in string formatting(to get the bits) and in _unpack_integer(). </p>
+<p>Unfortunately I am not sure how to proceed here. I'm thinking about either using cython or directly writing some c code to do the read in. I also tried Pypy ant it gave me huge performance gain but unfortunately it needs to be compatible to a bigger project which doesn't work with Pypy.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I would recommend trying <a href="https://docs.python.org/3/library/ctypes.html" rel="nofollow noreferrer">ctypes</a>, if you already have a c/c++ library that recognizes the data-strcture. The benefits are, the datastructues are still available to your python while the 'loading' would be fast. If you already have a c library to load the data you can use the function call from that library to do the heavy lifting and just map the data into your python structures. I'm sorry I won't be able to try out and provide proper code for your example (perhaps someone else cane) but here are a couple of tips to get you started</p>
+<p>My take on how one might create bit vectors in python:
+<a href="https://stackoverflow.com/a/40364970/262108">https://stackoverflow.com/a/40364970/262108</a></p>
+<p>The approach I mentioned above which I applied to a similar problem that you described. Here I use ctypes to create a ctypes data-structure (thus enabling me to use the object as any other python object), while also being able to pass it along to a C library:</p>
+<p><a href="https://gist.github.com/lonetwin/2bfdd41da41dae326afb" rel="nofollow noreferrer">https://gist.github.com/lonetwin/2bfdd41da41dae326afb</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Thanks to the hint by Jean-François Fabre I found a suitable sulution using bitmasks which gives me a speedup of factor 6 in comparison to the code in the question. It has now a throuput of around 300k datapoints/s.</p>
+<p>Also I neglected using the admittedly nice named tuples and replaced it by a list because I found out this is also a bottleneck.</p>
+<p>The code now looks like</p>
+<pre><code>masks = [2**(31-i) for i in range(4)]
+def unpack3(data):
+    data = struct.unpack('&gt;I', data)[0]
+    quad2 = (data &amp; 0xfffc000) &gt;&gt; 14
+    quad1 = data &amp; 0x3fff
+    if (quad2 &amp; (1 &lt;&lt; (14 - 1))) != 0:
+        quad2 = quad2 - (1 &lt;&lt; 14)
+    if (quad1 &amp; (1 &lt;&lt; (14 - 1))) != 0:
+        quad1 = quad1 - (1 &lt;&lt; 14)
+    flag0 = data &amp; masks[0]
+    flag1 = data &amp; masks[1]
+    flag2 = data &amp; masks[2]
+    flag3 = data &amp; masks[3]
+    return flag0, flag1, flag2, flag3, quad2, quad1
+</code></pre>
+<p>The line profiler says:</p>
+<pre><code>Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+    58                                           @profile
+    59                                           def unpack3(data):
+    60   1000000      3805727      3.8     12.3      data = struct.unpack('&gt;I', data)[0]
+    61   1000000      2670576      2.7      8.7      quad2 = (data &amp; 0xfffc000) &gt;&gt; 14
+    62   1000000      2257150      2.3      7.3      quad1 = data &amp; 0x3fff
+    63   1000000      2634679      2.6      8.5      if (quad2 &amp; (1 &lt;&lt; (14 - 1))) != 0:
+    64    976874      2234091      2.3      7.2          quad2 = quad2 - (1 &lt;&lt; 14)
+    65   1000000      2660488      2.7      8.6      if (quad1 &amp; (1 &lt;&lt; (14 - 1))) != 0:
+    66    510978      1218965      2.4      3.9          quad1 = quad1 - (1 &lt;&lt; 14)
+    67   1000000      3099397      3.1     10.0      flag0 = data &amp; masks[0]
+    68   1000000      2583991      2.6      8.4      flag1 = data &amp; masks[1]
+    69   1000000      2486619      2.5      8.1      flag2 = data &amp; masks[2]
+    70   1000000      2473058      2.5      8.0      flag3 = data &amp; masks[3]
+    71   1000000      2742228      2.7      8.9      return flag0, flag1, flag2, flag3, quad2, quad1
+</code></pre>
+<p>So there is not one clear bottleneck anymore. Probably now it's as fast as it gets in pure Python. Or does anyone have an idea for further speedup?</p>
+</div>
+<span class="comment-copy">drop the formatting and use masks directly on the read values. skip the "convert to string to get bits" phase.</span>
+<span class="comment-copy">thanks. well that seems to make a lot of sense. so to get i.e.quad2 i would need to do something along the lines data &amp;= 00001111111111111100000000000000 but then i'm not sure how to cast this to an int16</span>
+<span class="comment-copy">For rigorousness' sake, 1 kB has <b>1024</b> B (not 1000).</span>
+<span class="comment-copy">I think I don't agree if I understand <a href="https://en.wikipedia.org/wiki/Kibibyte" rel="nofollow noreferrer">en.wikipedia.org/wiki/Kibibyte</a> correctly.</span>
+<span class="comment-copy">Right, I always forget about the "i".</span>
+<span class="comment-copy">That is a good hint, thanks. I will try doing it in C soon to see wether I can gain even more performance than in my answer.</span>

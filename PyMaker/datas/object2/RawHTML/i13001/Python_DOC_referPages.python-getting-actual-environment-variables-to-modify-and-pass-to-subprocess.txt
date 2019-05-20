@@ -1,0 +1,104 @@
+<div class="post-text" itemprop="text">
+<p>Well, it seems situation with environment variables is not consistent in python.</p>
+<p>It's not a secret that reading environment variables using <code>os.environ</code> or <code>os.getenv</code> returns the state of env at the moment <code>os</code> module was imported. It's still possible to update environment using assignment to <code>os.environ</code> keys.</p>
+<p>But once I used <code>os.putenv</code> or run any ctypes code that has modified the environment I get inconsistency between actual process environment and <code>os.environ</code>. Nuff said, this actual environment will be preserved for subprocess, no matter created with <code>os.system</code> or <code>subprocess</code> library. In my case it's desired behavior.</p>
+<p>Now I want to review and change the environment passed to subprocesses. Usually it's suggested to get copy of <code>os.environ</code>, modify it and pass as a parameter to <code>subprocess.Popen</code> call. But in this case updates made to environment made by ctypes code will be lost.</p>
+<p>Is there any way to overcome this issue? Strictly speaking is there a way to reload os.environ or get a copy with actual environment using other facilities?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>os.putenv()</code> does not update <code>os.environ</code> as <a href="https://docs.python.org/3/library/os.html#os.environ" rel="nofollow noreferrer">its docs say explicitly</a>. C <code>putenv()</code> (in a CPython extension module) does not update <code>os.environ</code> too (as documented: changes in the environment after <code>os</code> import are not reflected in <code>os.environ</code>).</p>
+<p><a href="https://hg.python.org/cpython/file/e259c0ab7a69/Lib/os.py#l770-l774" rel="nofollow noreferrer"><code>os.getenv(var)</code> is just <code>os.environ.get(var)</code></a>. There is <a href="https://bugs.python.org/issue1159" rel="nofollow noreferrer">related Python issue</a> as <a href="https://stackoverflow.com/a/33635933/4279">@ShadowRanger has mentioned</a>.</p>
+<p>If you need it; you could access <a href="http://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap08.html#tag_08" rel="nofollow noreferrer">C environ</a> from Python using <code>ctypes</code> e.g. (tested on Ubuntu, it might work on OS X (you might need to call <a href="https://developer.apple.com/library/prerelease/mac/documentation/Darwin/Reference/ManPages/man7/environ.7.html" rel="nofollow noreferrer"><code>_NSGetEnviron()</code> there</a>), it is unlikely to work on Windows (<a href="https://github.com/python/cpython/blob/e30464040a38c7b038621768b7e9ba8a083ee702/Modules/posixmodule.c#L1150-L1180" rel="nofollow noreferrer">use <code>_wenviron</code> there)</a>):</p>
+<pre><code>import ctypes
+
+libc = ctypes.CDLL(None)
+environ = ctypes.POINTER(ctypes.c_char_p).in_dll(libc, 'environ')
+</code></pre>
+<p><code>environ</code> is a pointer to an array of C (NUL-terminated) strings (<code>char*</code>) where the last item is <code>NULL</code>. To enumerate values in Python 2:</p>
+<pre><code>for envvar in iter(iter(environ).next, None):
+    print envvar
+</code></pre>
+<h3>Output</h3>
+<pre><code>LC_PAPER=en_GB.UTF-8
+LC_ADDRESS=en_GB.UTF-8
+CLUTTER_IM_MODULE=xim
+LC_MONETARY=en_GB.UTF-8
+VIRTUALENVWRAPPER_PROJECT_FILENAME=.project
+SESSION=ubuntu
+...
+</code></pre>
+<p>To get it as a dictionary that you could modify and pass to a child process:</p>
+<pre><code>env = dict(envvar.split(b'=', 1) for envvar in iter(iter(environ).next, None))
+</code></pre>
+<p>To synchronize with <code>os.environ</code>:</p>
+<pre><code>os.environ.clear() # NOTE: it clears C environ too!
+getattr(os, 'environb', os.environ).update(env) # single source Python 2/3 compat.
+</code></pre>
+<p>Here're several convenience functions:</p>
+<pre><code>#!/usr/bin/env python
+import ctypes
+import functools
+import os
+
+
+_environ = None
+
+
+def get_libc_environb_items():
+    """Get envvars from C environ as bytestrings (unsplit on b'=')."""
+    global _environ
+    if _environ is None:
+        libc = ctypes.CDLL(None)
+        _environ = ctypes.POINTER(ctypes.c_char_p).in_dll(libc, 'environ')
+    return iter(functools.partial(next, iter(_environ)), None)
+
+
+def get_libc_environb():
+    """Get a copy of C environ as a key,value mapping of bytestrings."""
+    return dict(k_v.split(b'=', 1) for k_v in get_libc_environb_items()
+                if b'=' in k_v)  # like CPython
+
+
+
+def get_libc_environ():
+    """Get a copy of C environ as a key,value mapping of strings."""
+    environb = get_libc_environb()
+    # XXX sys.getfilesystemencoding()+'surrogateescape'
+    fsdecode = getattr(os, 'fsdecode', None)
+    if fsdecode is None:  # Python 2
+        return environb  # keep bytestrings as is (`str` type)
+    else:  # Python 3, decode to Unicode
+        return {fsdecode(k): fsdecode(v) for k, v in environb.items()}
+
+
+def synchronize_environ():
+    """Synchronize os.environ with C environ."""
+    libc_environ = get_libc_environ()
+    os.environ.clear()
+    os.environ.update(libc_environ)
+
+
+def test():
+    assert 'SPAM' not in os.environ
+    assert 'SPAM' not in get_libc_environ()
+    os.putenv('SPAM', 'egg')
+    assert 'SPAM' not in os.environ
+    assert os.getenv('SPAM') is None
+    assert get_libc_environ()['SPAM'] == 'egg'
+    assert os.popen('echo $SPAM').read().strip() == 'egg'
+    synchronize_environ()
+    assert os.environ['SPAM'] == 'egg'
+
+
+if __name__ == "__main__":
+    test()
+    from pprint import pprint
+    pprint(get_libc_environ())
+</code></pre>
+<p>It works on CPython 2, CPython 3, pypy. It doesn't work on Jython.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is a <a href="https://bugs.python.org/issue1159" rel="nofollow">known issue with Python, as yet unfixed</a>. <code>os.getenv</code> reads from <code>os.environ</code>, and setting an item on <code>os.environ</code> implicitly does an <code>os.putenv</code>, deleting implicitly calls <code>os.unsetenv</code>, etc.</p>
+<p>But even though <code>os.getenv</code> reads from <code>os.environ</code>, <code>os.putenv</code> doesn't write to it (and <a href="https://docs.python.org/3/library/os.html#os.putenv" rel="nofollow">this behavior is documented</a>). And <a href="https://bugs.python.org/issue463506" rel="nofollow">there doesn't appear to be a way to make it reread the <code>os.environ</code></a>. Basically, if you want a consistent environment, you have to update <code>os.environ</code> only, not use <code>os.putenv</code>; if <code>ctypes</code> calls are updating the C level <code>environ</code> directly, you're going to need another <code>ctypes</code> call to read the C level <code>environ</code> and update <code>os.environ</code> to match.</p>
+</div>
+<span class="comment-copy">I don't know what exactly is this <code>environ</code> variable returned by <code>in_dll</code>.  It's diffrent from what <code>extern char **environ</code> is. See <a href="https://github.com/dvarrazzo/py-setproctitle/blob/master/src/spt_setup.c#L21" rel="nofollow noreferrer">github.com/dvarrazzo/py-setproctitle/blob/master/src/…</a> for examplec</span>

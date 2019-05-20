@@ -1,0 +1,108 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to write a Tornado web app which runs a local command asynchronously, as a coroutine. This is the stripped down example code:</p>
+<pre><code>#! /usr/bin/env python3
+
+import shlex
+import asyncio
+import logging
+
+from tornado.web import Application, url, RequestHandler
+from tornado.httpserver import HTTPServer
+from tornado.ioloop import IOLoop
+
+logging.getLogger('asyncio').setLevel(logging.DEBUG)
+
+
+async def run():
+    command = "python3 /path/to/my/script.py"
+    logging.debug('Calling command: {}'.format(command))
+    process = asyncio.create_subprocess_exec(
+        *shlex.split(command),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT
+    )
+    logging.debug('  - process created')
+
+    result = await process
+    stdout, stderr = result.communicate()
+    output = stdout.decode()
+    return output
+
+def run_sync(self, path):
+    command = "python3 /path/to/my/script.py"
+    logging.debug('Calling command: {}'.format(command))
+    try:
+        result = subprocess.run(
+            *shlex.split(command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=True
+        )
+    except subprocess.CalledProcessError as ex:
+        raise RunnerError(ex.output)
+    else:
+        return result.stdout
+
+
+class TestRunner(RequestHandler):
+
+    async def get(self):
+        result = await run()
+        self.write(result)
+
+url_list = [
+    url(r"/test", TestRunner),
+]
+HTTPServer(Application(url_list, debug=True)).listen(8080)
+logging.debug("Tornado server started at port {}.".format(8080))
+IOLoop.configure('tornado.platform.asyncio.AsyncIOLoop')
+IOLoop.instance().start()
+</code></pre>
+<p>When <code>/path/to/my/script.py</code> is called directly it executes as expected. Also, when I have <code>TestHandler.get</code> implemented as a regular, synchronous method (see <code>run_sync</code>), it executes correctly. However, when running the above app and calling <code>/test</code>, the log shows:</p>
+<pre><code>DEBUG:asyncio:Using selector: EpollSelector
+DEBUG:asyncio:execute program 'python3' stdout=stderr=&lt;pipe&gt;
+DEBUG:asyncio:process 'python3' created: pid 21835
+</code></pre>
+<p>However, <code>ps</code> shows that the process hanged:</p>
+<pre><code>$ ps -ef | grep 21835
+berislav 21835 21834  0 19:19 pts/2    00:00:00 [python3] &lt;defunct&gt;
+</code></pre>
+<p>I have a feeling that I'm not implementing the right loop, or I'm doing it wrong, but all the <a href="https://docs.python.org/3/library/asyncio-subprocess.html#subprocess-using-streams" rel="nofollow noreferrer">examples</a> I've seen show how to use <code>asyncio.get_event_loop().run_until_complete(your_coro())</code>, and I couldn't find much about combining asyncio and Tornado. All suggestions welcome!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Subprocesses are tricky because of the singleton <code>SIGCHLD</code> handler. In asyncio, this means that they only work with the "main" event loop. If you change <code>tornado.ioloop.IOLoop.configure('tornado.platform.asyncio.AsyncIOLoop')</code> to <code>tornado.platform.asyncio.AsyncIOMainLoop().install()</code>, then the example works. A few other cleanups were also necessary; here's the full code:</p>
+<pre><code>#! /usr/bin/env python3
+
+import shlex
+import asyncio
+import logging
+
+import tornado.platform.asyncio
+from tornado.web import Application, url, RequestHandler
+from tornado.httpserver import HTTPServer
+from tornado.ioloop import IOLoop
+
+logging.getLogger('asyncio').setLevel(logging.DEBUG)
+
+async def run():
+    command = "python3 /path/to/my/script.py"
+    logging.debug('Calling command: {}'.format(command))
+    process = await asyncio.create_subprocess_exec(
+        *shlex.split(command),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT
+    )
+    logging.debug('  - process created')
+
+    result = await process.wait()
+    stdout, stderr = await process.communicate()
+    output = stdout.decode()
+    return output
+
+tornado.platform.asyncio.AsyncIOMainLoop().install()
+IOLoop.instance().run_sync(run)
+</code></pre>
+<p>Also note that tornado has its own subprocess interface in <a href="http://www.tornadoweb.org/en/stable/process.html#tornado.process.Subprocess" rel="nofollow noreferrer"><code>tornado.process.Subprocess</code></a>, so if that's the only thing you need asyncio for, consider using the Tornado version instead. Be aware that combining Tornado and asyncio's subprocesses interfaces in the same process may produce conflicts with the <code>SIGCHLD</code> handler, so you should pick one or the other, or use the libraries in such a way that the SIGCHLD handler is unnecessary (for example by relying solely on stdout/stderr instead of the process's exit status).</p>
+</div>
+<span class="comment-copy">Hi Ben, thanks for the answer! You pointed me not in one but in two directions with your answer, and both seem to be working fine -- one is using <code>AsyncIOMainLoop</code> (although it needs to be explicitly closed using <code>asyncio.get_event_loop().close()</code> at the end) and the other is Tornado's <code>Subprocess</code>, which I wasn't aware of and need to explore a bit more. The documentation on the latter is not very complete though -- my understanding is that it's possible to communicate with the subprocess using the <code>STREAM</code> option aof <code>stdin</code>/<code>stdout</code>, is that correct?</span>
+<span class="comment-copy">Yes, use the stream option to communicate with the subprocess.</span>

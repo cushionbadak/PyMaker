@@ -1,0 +1,77 @@
+<div class="post-text" itemprop="text">
+<p>I am getting used to asyncio and find the task handling quite nice, but it can be difficult to mix async libraries with traditional io libraries.  The problem I am currently facing is how to properly decode an async StreamReader.</p>
+<p>The simplest solution is to <code>read()</code> chunks of byte strings, and then decode each chunk - see code below. (In my program, I wouldn't print each chunk, but decode it into a string and send it into another method for processing):</p>
+<pre><code>import asyncio
+import aiohttp
+
+async def get_data(port):
+    url = 'http://localhost:{}/'.format(port)
+    r = await aiohttp.get(url)
+    stream = r.content
+    while not stream.at_eof():
+        data = await stream.read(4)
+        print(data.decode('utf-8'))
+</code></pre>
+<p>This works fine, until there is a utf-8 character that is split between too chunks. For example if the response is <code>b'M\xc3\xa4dchen mit Bi\xc3\x9f\n'</code>, then reading chunks of 3 will work, but chunks of 4 will not (as <code>\xc3</code> and <code>\x9f</code> are in different chunks and decoding the chunk ending with <code>\xc3</code> will raise the following error:</p>
+<p><code>UnicodeDecodeError: 'utf-8' codec can't decode byte 0xc3 in position 3: unexpected end of data</code></p>
+<p>I looked at proper solutions to this problem, and at least in the blocking world, seems to be either io.TextIOWrapper or codecs.StreamReaderWriter (the differences of which are discussed in <a href="https://www.python.org/dev/peps/pep-0400/" rel="noreferrer">PEP 0400</a>).  However, both of these rely on typical blocking streams.</p>
+<p>I spent 30 minutes searching for examples with asyncio and kept finding my decode() solution.  Does anyone know of a better solution or is this a missing feature in python's asyncio?</p>
+<p>For reference, here are the results from using the two "standard" decoders with async streams.</p>
+<p>Using the codec stream reader:</p>
+<pre><code>r = yield from aiohttp.get(url)
+decoder = codecs.getreader('utf-8')
+stream = decoder(r.content)
+</code></pre>
+<p>Exception:  </p>
+<pre><code>File "echo_client.py", line 13, in get_data
+  data = yield from stream.read(4)
+File "/usr/lib/python3.5/codecs.py", line 497, in read
+  data = self.bytebuffer + newdata
+TypeError: can't concat bytes to generator
+</code></pre>
+<p>(it calls read() directly, rather than <code>yield from</code> or <code>await</code> it)</p>
+<p>I also tried wrapping stream with io.TextIOWrapper:</p>
+<pre><code>stream = TextIOWrapper(r.content)
+</code></pre>
+<p>But that leads to the following:</p>
+<pre><code>File "echo_client.py", line 10, in get_data
+  stream = TextIOWrapper(r.content)
+AttributeError: 'FlowControlStreamReader' object has no attribute 'readable'
+</code></pre>
+<p>P.S. If you want a sample test case for this, please look at <a href="https://gist.github.com/ethanfrey/75e58db27095936b9e5e" rel="noreferrer">this gist</a>.  You can run it with python3.5 to reproduce the error.  If you change the chunk size from 4 to 3 (or 30), it will work correctly.</p>
+<p><strong>EDIT</strong></p>
+<p>The accepted answer fixed this like a charm.  Thanks!  If someone else has this issue, here is a simple wrapper class I made to handle the decoding on a StreamReader:</p>
+<pre><code>import codecs
+
+class DecodingStreamReader:
+    def __init__(self, stream, encoding='utf-8', errors='strict'):
+        self.stream = stream
+        self.decoder = codecs.getincrementaldecoder(encoding)(errors=errors)
+
+    async def read(self, n=-1):
+        data = await self.stream.read(n)
+        if isinstance(data, (bytes, bytearray)):
+            data = self.decoder.decode(data)
+        return data
+
+    def at_eof(self):
+        return self.stream.at_eof() 
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can use an <a href="https://docs.python.org/3/library/codecs.html#codecs.IncrementalDecoder" rel="noreferrer">IncrementalDecoder</a>:</p>
+<pre><code>Utf8Decoder = codecs.getincrementaldecoder('utf-8')
+</code></pre>
+<p>With your example:</p>
+<pre><code>decoder = Utf8Decoder(error='strict')
+while not stream.at_eof():
+    data = await stream.read(4)
+    print(decoder.decode(data), end='')
+</code></pre>
+<p>Output:</p>
+<pre><code>Mädchen mit Biß
+</code></pre>
+</div>
+<span class="comment-copy">And before someone asks why I don't just load the entire response in memory, consider web sockets or long keep alive feeds (such as couchdb's _changes feed in continuous mode).  I want to parse each incoming data, as it arrives, without waiting (possibly minutes) for the HTTP connection to close.</span>
+<span class="comment-copy">It might be related to this bug: <a href="https://bugs.python.org/issue31087" rel="nofollow noreferrer">bugs.python.org/issue31087</a></span>
+<span class="comment-copy">Great!  I tried it and it works perfect.  Thanks for the quick answer.</span>

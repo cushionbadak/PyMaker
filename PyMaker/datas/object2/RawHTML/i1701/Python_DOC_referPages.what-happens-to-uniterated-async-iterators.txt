@@ -1,0 +1,78 @@
+<div class="post-text" itemprop="text">
+<p>Say I have the following function</p>
+<pre><code>async def f1():
+    async for item in asynciterator():
+        return
+</code></pre>
+<p>What happens to the async iterator after</p>
+<pre><code>await f1()
+</code></pre>
+<p>? Should I worry about cleaning up or will the generator be somehow garbage collected when it goes out of sight?</p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>Should I worry about cleaning up or will the generator be somehow garbage collected when it goes out of sight?</p>
+</blockquote>
+<p>TL;DR Python's gc and asyncio will ensure eventual cleanup of incompletely iterated async generators.</p>
+<p>"Cleanup" here refers to running the code specified by a <code>finally</code> around the <code>yield</code>, or by the <code>__aexit__</code> part of the context manager used in a <code>with</code> statement around the <code>yield</code>. For example, the <code>print</code> in this simple generator is invoked by the same mechanism used by a <code>aiohttp.ClientSession</code> to close its resources:</p>
+<pre><code>async def my_gen():
+    try:
+        yield 1
+        yield 2
+        yield 3
+    finally:
+        await asyncio.sleep(0.1)  # make it interesting by awaiting
+        print('cleaned up')
+</code></pre>
+<p>If you run a coroutine that iterates through the whole generator, the cleanup will be executed immediately:</p>
+<pre><code>&gt;&gt;&gt; async def test():
+...     gen = my_gen()
+...     async for _ in gen:
+...         pass
+...     print('test done')
+... 
+&gt;&gt;&gt; asyncio.get_event_loop().run_until_complete(test())
+cleaned up
+test done
+</code></pre>
+<p>Note how the cleanup is executed immediately after the loop, even though the generator was still in scope without the chance to get garbage collected. This is because the <code>async for</code> loop ensures the async generator cleanup on loop exhaustion.</p>
+<p>The question is what happens when the loop is <em>not</em> exhausted:</p>
+<pre><code>&gt;&gt;&gt; async def test():
+...     gen = my_gen()
+...     async for _ in gen:
+...         break  # exit at once
+...     print('test done')
+... 
+&gt;&gt;&gt; asyncio.get_event_loop().run_until_complete(test())
+test done
+</code></pre>
+<p>Here <code>gen</code> got out of scope, but the cleanup simply didn't occur. If you tried this with an ordinary generator, the cleanup would get called by the reference countered immediately (though still <em>after</em> the exit from <code>test</code>, because that's when the running generator is no longer referred to), this being possible because <code>gen</code> does not participate in a cycle:</p>
+<pre><code>&gt;&gt;&gt; def my_gen():
+...     try:
+...         yield 1
+...         yield 2
+...         yield 3
+...     finally:
+...         print('cleaned up')
+... 
+&gt;&gt;&gt; def test():
+...     gen = my_gen()
+...     for _ in gen:
+...         break
+...     print('test done')
+... 
+&gt;&gt;&gt; test()
+test done
+cleaned up
+</code></pre>
+<p>With <code>my_gen</code> being an <em>asynchronous</em> generator, its cleanup is asynchronous as well. This means it can't just be executed by the garbage collector, it needs to be run by an event loop. To make this possible, asyncio <a href="https://docs.python.org/3/library/sys.html#sys.set_asyncgen_hooks" rel="nofollow noreferrer">registers</a> the asyncgen finalizer hook, but it never gets a chance to execute because we're using <code>run_until_complete</code> which stops the loop immediately after executing a coroutine.</p>
+<p>If we tried to spin the same event loop some more, we'd see the cleanup executed:</p>
+<pre><code>&gt;&gt;&gt; asyncio.get_event_loop().run_until_complete(asyncio.sleep(0))
+cleaned up
+</code></pre>
+<p>In a normal asyncio application this does not lead to problems because the event loop typically runs as long as the application. If there is no event loop to clean up the async generators, it likely means the process is exiting anyway.</p>
+</div>
+<span class="comment-copy">A guess: <code>f1()</code> returns the coroutine, which is just a callable object on the heap, including the function's frame (local variables etc.) Therefore, garbage collection should clean it up just fine. In this case you don't want <code>f1</code> to hold any external resources like file handles though</span>
+<span class="comment-copy">how about the asynciterator. In the asynciterator I am using aiohttp session as a context manager to perform a get. after I do the get, I parse the body and yield items from the body. Should I release the aiohttp session as soon as I receive the http response and before starting to parse and yield items from it ?</span>
+<span class="comment-copy">Related: <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.shutdown_asyncgens" rel="nofollow noreferrer">loop.shutdown_asyncgens</a> and <a href="https://docs.python.org/3/library/sys.html#sys.set_asyncgen_hooks" rel="nofollow noreferrer">sys.set_asyncgen_hooks</a></span>
+<span class="comment-copy">More precisely, when an async generator is about to get garbage collected, asyncio schedules the <code>agen.aclose()</code> coroutine.</span>

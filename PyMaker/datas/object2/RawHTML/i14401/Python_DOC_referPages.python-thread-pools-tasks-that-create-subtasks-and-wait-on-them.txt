@@ -1,0 +1,163 @@
+<div class="post-text" itemprop="text">
+<p>Say I have a thread pool executor with max. 10 threads, and I submit a task to it which itself creates another task and in turn waits for it to complete, recursively until I reach a depth of 11.</p>
+<p>Example code in Python:</p>
+<pre><code>import concurrent.futures
+
+e = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+
+def task(depth):
+    print 'started depth %d' % (depth, )
+    if depth &gt; 10:
+        return depth
+    else:
+        f = e.submit(task, depth + 1)
+        concurrent.futures.wait([f])
+
+
+f = e.submit(task, 0)
+print f.result()
+</code></pre>
+<p>The above code outputs:</p>
+<pre><code>started depth 0
+started depth 1
+started depth 2
+started depth 3
+started depth 4
+started depth 5
+started depth 6
+started depth 7
+started depth 8
+started depth 9
+</code></pre>
+<p>and deadlocks.</p>
+<p>Is there any way to solve this problem without creating additional threads and executors?</p>
+<p>In other words, a way for the worker threads to work on other tasks while waiting?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Using coroutines your code could be rewritten as:</p>
+<pre><code>import asyncio
+
+@asyncio.coroutine
+def task(depth):
+    print('started depth %d' % (depth, ))
+    if depth &gt; 10:
+        return depth
+    else:
+        # create new task
+        t = asyncio.async(task(depth + 1))
+        # wait for task to complete
+        yield from t
+        # get the result of the task
+        return t.result()
+
+loop = asyncio.get_event_loop()
+result = loop.run_until_complete(task(1))
+print(result)
+loop.close()
+</code></pre>
+<p>However, I'm struggling to see why you need all this extra code. In your example code you always wait directly for the result of the task, thus your code would run no different without the executor. For example, the following would produce the same result</p>
+<pre><code>def task(depth):
+    print 'started depth %d' % (depth, )
+    if depth &gt; 10:
+        return depth
+    else:
+        task(depth + 1)
+</code></pre>
+<p>I think this example from the documentation better shows how async coroutines are able to parallelise tasks. This example creates 3 tasks, each of which computes a different factorial. Notice how when each task yields to another coroutine (in this case <code>async.sleep</code>), another task is allowed to continue its execution.</p>
+<pre><code>import asyncio
+
+@asyncio.coroutine
+def factorial(name, number):
+    f = 1
+    for i in range(2, number+1):
+        print("Task %s: Compute factorial(%s)..." % (name, i))
+        yield from asyncio.sleep(1)
+        f *= i
+    print("Task %s: factorial(%s) = %s" % (name, number, f))
+
+loop = asyncio.get_event_loop()
+tasks = [
+    asyncio.ensure_future(factorial("A", 2)),
+    asyncio.ensure_future(factorial("B", 3)),
+    asyncio.ensure_future(factorial("C", 4))]
+loop.run_until_complete(asyncio.wait(tasks))
+loop.close()
+</code></pre>
+<p>Output:</p>
+<pre><code>Task A: Compute factorial(2)...
+Task B: Compute factorial(2)...
+Task C: Compute factorial(2)...
+Task A: factorial(2) = 2
+Task B: Compute factorial(3)...
+Task C: Compute factorial(3)...
+Task B: factorial(3) = 6
+Task C: Compute factorial(4)...
+Task C: factorial(4) = 24
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, if you want to avoid a deadlock you can't wait on a future from the same executor in a task.</p>
+<p>The only thing you could do in this example is to return the future and then recursively process the results:</p>
+<pre><code>import concurrent.futures
+import time
+
+e = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+
+def task(depth):
+    print 'started depth %d' % (depth, )
+    if depth &gt; 10:
+        return depth
+    else:
+        f = e.submit(task, depth + 1)
+        return f
+
+
+f = e.submit(task, 0)
+while isinstance(f.result(), concurrent.futures.Future):
+    f = f.result()
+
+print f.result()
+</code></pre>
+<p>However it would be best to avoid such a recursive execution in the first place.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>What you're experiencing here, is what you already rightly called a <a href="https://stackoverflow.com/questions/34512/what-is-a-deadlock">deadlock</a>. The first thread which starts the next thread and waits for it is holding a <code>lock</code> which all subsequent tasks will deadlock on while waiting for the same <code>lock</code> to be released (which is never in your case). I'd suggest that you start your own threads in the tasks instead of using the pool, something like:</p>
+<pre><code>import concurrent.futures
+import threading
+
+
+class TaskWrapper(threading.Thread):
+
+    def __init__(self, depth, *args, **kwargs):
+        self._depth = depth
+        self._result = None
+        super(TaskWrapper, self).__init__(*args, **kwargs)
+
+    def run(self):
+        self._result = task(self._depth)
+
+    def get(self):
+        self.join()
+        return self._result
+
+e = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+
+
+def task(depth):
+    print 'started depth %d' % (depth, )
+    if depth &gt; 10:
+        return depth
+    else:
+        t = TaskWrapper(depth + 1)
+        t.start()
+        return t.get()
+
+f = e.submit(task, 0)
+print f.result()
+</code></pre>
+</div>
+<span class="comment-copy"><a href="http://stackoverflow.com/questions/1239035/asynchronous-method-call-in-python" title="asynchronous method call in python">stackoverflow.com/questions/1239035/…</a></span>
+<span class="comment-copy">Or better yet go with high level solution like Celery <a href="http://www.celeryproject.org/" rel="nofollow noreferrer">celeryproject.org</a></span>
+<span class="comment-copy">Doesn't it deadlock because it keeps calling new threads, but the maximum number in the pool is only 10.  None of the threads ever finish their task.</span>
+<span class="comment-copy">@Alexander - that's right, but none of them are working either, they're all sleeping when there's work to be done. I'm looking for a way to make them quit waiting and go do other tasks so that the operation may complete.</span>
+<span class="comment-copy">Short answer - no. At least not using an executor. However, you might want to think about refactoring your code to use coroutines instead. <a href="https://docs.python.org/3/library/asyncio-task.html" rel="nofollow noreferrer">docs.python.org/3/library/asyncio-task.html</a></span>

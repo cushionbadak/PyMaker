@@ -1,0 +1,76 @@
+<div class="post-text" itemprop="text">
+<p>Documentation says that connection pool also is not designed for multithreading:</p>
+<blockquote>
+<p>It’s critical that when using a connection pool, and by extension when
+  using an Engine created via create_engine(), that the pooled
+  connections are not shared to a forked process. TCP connections are
+  represented as file descriptors, which usually work across process
+  boundaries, meaning this will cause concurrent access to the file
+  descriptor on behalf of two or more entirely independent Python
+  interpreter states.</p>
+</blockquote>
+<p>As i understand this, if i create connection pool:</p>
+<pre><code>self.engine = create_engine('postgresql://{user}:{password}@{host}:{port}/{db}'.format(
+    user=Configuration().get(section='repository', option='user'),
+    password=Configuration().get(section='repository', option='password'),
+    host=Configuration().get(section='repository', option='host'),
+    port=Configuration().get(section='repository', option='port'),
+    db=Configuration().get(section='repository', option='database')
+), echo=False, pool_size=3)
+
+self.session = sessionmaker(self.engine, expire_on_commit=False)
+</code></pre>
+<p>and then call <code>self.session()</code> in different threads i will have 3 different connections which are used in N different threads. 
+Does it mean that only 3 concurrent thread will do some work while others will wait until one or more thread will call <code>session.close()</code>? Or there is a chance that &gt;2 threads will use the same connection simultaneously?</p>
+<p>Is NullPool safer (because each new session is a new connection) or no?</p>
+<pre><code>self.engine = create_engine('postgresql://{user}:{password}@{host}:{port}/{db}'.format(
+            user=Configuration().get(section='repository', option='user'),
+            password=Configuration().get(section='repository', option='password'),
+            host=Configuration().get(section='repository', option='host'),
+            port=Configuration().get(section='repository', option='port'),
+            db=Configuration().get(section='repository', option='database')
+        ), echo=False, poolclass=NullPool)
+</code></pre>
+<p>The general question: is it ok to use the same connection pool in such case:</p>
+<pre><code>engine = create_engine('connection_string', echo=False, pool_size=3)
+Session = sessionmaker(engine)
+
+def some_function():
+    session = Session()
+    ...
+
+pool = Pool(processes=10)
+pool.map(some_function)
+pool.close()
+pool.join()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>All in all there seems to be a mix between threads and processes. The question begins by asking if an SQLAlchemy connection pool is thread-safe, but ends with a code example that uses <a href="https://docs.python.org/3/library/multiprocessing.html" rel="nofollow noreferrer"><code>multiprocessing</code></a>. The short answer to the "general question" is: no, you should not share an engine and its associated connection pool over process boundaries, if forking is used. There are exceptions, though.</p>
+<p>The pool implementations are thread-safe themselves and by proxy an <a href="https://groups.google.com/forum/#!msg/sqlalchemy/t8i3RSKZGb0/QxWshAS3iKgJ" rel="nofollow noreferrer"><code>Engine</code> is thread-safe as well</a>, because an engine does not hold state in addition to keeping a reference to the pool. On the other hand the connections checked out from a pool are <a href="http://docs.sqlalchemy.org/en/latest/core/connections.html#connection-engine-api" rel="nofollow noreferrer"><strong>not</strong> thread-safe</a>, and <a href="http://docs.sqlalchemy.org/en/latest/orm/session_basics.html#is-the-session-thread-safe" rel="nofollow noreferrer">neither is a <code>Session</code></a>.</p>
+<blockquote>
+<p>Documentation says that connection pool also is not designed for multithreading:</p>
+</blockquote>
+<p>There's a bit of a misreading, since the original quote from the documentation is about sharing connection pools over <strong>process</strong> boundaries, if forking is used. This will likely lead to trouble, because beneath the SQLAlchemy and DB-API layers there is usually a TCP/IP socket or a file handle, and those should not be operated on concurrently.</p>
+<p>In this particular case using a <code>NullPool</code> would be safe, while others are not, since it does not pool at all and so connections won't be shared between processes, unless one goes out of their way to do so.</p>
+<blockquote>
+<p>Does it mean that only 3 concurrent <em>thread</em> will do some work while others will wait until one or more thread will call <code>session.close()</code>?</p>
+</blockquote>
+<p>Assuming a <a href="http://docs.sqlalchemy.org/en/latest/core/pooling.html#sqlalchemy.pool.QueuePool" rel="nofollow noreferrer"><code>QueuePool</code></a> is in use, the set size is not a hard limit and there is some room for overflow. The size determines the number of connections to keep persistently in the pool. If the overflow limit is reached, the call will wait for <a href="http://docs.sqlalchemy.org/en/latest/core/pooling.html#sqlalchemy.pool.QueuePool.params.timeout" rel="nofollow noreferrer"><code>timeout</code></a> seconds before giving up and raising a <a href="http://docs.sqlalchemy.org/en/latest/core/exceptions.html#sqlalchemy.exc.TimeoutError" rel="nofollow noreferrer"><code>TimeoutError</code></a>, if no connection became available.</p>
+<blockquote>
+<p>Or there is a chance that &gt;2 <em>threads</em> will use the same connection simultaneously?</p>
+</blockquote>
+<p>Two or more <em>threads</em> will not be able to accidentally checkout the same connection from a pool, except a <a href="http://docs.sqlalchemy.org/en/latest/core/pooling.html#sqlalchemy.pool.StaticPool" rel="nofollow noreferrer"><code>StaticPool</code></a>, but one could explicitly share it between threads after (don't).</p>
+<hr/>
+<p>In the end, <a href="http://docs.sqlalchemy.org/en/latest/core/connections.html#basic-usage" rel="nofollow noreferrer">"Working with Engines and Connections - Basic Usage"</a> covers the main parts of the question:</p>
+<blockquote>
+<p>A single <code>Engine</code> manages many individual DBAPI connections on behalf of the process and <strong>is intended to be called upon in a concurrent fashion</strong> [emphasis added].</p>
+<p>...</p>
+<p>For a multiple-process application that uses the <code>os.fork</code> system call, or for example the Python <code>multiprocessing</code> module, it’s usually required that a separate <code>Engine</code> be used for each child process. This is because the <code>Engine</code> maintains a reference to a connection pool that ultimately references DBAPI connections - these tend to not be portable across process boundaries. An <code>Engine</code> that is configured not to use pooling (which is achieved via the usage of <code>NullPool</code>) does not have this requirement.</p>
+</blockquote>
+</div>
+<span class="comment-copy">@IljaEverilä, but i still don't understand this part: can i use the same connection pool in multiple threads or not?</span>
+<span class="comment-copy">Now it seems that i got the main idea</span>
+<span class="comment-copy">Related: <a href="https://stackoverflow.com/questions/6297404/multi-threaded-use-of-sqlalchemy" title="multi threaded use of sqlalchemy">stackoverflow.com/questions/6297404/…</a>, <a href="https://stackoverflow.com/questions/9619789/sqlalchemy-proper-session-handling-in-multi-thread-applications" title="sqlalchemy proper session handling in multi thread applications">stackoverflow.com/questions/9619789/…</a>, <a href="https://stackoverflow.com/questions/30734792/are-transactions-in-sqlalchemy-thread-safe" title="are transactions in sqlalchemy thread safe">stackoverflow.com/questions/30734792/…</a></span>
+<span class="comment-copy">Amazing answer! Thank you!  <code>The question begins by asking if an SQLAlchemy connection pool is thread-safe, but ends with a code example that uses multiprocessing</code> probably i still confuse this terms</span>
+<span class="comment-copy">A <a href="https://en.wikipedia.org/wiki/Process_(computing)" rel="nofollow noreferrer">process</a> can consist of one or more <a href="https://en.wikipedia.org/wiki/Thread_(computing)" rel="nofollow noreferrer">threads</a>, running concurrently and possibly in parallel. The line between the two <a href="https://unix.stackexchange.com/questions/364660/are-threads-implemented-as-processes-on-linux">may seem a bit blurred at times</a>.</span>

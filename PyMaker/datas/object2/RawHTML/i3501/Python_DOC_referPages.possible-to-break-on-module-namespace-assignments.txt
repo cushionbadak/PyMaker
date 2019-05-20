@@ -1,0 +1,97 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to track down the cause of a bug: <a href="https://github.com/numba/numba/issues/3027" rel="nofollow noreferrer">https://github.com/numba/numba/issues/3027</a></p>
+<p>It seems that for some older ubuntu installations, compiling a recursive numba function causes sys.stdout to be reset. I've verified that <a href="https://stackoverflow.com/questions/50880121/possible-to-know-if-a-python-module-has-been-reloaded">sys is not being reloaded</a>, instead it must be that something somewhere is assigning to sys. So, I'd like to arrange for a breakpoint to be hit if members of the sys namespace are assigned to. Is this possible?</p>
+<p>Reassigning: <code>sys.__setattr__</code>, <code>__builtins__.setattr</code> doesn't seem to catch it:</p>
+<pre><code>import sys
+
+def f(*args, **kw):
+    print &gt;&gt;sys.stderr, args, kw
+    raise Exception("Break here")  # Never reached
+
+print &gt;&gt;sys.stderr, sys.__setattr__
+sys.__setattr__ = f
+__builtins__.setattr = f
+print &gt;&gt;sys.stderr, sys.__setattr__ #Changed
+
+
+sys.stdout = 12345 # Should cause exception.
+</code></pre>
+<p>And also, there's something magic about the sys namespace:</p>
+<pre><code>pprint.pprint(dir(sys)) # No __setattr__ here
+print "__setattr__" in dir(sys) # False. Nope
+
+# But this:
+print &gt;&gt;sys.stderr, sys.__setattr__  # &lt;method-wrapper '__setattr__' of module object at 0x7f8065b6cbb0&gt;
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>__setattr__</code> is a <a href="https://docs.python.org/3/reference/datamodel.html#special-method-lookup" rel="nofollow noreferrer">special method</a>:</p>
+<blockquote>
+<p>For custom classes, implicit invocations of special methods are only guaranteed to work correctly if defined on an object’s type, not in the object’s instance dictionary.</p>
+</blockquote>
+<p>Python doesn't document anywhere exactly which special methods skip the instance dictionary, and when they do so—in fact, it's really up to each implementation—but (at least in CPython and PyPy), <code>__setattr__</code> always goes straight to the type.</p>
+<p>Note that <a href="https://www.python.org/dev/peps/pep-0562/" rel="nofollow noreferrer">PEP 562</a> adds a special case for <code>__getattr__</code> and <code>__dir__</code> on <code>ModuleType</code> to Python 3.7, but does not include <code>__setattr__</code>.</p>
+<p>So, assigning <code>sys.__setattr__</code> has no effect.</p>
+<p>This is also why <code>'__setattr__' in dir(sys)</code> is False—just as it is for anything that isn't a type. The <code>dir</code> function doesn't return attributes found on the class (or inherited from a base class). If you want to check for an attribute, you normally use <code>hasattr(sys, '__setattr__')</code>—or, better, just try to access the attribute (because that works even with, e.g., dynamic attributes created by custom <code>__getattribute__</code>).</p>
+<p>Also, this means that the place to set your breakpoint would be <code>types.ModuleType.__setattr__</code> (or <code>type(sys).__setattr__</code>, which is the same place). But that isn't going to work in CPython, because that's a C function slot on a builtin type (actually just inherited from <code>object.__setattr__</code>), not a Python method.</p>
+<hr/>
+<p>There are two traditional ways around this. Neither of them is guaranteed to work with builtin modules; from a quick test, with CPython 3.7, the first one works but the second doesn't. But try them both on your own Python implementation/version.</p>
+<hr/>
+<p>First, you can just create a subclass:</p>
+<pre><code>class HookedModuleType(types.ModuleType):
+    def __setattr__(self, name, value):
+        print(f'{self.__name__}.__setattr__({name}, {value})')
+        return super().__setattr__(name, value)
+</code></pre>
+<p>… and then re-type the module:</p>
+<pre><code>mymodule.__class__ = HookedModuleType
+</code></pre>
+<hr/>
+<p>Alternatively, since <code>ModuleType</code> doesn't override the default behavior of <code>__setattr__</code>, it just inherits it from <code>object</code>, which means that all it does is set <code>self.__dict__[name] = value</code>. So, you can write a <code>dict</code> that intercepts <code>__setitem__</code> and get the same effect:</p>
+<pre><code>class HookedDict(dict):
+    def __setitem__(self, key, value):
+        print(f'{self._name}.__setitem__({key}, {value})')
+        return super().__setitem__(key, value)
+
+mymodule.__dict__ = HookedDict(mymodule.__dict__)
+mymodule.__dict__._name = mymodule.__name__
+</code></pre>
+<hr/>
+<p>If neither of these works, you have to create a slightly more complicated class that proxies to an actual module object:</p>
+<pre><code>class ModuleProxy(object):
+    def __init__(self, module):
+        object.__setattr__(self, '_module', module)
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+    def __delattr__(self, name):
+        delattr(self._module, name)
+    def __setattr__(self, name, value):
+        print(f'{self._module.__name__}.__setattr__({name}, {value})')
+        setattr(self._module, name, value)
+</code></pre>
+<p>… and then replace the module with a proxy to it:</p>
+<pre><code>sys = sys.modules['sys'] = ModuleProxy(sys)
+</code></pre>
+<p>This one is a bit easier to get wrong, and may cause some weird behavior in a few edge cases, but it doesn't rely on any non-guaranteed behavior, and it seems to work in CPython 3.7, 3.6, and 2.7 and PyPy 5.10/3.5 and 5.10/2.7 (obviously 2.7 requires changing the f-string to a <code>format</code> call).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>A proxy or wrapper class will work:</p>
+<pre><code>class DebugModule(object):
+    def __init__(self, module):
+       self.__dict__["_module"] = module
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+    def __setattr__(self, name, value):
+        setattr(self._module, name, value)
+        print("{}.{} = {}".format(self._module.__name__, name, repr(value)))
+</code></pre>
+<p>Usage:</p>
+<pre><code>import sys
+sys = DebugModule(sys)
+</code></pre>
+</div>
+<span class="comment-copy">Thanks. But <code>sys.__class__ = HookedModuleType</code> ==&gt; <code>TypeError: __class__ assignment: only for heap types</code>  :-(</span>
+<span class="comment-copy">... in python 2.7</span>
+<span class="comment-copy">And <code>sys.__dict__ = HookedDict(sys.__dict__)</code> ==&gt; <code>TypeError: readonly attribute</code></span>
+<span class="comment-copy">@user48956 See the third option then.</span>
+<span class="comment-copy">This did it. I didn't find a ModuleProxy class but @kindall shows how.</span>

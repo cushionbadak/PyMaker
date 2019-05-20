@@ -1,0 +1,183 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to create a new application based on PyQt5 and asyncio (with python 3.4, looking forward to eventually upgrade to 3.5 with async/await). My goal is to use asyncio so that the GUI stays responsive even when the application is waiting for some connected hardware to finish an operation.</p>
+<p>When looking how to merge the event loops of Qt5 and asyncio, I found a <a href="https://riverbankcomputing.com/pipermail/pyqt/2014-August/034638.html" rel="noreferrer">mailing list posting</a>, suggesting to use <a href="https://github.com/harvimt/quamash" rel="noreferrer">quamash</a>. However, when running this example (unmodified), the</p>
+<pre><code>yield from fut
+</code></pre>
+<p>nevers seems to return. I see the output 'Timeout', so the timer callback obviously fires, but the Future fails to wake up the waiting method. When manually closing the window, it tells me that there are uncompleted futures:</p>
+<pre><code>Yielding until signal...
+Timeout
+Traceback (most recent call last):
+  File "pyqt_asyncio_list.py", line 26, in &lt;module&gt;
+    loop.run_until_complete(_go())
+  File "/usr/local/lib/python3.5/site-packages/quamash/__init__.py", line 291, in run_until_complete
+    raise RuntimeError('Event loop stopped before Future completed.')
+RuntimeError: Event loop stopped before Future completed.
+</code></pre>
+<p>I tested this on Ubuntu with python 3.5 and on Windows with 3.4, same behaviour on both platforms.</p>
+<p>Anyway, since this is not what I actually try to achieve, I tested some other code as well:</p>
+<pre><code>import quamash
+import asyncio
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
+
+@asyncio.coroutine
+def op():
+  print('op()')
+
+@asyncio.coroutine
+def slow_operation():
+  print('clicked')
+  yield from op()
+  print('op done')
+  yield from asyncio.sleep(0.1)
+  print('timeout expired')
+  yield from asyncio.sleep(2)
+  print('second timeout expired')
+
+def coroCallHelper(coro):
+  asyncio.ensure_future(coro(), loop=loop)
+
+class Example(QWidget):
+
+  def __init__(self):
+    super().__init__()
+    self.initUI()
+
+  def initUI(self):
+    def btnCallback(obj):
+      #~ loop.call_soon(coroCallHelper, slow_operation)
+      asyncio.ensure_future(slow_operation(), loop=loop)
+      print('btnCallback returns...')
+
+    btn = QPushButton('Button', self)
+    btn.resize(btn.sizeHint())
+    btn.move(50, 50)
+    btn.clicked.connect(btnCallback)
+
+    self.setGeometry(300, 300, 300, 200)
+    self.setWindowTitle('Async')    
+    self.show()
+
+with quamash.QEventLoop(app=QApplication([])) as loop:
+  w = Example()
+  loop.run_forever()
+#~ loop = asyncio.get_event_loop()
+#~ loop.run_until_complete(slow_operation())
+</code></pre>
+<p>The program is supposed to display a window with a button in it (which it does), with the button invoking slow_operation() without blocking the GUI. When running this example, I can click the button as often as I want, so the GUI is not blocked. But the</p>
+<pre><code>yield from asyncio.sleep(0.1)
+</code></pre>
+<p>is never passed and the terminal output looks like this:</p>
+<pre><code>btnCallback returns...
+clicked
+op()
+op done
+btnCallback returns...
+clicked
+op()
+op done
+</code></pre>
+<p>There is no exception thrown when I close the window this time. The slow_operation() function basically works if I directly run the event loop with it:</p>
+<pre><code>#~ with quamash.QEventLoop(app=QApplication([])) as loop:
+  #~ w = Example()
+  #~ loop.run_forever()
+loop = asyncio.get_event_loop()
+loop.run_until_complete(slow_operation())
+</code></pre>
+<p>Now, two questions:</p>
+<ol>
+<li><p>Is this a sensible way to achieve decoupling of lengthy operations from the GUI, generally? My intention is that the button callback posts the coroutine call to the event loop (with or without an additional level of nesting, cf. coroCallHelper()), where it is then scheduled and executed. I don't need separate threads, as it is really only I/O that takes time, no actual processing.</p></li>
+<li><p>How can I fix this behaviour?</p></li>
+</ol>
+<p>Thanks,
+Philipp</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Ok, that's one plus of SO: Writing down a question makes you think again about everything. Somehow I just figured it out:</p>
+<p>Looking again at the example from the <a href="https://github.com/harvimt/quamash" rel="noreferrer">quamash repo</a>, I found that the event loop to use is obtained somewhat differently:</p>
+<pre><code>app = QApplication(sys.argv)
+loop = QEventLoop(app)
+asyncio.set_event_loop(loop)  # NEW must set the event loop
+
+# ...
+
+with loop:
+    loop.run_until_complete(master())
+</code></pre>
+<p>The key seems to be the <code>asyncio.set_event_loop()</code>. It is also important to note that the <code>QEventLoop</code> mentioned there is the one from the quamash package, NOT from Qt5. So my example now looks like this:</p>
+<pre><code>import sys
+import quamash
+import asyncio
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
+
+@asyncio.coroutine
+def op():
+  print('op()')
+
+
+@asyncio.coroutine
+def slow_operation():
+  print('clicked')
+  yield from op()
+  print('op done')
+  yield from asyncio.sleep(0.1)
+  print('timeout expired')
+  yield from asyncio.sleep(2)
+  print('second timeout expired')
+
+  loop.stop()
+
+def coroCallHelper(coro):
+  asyncio.ensure_future(coro(), loop=loop)
+
+class Example(QWidget):
+
+  def __init__(self):
+    super().__init__()
+    self.initUI()
+
+  def initUI(self):
+    def btnCallback(obj):
+      #~ loop.call_soon(coroCallHelper, slow_operation)
+      asyncio.ensure_future(slow_operation(), loop=loop)
+      print('btnCallback returns...')
+
+    btn = QPushButton('Button', self)
+    btn.resize(btn.sizeHint())
+    btn.move(50, 50)
+    btn.clicked.connect(btnCallback)
+
+    self.setGeometry(300, 300, 300, 200)
+    self.setWindowTitle('Async')    
+    self.show()
+
+app = QApplication(sys.argv)
+loop = quamash.QEventLoop(app)
+asyncio.set_event_loop(loop)  # NEW must set the event loop
+
+with loop:
+    w = Example()
+    w.show()
+    loop.run_forever()
+print('Coroutine has ended')
+</code></pre>
+<p>And it 'just works' now:</p>
+<pre><code>btnCallback returns...
+clicked
+op()
+op done
+timeout expired
+second timeout expired
+Coroutine has ended
+</code></pre>
+<p>Maybe this is of some help for others. I'm happy with it at least ;)
+Comments on the general pattern are still welcome, of course!</p>
+<p>Regards,
+Philipp</p>
+</div>
+<span class="comment-copy">Yes. By default <code>asyncio.get_event_loop()</code> returns the default <code>SelectorEventLoop</code>. There are many functions internally in <code>asyncio</code> that make use of <code>get_event_loop()</code> to get the loop and attach callbacks to it. If you don't <code>set_event_loop</code> your custom event loop, all the Futures and coroutines get scheduled to the default event loop, which is never run.</span>
+<span class="comment-copy">Thanks for the explanation, this makes perfect sense now.</span>
+<span class="comment-copy">@PhilippBurch don't mind accepting your own answer, it's completely fine on SO/SE to do that.</span>
+<span class="comment-copy">Btw that Q/A helped me a lot! Also in Python 3.5+ you can (and should - <a href="https://docs.python.org/3/library/asyncio-task.html#coroutines" rel="nofollow noreferrer">docs.python.org/3/library/asyncio-task.html#coroutines</a>) use <code>async def</code> instead of <code>@asyncio.coroutine</code></span>
+<span class="comment-copy">@RudolfOlah: Quamash is only there to combine asyncio with a Qt event loop. If you don't use Qt, then it is not necessary.</span>

@@ -1,0 +1,124 @@
+<div class="post-text" itemprop="text">
+<p>I have this piece of code where I want to connect to a websocket and keep the connection alive by sending heartbeats. While doing this, I also want to be able to send payloads to the websocket, however I keep getting stuck awaiting the result of my <code>keepAlive</code> coroutine</p>
+<pre><code>import asyncio
+import websockets
+ws=#path goes here
+async def sendHeartbeat(socket):
+    message={
+        "op": 1,
+        "d": 0
+        }
+    await socket.send(json.dumps(message))
+    print("heartbeat sent")
+
+
+async def keepAlive(socket):
+    while 1==1:
+        await sendHeartbeat(socket)
+        resp=await(socket.recv())
+        print(resp)
+        if json.loads(resp)["op"]==11:
+            #the server sent an ack back
+            print("ack received")
+        else:
+            socket.close()
+        await asyncio.sleep(10)
+
+
+
+
+async def beginSocket(loop):
+    async with websockets.connect(ws) as socket:
+        print(await socket.recv())
+        await keepAlive(socket)
+        #payloads would be sent here
+        print("Hey payloads being sent and stuff")
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(beginSocket(loop))
+</code></pre>
+<p>With this piece of code however, print statement after awaiting <code>keepAlive</code> is never printed. How can I make it so that the code does not wait for the result of <code>keepAlive</code>?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Although <code>keepAlive(socket)</code> would return immediatly, since <code>keepAlive</code> is a couroutine, <code>await keepAlive(socket)</code> would never return since <code>keepAlive()</code> includes an infinite loop.</p>
+<p>Instead of using <code>await</code>, try <code>asyncio.ensure_future(keepAlive(socket))</code>.</p>
+<p>If you do want to use <code>await keepAlive(socket)</code>, try sending your payloads from somewhere else (maybe use <code>asyncio.ensure_future(send_payload(socket))</code> beforehand).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is a case where you are conceptually having two separate conversations over the same socket. One conversation is your heartbeat and reply messages. Another is the other packets of data you are sending.</p>
+<p>I would keep 3 separate top-level (i.e. they report directly to the event loop) tasks going for this. I would have them all keep a reference to some coordinator so any of them can cancel all of the others when it becomes time to do so.</p>
+<ol>
+<li>The heartbeat task, basically your <code>keepAlive</code> function.</li>
+<li>The task handling the other conversation you're having over the websocket.</li>
+<li>The task that multiplexes reads from the websocket.</li>
+</ol>
+<p>The multiplexing task's job is to route messages to the appropriate task. The heartbeat task should only get heartbeat responses and the other task should get all the other messages.</p>
+<p>Since websockets already frame messages and so you can only <code>send</code> or <code>recv</code> a whole message, the other job it could have isn't relevant.</p>
+<p>Here is one way you could write this.</p>
+<pre><code>import asyncio
+import websockets
+ws=#path goes here
+
+class RoutingTask(object):
+    def __init__(self, sock, defaultQueue, **kwargs):
+        super().__init__(**kwargs)
+        self.sock = sock
+        self.defaultQueue = defaultQueue # The queue all messages not otherwise matched go to.
+        self.matchers = []
+
+    async def run(self):
+        while True:
+            msg = await self.sock.recv()
+            msg = json.loads(msg)
+            matched = False
+            for matcher, queue in matchers:
+                if matcher(msg):
+                    await queue.put(msg)
+                    matched = True
+                    break
+            if not matched:
+                await self.defaultQueue.put(msg)
+
+    def addMatcher(self, matcher, queue):
+        el = (matcher, queue)
+        self.matchers.append(el)
+
+async def heartbeatTask(wssock, incomingq):
+    message=json.dumps({
+        "op": 1,
+        "d": 0
+        }) # Do this just once.
+    while True:
+       await wssock.send(message)
+       print("heartbeat sent")
+       response = await asyncio.wait_for(incomingq.get(), 10) # Wait 10 seconds for response.
+       assert response['op'] == 11
+       print("heartbeat response received.")
+       await asyncio.sleep(10) # Wait 10 seconds to send another heartbeat.
+
+async def beginSocket(loop):
+    def heartbeatMatcher(jsondict):
+        return jsondict.get('op', None) == 11
+
+    async with websockets.connect(ws) as socket:
+        myq = asyncio.Queue(maxsize=1)
+        heartbeatq = asyncio.Queue(maxsize=1)
+        router = RoutingTask(socket, myq)
+        router.addMatcher(heartbeatMatcher, heartbeatq)
+        router = asyncio.ensure_future(router.run())
+        heartbeat = asyncio.ensure_future(heartbeatTask(socket, heartbeatq)
+
+        print(await myq.get())
+        #payloads would be sent here
+        print("Hey payloads being sent and stuff")
+
+    heartbeat.cancel() # Stop the heartbeat
+    router.cancel() # Stop the router task
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(beginSocket(loop))
+</code></pre>
+<p>There are some problems here. If an exception is thrown, the <code>heartbeat</code> and <code>router</code> tasks might not end up being canceled. They also have no really good way to report problems back to the main <code>beginSocket</code> task. This is basically a sort of quick and dirty one-off to demonstrate how to do what you want to do.</p>
+<p>In my opinion, <code>asyncio.ensure_future</code> is misnamed. What it does is tell the event loop that there is a new thing that it needs to keep running. It's basically launching the coroutine equivalent of a thread.</p>
+</div>
+<span class="comment-copy">My advice is to understand and execute the examples here: <a href="https://docs.python.org/3/library/asyncio-task.html" rel="nofollow noreferrer">docs.python.org/3/library/asyncio-task.html</a> before trying anyting more complex. In other words, start with Hello World. :) Good luck!</span>

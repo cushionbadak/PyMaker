@@ -1,0 +1,40 @@
+<div class="post-text" itemprop="text">
+<p>I found this piece of code in the <a href="https://docs.python.org/3/library/subprocess.html#replacing-shell-pipeline" rel="noreferrer"><code>subprocess</code> documentation</a>, where one process's stdout is being piped into another process:</p>
+<pre><code>p1 = Popen(["dmesg"], stdout=PIPE)
+p2 = Popen(["grep", "hda"], stdin=p1.stdout, stdout=PIPE)
+p1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
+output = p2.communicate()[0]
+</code></pre>
+<p>And I'm confused by that <code>stdout.close()</code> call. Surely closing the stdout handle prevents the process from producing any output?</p>
+<p>So I ran an experiment, and to my surprise the process wasn't affected by it at all:</p>
+<pre><code>from subprocess import Popen, PIPE
+
+p1 = Popen(['python', '-c', 'import time; time.sleep(5); print(1)'], stdout=PIPE)
+p2 = Popen(['python', '-c', 'print(input()*3)'], stdin=p1.stdout, stdout=PIPE)
+p1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
+print('stdout closed')
+print('stdout:', p2.communicate()[0])
+
+# output:
+# stdout closed
+# [5 second pause]
+# stdout: b'111\n'
+</code></pre>
+<p>What's going on here? Why can the process write to a closed pipe?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Closing a file decriptor just means decrementing a reference count (inside the operating system kernel). The descriptor number becomes invalid, but nothing happens to the object it refers to unless the reference count hits zero.</p>
+<p>Inside the <code>Popen</code> calls, operations are taking place which duplicate the file descriptor, thereby increasing the reference count: operations like <code>dup</code>/<code>dup2</code> and <code>fork</code>.</p>
+<p>If we <code>fork</code> a child process which receives a file descriptor from the parent, that file descriptor is a duplicate which points to the same object. </p>
+<p>If the parent closes its original copy of that descriptor, that doesn't affect the one in the child. And vice versa. Only if both the parent and child close that descriptor does the underlying open file/device object go away; and only if there are no additional descriptors referencing it.</p>
+<p>This is true even though the descriptors have the same number; each process has its own table of file descriptor numbers. File descriptor 3 in a child is  different from the 3 in the parent.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Each process has its own set of file descriptors.  You can (and should) close the parent’s copy once you don’t need it; the actual pipe (endpoint) survives until the <em>last</em> process (presumably <code>p2</code>) closes it.  Only then does a process trying to write to the (other end of the) pipe get <code>SIGPIPE</code>.</p>
+<p>If you don’t close it, the possibility remains that the <em>parent</em> will read from it even after <code>p2</code> exits, which will needlessly keep <code>p1</code> alive (and can cause deadlock if the parent <code>wait</code>s on it).</p>
+</div>
+<span class="comment-copy"><code>p1.stdout</code> is  Python object <i>connected</i> to the standard output of <code>dmesg</code>; it is not the file descriptor actually used by <code>dmesg</code>. Likewise, <code>grep</code>'s standard input has already gotten its own copy of the file handle before you attempt to close it.</span>
+<span class="comment-copy">@chepner I guess that sort of makes sense, but then why does it matter if we close the output pipe or not? If that's only a copy, why does closing it allow the process to receive a SIGPIPE?</span>
+<span class="comment-copy">It doesn't; <code>dmesg</code> gets a SIGPIPE if it attempts to write to its end of the pipe after <code>grep</code> closes. Under normal operation, <code>dmesg</code> writes what it needs to, then exits normally. <code>grep</code>, on the other hand, stays open until it sees that pipe it is <i>reading</i> from has been closed on the other hand, then exits normally. No <code>SIGPIPE</code> is sent unless <code>grep</code> terminates early, and before <code>dmesg</code> has finished writing its output.</span>
+<span class="comment-copy">In short, pipes and processes and signals are confusing. Gotcha. I didn't understand half of that, but I appreciate the explanation nonetheless, thanks. I guess I have some reading on wikipedia to do.</span>
+<span class="comment-copy">The reason I didn't post an answer is that I'm almost certain there is some subtle aspect of this I didn't explain correctly. :)</span>

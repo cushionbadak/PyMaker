@@ -1,0 +1,216 @@
+<div class="post-text" itemprop="text">
+<p>I want to use a management command to run a one-time analysis of the buildings in Massachusetts. I have reduced the offending code to an 8 line snippet that demonstrates the problem I encounter. The comments just explain why I want to do this at all. I am running the code below verbatim, in an otherwise-blank management command</p>
+<pre><code>zips = ZipCode.objects.filter(state='MA').order_by('id')
+for zip in zips.iterator():
+    buildings = Building.objects.filter(boundary__within=zip.boundary)
+    important_buildings = []
+    for building in buildings.iterator():
+        # Some conditionals would go here
+        important_buildings.append(building)
+    # Several types of analysis would be done on important_buildings, here
+    important_buildings = None
+</code></pre>
+<p>When I run this exact code, I find that memory usage steadily increases with each iteration outer loop (I use <code>print('mem', process.memory_info().rss)</code> to check memory usage). </p>
+<p>It seems like the <code>important_buildings</code> list is hogging up memory, even after going out of scope. If I replace <code>important_buildings.append(building)</code> with <code>_ = building.pk</code>, it no longer consumes much memory, but I do need that list for some of the analysis.</p>
+<p>So, my question is: <strong>How can I force Python to release the list of Django models when it goes out of scope?</strong></p>
+<p>Edit: I feel like there's a bit of a catch 22 on stack overflow -- if I write too much detail, no one wants to take the time to read it (and it becomes a less applicable problem), but if I write too little detail, I risk overlooking part of the problem. Anyway, I really appreciate the answers, and plan to try some of the suggestions out this weekend when I finally get a chance to get back to this!!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You don't provide much information about how big your models are, nor what links there are between them, so here are a few ideas:</p>
+<p>By default <code>QuerySet.iterator()</code> will load <a href="https://docs.djangoproject.com/en/2.1/ref/models/querysets/#iterator" rel="nofollow noreferrer"><code>2000</code> elements in memory</a> (assuming you're using django &gt;= 2.0). If your <code>Building</code> model contains a lot of info, this could possibly hog up a lot of memory. You could try changing the <code>chunk_size</code> parameter to something lower.</p>
+<p>Does your <code>Building</code> model have links between instances that could cause reference cycles that the <code>gc</code> can't find? You could use <code>gc</code> debug features to get more detail.</p>
+<p>Or shortcircuiting the above idea, maybe just call <code>del(important_buildings)</code> and <code>del(buildings)</code> followed by <code>gc.collect()</code> at the end of every loop to force garbage collection?</p>
+<p>The scope of your variables is the function, not just the <code>for</code> loop, so breaking up your code into smaller functions might help. Although note that the python garbage collector won't always return memory to the OS, so as explained in <a href="https://stackoverflow.com/a/1316799/1138710">this answer</a> you might need to get to more brutal measures to see the <code>rss</code> go down.</p>
+<p>Hope this helps!</p>
+<p><strong>EDIT:</strong></p>
+<p>To help you understand what code uses your memory and how much, you could use the <a href="https://docs.python.org/3/library/tracemalloc.html#pretty-top" rel="nofollow noreferrer">tracemalloc</a> module, for instance using the suggested code:</p>
+<pre><code>import linecache
+import os
+import tracemalloc
+
+def display_top(snapshot, key_type='lineno', limit=10):
+    snapshot = snapshot.filter_traces((
+        tracemalloc.Filter(False, "&lt;frozen importlib._bootstrap&gt;"),
+        tracemalloc.Filter(False, "&lt;unknown&gt;"),
+    ))
+    top_stats = snapshot.statistics(key_type)
+
+    print("Top %s lines" % limit)
+    for index, stat in enumerate(top_stats[:limit], 1):
+        frame = stat.traceback[0]
+        # replace "/path/to/module/file.py" with "module/file.py"
+        filename = os.sep.join(frame.filename.split(os.sep)[-2:])
+        print("#%s: %s:%s: %.1f KiB"
+              % (index, filename, frame.lineno, stat.size / 1024))
+        line = linecache.getline(frame.filename, frame.lineno).strip()
+        if line:
+            print('    %s' % line)
+
+    other = top_stats[limit:]
+    if other:
+        size = sum(stat.size for stat in other)
+        print("%s other: %.1f KiB" % (len(other), size / 1024))
+    total = sum(stat.size for stat in top_stats)
+    print("Total allocated size: %.1f KiB" % (total / 1024))
+
+tracemalloc.start()
+
+# ... run your code ...
+
+snapshot = tracemalloc.take_snapshot()
+display_top(snapshot)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<h2>Very quick answer.</h2>
+<p>Memory is being freed, <code>rss</code> is not a very accurate tool for telling <strong>where the memory is being consumed</strong>, <code>rss</code> gives a measure of the memory the process has <strong>used</strong>, not the memory the process is <strong>using</strong> (keep reading to see a demo), you can use the package <a href="https://pypi.org/project/memory-profiler/" rel="nofollow noreferrer">memory-profiler</a> in order to check line by line, the memory use of your function.</p>
+<p>So, <strong>How to force Django models to be released from memory?</strong>,  you can't tell have such problem just using <code>process.memory_info().rss</code>.</p>
+<p>I can, however, propose a solution for you to optimize your code. And write a demo on why <code>process.memory_info().rss</code> is not a very accurate tool to measure memory <em>being used</em> in some block of code. </p>
+<h2>Proposed solution:</h2>
+<p>As demonstrated later in this same post, applying <code>del</code> to the list is not going to be the solution, optimization using <code>chunk_size</code> for <code>iterator</code> will help (be aware <code>chunk_size</code> option for <code>iterator</code> was added in Django 2.0), that's for sure, but the real enemy here is that nasty list.</p>
+<p>Said that, you can use a list of just fields you need to perform your analysis (I'm assuming your analysis can't be tackled one building at the time) in order to reduce the amount of data stored in that list.</p>
+<h3>Try getting just the attributes you need on the go and select targeted buildings using the Django's ORM.</h3>
+<pre><code>for zip in zips.iterator(): # Using chunk_size here if you're working with Django &gt;= 2.0 might help.
+    important_buildings = Building.objects.filter(
+        boundary__within=zip.boundary,
+        # Some conditions here ... 
+
+        # You could even use annotations with conditional expressions
+        # as Case and When.
+
+        # Also Q and F expressions.
+
+        # It is very uncommon the use case you cannot address 
+        # with Django's ORM.
+
+        # Ultimately you could use raw SQL. Anything to avoid having
+        # a list with the whole object.
+    )
+
+    # And then just load into the list the data you need
+    # to perform your analysis.
+
+    # Analisis according size.
+    data = important_buildings.values_list('size', flat=True)
+
+    # Analisis according height.
+    data = important_buildings.values_list('height', flat=True)
+
+    # Perhaps you need more than one attribute ...
+    # Analysis according to height and size.
+    data = important_buildings.values_list('height', 'size')
+
+    # Etc ...
+</code></pre>
+<p><strong>It's very important</strong> to note that if you use a solution like this, you'll be only hitting database when populating <code>data</code> variable. And of course, you will only have in memory the minimum required for accomplishing your analysis.</p>
+<h2>Thinking in advance.</h2>
+<p>When you hit issues like this you should start thinking about parallelism, clusterization, big data, etc ... Read also about <a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/index.html" rel="nofollow noreferrer">ElasticSearch</a> it has very good analysis capabilities.</p>
+<h1>Demo</h1>
+<h2><code>process.memory_info().rss</code> Won't tell you about memory being freed.</h2>
+<p>I was really intrigued by your question and the fact you describe here: </p>
+<blockquote>
+<p><em>It seems like the important_buildings list is hogging up memory, even after going out of scope.</em></p>
+</blockquote>
+<p>Indeed, it seems but is not. Look the following example:</p>
+<pre><code>from psutil import Process
+
+def memory_test():
+    a = []
+    for i in range(10000):
+        a.append(i)
+    del a
+
+print(process.memory_info().rss)  # Prints 29728768
+memory_test()
+print(process.memory_info().rss)  # Prints 30023680
+</code></pre>
+<p>So even if <code>a</code> memory is freed, the last number is bigger. That's because <code>memory_info.rss()</code> is the total memory the process <strong>has</strong> used, not the memory is <strong>using</strong> at the moment, as stated here in the docs: <a href="https://psutil.readthedocs.io/en/latest/#psutil.Process.memory_info" rel="nofollow noreferrer">memory_info</a>.</p>
+<p>The following image is a plot (memory/time) for the same code as before but with <code>range(10000000)</code> </p>
+<p><a href="https://i.stack.imgur.com/ggGzj.png" rel="nofollow noreferrer"><img alt="Image against time." src="https://i.stack.imgur.com/ggGzj.png"/></a>
+I use the script <code>mprof</code> that comes in <a href="https://pypi.org/project/memory-profiler/" rel="nofollow noreferrer">memory-profiler</a> for this graph generation.</p>
+<p>You can see the memory is completely freed, is not what you see when you profile using <code>process.memory_info().rss</code>. </p>
+<blockquote>
+<p><em>If I replace important_buildings.append(building) with _ = building use less memory</em></p>
+</blockquote>
+<p>That's always will be that way, a list of objects will always use more memory than a single object.</p>
+<p>And on the other hand, you also can see the memory used don't grow linearly as you would expect. Why?</p>
+<p>From this excellent <a href="https://bradfieldcs.com/algos/analysis/performance-of-python-types/" rel="nofollow noreferrer">site</a> we can read:</p>
+<blockquote>
+<p>The append method is “amortized” O(1). In most cases, the memory required to append a new value has already been allocated, which is strictly O(1). Once the C array underlying the list has been exhausted, it must be expanded in order to accommodate further appends. This periodic expansion process is linear relative to the size of the new array, which seems to contradict our claim that appending is O(1).</p>
+<p>However, <strong>the expansion rate is cleverly chosen to be three times the previous size of the array</strong>; when we spread the expansion cost over each additional append afforded by this extra space, the cost per append is O(1) on an amortized basis.</p>
+</blockquote>
+<p>It is fast but has a memory cost.</p>
+<p>The real problem is not <strong>the Django models not being released from memory</strong>. The problem is the algorithm/solution you've implemented, it uses too much memory. And of course, the list is the villain.</p>
+<p>A golden rule for Django optimization: Replace the use of a list for querisets wherever you can.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Laurent S's answer is quite on the point (+1 and well done from me :D).</p>
+<p>There are some points to consider in order to cut down in your memory usage:</p>
+<ol>
+<li><p><strong>The <a href="https://docs.djangoproject.com/en/2.1/ref/models/querysets/#iterator" rel="nofollow noreferrer"><code>iterator</code></a> usage:</strong></p>
+<p>You can set the <code>chunk_size</code> parameter of the iterator to something as small as you can get away with (ex. 500 items per chunk).<br/>
+That will make your query slower (since every step of the iterator will reevaluate the query) but it will cut down in your memory consumption.</p></li>
+<li><p><strong>The <a href="https://docs.djangoproject.com/en/2.1/ref/models/querysets/#only" rel="nofollow noreferrer"><code>only</code></a> and <a href="https://docs.djangoproject.com/en/2.1/ref/models/querysets/#django.db.models.query.QuerySet.defer" rel="nofollow noreferrer"><code>defer</code></a> options:</strong> </p>
+<blockquote>
+<p><strong><code>defer()</code></strong>: In some complex data-modeling situations, <strong>your models might contain a lot of fields, some of which could contain a lot of data (for example, text fields)</strong>, or require expensive processing to convert them to Python objects. If you are using the results of a queryset in some situation where you don’t know if you need those particular fields when you initially fetch the data, you can tell Django not to retrieve them from the database.</p>
+<p><strong><code>only()</code>:</strong> Is more or less the opposite of <code>defer()</code>. You call it with the fields that should not be deferred when retrieving a model. If you have a model where almost all the fields need to be deferred, using only() to specify the complementary set of fields can result in simpler code.</p>
+</blockquote>
+<p>Therefore you can cut down on what you are retrieving from your models in each iterator step and keep only the essential fields for your operation.</p></li>
+<li><p>If your query still remains too memory heavy, you can choose to keep only the <code>building_id</code> in your <code>important_buildings</code> list and then use this list to make the queries you need from your <code>Building</code>'s model, for each of your operations (this will slow down your operations, but it will cut down on the memory usage).</p></li>
+<li><p><em>You may improve your queries so much as to solve parts (or even whole) of your analysis but with the state of your question at this moment I cannot tell for sure (see <strong>PS</strong> on the end of this answer)</em></p></li>
+</ol>
+<p>Now let's try to bring all the above points together in your sample code:</p>
+<pre><code># You don't use more than the "boundary" field, so why bring more?
+# You can even use "values_list('boundary', flat=True)"
+# except if you are using more than that (I cannot tell from your sample)
+zips = ZipCode.objects.filter(state='MA').order_by('id').only('boundary')
+for zip in zips.iterator():
+    # I would use "set()" instead of list to avoid dublicates
+    important_buildings = set()
+
+    # Keep only the essential fields for your operations using "only" (or "defer")
+    for building in Building.objects.filter(boundary__within=zip.boundary)\
+                    .only('essential_field_1', 'essential_field_2', ...)\
+                    .iterator(chunk_size=500):
+        # Some conditionals would go here
+        important_buildings.add(building)
+</code></pre>
+<p>If this still hogs too much memory for your liking you can use the 3rd point above like this:</p>
+<pre><code>zips = ZipCode.objects.filter(state='MA').order_by('id').only('boundary')
+for zip in zips.iterator():
+    important_buildings = set()
+    for building in Building.objects.filter(boundary__within=zip.boundary)\
+                    .only('pk', 'essential_field_1', 'essential_field_2', ...)\
+                    .iterator(chunk_size=500):
+        # Some conditionals would go here
+
+        # Create a set containing only the important buildings' ids
+        important_buildings.add(building.pk)
+</code></pre>
+<p>and then use that set to query your buildings for the rest of your operations:</p>
+<pre><code># Converting set to list may not be needed but I don't remember for sure :)
+Building.objects.filter(pk__in=list(important_buildings))...
+</code></pre>
+<hr/>
+<p><strong>PS:</strong> If you can update your answer with more specifics, like the structure of your models and some of the analysis operations you are trying to run, we may be able to provide more concrete answers to help you!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Have you considered <a href="https://docs.djangoproject.com/en/dev/ref/contrib/gis/geoquerysets/#django.contrib.gis.db.models.Union" rel="nofollow noreferrer">Union</a>? By looking at the code you posted you are running a lot of queries within that command but you could offload that to the database with Union.</p>
+<pre class="lang-py prettyprint-override"><code>combined_area = FooModel.objects.filter(...).aggregate(area=Union('geom'))['area']
+final = BarModel.objects.filter(coordinates__within=combined_area)
+</code></pre>
+<p>Tweaking the above could essentially narrow down the queries needed for this function to one.</p>
+<p>It's also worth looking at <a href="https://django-debug-toolbar.readthedocs.io/en/latest/" rel="nofollow noreferrer">DjangoDebugToolbar</a> - if you haven't looked it it already.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>To release memory, you must duplicate the important details of each in the buildings in the inner loop into a new object, to be used later, while eliminating those not suitable. In code not shown in the original post references to the inner loop exist. Thus the memory issues. By copying the relevant fields to new objects, the originals can be deleted as intended.</p>
+</div>
+<span class="comment-copy">Does your analysis code happen to create references between instances of <code>building</code> so that you'd end up with a reference cycle, preventing <code>gc</code> from doing its work?</span>
+<span class="comment-copy">I've taken out the analysis code. the code above is verbatim what I run</span>
+<span class="comment-copy">Are you running this code with DEBUG=True?</span>
+<span class="comment-copy">The catch-22 is resolved by providing a minimally reproducible sample of your code and the conditions to reproduce the problems. Since you have not provided that, guesses tend to surface.  And in SO form the best guess receives your 1/2 bounty.</span>
+<span class="comment-copy">The above code was minimally reproducible. Any django model would have had the effect that I mentioned, because I misunderstood how <code>process.memory_info().rss</code> worked. Turned out there was no memory issue in the above snippet. I awarded the full bounty for that reason</span>
+<span class="comment-copy">rss is going never go down, is a measure of the memory the process has used , not the memory the process is using.</span>
+<span class="comment-copy">isn't it an overhead to call <code>gc.collect()</code> at the end of every loop?  as it can take considerable time to evaluate every memory object within a large system</span>
+<span class="comment-copy">The list is not the issue, as it is really quite small in individual passes of the loop, and my issue was about accumulating memory linearly over multiple iterations of the loop. I am still using the list. But the other information you provided, particularly about memory profiling, helped me diagnose the real issue. thanks.</span>
+<span class="comment-copy">I'm glad to help, any time.</span>

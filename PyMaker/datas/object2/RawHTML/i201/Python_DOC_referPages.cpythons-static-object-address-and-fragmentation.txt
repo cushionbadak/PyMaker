@@ -1,0 +1,32 @@
+<div class="post-text" itemprop="text">
+<p>I read </p>
+<blockquote>
+<p>For CPython, id(x) is the memory address where x is stored.</p>
+</blockquote>
+<p>And it's a given the <code>id</code> of an object never changes, which means an object always stored at a given memory address in its lifetime. This leads to the question: what about fragmentation of (virtual) memory?</p>
+<p>Say an object <code>A</code> is at address 1 (has <code>id</code> 1), takes up 10 bytes, so it takes up addresses 1-10. Object <code>B</code> has <code>id</code> 11 and takes up bytes 11-12, and object <code>C</code> takes up addresses 13-22. Once B goes out of scope and gets GC'd, we'll have fragmentation. </p>
+<p>How is this conundrum resolved?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>CPython uses its own memory allocator for small objects, the <a href="https://docs.python.org/3/c-api/memory.html#the-pymalloc-allocator" rel="nofollow noreferrer">pymalloc-allocator</a>. A quite good description can be found in the <a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Objects/obmalloc.c#L741" rel="nofollow noreferrer">code itself</a>. </p>
+<p>This allocator is pretty good at avoiding memory fragmentation, because it reuses the freed memory efficiently. However, it is only a heuristic and one could come up with scenarios which lead to memory fragmentation.</p>
+<p>Let's play through what happens when we allocate an object with size of 1byte.</p>
+<p>CPython has its own so called arena for objects smaller than 512 bytes. Obviously, 1 byte request will be managed by its allocator.</p>
+<p>Requested sizes are divided in 64 different classes: 0th-class is for sizes of 1..8 bytes, 1th-class is for sizes or 9..16 bytes and so on - this is due to required alignment of 8 bytes. Every of the above classes has its own more or less independent/dedicated memory. Our request is for the 0th-class. </p>
+<p>Let's assume this is the first request for this size-class. A new "pool" will be created or an empty pool reused. A pool is <a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Objects/obmalloc.c#L867" rel="nofollow noreferrer">4KB big</a>, and thus has space for 512 8-byte "blocks". Despite requestion only 1 byte we will be blocking another 7 bytes of the occupied block, so they cannot be used for another objects. All free blocks are kept in a list - in the beginning all 512 blocks are in this list. The allocator deletes the first block from this free-block-list and returns its address as pointer.</p>
+<p>The pool itself is marked as "used" and added to a list of used pools for 0th-class.</p>
+<p>Now, allocation another object with size &lt;=8 bytes happens as follows. At first we look at the list of used pools for 0th-class and will find a pool which already in use, i.e. has some used and some free blocks. Allocator uses the first free block, deletes it from the list of free blocks and returns its address as pointer.</p>
+<p>Deleting first object is easy - we add the occupied block as head of the list of free blocks in the (so far single) used pool.</p>
+<p>When a new object of 8 byte is created, so the first block in the free-block-list is used, and this is the block which was used by the first, now deleted, object.</p>
+<p>As you can see the memory gets reused, and thus memory fragmentation is vastly reduced. This doesn't mean there cannot be memory fragmentation:</p>
+<p>After allocating 512 1-byte-objects, the first pool becomes "full" and a new pool for 0th-class-sizes will be created/used. Once also we add another 512 objects also the second pool becomes "full". And so on. </p>
+<p>Now, if the first 511 elements are deleted - there will be still one byte which blocks whole 4KB, which cannot be used for <strong>other</strong> classes. </p>
+<p>Only when the last block is freed, the pool becomes "empty" and thus can be reused for other size-classes.</p>
+<hr/>
+<p>The empty pools are not returned to the OS, but stay in the arena and are reused. However, the pymalloc <a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Objects/obmalloc.c#L1074" rel="nofollow noreferrer">manages multiple arenas</a>, and if an arena becomes "unused" it might be freed and occupied memory (i.e. pools) is returned  to the OS.</p>
+</div>
+<span class="comment-copy">CPython will likely reuse B's memory for another object of the same size later, see e.g. <a href="https://stackoverflow.com/q/3877230/3001761">stackoverflow.com/q/3877230/3001761</a>. It's during the <i>object's</i> lifetime, once it's "dead" that ID is available again.</span>
+<span class="comment-copy">@jonrsharpe If B's memory can only be used later for the an object of the same size, then this is exactly what internal fragmentation is. If there are two small blocks, then we can't use both for something bigger...is can we? Surely CPython has a way to get around this problem?</span>
+<span class="comment-copy">Wow, thanks for reading through the code and giving this detailed breakdown. Yes, if we group similar-sized objects into pools/regions of memory, then the fragmentation is less. Hmm, I guess if <code>id</code> didn't have to be kept constant, avoiding fragmentation would be easier because we can simply relocate/compact the small objects. I am wondering why Python has this constant <code>id</code> requirement...but I guess that would be a whole new other topic/question.</span>
+<span class="comment-copy">@flow2k I'm not sure there is any memory allocator, which would use the proposed strategy of relocating of the pointers - in this case it would have to update all places where the old address is saved - that doesn't look like a cheap operation (one also has to track all these places).</span>
+<span class="comment-copy">There definitely needs to be more work done, but perhaps one efficient way is to simply have one extra layer of redirection: maintain a map/table that maps the "virtual" address of the object to the virtual memory address - yes, this is similar to the paging mechanism in OS, which was introduced with the express desire of alleviating fragmentation of physical memory. I wonder why this is not done in the allocators - perhaps just for efficiency?</span>

@@ -1,0 +1,267 @@
+<div class="post-text" itemprop="text">
+<p>In my application, I have a coroutine, which may await on several other coroutines, and each if this coroutines, may await on another ones and so on.
+If one of such coroutines fails, there is no need to execute all others, that was not executed yet. (<em>In my case this is even harmful, and I want to launch several rollback coroutines instead</em>).
+So, how do I cancel execution of all nested coroutines? Here is what I have for now:</p>
+<pre><code>import asyncio
+
+async def foo():
+    for i in range(5):
+        print('Foo', i)
+        await asyncio.sleep(0.5)
+    print('Foo2 done')
+
+async def bar():
+    await asyncio.gather(bar1(), bar2())
+
+
+async def bar1():
+    await asyncio.sleep(1)
+    raise Exception('Boom!')
+
+
+async def bar2():
+    for i in range(5):
+        print('Bar2', i)
+        await asyncio.sleep(0.5)
+    print('Bar2 done')
+
+
+async def baz():
+    for i in range(5):
+        print('Baz', i)
+        await asyncio.sleep(0.5)
+
+async def main():
+    task_foo = asyncio.Task(foo())
+    task_bar = asyncio.Task(bar())
+    try:
+        await asyncio.gather(task_foo, task_bar)
+    except Exception:
+        print('One task failed. Canceling all')
+        task_foo.cancel()
+        task_bar.cancel()
+    print('Now we want baz')
+    await baz()
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.close()
+</code></pre>
+<p>This obviously does not work. As you can see, <code>foo</code> coroutine is canceled, as I want, but <code>bar2</code> is still running:</p>
+<pre><code>Foo 0
+Bar2 0
+Foo 1
+Bar2 1
+Foo 2
+Bar2 2
+One task failed. Canceling all
+Now we want baz
+Baz 0
+Bar2 3
+Baz 1
+Bar2 4
+Baz 2
+Bar2 done
+Baz 3
+Baz 4
+</code></pre>
+<p>So, I'm definitely doing something wrong. What is the correct approach here?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>By the time you call <code>task_bar.cancel()</code> the task is already finished, so there's no effect. As the <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.gather" rel="nofollow noreferrer">gather docs state</a>:</p>
+<blockquote>
+<p>If return_exceptions is true, exceptions in the tasks are treated the same as successful results, and gathered in the result list; <strong>otherwise, the first raised exception will be immediately propagated to the returned future.</strong></p>
+</blockquote>
+<p>This is exactly what's happening, a slight modification of your <code>task_bar</code> coroutine to:</p>
+<pre><code>async def bar():
+    try:
+        await asyncio.gather(bar1(), bar2())
+    except Exception:
+        print("Got a generic exception on bar")
+        raise
+</code></pre>
+<p>Outputs:</p>
+<pre><code>Foo 0
+Bar2 0
+Foo 1
+Bar2 1
+Foo 2
+Bar2 2
+Got a generic exception on bar
+One task failed. Canceling all
+&lt;Task finished coro=&lt;bar() done, defined at cancel_nested_coroutines.py:11&gt; exception=Exception('Boom!',)&gt;
+Now we want baz
+Baz 0
+Bar2 3
+Baz 1
+Bar2 4
+Baz 2
+Bar2 done
+Baz 3
+Baz 4
+</code></pre>
+<p>I'm also printing <code>task_bar</code> before the <code>task_bar.cancel()</code> call, notice it's finished, so calling <code>cancel</code> has no effect.</p>
+<p>In terms of a solution I think the spawning coroutine needs to handle the cancellation of the coroutines it scheduled as I couldn't find a way to retrieve them once the coroutine is finished (beyond abusing <code>Task.all_tasks</code> which sounds wrong).</p>
+<p>Having said that I had to use <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.wait" rel="nofollow noreferrer"><code>wait</code></a> instead of <code>gather</code> and return on first exception, here's a full example:</p>
+<pre><code>import asyncio
+
+
+async def foo():
+    for i in range(5):
+        print('Foo', i)
+        await asyncio.sleep(0.5)
+    print('Foo done')
+
+
+async def bar():
+    done, pending = await asyncio.wait(
+        [bar1(), bar2()], return_when=asyncio.FIRST_EXCEPTION)
+
+    for task in pending:
+        task.cancel()
+
+    for task in done:
+        task.result()  # needed to raise the exception if it happened
+
+
+async def bar1():
+    await asyncio.sleep(1)
+    raise Exception('Boom!')
+
+
+async def bar2():
+    for i in range(5):
+        print('Bar2', i)
+        await asyncio.sleep(0.5)
+    print('Bar2 done')
+
+
+async def baz():
+    for i in range(5):
+        print('Baz', i)
+        await asyncio.sleep(0.5)
+
+
+async def main():
+    task_foo = asyncio.Task(foo())
+    task_bar = asyncio.Task(bar())
+    try:
+        await asyncio.gather(task_foo, task_bar)
+    except Exception:
+        print('One task failed. Canceling all')
+        print(task_bar)
+        task_foo.cancel()
+        task_bar.cancel()
+
+    print('Now we want baz')
+    await baz()
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.close()
+</code></pre>
+<p>Which outputs:</p>
+<pre><code>Foo 0
+Bar2 0
+Foo 1
+Bar2 1
+Foo 2
+Bar2 2
+One task failed. Canceling all
+&lt;Task finished coro=&lt;bar() done, defined at cancel_nested_coroutines_2.py:11&gt; exception=Exception('Boom!',)&gt;
+Now we want baz
+Baz 0
+Baz 1
+Baz 2
+Baz 3
+Baz 4
+</code></pre>
+<p>It's not great, but it works.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As far as I know,  it's not possible to automatically cancel all subtasks of a coroutine when cancelling the coroutine itself. So you have to clean up the subtasks manually.
+When an exception is thrown while awaiting an asyncio.gather future, you can access the remaining tasks by the <code>_children</code> attribute of the Gathering_future object.
+Your example working:</p>
+<pre><code>import asyncio
+
+async def foo():
+    for i in range(5):
+        print('Foo', i)
+        await asyncio.sleep(0.5)
+    print('Foo2 done')
+
+async def bar():
+    gathering = asyncio.gather(bar1(), bar2())
+    try:
+        await gathering
+    except Exception:
+        # cancel all subtasks of this coroutine
+        [task.cancel() for task in gathering._children]
+        raise
+
+async def bar1():
+    await asyncio.sleep(1)
+    raise Exception('Boom!')
+
+async def bar2():
+    for i in range(5):
+        print('Bar2', i)
+        try:
+            await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            # you can cleanup here
+            print("Bar2 cancelled")
+            break
+    else:
+        print('Bar2 done')
+
+async def baz():
+    for i in range(5):
+        print('Baz', i)
+        await asyncio.sleep(0.5)
+
+async def main():
+    task_foo = asyncio.Task(foo())
+    task_bar = asyncio.Task(bar())
+    try:
+        task = asyncio.gather(task_foo, task_bar)
+        await task
+    except Exception:
+        print('One task failed. Canceling all')
+        task_foo.cancel()
+        task_bar.cancel()
+    print('Now we want baz')
+    await baz()
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.close()
+</code></pre>
+<p>returns</p>
+<pre><code>Foo 0
+Bar2 0
+Foo 1
+Bar2 1
+Foo 2
+Bar2 2
+Bar2 cancelled
+One task failed. Canceling all
+Now we want baz
+Baz 0
+Baz 1
+Baz 2
+Baz 3
+Baz 4
+</code></pre>
+</div>
+<span class="comment-copy">you might find RxPy helpful too. Check it out here <a href="https://github.com/ReactiveX/RxPY" rel="nofollow noreferrer">github.com/ReactiveX/RxPY</a></span>
+<span class="comment-copy">Unfortunately, this is not what I want. What you did, is actually just duplication of code from <code>main</code> into <code>bar</code>. I think this by itself is against DRY. But this also cannot be done if I'm awaiting for coroutines from 3rd party libs. Also if you look at this: <a href="https://repl.it/EhTf/0" rel="nofollow noreferrer">repl.it/EhTf/0</a>, you may see that <code>foo</code> subtasks are still canceled. But it doesn't cancel neighbor subtasks if one of them raised exception.</span>

@@ -1,0 +1,127 @@
+<div class="post-text" itemprop="text">
+<p><strong>TL;DR</strong> threading.Timer uses system time but the time changes while I'm using it, how can I get it to use system uptime?</p>
+<p>I have a Python script that does a bunch of stuff one of which is set the system time. When this script starts up the time is wrong. This script also needs to have a global timeout of 30 seconds.</p>
+<p>I have been using the following timeout class:</p>
+<pre><code>class Timeout(object):
+    def __init__(self, seconds=1, signum=signal.SIGUSR1, exception=TimeoutException):
+        self.exception = exception
+        self.pid = os.getpid()
+        self.signum = signum
+        self.timer = threading.Timer(seconds, self.exit_function)
+
+    def exit_function(self):
+        os.kill(self.pid, self.signum)
+
+    def handle_timeout(self, signum, frame):
+        raise self.exception()
+
+    def __enter__(self):
+        signal.signal(self.signum, self.handle_timeout)
+        self.timer.start()
+
+    def __exit__(self, type, value, traceback):
+        self.timer.cancel()
+</code></pre>
+<p>Which wraps my entire script:</p>
+<pre><code>with Timeout(seconds=30):
+    main()
+</code></pre>
+<p>occasionally the script fails really quickly or never gets killed after the 30 seconds. I believe this is because <code>threading.Timer</code> uses the system time which gets changed while the script is running. Is there anyway I can get it to use system uptime?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It seem like your are using Python &lt; 3.3. On Python 3.3 or newer, <code>monotonic</code> will be an alias of <code>time.monotonic</code> from the standard library. 
+<code>time.monotonic</code> was then also used for the <code>threading</code>-libary. As said in the <a href="https://docs.python.org/3/library/time.html#time.monotonic" rel="nofollow noreferrer">docs</a>:</p>
+<blockquote>
+<p>Return the value (in fractional seconds) of a monotonic clock, i.e. a clock that cannot go backwards. <strong>The clock is not affected by system clock updates.</strong></p>
+</blockquote>
+<p>So, with Python &gt;=3.3 <code>threading.Timer</code> will be independent.</p>
+<hr/>
+<p>trying to solve your problem:
+<strong>Windows</strong></p>
+<p>I see an option to get your desired system-uptime using <a href="https://msdn.microsoft.com/en-us/library/windows/desktop/ms724408(v=vs.85).aspx" rel="nofollow noreferrer"><code>gettickcount</code></a> from the <code>kernel32.dll</code> using <code>ctypes</code>:</p>
+<pre><code>import ctypes
+kernel_32 = ctypes.cdll.LoadLibrary("Kernel32.dll")
+kernel_32.GetTickCount()  # overflow after 49.7 days
+kernel_32.GetTickCount64()
+</code></pre>
+<p>with this you could create your own timer with something unperformant as this:</p>
+<pre><code>def sleep(time):
+    start = kernel_32.GetTickCount64()
+    end = start + time
+    while kernel_32.GetTickCount64() &lt; end:
+        pass
+    print('done')
+</code></pre>
+<p>I realy hope this approach helps with your problem - good luck</p>
+<hr/>
+<p>EDIT:
+<strong>Linux</strong></p>
+<p>based on <a href="https://pypi.python.org/pypi/monotonic" rel="nofollow noreferrer">monotonic</a>: you can try this as alternative to getTickCount<sub>1</sub>:</p>
+<pre><code>try:
+    clock_gettime = ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True).clock_gettime
+except Exception:
+    clock_gettime = ctypes.CDLL(ctypes.util.find_library('rt'), use_errno=True).clock_gettime
+
+class timespec(ctypes.Structure):
+    """Time specification, as described in clock_gettime(3)."""
+    _fields_ = (('tv_sec', ctypes.c_long), ('tv_nsec', ctypes.c_long))
+
+if sys.platform.startswith('linux'):
+    CLOCK_MONOTONIC = 1
+elif sys.platform.startswith('freebsd'):
+    CLOCK_MONOTONIC = 4
+elif sys.platform.startswith('sunos5'):
+    CLOCK_MONOTONIC = 4
+elif 'bsd' in sys.platform:
+    CLOCK_MONOTONIC = 3
+elif sys.platform.startswith('aix'):
+    CLOCK_MONOTONIC = ctypes.c_longlong(10)
+
+def monotonic():
+    """Monotonic clock, cannot go backward."""
+    ts = timespec()
+    if clock_gettime(CLOCK_MONOTONIC, ctypes.pointer(ts)):
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    return ts.tv_sec + ts.tv_nsec / 1.0e9
+</code></pre>
+<hr/>
+<p><sub>1:  Copyright 2014, 2015, 2016 Ori Livneh 
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+  <a href="http://www.apache.org/licenses/LICENSE-2.0" rel="nofollow noreferrer">http://www.apache.org/licenses/LICENSE-2.0</a>
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. </sub></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I ended up extending <code>threading.Timer</code> to use system uptime.</p>
+<pre><code>class Timer(threading._Timer):
+
+    def __init__(self, *args, **kwargs):
+        super(Timer, self).__init__(*args, **kwargs)
+
+        # only works on Linux
+        self._libc = ctypes.CDLL('libc.so.6')
+        self._buf = ctypes.create_string_buffer(128)
+
+    def uptime(self):
+        self._libc.sysinfo(self._buf)
+        return struct.unpack_from('@l', self._buf.raw)[0]
+
+    def run(self):
+        start_time = self.uptime()
+        while not self.finished.is_set():
+            time.sleep(0.1)
+            if self.uptime() - start_time &gt; self.interval:
+                self.function(*self.args, **self.kwargs)
+                break
+        self.finished.set()
+</code></pre>
+</div>
+<span class="comment-copy">Possible duplicate of <a href="https://stackoverflow.com/questions/16148735/how-to-implement-a-watchdog-timer-in-python">How to implement a watchdog timer in Python?</a></span>
+<span class="comment-copy">Not a duplicate, all those examples also use system time, I want to use system uptime like that is is <code>/proc/uptime</code></span>
+<span class="comment-copy"><code>threading.Timer</code> are based on condition locks, based on a monotonic timer which saids: <i>The clock is not affected by system clock updates.</i> So this is not your issue. You don't need system-uptime - you allready have an independent time</span>
+<span class="comment-copy">Hmmm I am running <code>Debian Linux 3.10.103-marvell armv7l GNU/Linux</code>  and Python 2.7.9. If I change the time it affects the <code>Event.interval</code> call inside <code>threading.Timer</code>.</span>
+<span class="comment-copy">yeah, just found that you probably have python &lt; 3.3. Pretty intresting topic. I may have a approach for you in the given answer. EDIT: oh crap - you are using linux</span>

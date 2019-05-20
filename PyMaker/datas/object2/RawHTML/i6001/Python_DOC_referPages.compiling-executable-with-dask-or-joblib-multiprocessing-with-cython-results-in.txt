@@ -1,0 +1,162 @@
+<div class="post-text" itemprop="text">
+<p>I'm converting some serial processed python jobs to multiprocessing with dask or joblib. Sadly I need to work on windows.<br/>
+When running from within IPython or from command line invoking the py-file with python everything is running fine.<br/>
+When compiling an executable with cython, it is no longer running fine: Step by step more and more processes (unlimited and bigger than the number of requested processes) get startet and block my system.<br/>
+It somehow feels like <a href="https://stackoverflow.com/questions/2697640/multiprocessing-bomb">Multiprocessing Bomb</a> - but of course I used <code>if __name__=="__main__:"</code> for having the control block - approved by fine running from python call at the command line.<br/>
+My cython call is <code>cython --embed --verbose --annotate THECODE.PY</code> and I'm compiling with <code>gcc -time -municode -DMS_WIN64 -mthreads -Wall -O -I"PATH_TO_\include" -L"PATH_TO_\libs"  THECODE.c -lpython36 -o THECODE</code> resulting in a windows executable <code>THECODE.exe</code>.<br/>
+With other (single processing) code that is running fine.<br/>
+The problem seems to be the same for dask and joblib (what might mean, that dask works like or is based on joblib).<br/>
+Any suggestions?</p>
+<p>For those interested in a <a href="http://stackoverflow.com/help/mcve">mcve</a>: Just taking the first code from <a href="https://stackoverflow.com/questions/2697640/multiprocessing-bomb">Multiprocessing Bomb</a> and compiling it with my cython commands above will result in an executable blowing your system. (I just tried :-) )</p>
+<p>I just found something interesting by adding one line to the code sample for showing the <code>__name__</code>:</p>
+<pre><code>import multiprocessing
+
+def worker():
+    """worker function"""
+    print('Worker')
+    return
+
+print("--&gt;" + __name__ + "&lt;--")
+if __name__ == '__main__':
+    jobs = []
+    for i in range(5):
+        p = multiprocessing.Process(target=worker)
+        jobs.append(p)
+        p.start()
+</code></pre>
+<p>When running that piece of code with <code>python</code> it shows</p>
+<pre><code>__main__
+__mp_main__
+__mp_main__
+__mp_main__
+__mp_main__
+__mp_main__
+</code></pre>
+<p>(other output supressed). Explaining that the if decision works.
+When running the executable after cython and compilation is shows</p>
+<pre><code>__main__
+__main__
+__main__
+__main__
+__main__
+__main__
+</code></pre>
+<p>and more and more. Thus the workers call to the module are no longer <code>masqueraded</code> like an import and thus each workers tries to start five new ones in a recursive manner.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>At first I was surprised to see, that your cython version worked somehow, but it is only an appearance of working. However, with some hacking it seems to be possible to make it work. </p>
+<p>I'm on linux, so I use <code>mp.set_start_method('spawn')</code> to simulate the behavior of windows. </p>
+<p>What happens in the <code>spawn</code>-mode? Let's add some <code>sleep</code>s, so we can investigate the processes:</p>
+<pre><code>#bomb.py
+import multiprocessing as mp
+import sys
+import time
+
+def worker():
+    time.sleep(50)
+    print('Worker')
+    return
+
+if __name__ == '__main__':
+        print("Starting...")
+        time.sleep(20)
+        mp.set_start_method('spawn') ## use spawn!
+        jobs = []
+        for i in range(5):
+            p = mp.Process(target=worker)
+            jobs.append(p)
+            p.start()
+</code></pre>
+<p>By using <code>pgrep python</code> we can see that at first there is only one-python process, then 7(!) different <code>pid</code>s. We can see the command-line arguments via <code>cat /proc/&lt;pid&gt;/cmdline</code>. 5 of the new processes have command line</p>
+<pre><code>-c "from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=5, pipe_handle=11)" --multiprocessing-fork
+</code></pre>
+<p>and one:</p>
+<pre><code>-c "from multiprocessing.semaphore_tracker import main;main(4)"
+</code></pre>
+<p>That means, the parent process starts 6 new python interpreter instances and every newly started interpreter executes a code sent from the parent via the command line options, the information is shared via pipes. One of these 6 python-instances is a tracker, which observes the whole thing.</p>
+<p>Ok, what happens if cythonized+embeded? The same as with the normal python, the only difference is that the <code>bomb</code>-executable is started instead of python. But differently as the python-interpreter, it doesn't execute/isn't aware of the command line arguments, so the <code>main</code> function runs over and over and over again.</p>
+<p>There is an easy fix: let the <code>bomb</code>-exe to start the python interpreter</p>
+<pre><code> ...
+ if __name__ == '__main__':
+    mp.set_executable(&lt;PATH TO PYTHON&gt;)
+ ....
+</code></pre>
+<p>Now the <code>bomb</code> is no longer a multiprocessing bomb! </p>
+<p>However, the goal is probably not to have a python-interpreter around, so we need to make our program aware of possible command lines:</p>
+<pre><code>import re
+......
+if __name__ == '__main__':
+    if len(sys.argv)==3:  # should start in semaphore_tracker mode
+        nr=list(map(int, re.findall(r'\d+',sys.argv[2])))          
+        sys.argv[1]='--multiprocessing-fork'   # this canary is needed for multiprocessing module to work   
+        from multiprocessing.semaphore_tracker import main;main(nr[0])
+
+    elif len(sys.argv)&gt;3: # should start in slave mode
+        fd, pipe=map(int, re.findall(r'\d+',sys.argv[2]))
+        print("I'm a slave!, fd=%d, pipe=%d"%(fd,pipe)) 
+        sys.argv[1]='--multiprocessing-fork'   # this canary is needed for multiprocessing module to work  
+        from multiprocessing.spawn import spawn_main; 
+        spawn_main(tracker_fd=fd, pipe_handle=pipe)
+
+    else: #main mode
+        print("Starting...")
+        mp.set_start_method('spawn')
+        jobs = []
+        for i in range(5):
+            p = mp.Process(target=worker)
+            jobs.append(p)
+            p.start()
+</code></pre>
+<p>Now, our bomb doesn't need a stand-alone python-interpreter and stops after the workers are done. Please note the following:</p>
+<ol>
+<li>The way it is decide, in which mode <code>bomb</code> should be started is not very error-safe, but I hope you get the gist</li>
+<li><code>--multiprocessing-fork</code> is just a canary, it doesn't do anything it only must be there, see <a href="https://github.com/python/cpython/blob/bd73e72b4a9f019be514954b1d40e64dc3a5e81c/Lib/multiprocessing/spawn.py#L52" rel="nofollow noreferrer">here</a>.</li>
+</ol>
+<p>I would like to end with a disclaimer: I don't have much experience with multiprocessing-module and none on windows, so I'm not sure this solution should be recommended. But at least it is a funny one:)</p>
+<hr/>
+<p>NB: The changed code can be also used with python, because after executing <code>"from multiprocessing.spawn import spawn_main; spawn_main(tracker_fd=5, pipe_handle=11)" --multiprocessing-fork</code> python changes the <code>sys.argv</code> so the code no longer sees the original command line and <code>len(sys.argv)</code> is <code>1</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Inspired by the answer (or the given ideas there) from <a href="https://stackoverflow.com/users/5769463/ead">ead</a>, I found a very simple solution - or lets better call it workaround.<br/>
+For me just changing the if clause to</p>
+<pre><code>if __name__ == '__main__':
+    if len(sys.argv) == 1:
+        main()
+    else:
+        sys.argv[1] = sys.argv[3]
+        exec(sys.argv[2])
+</code></pre>
+<p>did it.<br/>
+The reason why that works is (in my case):
+When calling the original .py-file the worker's <code>__name__</code> is set to <code>__mp_main__</code> (but all processes are just the plain .py-file).<br/>
+When running the (cython) compiled version the worker's <code>name</code> is not usable, but the workers get called different and thus we can identify them by more that one argument in argv. In my case worker's argv reads</p>
+<pre><code>['MYPROGRAMM.exe',
+ '-c',
+ 'from multiprocessing.spawn import spawn_main;
+       spawn_main(parent_pid=9316, pipe_handle =392)',
+ '--multiprocessing-fork']
+</code></pre>
+<p>Thus in <code>argv[2]</code> the code for activation of the workers is found and gets executed with the upper commands.<br/>
+Of course if you need arguments for your compiled file, you need a bigger effort, maybe parsing for the parent_pid in the call. But in my case, that would simply be overdone.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think based on the detail from the <a href="https://github.com/cython/cython/issues/2014#" rel="nofollow noreferrer">submitted bug report</a>, I can offer the maybe most elegant solution over here</p>
+<pre><code>if __name__ == '__main__':
+    if sys.argv[0][-4:] == '.exe':
+        setattr(sys, 'frozen', True)
+    multiprocessing.freeze_support()
+    YOURMAINROUTINE()
+</code></pre>
+<p>The <code>freeze_support()</code>-call is needed on windows - see <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.freeze_support" rel="nofollow noreferrer">python multiprocessing documentation</a>.<br/>
+If running within python only with that line it is already fine.<br/>
+But somehow cython is obviously not aware of some of those things (the docs tell it is tested with <code>py2exe</code>, <code>PyInstaller</code> and <code>cx_Freeze</code>). It could be alleviated by the <code>setattr</code>-call, which only may be used when compiling, thus the decision by file extension.</p>
+</div>
+<span class="comment-copy">I think this might be worth reporting as a bug (<a href="https://github.com/cython/cython/issues" rel="nofollow noreferrer">github.com/cython/cython/issues</a>).</span>
+<span class="comment-copy">@DavidW Good option - I'll do that exactly now. THX</span>
+<span class="comment-copy">Hi, thank you for the big explaining answer. Looks great, but so sad - does not seem to work. Within my Windooze-Environment in every call <code>len(sys.argv)</code> is 1, thus no way to distict between the calls.</span>
+<span class="comment-copy">@BastianEbeling <code>len(sys.argv)==1</code> is when you try to run with python (see my update in this case) or the cythonized stand-alone version? With which command line are the slave-python processes started, when you run the script in the python-version? And does the <code>mp.set_executable(&lt;PATH TO PYTHON&gt;)</code> - trick work?</span>
+<span class="comment-copy">Hi, <code>len(sys.argv)==1</code> ist always within python, when running compiled it differs. The <i>master</i> is <code>['testprob-20171120_7224581.exe']</code> while the workers are <code>['C:\\Users\\EbelingB\\iFolder\\Programmierung\\python\\testprob-20171120_7224581.exe', '-c', 'from multiprocessing.spawn import spawn_main; spawn_main(parent_pid=9316, pipe_handle =392)', '--multiprocessing-fork']</code>. Thus I can identify the workers what is enough for me for a workaround. I'll post that as a self-answer based on your great ideas. THX</span>
+<span class="comment-copy">Your solution will only work for your minimal/similar examples. As soon as data must be shared between the master and the slaves your work around will break down...</span>
+<span class="comment-copy">@ead oh sad - you are right. I just tested. Do you know, why? What can I do further? (Okay, it is no longer a process-bomp, but non functional. :-( )</span>
+<span class="comment-copy">What is about my solution, which mimics the the right behavior of the python-interpreter? You will need to adjust it for windows (<code>parent_pid</code> instead of <code>fd</code> and <code>pipe_handle</code> instead of <code>pipe</code>), but I think that should set up the communication correctly</span>
+<span class="comment-copy">@ead your solution works - I just needed to understand it. I'm fine with that - but I think it could be done (working for me also with big worker functions) in a more readable (or understandable) fashion - I'll update my answer.</span>

@@ -1,0 +1,147 @@
+<div class="post-text" itemprop="text">
+<p>I am interested in streaming a custom object into a pandas dataframe. According to <a href="https://pandas.pydata.org/pandas-docs/stable/generated/pandas.read_csv.html" rel="nofollow noreferrer">the documentation</a>, any object with a read() method can be used. However, even after implementing this function I am still getting this error: </p>
+<blockquote>
+<p>ValueError: Invalid file path or buffer object type: &lt;class '__main__.DataFile'&gt;</p>
+</blockquote>
+<p>Here is a simple version of the object, and how I am calling it:</p>
+<pre><code>class DataFile(object):
+    def __init__(self, files):
+        self.files = files
+
+    def read(self):
+        for file_name in self.files:
+            with open(file_name, 'r') as file:
+                for line in file:
+                    yield line
+
+import pandas as pd
+hours = ['file1.csv', 'file2.csv', 'file3.csv']
+
+data = DataFile(hours)
+df = pd.read_csv(data)
+</code></pre>
+<p>Am I missing something, or is it just not possible to use a custom generator in Pandas? When I call the read() method it works just fine.</p>
+<p>EDIT:
+The reason I want to use a custom object rather than concatenating the dataframes together is to see if it is possible to reduce memory usage. I have used the <a href="https://radimrehurek.com/gensim/" rel="nofollow noreferrer">gensim</a> library in the past, and it makes it really easy to use custom data objects, so I was hoping to find some similar approach.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The documentation mentions the <code>read</code> method but it's actually checking if it's a <a href="https://github.com/pandas-dev/pandas/blob/v0.20.3/pandas/core/dtypes/inference.py#L140-L177" rel="nofollow noreferrer"><code>is_file_like</code></a> argument (that's where the exception is thrown). That function is actually very simple:</p>
+<pre><code>def is_file_like(obj):
+    if not (hasattr(obj, 'read') or hasattr(obj, 'write')):
+        return False
+    if not hasattr(obj, "__iter__"):
+        return False
+    return True
+</code></pre>
+<p>So it also needs an <code>__iter__</code> method.</p>
+<p>But that's not the only problem. Pandas requires that it actually behaves file-like. So the <code>read</code> method should accept an additional argument for the number of bytes (so you can't make <code>read</code> a generator - because it has to be callable with 2 arguments and should return a string).</p>
+<p>So for example:</p>
+<pre><code>class DataFile(object):
+    def __init__(self, files):
+        self.data = """a b
+1 2
+2 3
+"""
+        self.pos = 0
+
+    def read(self, x):
+        nxt = self.pos + x
+        ret = self.data[self.pos:nxt]
+        self.pos = nxt
+        return ret
+
+    def __iter__(self):
+        yield from self.data.split('\n')
+</code></pre>
+<p>will be recognized as valid input.</p>
+<p>However it's harder for multiple files, I hoped that <a href="https://docs.python.org/3/library/fileinput.html" rel="nofollow noreferrer"><code>fileinput</code></a> could have some appropriate routines but it doesn't seem like it:</p>
+<pre><code>import fileinput
+
+pd.read_csv(fileinput.input([...]))
+# ValueError: Invalid file path or buffer object type: &lt;class 'fileinput.FileInput'&gt;
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>One way to make a file-like object in Python3 by subclassing <a href="https://docs.python.org/3/library/io.html#io.RawIOBase" rel="nofollow noreferrer"><code>io.RawIOBase</code></a>.
+And using <a href="http://stackoverflow.com/a/20260030/190597">Mechanical snail's <code>iterstream</code></a>,
+you can convert <em>any iterable of bytes</em> into a file-like object:</p>
+<pre><code>import tempfile
+import io
+import pandas as pd
+
+def iterstream(iterable, buffer_size=io.DEFAULT_BUFFER_SIZE):
+    """
+    http://stackoverflow.com/a/20260030/190597 (Mechanical snail)
+    Lets you use an iterable (e.g. a generator) that yields bytestrings as a
+    read-only input stream.
+
+    The stream implements Python 3's newer I/O API (available in Python 2's io
+    module).
+
+    For efficiency, the stream is buffered.
+    """
+    class IterStream(io.RawIOBase):
+        def __init__(self):
+            self.leftover = None
+        def readable(self):
+            return True
+        def readinto(self, b):
+            try:
+                l = len(b)  # We're supposed to return at most this much
+                chunk = self.leftover or next(iterable)
+                output, self.leftover = chunk[:l], chunk[l:]
+                b[:len(output)] = output
+                return len(output)
+            except StopIteration:
+                return 0    # indicate EOF
+    return io.BufferedReader(IterStream(), buffer_size=buffer_size)
+
+
+class DataFile(object):
+    def __init__(self, files):
+        self.files = files
+
+    def read(self):
+        for file_name in self.files:
+            with open(file_name, 'rb') as f:
+                for line in f:
+                    yield line
+
+def make_files(num):
+    filenames = []
+    for i in range(num):
+        with tempfile.NamedTemporaryFile(mode='wb', delete=False) as f:
+            f.write(b'''1,2,3\n4,5,6\n''')
+            filenames.append(f.name)
+    return filenames
+
+# hours = ['file1.csv', 'file2.csv', 'file3.csv']
+hours = make_files(3)
+print(hours)
+data = DataFile(hours)
+df = pd.read_csv(iterstream(data.read()), header=None)
+
+print(df)
+</code></pre>
+<p>prints</p>
+<pre><code>   0  1  2
+0  1  2  3
+1  4  5  6
+2  1  2  3
+3  4  5  6
+4  1  2  3
+5  4  5  6
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>How about this alternative approach:</p>
+<pre><code>def get_merged_csv(flist, **kwargs):
+    return pd.concat([pd.read_csv(f, **kwargs) for f in flist], ignore_index=True)
+
+df = get_merged_csv(hours)
+</code></pre>
+</div>
+<span class="comment-copy">Even if this worked as documented, I doubt your <code>read</code> method would work, because generally, <code>read(x)</code> reads <i>x bytes from the buffer</i>. Instead, your <code>read</code> method returns a generator object.</span>
+<span class="comment-copy">I couldn't find the <code>is_file_like</code> function, because the import statement implied it would be at <code>pandas.core.dtypes.common</code>, but it was in <code>pandas.core.dtypes.inference</code> ... weird... Anyway, looking at the actual csv parsing code, I <i>believe</i> that it uses <code>.readline</code> if you pass <code>engine='python'</code></span>
+<span class="comment-copy">Gah! And look what I found in <code>pandas.core.dtypes.common</code>: <code>from .inference import *  # noqa</code> Yes, no quality-assurance indeed...</span>
+<span class="comment-copy">hm, I just used <code>pd.io.common.is_file_like.__module__</code> (the <code>pd.io.common</code> was the module where the function was called). :)</span>

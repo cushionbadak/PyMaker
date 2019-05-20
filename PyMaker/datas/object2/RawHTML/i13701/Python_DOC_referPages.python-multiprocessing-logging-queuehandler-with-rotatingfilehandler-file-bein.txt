@@ -1,0 +1,75 @@
+<div class="post-text" itemprop="text">
+<p>I'm converting a program to multiprocessing and need to be able to log to a single rotating log from the main process as well as subprocesses. I'm trying to use the 2nd example in the python cookbook <a href="https://docs.python.org/3/howto/logging-cookbook.html#logging-to-a-single-file-from-multiple-processes" rel="nofollow">Logging to a single file from multiple processes</a>, which starts a <code>logger_thread</code> running as part of the main process, picking up log messages off a queue that the subprocesses add to. The example works well as is, and also works if I switch to a RotatingFileHandler.</p>
+<p>However if I change it to start <code>logger_thread</code> before the subprocesses (so that I can log from the main process as well), then as soon as the log rotates, all subsequent logging generates a traceback with <code>WindowsError: [Error 32] The process cannot access the file because it is being used by another process</code>.</p>
+<p>In other words I change this code from the 2nd example</p>
+<pre><code>workers = []
+for i in range(5):
+    wp = Process(target=worker_process, name='worker %d' % (i + 1), args=(q,))
+    workers.append(wp)
+    wp.start()
+logging.config.dictConfig(d)
+lp = threading.Thread(target=logger_thread, args=(q,))
+lp.start()
+</code></pre>
+<p>to this:</p>
+<pre><code>logging.config.dictConfig(d)
+lp = threading.Thread(target=logger_thread, args=(q,))
+lp.start()
+workers = []
+for i in range(5):
+    wp = Process(target=worker_process, name='worker %d' % (i + 1), args=(q,))
+    workers.append(wp)
+    wp.start()
+</code></pre>
+<p>and swap out <code>logging.FileHandler</code> for <code>logging.handlers.RotatingFileHandler</code> (with a very small <code>maxBytes</code> for testing) and then I hit this error.</p>
+<p>I'm using Windows and python 2.7. <code>QueueHandler</code> is not part of stdlib til python 3.2 but I've copied the source code from <a href="https://gist.github.com/vsajip/591589" rel="nofollow">Gist</a>, which it says is safe to do.</p>
+<p>I don't understand why starting the listener first would make any difference, nor do I understand why any process other than main would be attempting to access the file. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You should never start <em>any</em> threads before subprocesses.  When Python forks, the threads and IPC state will not always be copied properly.</p>
+<p>There are several resources on this, just google for fork and threads.  Some people claim they can do it, but it's not clear to me that it can ever work properly.</p>
+<p>Just start all your processes first.</p>
+<p>Example additional information:</p>
+<p><a href="https://stackoverflow.com/questions/12984003/status-of-mixing-multiprocessing-and-threading-in-python">Status of mixing multiprocessing and threading in Python</a></p>
+<p><a href="https://stackoverflow.com/a/6079669/4279">https://stackoverflow.com/a/6079669/4279</a></p>
+<p>In your case, it might be that the copied open file handle is the problem, but you still should start your subprocesses before your threads (and before you open any files that you will later want to destroy).</p>
+<p>Some rules of thumb, summarized by fantabolous from the comments:</p>
+<ul>
+<li><p>Subprocesses must always be started before any threads created by the same process.</p></li>
+<li><p>multiprocessing.Pool creates both subprocesses AND threads, so one mustn't create additional Processes or Pools after the first one.</p></li>
+<li><p>Files should not already be open at the time a Process or Pool is created.  (This is OK in some cases, but not, e.g. if a file will be deleted later.)</p></li>
+<li><p>Subprocesses can create their own threads and processes, with the same rules above applying.</p></li>
+<li><p>Starting all processes first is the easiest way to do this</p></li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>So, you can simply make your own file log handler. I have yet to see logs getting garbled from multiprocessing, so it seems file log rotation is the big issue. Just do this in your main, and you don't have to change any of the rest of your logging</p>
+<pre><code>import logging
+import logging.handlers
+from multiprocessing import RLock
+
+class MultiprocessRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    def __init__(self, *kargs, **kwargs):
+        super(MultiprocessRotatingFileHandler, self).__init__(*kargs, **kwargs)
+        self.lock = RLock()
+
+    def shouldRollover(self, record):
+        with self.lock:
+            super(MultiprocessRotatingFileHandler, self).shouldRollover(record)
+
+file_log_path = os.path.join('var','log', os.path.basename(__file__) + '.log')
+file_log = MultiprocessRotatingFileHandler(file_log_path,
+                                           maxBytes=8*1000*1024,
+                                           backupCount=5,
+                                           delay=True)
+
+logging.basicConfig(level=logging.DEBUG)
+logging.addHandler(file_log)
+</code></pre>
+<p>I'm willing to guess that locking every time you try to rotate is probably slowing down logging, but then this is a case where we need to sacrifice performance for correctness.</p>
+</div>
+<span class="comment-copy">It's only files that you have open when you start the subprocess.  Opening, then closing immediately is no problem.  But, you can also close open file handles as part of the subprocess.  Perhaps consider doing a lot less in your main process, and moving even the logging to a subprocess.</span>
+<span class="comment-copy">Sorry, I don't know multiprocessing internals, but yeah, if its <a href="http://stackoverflow.com/a/24771322/3577601">async processing threads</a> are still running, I wouldn't create additional processes.  Maybe the main process should create a proxy process before it builds its pool, and then use the proxy process to create any additional one-off processes later, or maybe you move the pool creation itself into a subprocess.</span>
+<span class="comment-copy">It might be cleanest to have a "no threads" rule in the top level process, which would mean that you don't use multiprocessing.pool there.</span>
+<span class="comment-copy">That's the good rule of thumb.  In reality, you shouldn't have any threads except the main one running when you start a process; starting all processes first is the easy way to achieve this.</span>
+<span class="comment-copy">I couldn't undo the 5-people rejection on your edit, so I did it manually...</span>

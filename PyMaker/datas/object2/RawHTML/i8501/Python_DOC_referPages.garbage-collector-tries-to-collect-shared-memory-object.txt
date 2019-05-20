@@ -1,0 +1,159 @@
+<div class="post-text" itemprop="text">
+<p>I've got two Python scripts that both should do essentially the same thing: grab a large object in memory, then fork a bunch of children. The first script uses bare <code>os.fork</code>:</p>
+<pre class="lang-python prettyprint-override"><code>import time
+import signal
+import os
+import gc
+
+gc.set_debug(gc.DEBUG_STATS)
+
+
+class GracefulExit(Exception):
+    pass
+
+
+def child(i):
+    def exit(sig, frame):
+        raise GracefulExit("{} out".format(i))
+
+    signal.signal(signal.SIGTERM, exit)
+    while True:
+        time.sleep(1)
+
+
+if __name__ == '__main__':
+    workers = []
+
+    d = {}
+    for i in xrange(30000000):
+        d[i] = i
+
+    for i in range(5):
+        pid = os.fork()
+        if pid == 0:
+            child(i)
+        else:
+            print pid
+            workers.append(pid)
+
+    while True:
+        wpid, status = os.waitpid(-1, os.WNOHANG)
+        if wpid:
+            print wpid, status
+        time.sleep(1)
+</code></pre>
+<p>The second script uses <code>multiprocessing</code> module. I'm running both on Linux (Ubuntu 14.04), so it should use <code>os.fork</code> under the hood too, as <a href="https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods" rel="nofollow noreferrer">documentation</a> states:</p>
+<pre class="lang-python prettyprint-override"><code>import multiprocessing
+import time
+import signal
+import gc
+
+gc.set_debug(gc.DEBUG_STATS)
+
+
+class GracefulExit(Exception):
+    pass
+
+
+def child(i):
+    def exit(sig, frame):
+        raise GracefulExit("{} out".format(i))
+
+    signal.signal(signal.SIGTERM, exit)
+    while True:
+        time.sleep(1)
+
+
+if __name__ == '__main__':
+    workers = []
+
+    d = {}
+    for i in xrange(30000000):
+        d[i] = i
+
+    for i in range(5):
+        p = multiprocessing.Process(target=child, args=(i,))
+        p.start()
+        print p.pid
+        workers.append(p)
+
+    while True:
+        for worker in workers:
+            if not worker.is_alive():
+                worker.join()
+        time.sleep(1)
+</code></pre>
+<p>The difference between those two scripts is the following: when I kill a child (sending a SIGTERM), bare-fork script tries to garbagecollect the shared dictionary, despite the fact that it is still referenced by parent process and isn't actually copied into child's memory (because of copy-on-write)</p>
+<pre><code>kill &lt;pid&gt;
+
+Traceback (most recent call last):
+  File "test_mp_fork.py", line 33, in &lt;module&gt;
+    child(i)
+  File "test_mp_fork.py", line 19, in child
+    time.sleep(1)
+  File "test_mp_fork.py", line 15, in exit
+    raise GracefulExit("{} out".format(i))
+__main__.GracefulExit: 3 out
+gc: collecting generation 2...
+gc: objects in each generation: 521 3156 0
+gc: done, 0.0024s elapsed.
+</code></pre>
+<p>(<code>perf record -e page-faults -g -p &lt;pid&gt;</code> output:)</p>
+<pre><code>+  99,64%  python  python2.7           [.] PyInt_ClearFreeList
++   0,15%  python  libc-2.19.so        [.] vfprintf
++   0,09%  python  python2.7           [.] 0x0000000000144e90
++   0,06%  python  libc-2.19.so        [.] strlen
++   0,05%  python  python2.7           [.] PyArg_ParseTupleAndKeywords
++   0,00%  python  python2.7           [.] PyEval_EvalFrameEx
++   0,00%  python  python2.7           [.] Py_AddPendingCall
++   0,00%  python  libpthread-2.19.so  [.] sem_trywait
++   0,00%  python  libpthread-2.19.so  [.] __errno_location
+</code></pre>
+<p>While multiprocessing-based script does no such thing:</p>
+<pre><code>kill &lt;pid&gt;
+
+Process Process-3:
+Traceback (most recent call last):
+  File "/usr/lib/python2.7/multiprocessing/process.py", line 258, in _bootstrap
+    self.run()
+  File "/usr/lib/python2.7/multiprocessing/process.py", line 114, in run
+    self._target(*self._args, **self._kwargs)
+  File "test_mp.py", line 19, in child
+    time.sleep(1)
+  File "test_mp.py", line 15, in exit
+    raise GracefulExit("{} out".format(i))
+GracefulExit: 2 out
+</code></pre>
+<p>(<code>perf record -e page-faults -g -p &lt;pid&gt;</code> output:)</p>
+<pre><code>+  62,96%  python  python2.7           [.] 0x0000000000047a5b
++  32,28%  python  python2.7           [.] PyString_Format
++   2,65%  python  python2.7           [.] Py_BuildValue
++   1,06%  python  python2.7           [.] PyEval_GetFrame
++   0,53%  python  python2.7           [.] Py_AddPendingCall
++   0,53%  python  libpthread-2.19.so  [.] sem_trywait
+</code></pre>
+<p>I can also <em>force</em> the same behavior on multiprocessing-based script by explicitly calling <code>gc.collect()</code> before raising <code>GracefulExit</code>. Curiously enough, the reverse is not true: calling <code>gc.disable(); gc.set_threshold(0)</code> in bare-fork script doesn't help to get rid of <code>PyInt_ClearFreeList</code> calls.</p>
+<p>To the actual questions:</p>
+<ul>
+<li>Why is this happening? I sort of understand why python would like to free all the allocated memory on process exit, ignoring the fact that the child process doesn't physically own it, but how come multiprocessing module doesn't do the same?</li>
+<li>I'd like to achieve second-script-like behavior (i.e.: not trying to free the memory which has been allocated by a parent process) with bare-fork solution (mainly because I use a third-party process manager library which doesn't use multiprocessing); how could I possibly do that?</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>Couple things</p>
+<ul>
+<li><p>In python, multiple python <em>processes</em> means multiple interpreters with their own GIL, GC et al</p></li>
+<li><p>The <code>d</code> dictionary is not passed in as an argument to the process, it is a globally shared variable. </p></li>
+</ul>
+<p>The reason it gets collected is because each process thinks its the only one holding a reference to it which, strictly speaking, is true as it's a single globally shared object reference to the dictionary. </p>
+<p>When Python GC checks it, it checks the ref counter for that object. Since there is only the one shared reference, removing that would mean <code>ref count == 0</code>, so it gets collected.</p>
+<p>To resolve the issue, <code>d</code> should be passed into each forked process, making each process hold its own reference to it.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Multiprocessing behaves differently because it uses <code>os._exit</code> which doesn't call exit handler, which, apparently, involves garbage collection (<a href="https://stackoverflow.com/questions/5422831/what-is-the-difference-between-using-exit-exit-in-a-conventional-linux-fo" title="wat">more on the topic</a>). Explicitly calling <code>os._exit</code> in bare-fork version of the script achieves the same result.</p>
+</div>
+<span class="comment-copy">This doesn't explain multiprocessing-based script <i>not</i> performing garbage collection, though.</span>
+<span class="comment-copy">Yes, it does. <code>d</code> is a shared variable in the forked process by <code>os.fork</code> while it does not exist in the process spawned by <code>multiprocessing</code> and therefore cannot be collected.</span>
+<span class="comment-copy">This isn't true, because multiprocessing performs <code>os.fork</code> on Unix. You can add a line to the child's code, just after <code>time.sleep(1)</code>, something like <code>print d[0]</code> and see for yourself that <code>d</code> is accessible.</span>
+<span class="comment-copy">Not quite. You can see exactly what <code>multiprocessing</code> is doing in <code>&lt;python libdir&gt;/multiprocessing/forking.py</code>. It does use <code>os.fork</code>, however it does more things before it forks. See <code>prepare</code> function. The reference to <code>d</code> in the process spawned by multiprocessing is not the same reference to <code>d</code> in the main process, unlike the bare fork.</span>
+<span class="comment-copy">I've added a debug print in <code>prepare</code> and it isn't even being called. <code>Process.start</code> calls <code>multiprocessing.forking.Popen.__init__</code>, which does the forking, then calls <code>process_instance._bootstrap</code>. There are a couple of extra calls here, bit I cannot see anything related to "the reference to <code>d</code> is not the same" you mention, can you point it out for me? Also, if I add <code>print id(d)</code> in both parent and children, it prints the same id. Doesn't it mean the reference is the same?</span>

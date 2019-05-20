@@ -1,0 +1,107 @@
+<div class="post-text" itemprop="text">
+<p>I wish to read several log files as they are written and process their input with asyncio. The code will have to run on windows. From what I understand from searching around both stackoverflow and the web, asynchronous file I/O is tricky on most operating systems (<code>select</code> will not work as intended, for example). While I'm sure I could do this with other methods (e.g. threads), I though I would try out asyncio to see what it is like. The most helpful answer would probably be one that describes what the "architecture" of a solution to this problem should look like, i.e. how different functions and coroutines should be called or scheduled.</p>
+<p>The following gives me a generator that reads the files line by line (through polling, which is acceptable):</p>
+<pre><code>import time
+
+def line_reader(f):
+    while True:
+        line = f.readline()
+        if not line:
+            time.sleep(POLL_INTERVAL)
+            continue
+        process_line(line)
+</code></pre>
+<p>With several files to monitor and process, this sort of code would require threads. I have modified it slightly to be more usable with asyncio:</p>
+<pre><code>import asyncio
+
+def line_reader(f):
+    while True:
+        line = f.readline()
+        if not line:
+            yield from asyncio.sleep(POLL_INTERVAL)
+            continue
+        process_line(line)
+</code></pre>
+<p>This sort of works when I schedule it through the asyncio event loop, but if <code>process_data</code> blocks, then that is of course not good. When starting out, I imagined the solution would look something like</p>
+<pre><code>def process_data():
+    ...
+    while True:
+        ...
+        line = yield from line_reader()
+        ...
+</code></pre>
+<p>but I could not figure out how to make that work (at least not without <code>process_data</code> managing quite a bit of state).</p>
+<p>Any ideas on how I should structure this kind of code?</p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>From what I understand from searching around both stackoverflow and the web, asynchronous file I/O is tricky on most operating systems (select will not work as intended, for example). While I'm sure I could do this with other methods (e.g. threads), I though I would try out asyncio to see what it is like.</p>
+</blockquote>
+<p><code>asyncio</code> <em>is</em> <code>select</code> based on *nix systems under the hood, so you won't be able to do non-blocking file I/O without the use of threads. On Windows, <code>asyncio</code> can use <a href="https://msdn.microsoft.com/en-us/library/windows/desktop/aa365198%28v=vs.85%29.aspx">IOCP</a>, which supports non-blocking file I/O, but this isn't supported by <code>asyncio</code>.</p>
+<p>Your code is fine, except you should do blocking I/O calls in threads, so that you don't block the event loop if the I/O is slow. Fortunately, it's really simple to off load work to threads using the <code>loop.run_in_executor</code> function.</p>
+<p>First, setup a dedicated thread-pool for your I/O:</p>
+<pre><code>from concurrent.futures import ThreadPoolExecutor
+io_pool_exc = ThreadPoolExecutor()
+</code></pre>
+<p>And then simply offload any blocking I/O calls to the executor:</p>
+<pre><code>...
+line = yield from loop.run_in_executor(io_pool_exc, f.readline)
+...
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Using the <a href="https://github.com/Tinche/aiofiles" rel="nofollow noreferrer">aiofiles</a>:</p>
+<pre><code>async with aiofiles.open('filename', mode='r') as f:
+    async for line in f:
+        print(line)
+</code></pre>
+<p><strong>EDIT 1</strong></p>
+<p>As the @Jashandeep mentioned, you should care about blocking operations:</p>
+<p>Another method is <code>select</code> and or <code>epoll</code>:</p>
+<pre><code>from select import select
+
+files_to_read, files_to_write, exceptions = select([f1, f2], [f1, f2], [f1, f2], timeout=.1)
+</code></pre>
+<p>The <code>timeout</code> parameter is important here.</p>
+<p>see: <a href="https://docs.python.org/3/library/select.html#select.select" rel="nofollow noreferrer">https://docs.python.org/3/library/select.html#select.select</a></p>
+<p><strong>EDIT 2</strong></p>
+<p>You can register a file for read/write with: <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.AbstractEventLoop.add_reader" rel="nofollow noreferrer">loop.add_reader()</a></p>
+<p>It uses internal EPOLL Handler inside the loop.</p>
+<p><strong>EDIT 3</strong> </p>
+<p>But remember the Epoll will not work with regular files.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your code structure looks good to me, the following code runs fine on my machine:</p>
+<pre><code>import asyncio
+
+PERIOD = 0.5
+
+@asyncio.coroutine
+def readline(f):
+    while True:
+        data = f.readline()
+        if data:
+            return data
+        yield from asyncio.sleep(PERIOD)
+
+@asyncio.coroutine
+def test():
+    with open('test.txt') as f:
+        while True:
+            line = yield from readline(f)
+            print('Got: {!r}'.format(line))
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(test())
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>asyncio</code> doesn't support file operations yet, sorry.</p>
+<p>Thus it cannot help with your problem.</p>
+</div>
+<span class="comment-copy">I have tested the topmost version of the code, and that is able to read changes to the file.</span>
+<span class="comment-copy">That looks good! I had missed that I should open the file in the function you have named <code>test</code>, and that fixes my headaches. Thanks!</span>
+<span class="comment-copy">I think that's misleading a little - you are not actually offloading the read itself. You are just doing the <code>sleep</code> asynchronously. IIUC.</span>
+<span class="comment-copy">@guyarad You're absolutely right. That answer was simply about fixing OP's code. Maybe I'll delete it.</span>
+<span class="comment-copy">Yes, but to be more constructive, I can approve the method: <code>loop.add_reader</code> (Sharing EPOLL handler inside the loop) is enough to read a file chunk by chunk without blocking the entire thread and achieve the maximum performance, So I disagree with you, Python supports reading files in asyncio manner with some limitations.</span>
+<span class="comment-copy">EPOLL doesn't support regular files on Linux</span>

@@ -1,0 +1,105 @@
+<div class="post-text" itemprop="text">
+<h2>My practice now:</h2>
+<hr/>
+<p>I let my backend to catch the <strong>get request</strong> sent by the front-end page  to run my scrapy spider, everytime the page is refreshed or loaded. The crawled data will be shown in my front page. Here's the code, I call a <strong>subprocess</strong> to run the spider:</p>
+<pre><code>from subprocess import run
+
+@get('/api/get_presentcode')
+def api_get_presentcode():
+    if os.path.exists("/static/presentcodes.json"):
+        run("rm presentcodes.json", shell=True)
+
+    run("scrapy crawl presentcodespider -o ../static/presentcodes.json", shell=True, cwd="./presentcodeSpider")
+    with open("/static/presentcodes.json") as data_file:
+        data = json.load(data_file)
+
+    logging.info(data)
+    return data
+</code></pre>
+<p>It works well.</p>
+<h2>What I want:</h2>
+<hr/>
+<p>However, the spider crawls a website which barely changes, so it's no need to crawl that often. </p>
+<p>So I want to run my scrapy spider every 30 minutes using the <strong>coroutine</strong> method just at backend.</p>
+<h2>What I tried and succeeded:</h2>
+<hr/>
+<pre><code>from subprocess import run
+
+# init of my web application
+async def init(loop):
+....
+
+async def run_spider():
+    while True:
+        print("Run spider...")
+        await asyncio.sleep(10)  #  to check results more obviously 
+
+loop = asyncio.get_event_loop()
+tasks = [run_spider(), init(loop)]
+loop.run_until_complete(asyncio.wait(tasks))
+loop.run_forever()
+</code></pre>
+<p>It works well too.</p>
+<p>But when I change the codes of <code>run_spider()</code> into this (which is basically the same as the first one):</p>
+<pre><code>async def run_spider():
+    while True:
+        if os.path.exists("/static/presentcodes.json"):
+            run("rm presentcodes.json", shell=True)
+
+        run("scrapy crawl presentcodespider -o ../static/presentcodes.json", shell=True, cwd="./presentcodeSpider")
+        await asyncio.sleep(20)
+</code></pre>
+<p>the spider was run only at the first time and crawled data was stored to <em>presentcode.json</em> successfully, but the spider never called after 20 seconds later.</p>
+<h3>Questions</h3>
+<hr/>
+<ol>
+<li><p>What's wrong with my program? Is it because I called a <strong>subprocess</strong> in a <strong>coroutine</strong> and it is invalid?</p></li>
+<li><p>Any better thoughts to run a spider while the main application is running?</p></li>
+</ol>
+<h2>Edit:</h2>
+<hr/>
+<p>Let me put the code of my web app init function here first:</p>
+<pre><code>async def init(loop):
+    logging.info("App started at {0}".format(datetime.now()))
+    await orm.create_pool(loop=loop, user='root', password='', db='myBlog')
+    app = web.Application(loop=loop, middlewares=[
+        logger_factory, auth_factory, response_factory
+    ])
+    init_jinja2(app, filters=dict(datetime=datetime_filter))
+    add_routes(app, 'handlers')
+    add_static(app)
+    srv = await loop.create_server(app.make_handler(), '127.0.0.1', 9000)  # It seems something happened here.
+    logging.info('server started at http://127.0.0.1:9000') # this log didn't show up.
+    return srv
+</code></pre>
+<p>My thought is, the main app made coroutine event loop 'stuck' so the spider cannot be callback later after. </p>
+<p>Let me check the source code of <code>create_server</code> and <code>run_until_complete</code>..</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Probably not a complete answer, and I would not do it like you do. But calling <code>subprocess</code> from within an <code>asyncio</code> coroutine is definitely not correct. Coroutines offer <em>cooperative multitasking</em>, so when you call <code>subprocess</code> from within a coroutine, that coroutine effectively stops your whole app until called process is finished.</p>
+<p>One thing you need to understand when working with <code>asyncio</code> is that control flow can be switched from one coroutine to another only when you call <code>await</code> (or <code>yield from</code>, or <code>async for</code>, <code>async with</code> and other shortcuts). If you do some long action without calling any of those then you block any other coroutines until this action is finished.</p>
+<p>What you need to use is <a href="https://docs.python.org/3/library/asyncio-subprocess.html" rel="nofollow noreferrer"><code>asyncio.subprocess</code></a> which will properly return control flow to other parts of your application (namely webserver) while the subprocess is running.</p>
+<p>Here is how actual <code>run_spider()</code> coroutine could look:</p>
+<pre><code>import asyncio
+
+async def run_spider():
+    while True:
+        sp = await asyncio.subprocess.create_subprocess_shell(
+            "scrapy srawl presentcodespider -o ../static/presentcodes.new.json",
+            cwd="./presentcodeSpider")
+        code = await sp.wait()
+        if code != 0:
+            print("Warning: something went wrong, code %d" % code)
+            continue  # retry immediately
+        if os.path.exists("/static/presentcodes.new.json"):
+            # output was created, overwrite older version (if any)
+            os.rename("/static/presentcodes.new.json", "/static/presentcodes.json")
+        else:
+            print("Warning: output file was not found")
+
+        await asyncio.sleep(20)
+</code></pre>
+</div>
+<span class="comment-copy">This is a Python/async question. Not a scrapy one :) On the principles, don't do <code>rm</code> and then <code>scrapy crawl</code> because then you will have some time where there will be no file and your requests will be failing. Do the <code>scrapy crawl</code> first writing to a temp file e.g. <code>/static/presentcodes.json.tmp</code> and then do an <code>mv /static/presentcodes.json.tmp /static/presentcodes.json</code> which is atomic-<a href="http://stackoverflow.com/questions/18706419/is-a-move-operation-in-unix-atomic">ish</a></span>
+<span class="comment-copy">@neverlastn You mean which <i>request</i> will be failing? The REST get request from web page? Actually, I'm not using request now, I am just making the <i>main web application</i> and <i>spider</i> run at same time. The file reading and data showing at frontend page will be considered later, now they are both "commented".  Anyway, I will try your solution first, thanks!</span>
+<span class="comment-copy">Exactly, you're right! Nothing failing now but with <code>rm</code>+<code>crawl</code> you will have moments of unavailability as soon as you try to do anything with that file (unless you have relatively complex synchronization)</span>

@@ -1,0 +1,185 @@
+<div class="post-text" itemprop="text">
+<p>I have to implement a search function which will be fault tolerant.<br/>
+Currently, I have the following situation:</p>
+<p><strong><em>Models:</em></strong></p>
+<pre><code>class Tag(models.Model):
+    name = models.CharField(max_length=255)
+
+class Illustration(models.Model):
+    name = models.CharField(max_length=255)
+    tags = models.ManyToManyField(Tag)
+</code></pre>
+<p><strong><em>Query:</em></strong></p>
+<pre><code>queryset.annotate(similarity=TrigramSimilarity('name', fulltext) + TrigramSimilarity('tags__name', fulltext))
+</code></pre>
+<p><strong><em>Example data:</em></strong></p>
+<p>Illustrations:</p>
+<pre><code>ID |  Name  |        Tags       |
+---|--------|-------------------|
+ 1 | "Dog"  | "Animal", "Brown" |
+ 2 | "Cat"  | "Animals"         |
+</code></pre>
+<p>Illustration has Tags:</p>
+<pre><code>ID_Illustration | ID_Tag |
+----------------|--------|
+       1        |    1   |
+       1        |    2   |
+       2        |    3   |
+</code></pre>
+<p>Tags:</p>
+<pre><code>ID_Tag |   Name   |
+-------|----------|
+   1   |  Animal  |
+   2   |  Brown   |
+   3   |  Animals |
+</code></pre>
+<p>When I run the query with <code>"Animal"</code>, the similarity for <code>"Dog"</code> should be higher than for <code>"Cat"</code>, as it is a perfect match.<br/>
+Unfortunately, both tags are considered together somehow.<br/>
+Currently, it looks like it's concatenating the tags in a single string and then checks for similarity:</p>
+<pre><code>TrigramSimilarity("Animal Brown", "Animal") =&gt; X
+</code></pre>
+<p>But I would like to adjust it in a way that I will get the highest similarity between an <code>Illustration</code> instance name and its tags:</p>
+<pre><code>Max([
+    TrigramSimilarity('Name', "Animal"), 
+    TrigramSimilarity("Tag_1", "Animal"), 
+    TrigramSimilarity("Tag_2", "Animal"),
+]) =&gt; X
+</code></pre>
+<hr/>
+<p>Edit1: I'm trying to query all Illustration, where either the title or one of the tags has a similarity bigger than X.</p>
+<p>Edit2: Additional example:</p>
+<blockquote>
+<p>fulltext = 'Animal'</p>
+<p>TrigramSimilarity('Animal Brown', fulltext) =&gt; x
+  TrigramSimilarity('Animals', fulltext) =&gt; y</p>
+<p>Where x &lt; y</p>
+<p>But what I want is actually</p>
+<p>TrigramSimilarity(Max(['Animal', 'Brown]), fulltext) =&gt; x (Similarity
+  to Animal) TrigramSimilarity('Animals', fulltext) =&gt; y</p>
+<p>Where x &gt; y</p>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<p>You cannot break up the <code>tags__name</code> (at least I don't know a way).<br/> 
+From your examples, I can assume 2 possible solutions (1st solution is not strictly using Django):</p>
+<hr/>
+<ol>
+<li><p><strong>Not everything needs to pass strictly through Django</strong><br/>
+We have Python powers, so let's use them:</p>
+<p>Let us compose the query first:</p>
+<pre><code>from difflib import SequenceMatcher
+
+from django.db.models import Q
+
+def create_query(fulltext):
+    illustration_names = Illustration.objects.values_list('name', flat=True)
+    tag_names = Tag.objects.values_list('name', flat=True)
+    query = []
+
+    for name in illustration_names:
+        score = SequenceMatcher(None, name, fulltext).ratio()
+        if score == 1:
+            # Perfect Match for name
+            return [Q(name=name)]
+
+         if score &gt;= THRESHOLD:
+            query.append(Q(name=name))
+
+    for name in tag_names:
+        score = SequenceMatcher(None, name, fulltext).ratio()
+        if score == 1:
+            # Perfect Match for name
+            return [Q(tags__name=name)]
+
+         if score &gt;= THRESHOLD:
+            query.append(Q(tags__name=name))
+
+    return query
+</code></pre>
+<p>Then to create your queryset:</p>
+<pre><code>from functools import reduce # Needed only in python 3
+from operator import or_
+
+queryset = Illustration.objects.filter(reduce(or_, create_query(fulltext)))
+</code></pre>
+<p><strong>Decode the above:</strong></p>
+<p><em>We are checking every <code>Illustration</code> and <code>Tag</code> name against our <code>fulltext</code> and we are composing a query with every name that it's similarity passes the <code>THRESHOLD</code>.</em></p>
+<ul>
+<li><a href="https://docs.python.org/3/library/difflib.html#difflib.SequenceMatcher" rel="nofollow noreferrer"><code>SequenceMatcher</code></a> method compares sequences and returns a ratio <code>0 &lt; ratio &lt; 1</code> where 0 indicates <strong>No-Match</strong> and 1 indicates <strong>Perfect-Match</strong>. Check this answer for another usage example: <a href="https://stackoverflow.com/questions/17388213/find-the-similarity-percent-between-two-strings">Find the similarity percent between two strings</a> (<em>Note:</em> There are other strings comparing modules as well, find one that suits you)</li>
+<li><a href="https://docs.djangoproject.com/en/2.0/ref/models/querysets/#django.db.models.Q" rel="nofollow noreferrer"><code>Q()</code></a> Django objects, allow the creation of complex queries (more on the linked docs).</li>
+<li>With the <a href="https://docs.python.org/3/library/operator.html#module-operator" rel="nofollow noreferrer"><code>operator</code></a> and <a href="https://docs.python.org/3.0/library/functools.html#functools.reduce" rel="nofollow noreferrer"><code>reduce</code></a> we transform a list of <code>Q()</code> objects to an OR separated query argument: <br/><code>Q(name=name_1) | Q(name=name_2) | ... | Q(tag_name=tag_name_1) | ...</code><br/><br/></li>
+</ul>
+<p><strong>Note:</strong>
+You need to define an acceptable <code>THRESHOLD</code>.<br/>
+As you can imagine this will be a bit slow but it is to be expected when you need to do a "fuzzy" search. </p></li>
+</ol>
+<hr/>
+<ol start="2">
+<li><p><strong>(The Django Way:)</strong> <br/>Use a query with a high similarity threshold and order the queryset by this similarity rate:  </p>
+<pre><code>queryset.annotate(
+    similarity=Greatest(
+        TrigramSimilarity('name', fulltext), 
+        TrigramSimilarity('tags__name', fulltext)
+    )).filter(similarity__gte=threshold).order_by('-similarity')
+</code></pre>
+<p><strong>Decode the above:</strong></p>
+<ul>
+<li><a href="https://docs.djangoproject.com/en/2.0/ref/models/database-functions/#greatest" rel="nofollow noreferrer"><code>Greatest()</code></a> accepts an aggregation (not to be confused with the Django method <code>aggregate</code>) of expressions or of model fields and returns the max item.</li>
+<li><code>TrigramSimilarity(word, search)</code> returns a rate between 0 and 1. The closer the rate is to 1, the more similar the <code>word</code> is to <code>search</code>.</li>
+<li><code>.filter(similarity__gte=threshold)</code>, will filter similarities lower than the <code>threshold</code>.</li>
+<li><code>0 &lt; threshold &lt; 1</code>. You can set the threshold to <code>0.6</code> which is pretty high (consider that the default is <code>0.3</code>). <strong>You can play around with that to tune your performance.</strong></li>
+<li>Finally, order the queryset by the <code>similarity</code> rate in a descending order.<br/></li>
+</ul></li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<p>I solved it using only <a href="https://docs.djangoproject.com/en/dev/ref/contrib/postgres/search/#trigramsimilarity" rel="nofollow noreferrer">TrigramSimilarity</a>, <a href="https://docs.djangoproject.com/en/dev/ref/models/querysets/#max" rel="nofollow noreferrer">Max</a> and <a href="https://docs.djangoproject.com/en/dev/ref/models/database-functions/#greatest" rel="nofollow noreferrer">Greatest</a>.</p>
+<p><em>I populated some data as in your question:</em></p>
+<pre><code>from illustrations.models import Illustration, Tag
+Tag.objects.bulk_create([Tag(name=t) for t in ['Animal', 'Brown', 'Animals']])
+Illustration.objects.bulk_create([Illustration(name=t) for t in ['Dog', 'Cat']])
+dog=Illustration.objects.get(name='Dog')
+cat=Illustration.objects.get(name='Cat')
+animal=Tag.objects.get(name='Animal')
+brown=Tag.objects.get(name='Brown')
+animals=Tag.objects.get(name='Animals')
+dog.tags.add(animal, brown)
+cat.tags.add(animals)
+</code></pre>
+<p><em>I imported all necessary functions and initialized <code>fulltext</code>:</em></p>
+<pre><code>from illustrations.models import Illustration
+from django.contrib.postgres.search import TrigramSimilarity
+from django.db.models.functions import Greatest
+from django.db.models import Max
+fulltext = 'Animal'
+</code></pre>
+<p><strong>Then I executed the query:</strong></p>
+<pre><code>Illustration.objects.annotate(
+    max_similarity=Greatest(
+        Max(TrigramSimilarity('tags__name', fulltext)),
+        TrigramSimilarity('name', fulltext)
+    )
+).values('name', 'max_similarity')
+</code></pre>
+<p><strong>With this results:</strong></p>
+<pre><code>&lt;QuerySet [{'name': 'Dog', 'max_similarity': 1.0}, {'name': 'Cat', 'max_similarity': 0.666667}]&gt;
+</code></pre>
+<p><em>This is the SQL query exceuted from PostgreSQL:</em></p>
+<pre><code>SELECT "illustrations_illustration"."name", GREATEST(MAX(SIMILARITY("illustrations_tag"."name", 'Animal')), SIMILARITY("illustrations_illustration"."name", 'Animal')) AS "max_similarity"
+FROM "illustrations_illustration"
+LEFT OUTER JOIN "illustrations_illustration_tags" ON ("illustrations_illustration"."id" = "illustrations_illustration_tags"."illustration_id")
+LEFT OUTER JOIN "illustrations_tag" ON ("illustrations_illustration_tags"."tag_id" = "illustrations_tag"."id")
+GROUP BY "illustrations_illustration"."id", SIMILARITY("illustrations_illustration"."name", 'Animal')
+</code></pre>
+<p>You can use the <code>max_similarity</code> annotation to filter or order your results.</p>
+</div>
+<span class="comment-copy">Can you precise from which model you are doing the queryset? Also, what are those example data ? the name+id of the illustration and the tags ?</span>
+<span class="comment-copy">Question adjusted</span>
+<span class="comment-copy">Edit 2 added (for more details).</span>
+<span class="comment-copy">is <code>TrigramSimilarity</code> a python function or does it translate to SQL? If it's python, I don't think you can use it in the <code>annotate</code> call as you're trying to do.</span>
+<span class="comment-copy">TrigramSimilarity is part of the Django Framework ( <a href="https://docs.djangoproject.com/en/2.0/ref/contrib/postgres/search/" rel="nofollow noreferrer">docs.djangoproject.com/en/2.0/ref/contrib/postgres/search</a>), but it requires a PostgreSQL Database (won't work with SQLite) with the pg_trgm extension activated.</span>
+<span class="comment-copy">Unfortunately it is not working like this, as TrigramSimilarity only works like this: TrigramSimilarity(columnName, searchString). Therefore it would search for a column labeled as "Animal", "Brown" or "Animals".</span>
+<span class="comment-copy">@Lukas I posted an edit, have a look :)</span>
+<span class="comment-copy">Thanks a lot, I will try it out. But it looks different to what I had before, as it only allows me to filter, but not to sort depending on the result or am I wrong?</span>
+<span class="comment-copy">@Lukas you cannot sort as it is but with a slight modification you could do it (<code>sort</code> the name lists before the composition of the query).</span>
+<span class="comment-copy">I was able to resolve the issue as you described in option 1. Thanks a lot for your help!</span>

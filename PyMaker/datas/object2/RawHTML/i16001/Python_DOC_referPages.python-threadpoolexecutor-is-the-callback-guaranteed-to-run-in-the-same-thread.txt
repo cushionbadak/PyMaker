@@ -1,0 +1,89 @@
+<div class="post-text" itemprop="text">
+<p>In the ThreadPoolExecutor (TPE), is the callback always guaranteed to run in the same thread as the submitted function? </p>
+<p>For example, I tested this with the following code. I ran it many times and it seemed like <code>func</code> and <code>callback</code> always ran in the same thread. </p>
+<pre><code>import concurrent.futures 
+import random 
+import threading 
+import time 
+
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=3) 
+
+def func(x): 
+    time.sleep(random.random()) 
+    return threading.current_thread().name 
+
+def callback(future): 
+    time.sleep(random.random()) 
+    x = future.result() 
+    cur_thread = threading.current_thread().name 
+    if (cur_thread != x): 
+        print(cur_thread, x) 
+
+print('main thread: %s' % threading.current_thread()) 
+for i in range(10000): 
+    future = executor.submit(func, i) 
+    future.add_done_callback(callback) 
+</code></pre>
+<p>However, it seemed to fail when I removed the <code>time.sleep(random.random())</code> statements, i.e. at least a few <code>func</code> functions and <code>callbacks</code> <strong>did not</strong> run in the same thread. </p>
+<p>For a project that I am working on, the callback must always run on the same thread as the submitted function, so I wanted to be sure that this is guaranteed by TPE. (And also the results of the test without the random sleep seemed puzzling). </p>
+<p>I looked at the <a href="https://hg.python.org/cpython/file/6d44906344f4/Lib/concurrent/futures/_base.py#l297" rel="noreferrer">source code for executors</a> and it does not seem like we switch the thread to the main thread before we run the callback. But just wanted to be sure. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The documentation does not guarantee which thread callbacks run in. <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Future.add_done_callback" rel="nofollow noreferrer">The only documented guarantee</a> is that callbacks will be run in a thread belonging to the process that added the callback, but that could be any thread, since you're using a ThreadPoolExecutor instead of a ProcessPoolExecutor:</p>
+<blockquote>
+<p>Added callables are called in the order that they were added and are always called in a thread belonging to the process that added them.</p>
+</blockquote>
+<hr/>
+<p>In the current ThreadPoolExecutor implementation, the thread a callback executes in depends on the state of the <code>Future</code> at the time the callback is added, and whether or not the <code>Future</code> is cancelled. These are implementation details; you should not rely on them, as they may be different in different Python implementations or different versions, and they are subject to change without notice.</p>
+<p>If you add the callback after the <code>Future</code> completes, the callback will execute in whatever thread you called <code>add_done_callback</code> in. You can see this by looking at the <code>add_done_callback</code> source:</p>
+<pre><code>def add_done_callback(self, fn):
+    """Attaches a callable that will be called when the future finishes.
+
+    Args:
+        fn: A callable that will be called with this future as its only
+            argument when the future completes or is cancelled. The callable
+            will always be called by a thread in the same process in which
+            it was added. If the future has already completed or been
+            cancelled then the callable will be called immediately. These
+            callables are called in the order that they were added.
+    """
+    with self._condition:
+        if self._state not in [CANCELLED, CANCELLED_AND_NOTIFIED, FINISHED]:
+            self._done_callbacks.append(fn)
+            return
+    fn(self)
+</code></pre>
+<p>If the state of the <code>Future</code> indicates it's cancelled or finished, <code>fn</code> is just immediately called in the current thread of execution. Otherwise, it's added to an internal list of callbacks to run when the <code>Future</code> is complete.</p>
+<p>For example:</p>
+<pre><code>&gt;&gt;&gt; def func(*args):
+...  time.sleep(5)
+...  print("func {}".format(threading.current_thread()))
+&gt;&gt;&gt; def cb(a): print("cb {}".format(threading.current_thread()))
+... 
+&gt;&gt;&gt; fut = ex.submit(func)
+&gt;&gt;&gt; func &lt;Thread(Thread-1, started daemon 140084551563008)&gt;
+&gt;&gt;&gt; fut = e.add_done_callback(cb)
+cb &lt;_MainThread(MainThread, started 140084622018368)&gt;
+</code></pre>
+<p>If a future is cancelled by a successful <code>cancel</code> call, then the thread performing the cancellation immediately invokes all callbacks:</p>
+<pre><code>def cancel(self):
+    """Cancel the future if possible.
+    Returns True if the future was cancelled, False otherwise. A future
+    cannot be cancelled if it is running or has already completed.
+    """
+    with self._condition:
+        if self._state in [RUNNING, FINISHED]:
+            return False
+
+        if self._state in [CANCELLED, CANCELLED_AND_NOTIFIED]:
+            return True
+
+        self._state = CANCELLED
+        self._condition.notify_all()
+
+    self._invoke_callbacks()
+    return True
+</code></pre>
+<p>Otherwise, callbacks are invoked by the thread that executes the future's task.</p>
+</div>
+<span class="comment-copy">And what about <code>ProcessPoolExecutor</code>? Callback's <code>get_ident</code> is also different</span>

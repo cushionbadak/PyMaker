@@ -1,0 +1,65 @@
+<div class="post-text" itemprop="text">
+<p>There's a class in a library I'm using that I want to override. It looks like this, and I can't change it:</p>
+<pre><code>class A(Q):
+    def __init__(self):
+        super().__init__()
+        self.data = {}
+        for x in range(10):
+            self.data[x] = x * x
+</code></pre>
+<p>In my child class, I want <code>data</code> to behave differently based on rules that apply at runtime:</p>
+<pre><code>class B(A):
+    @property
+    def data(self):
+        return {x: x*x for x in super().data if x not in some_list_that_changes_at_runtime}
+
+    @data.setter
+    def data(self, value):
+        super().data = value
+</code></pre>
+<p>Unfortunately, this doesn't work, for at least two reasons:</p>
+<p>1) <code>super().data</code> doesn't seem to actually work for accessing the version of <code>data</code> that's defined on <code>A</code>.</p>
+<p>2) <code>A.__init__</code> crashes on the <code>self.data = {}</code> line, because it can't assign to the version of <code>data</code> that <code>B</code> defines.</p>
+<p>3) Theoretically, even if I could get this to work, the loop in <code>A.__init__</code> would also not work, because it's <em>getting</em> <code>data</code> in order to assign key/value pairs inside it. But doing that <em>get</em> will result in the <code>@property</code> being accessed, and returning a different object than <code>A.data</code>, meaning that <code>A.data</code> won't be altered.</p>
+<p>I can't edit <code>A</code>, and I need the <code>@property</code> to have the same name as the original dict attribute, because various other code in the library accesses <code>data</code>, and that code also can't be changed.</p>
+<p>I also can't really override <code>A.__init__</code> to make it not mess with <code>data</code>, because I need <code>Q.__init__</code> to run.</p>
+<p>Is there any viable way to do what I'm trying to do, here?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Property objects are <a href="https://docs.python.org/3/howto/descriptor.html" rel="nofollow noreferrer">data descriptor objects</a> that live on the class, while your base class uses <code>data</code> as an instance attribute. By making it a property in the subclass, <em>any and all access to <code>self.data</code></em> will now address the property, even in methods defined on the base class. And as <code>super()</code> addresses attributes (including descriptors) only on the specific parent class, <code>super().data</code> will fail; there is no such class attribute on the base class.</p>
+<p>That means that the line</p>
+<pre><code>self.data = {}
+</code></pre>
+<p>will trigger your <code>data</code> property setter, which tries to address a class attribute on a parent class that doesn't exist. Note that even if it <em>did</em> exist, you cant <em>assign</em> to a <code>super()</code>-bound object; <code>super()</code> only supports the <code>__get__</code> method on descriptors, it does not support the <code>__set__</code> or <code>__delete__</code> hooks required mutating attributes; so <code>super().data = ...</code> fails doubly here.</p>
+<p>Every <em>read</em> access will trigger the getter, so</p>
+<pre><code>for x in range(10):
+    self.data[x] = x * x
+</code></pre>
+<p>will call the getter each time, returning the result, then assigning to a key in the resulting dictionary. Because your getter creates a new dictionary each time, that assignment is lost entirely; the result of the dict comprehension <em>is not referenced anywhere else</em>, so after the key-value pair is assigned, the dictionary is garbage collected, changes and all.</p>
+<p>You'll need to redirect storage of that dictionary to a new instance attribute, and mutate the dictionary in-place (so that a reference is retained at all times):</p>
+<pre><code>some_set_that_changes_at_runtime = set(some_list_that_changes_at_runtime)
+
+class B(A):
+    @property
+    def data(self):
+        # filter out specific keys
+        for key in self._data.keys() &amp; some_set_that_changes_at_runtime:
+            del self._data[key]
+        return self._data
+
+    @data.setter
+    def data(self, value):
+        self._data = value
+</code></pre>
+<p>So now the property uses an instance attribute <code>_data</code>. Assignment to <code>self.data</code> will trigger the setter, which redirects the new dictionary produced from the value to <code>self._data</code> instead. The getter removes unwanted keys, keeping the same dictionary object so that any other references to it are still valid, and assignments of new values to keys will end up in the right place.</p>
+<p>The filtering uses a set intersection with the <a href="https://docs.python.org/3/library/stdtypes.html#dictionary-view-objects" rel="nofollow noreferrer">dictionary view</a> on the keys; this produces a new set so the loop only iterates on keys actually present in both.</p>
+</div>
+<span class="comment-copy">I don't get what you are trying to do with <code>super().data = value</code>...</span>
+<span class="comment-copy">I think, instead of <code>super().data</code>, just make a private variable: <code>self._data</code> in your getter and setter. However, then this will create a problem: when you do <code>self.data[0] = something</code> it <i>returns a new dict</i> which you will then assign to and immediately discard.</span>
+<span class="comment-copy">Is there an implementation detail of <code>property</code> that interferes with what you are trying to do? (That's a rhetorical question; I don't know. But if there is, you might be able to write a custom descriptor, implementing <code>__get__</code> and <code>__set__</code> yourself.)</span>
+<span class="comment-copy">@chepner: the moment you implement a <code>__set__</code> method on a descriptor, it is a data descriptor and will always override instance attributes.</span>
+<span class="comment-copy">Won't the for loop in <code>A.__init__</code> now fail to correctly populate the dictionary? While I was trying the same thing as above, I can initialize an instance just fine, <code>b = B()</code>, but now <code>b.data</code> returns an empty dict...</span>
+<span class="comment-copy">@juanpa.arrivillaga: yes, and I already addressed it.</span>
+<span class="comment-copy">Yes, sorry, just read your edit. That makes sense, although, I'm not sure if semantically that is what is being aimed for. It seems like they want <code>b.data</code> to return something that will be influenced by some (global?) <code>some_list_that_changes</code>. However, in this case, it is the <i>initial</i> dict that is being assigned that is filtered by this criteria, and the information is lost and unrecoverable at a later point.</span>
+<span class="comment-copy">@juanpa.arrivillaga: you can code for that in the setter though. <code>if '_foo' not in vars(self): # filter</code>.</span>
+<span class="comment-copy">Does the setter actually trigger when assigning to a key in <code>data</code>? i.e. does <code>self.data[2] = 2</code> execute the setter? I would assume that the <i>getter</i> will trigger, but that the setter will not, because you're not assigning <code>data</code> itself.</span>

@@ -1,0 +1,246 @@
+<div class="post-text" itemprop="text">
+<p>Python 3.6</p>
+<p>This program:</p>
+<ol>
+<li>launches ffmpeg as a subprocess  </li>
+<li>waits for a socket connection</li>
+<li>receives PNG images on the socket</li>
+<li>sends the PNG images to ffmpeg
+stdin</li>
+</ol>
+<p>The problem is step 4.  I can't work out how to send the received PNG image from the coroutine to the stdin of the ffmpeg subprocess. Can anyone please point me in the right direction to send the PNG image to the stdin of the ffmpeg subprocess?</p>
+<p>EDIT: to clarify - there's nothing wrong with this code, it receives the PNGs fine over the socket.  I just don't have any idea how to send the PNGs on into the stdin of ffmpeg.  I've done quite alot of Python but asyncio is new to me and how things tie together is a mystery.</p>
+<p>thanks!</p>
+<pre><code>import asyncio
+import argparse, sys
+import sys
+import base64
+from struct import unpack
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--port', help='ffmpeg listen port')
+parser.add_argument('--outputfilename', help='ffmpeg output filename')
+args = parser.parse_args()
+if not args.port:
+    print("port is required")
+    sys.exit(1)
+if not args.outputfilename:
+    print("outputfilename is required")
+    sys.exit(1)
+
+async def _read_stream(stream, cb):
+    while True:
+        line = await stream.readline()
+        if line:
+            cb(line)
+        else:
+            break
+
+async def _stream_subprocess(cmd, stdout_cb, stderr_cb):
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.PIPE,
+    )
+
+    await asyncio.wait([
+        _read_stream(process.stdout, stdout_cb),
+        _read_stream(process.stderr, stderr_cb)
+    ])
+    return await process.wait()
+
+
+def process_stderr(line):
+    # ffmpeg finishes processing and writes the output file when its input is closed
+    # thus the completion message will come out of stderr only when the socket or stdin or whatever is closed
+    line = line.decode()
+    print(line)
+    if "Output" in line:
+        if args.outputfilename in line:
+            print('finished!!!!')
+            sys.exit(0)
+
+def process_stdout(line):
+    print("STDOUT: %s" % line)
+
+def spawn_ffmpeg(listenport, outputfilename, framerate=30, format='webm'):
+    outputdirectory = "sftp://username:password@10.0.0.196/var/www/static/"
+    input_type = "pipe:0" #stdin
+
+    params = \
+        f"ffmpeg  " \
+        f"-loglevel 56 " \
+        f"-y -framerate {framerate} " \
+        f"-f image2pipe " \
+        f"-i {input_type} " \
+        f"-c:v libvpx-vp9 " \
+        f"-b:v 1024k " \
+        f"-q:v 0 " \
+        f"-pix_fmt yuva420p " \
+        f"{outputdirectory}{outputfilename} "
+
+    return params
+
+
+async def socket_png_receiver(reader, writer):
+    while True:
+        # first the client sends the length of the data to us
+        lengthbuf = await reader.read(4)
+        length, = unpack('!I', lengthbuf)
+        if length == 0:
+            print("length was 0, finish") # a zero length PNG says that there are no more frames
+            break
+        # then we read the PNG
+        data = await reader.read(length)
+        data = data.decode() # from bytes to string
+        png_bytes = base64.b64decode(data) # from base64 to bytes
+        # next line was just a guess, so I have commented it out.
+        #await proc.communicate(png_bytes)
+        print("Got PNG, length", length)
+    return
+
+
+loop = asyncio.get_event_loop()
+command = spawn_ffmpeg("24897", args.outputfilename)
+ffmpeg_process = _stream_subprocess(
+    command.split(),
+    process_stdout,
+    process_stderr,
+)
+#coro = asyncio.start_server(socket_png_receiver, '0.0.0.0', args.port, ffmpeg_process, loop=loop)
+coro = asyncio.start_server(socket_png_receiver, '0.0.0.0', args.port, loop=loop)
+several_futures = asyncio.gather(ffmpeg_process, coro)
+server = loop.run_until_complete(several_futures)
+server.close()
+loop.close()
+</code></pre>
+<p>Here are the changes suggested by @user4815162342</p>
+<pre><code>import asyncio
+import argparse, sys
+import sys
+import base64
+from struct import unpack
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--port', help='ffmpeg listen port')
+parser.add_argument('--outputfilename', help='ffmpeg output filename')
+args = parser.parse_args()
+if not args.port:
+    print("port is required")
+    sys.exit(1)
+if not args.outputfilename:
+    print("outputfilename is required")
+    sys.exit(1)
+if not args.outputfilename.endswith('.webm'):
+    print("outputfilename must end with '.webm'")
+    sys.exit(1)
+
+async def _read_stream(stream, cb):
+    while True:
+        line = await stream.readline()
+        if line:
+            cb(line)
+        else:
+            break
+
+
+async def _stream_subprocess(cmd, stdout_cb, stderr_cb):
+    global process
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.PIPE,
+    )
+
+    await asyncio.wait([
+        _read_stream(process.stdout, stdout_cb),
+        _read_stream(process.stderr, stderr_cb)
+    ])
+    return await process.wait()
+
+
+def process_stderr(line):
+    # ffmpeg finishes processing and writes the output file when its input is closed
+    # thus the completion message will come out of stderr only when the socket or stdin or whatever is closed
+    line = line.decode()
+    print(line)
+    if "Output" in line:
+        if args.outputfilename in line:
+            print('finished!!!!')
+            sys.exit(0)
+
+
+def process_stdout(line):
+    print("STDOUT: %s" % line)
+
+
+def spawn_ffmpeg(listenport, outputfilename, framerate=30, format='webm'):
+    outputdirectory = "sftp://username:password@10.0.0.196/var/www/static/"
+    input_type = "pipe:0"  # stdin
+
+    params = \
+        f"ffmpeg  " \
+        f"-loglevel 56 " \
+        f"-y " \
+        f"-framerate {framerate} " \
+        f"-i {input_type} " \
+        f"{outputdirectory}{outputfilename} "
+
+    print(params)
+    return params
+
+
+async def socket_png_receiver(reader, writer):
+    while True:
+        # first the client sends the length of the data to us
+        lengthbuf = await reader.readexactly(4)
+        length, = unpack('!I', lengthbuf)
+        if length == 0:
+            print("length was 0, finish")  # a zero length PNG says that there are no more frames
+            break
+        # then we read the PNG
+        print("Got PNG, length", length)
+        data = await reader.readexactly(length)
+        print(data)
+        png_bytes = base64.b64decode(data)  # from base64 to bytes
+        process.stdin.write(png_bytes)
+    return
+
+
+loop = asyncio.get_event_loop()
+command = spawn_ffmpeg("24897", args.outputfilename)
+ffmpeg_process = _stream_subprocess(
+    command.split(),
+    process_stdout,
+    process_stderr,
+)
+coro = asyncio.start_server(socket_png_receiver, '0.0.0.0', args.port, loop=loop)
+several_futures = asyncio.gather(ffmpeg_process, coro)
+server = loop.run_until_complete(several_futures)
+server.close()
+loop.close()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>There are several issues with the code:</p>
+<ul>
+<li><p><code>await reader.read(length)</code> should be <code>await reader.readexactly(length)</code> because the argument to <a href="https://docs.python.org/3/library/asyncio-stream.html#asyncio.StreamReader.read" rel="nofollow noreferrer"><code>StreamReader.read</code></a> is the <em>maximum</em> number of bytes to read, and it can return fewer.</p></li>
+<li><p><code>proc.communicate(png_bytes)</code> should be changed to <code>proc.stdin.write(png_bytes)</code>. The call to <code>communicate()</code> is incorrect here because you want to continue talking to the program, while <code>communicate()</code> waits for all the streams to close.</p></li>
+<li><p>The instance of process returned by <code>asyncio.create_subprocess_exec(...)</code> must be made available to <code>socket_png_receiver</code>, e.g. by making the <code>process</code> variable global using <code>global process</code>. (It would be better to use a class and assign to <code>self.process</code>, but that is beyond the scope of this answer.)</p></li>
+</ul>
+<p>Some potential issues:</p>
+<ul>
+<li><p>There is no need to decode <code>data</code> from bytes to string, <code>base64.b64decode</code> can accept bytes just fine.</p></li>
+<li><p><code>spawn_ffmpeg()</code> doesn't appear to use its <code>listenport</code> parameter.</p></li>
+</ul>
+</div>
+<span class="comment-copy">The question doesn't specify what exactly goes wrong with the provided implementation, but perhaps you should try to send the data using: <code>proc.stdin.write(png_bytes)</code> followed by <code>proc.stdin.close()</code>?</span>
+<span class="comment-copy">Also, <code>await reader.read(length)</code> should really be <code>await reader.readexactly(length)</code>. The argument to <a href="https://docs.python.org/3/library/asyncio-stream.html#asyncio.StreamReader.read" rel="nofollow noreferrer"><code>StreamReader.read</code></a> is the <i>maximum</i>, not exact number of bytes to read.</span>
+<span class="comment-copy">Another suspect thing is that <code>socket_png_receiver</code> appears to expect that it would keep sending data to <i>the same</i> ffmpeg process. That means that ffmpeg must be able to process multiple chunks of data on its stdin, i.e. that it needs to have a delimiting protocol like you implement by packing the length before the data. I suspect that you should instead start a new ffmpeg process in each iteration of the loop in <code>socket_png_receiver</code>.</span>
+<span class="comment-copy">@user4815162342 I've updated the code - there was an error in the line starting coro, so I have corrected it and left the old line commented out. I have also commented out await proc.communicate(png_bytes) because it was nothing more than a voodoo guess as to how to achieve my goal and just caused an error.  So, the code actually works fine, except there's just no mechanism for sending data to the ffmpeg stdin because I just can't figure out how at all.</span>
+<span class="comment-copy">@user4815162342 you are correct - socket_png_receiver will send ONLY to the one ffmpeg process. The idea is that once the sequence of PNG images is finished then both ffmpeg and this program that wraps it will exit.</span>
+<span class="comment-copy">Hey thanks you really went the distance here.</span>
+<span class="comment-copy">@DukeDougal Glad to help! Did you get it to work?</span>
+<span class="comment-copy">Indeed it works very well thanks/  Exactly what I wanted... spawns off video processing tasks nicely isolated from each other and the parent.</span>

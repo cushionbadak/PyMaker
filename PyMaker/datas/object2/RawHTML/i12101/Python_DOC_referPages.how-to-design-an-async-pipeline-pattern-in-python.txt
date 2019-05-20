@@ -1,0 +1,188 @@
+<div class="post-text" itemprop="text">
+<p>I am trying to design an async pipeline that can easily make a data processing pipeline. The pipeline is composed of several functions. Input data goes in at one end of the pipeline and comes out at the other end. </p>
+<p>I want to design the pipeline in a way that: </p>
+<ol>
+<li>Additional functions can be insert in the pipeline</li>
+<li>Functions already in the pipeline can be popped out.  </li>
+</ol>
+<p>Here is what I came up with:</p>
+<pre><code>import asyncio
+
+@asyncio.coroutine
+def add(x):
+    return x + 1
+
+@asyncio.coroutine
+def prod(x):
+    return x * 2
+
+@asyncio.coroutine
+def power(x):
+    return x ** 3
+
+def connect(funcs):
+    def wrapper(*args, **kwargs):
+        data_out = yield from funcs[0](*args, **kwargs)
+        for func in funcs[1:]:
+            data_out = yield from func(data_out)
+        return data_out
+    return wrapper
+
+pipeline = connect([add, prod, power])
+input = 1
+output = asyncio.get_event_loop().run_until_complete(pipeline(input))
+print(output)
+</code></pre>
+<p>This works, of course, but the problem is that if I want to add another function into (or pop out a function from) this pipeline, I have to disassemble and reconnect every function again.</p>
+<p>I would like to know if there is a better scheme or design pattern to create such  a pipeline?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I don't know if it is the best way to do it but here is my solution.</p>
+<p>While I think it's possible to control a pipeline using a list or a dictionary I found easier and more efficent to use a generator.</p>
+<p>Consider the following generator:</p>
+<pre><code>def controller():
+    old = value = None
+    while True:
+        new = (yield value)
+        value = old
+        old = new
+</code></pre>
+<p>This is basically a one-element queue, it stores the value that you send it and releases it at the next call of <code>send</code> (or <code>next</code>).</p>
+<p>Example:</p>
+<pre><code>&gt;&gt;&gt; c = controller()
+&gt;&gt;&gt; next(c)           # prime the generator
+&gt;&gt;&gt; c.send(8)         # send a value
+&gt;&gt;&gt; next(c)           # pull the value from the generator
+8
+</code></pre>
+<p>By associating every coroutine in the pipeline with its controller we will have an external handle that we can use to push the target of each one. We just need to define our coroutines in a way that they will pull the new target from our controller every cycle.</p>
+<p>Now consider the following coroutines:</p>
+<pre><code>def source(controller):
+    while True:
+        target = next(controller)
+        print("source sending to", target.__name__) 
+        yield (yield from target)
+
+def add():
+    return (yield) + 1
+
+def prod():
+    return (yield) * 2
+</code></pre>
+<p>The source is a coroutine that does not <code>return</code> so that it will not terminate itself after the first cycle. The other coroutines are "sinks" and does not need a controller.
+You can use these coroutines in a pipeline as in the following example. We initially set up a route <code>source --&gt; add</code> and after receiving the first result we change the route to <code>source --&gt; prod</code>.</p>
+<pre><code># create a controller for the source and prime it 
+cont_source = controller()
+next(cont_source)
+
+# create three coroutines
+# associate the source with its controller
+coro_source = source(cont_source)
+coro_add = add()
+coro_prod = prod()
+
+# create a pipeline
+cont_source.send(coro_add)
+
+# prime the source and send a value to it
+coro_source.send(None)
+print("add =", coro_source.send(4))
+
+# change target of the source
+cont_source.send(coro_prod)
+
+# reset the source, send another value
+coro_source.send(None)
+print("prod =", coro_source.send(8))
+</code></pre>
+<p>Output:</p>
+<pre><code>source sending to add
+add = 5
+source sending to prod
+prod = 16
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I've done something similar before, using just the <a href="https://docs.python.org/2/library/multiprocessing.html" rel="nofollow noreferrer">multiprocessing</a> library. It's a bit more manual, but it gives you the ability to easily create and modify your pipeline, as you've requested in your question.</p>
+<p>The idea is to create functions that can live in a multiprocessing pool, and their only arguments are an input queue and an output queue. You tie the stages together by passing them different queues. Each stage receives some work on its input queue, does some more work, and passes the result out to the next stage through its output queue.</p>
+<p>The workers spin on trying to get something from their queues, and when they get something, they do their work and pass the result to the next stage. All of the work ends by passing a "poison pill" through the pipeline, causing all stages to exit:</p>
+<p>This example just builds a string in multiple work stages:</p>
+<pre><code>import multiprocessing as mp                                              
+
+POISON_PILL = "STOP"                                                      
+
+def stage1(q_in, q_out):                                                  
+
+    while True:
+
+        # get either work or a poison pill from the previous stage (or main)
+        val = q_in.get()                                                  
+
+        # check to see if we got the poison pill - pass it along if we did
+        if val == POISON_PILL:                                            
+            q_out.put(val)                                                
+            return                                                        
+
+        # do stage 1 work                                                                  
+        val = val + "Stage 1 did some work.\n"
+
+        # pass the result to the next stage
+        q_out.put(val)                                                    
+
+def stage2(q_in, q_out):                                                  
+
+    while True:                                                           
+
+        val = q_in.get()                                                  
+        if val == POISON_PILL:                                            
+            q_out.put(val)                                                
+            return                                                        
+
+        val = val + "Stage 2 did some work.\n"                            
+        q_out.put(val)                                                    
+
+def main():                                                               
+
+    pool = mp.Pool()                                                      
+    manager = mp.Manager()                                                
+
+    # create managed queues                                               
+    q_main_to_s1 = manager.Queue()                                        
+    q_s1_to_s2 = manager.Queue()                                          
+    q_s2_to_main = manager.Queue()                                        
+
+    # launch workers, passing them the queues they need                   
+    results_s1 = pool.apply_async(stage1, (q_main_to_s1, q_s1_to_s2))     
+    results_s2 = pool.apply_async(stage2, (q_s1_to_s2, q_s2_to_main))     
+
+    # Send a message into the pipeline                                    
+    q_main_to_s1.put("Main started the job.\n")                           
+
+    # Wait for work to complete                                           
+    print(q_s2_to_main.get()+"Main finished the job.")                    
+
+    q_main_to_s1.put(POISON_PILL)                                         
+
+    pool.close()                                                          
+    pool.join()                                                           
+
+    return                                                                
+
+if __name__ == "__main__":                                                
+    main()
+</code></pre>
+<p>The code produces this output:</p>
+<blockquote>
+<p>Main started the job.<br/>
+  Stage 1 did some work.<br/>
+  Stage 2 did some work.<br/>
+  Main finished the job.  </p>
+</blockquote>
+<p>You can easily put more stages in the pipeline or rearrange them just by changing which functions get which queues. I'm not very familiar with the <a href="https://docs.python.org/3/library/asyncio.html" rel="nofollow noreferrer">asyncio</a> module, so I can't speak to what capabilities you would be losing by using the multiprocessing library instead, but this approach is very straightforward to implement and understand, so I like its simplicity.</p>
+</div>
+<span class="comment-copy">i think the standard thing would be to just recreate the pipeline, e.g., <code>connect([add, prod, somethingelse, power])</code>, or <code>connect([add, power])</code>. is there a reason why you don't want to do this? or maybe i don't understand your question?</span>
+<span class="comment-copy">I think you got my point, i don't want to recreate the whole thing just because it is not elegant to recreate everything when you need only change a small part, if the pipeline contains dozens of functions, and i need frequently change some functions, recreate everything become tedious and inefficient.</span>
+<span class="comment-copy">It seems like you could create a Pipeline class and maintain an instance var with your list of functions and then implement methods to get / remove functions from this list.  Then just implement <code>__call__</code> so that an instance of Pipeline can be sent to the asyncio event loop.</span>
+<span class="comment-copy">@EricConner I dont fully understand your suggestion, following your suggestion, i think the issue becomes how to implement the get/remove function? do i have to reconnect every function for just one function change?</span>
+<span class="comment-copy">could you store your functions in lists, and then have your pipelines reference the lists? like <code>L1 = [add, prod, power]</code>, <code>pipeline1 = connect(L1)</code> <code>pipeline2 = connect(L1 + [power])</code> <code>pipeline3 = connect([x for x in L1 if x != add])</code></span>
+<span class="comment-copy">This is a very interesting idea!, thanks!</span>

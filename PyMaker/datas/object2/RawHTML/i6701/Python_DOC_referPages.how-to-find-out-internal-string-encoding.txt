@@ -1,0 +1,110 @@
+<div class="post-text" itemprop="text">
+<p>From <a href="https://www.python.org/dev/peps/pep-0393/" rel="nofollow noreferrer">PEP 393</a> I understand that Python can use multiple encodings internally when storing strings: <code>latin1</code>, <code>UCS-2</code>, <code>UCS-4</code>. Is it possible to find out what encoding is used to store a particular string, e.g. in the interactive interpreter?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The only way you can test this from the Python layer (without resorting to manually mucking about with object internals via <code>ctypes</code> or Python extension modules) is by checking the ordinal value of the largest character in the string, which determines whether the string is stored as ASCII/latin-1, UCS-2 or UCS-4. A solution would be something like:</p>
+<pre><code>def get_bpc(s):
+    maxordinal = ord(max(s, default='\0'))
+    if maxordinal &lt; 256:
+        return 1
+    elif maxordinal &lt; 65536:
+        return 2
+    else:
+        return 4
+</code></pre>
+<p>You can't actually rely on <code>sys.getsizeof</code> because, for non-ASCII strings (even one byte per character strings that fit in the <code>latin-1</code> range), the string might or might not have populated the UTF-8 representation of the string, and tricks like adding an extra character to it and comparing sizes could actually show the size <em>decrease</em>, and it can actually happen "at a distance", so you're not directly responsible for the existence of the cached UTF-8 form on the string you're checking. For example:</p>
+<pre><code>&gt;&gt;&gt; e = 'é'
+&gt;&gt;&gt; sys.getsizeof(e)
+74
+&gt;&gt;&gt; sys.getsizeof(e + 'a')
+75
+&gt;&gt;&gt; class é: pass  # One of several ways to trigger creation/caching of UTF-8 form
+&gt;&gt;&gt; sys.getsizeof(e)
+77  # !!! Grew three bytes even though it's the same variable
+&gt;&gt;&gt; sys.getsizeof(e + 'a')
+75  # !!! Adding a character shrunk the string!
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>There is a CPython C API function for the kind of the unicode object: <a href="https://docs.python.org/3/c-api/unicode.html#c.PyUnicode_KIND" rel="nofollow noreferrer"><code>PyUnicode_KIND</code></a>.</p>
+<p>In case you have Cython and IPython<sup>1</sup> you can easily access that function:</p>
+<pre><code>In [1]: %load_ext cython
+   ...:
+
+In [2]: %%cython
+   ...:
+   ...: cdef extern from "Python.h":
+   ...:     int PyUnicode_KIND(object o)
+   ...:
+   ...: cpdef unicode_kind(astring):
+   ...:     if type(astring) is not str:
+   ...:         raise TypeError('astring must be a string')
+   ...:     return PyUnicode_KIND(astring)
+
+In [3]: a = 'a'
+   ...: b = 'Ǧ'
+   ...: c = '😀'
+
+In [4]: unicode_kind(a), unicode_kind(b), unicode_kind(c)
+Out[4]: (1, 2, 4)
+</code></pre>
+<p>Where <code>1</code> represents <code>latin-1</code> and <code>2</code> and <code>4</code> represent <code>UCS-2</code> and <code>UCS-4</code> respectively.</p>
+<p>You could then use a dictionary to map these numbers into a string that represents the encoding.</p>
+<hr/>
+<p><sup>1</sup> It's also possible without Cython and/or IPython, the combination is just very handy, otherwise it would be more code (without IPython) and/or require a manual installation (without Cython).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>One way of finding out which exact internal encoding CPython uses for a specific unicode string is to peek in the actual (CPython) object.</p>
+<p>According to <a href="https://www.python.org/dev/peps/pep-0393" rel="nofollow noreferrer">PEP 393</a> (<a href="https://www.python.org/dev/peps/pep-0393/#specification" rel="nofollow noreferrer">Specification</a> section), all unicode string objects start with <code>PyASCIIObject</code>:</p>
+<pre><code>typedef struct {
+  PyObject_HEAD
+  Py_ssize_t length;
+  Py_hash_t hash;
+  struct {
+      unsigned int interned:2;
+      unsigned int kind:2;
+      unsigned int compact:1;
+      unsigned int ascii:1;
+      unsigned int ready:1;
+  } state;
+  wchar_t *wstr;
+} PyASCIIObject;
+</code></pre>
+<p>Character size is stored in the <code>kind</code> bit-field, as described in the PEP, as well as in the <a href="https://github.com/python/cpython/blob/3.6/Include/unicodeobject.h#L288" rel="nofollow noreferrer">code comments in <code>unicodeobject</code></a>:</p>
+<pre><code>00 =&gt; str is not initialized (data are in wstr)
+01 =&gt; 1 byte (Latin-1)
+10 =&gt; 2 byte (UCS-2)
+11 =&gt; 4 byte (UCS-4);
+</code></pre>
+<p>After we get the address of the string with <code>id(string)</code>, we can use the <a href="https://docs.python.org/3/library/ctypes.html" rel="nofollow noreferrer"><code>ctypes</code></a> module to read the object's bytes (and the <code>kind</code> field):</p>
+<pre><code>import ctypes
+mystr = "x"
+first_byte = ctypes.c_uint8.from_address(id(mystr)).value
+</code></pre>
+<p>The offset from the object's start to <code>kind</code> is <code>PyObject_HEAD</code> + <code>Py_ssize_t length</code> + <code>Py_hash_t hash</code>, which in turn is <code>Py_ssize_t ob_refcnt</code> + pointer to <code>ob_type</code> + <code>Py_ssize_t length</code> + size of another pointer for the hash type:</p>
+<pre><code>offset = 2 * ctypes.sizeof(ctypes.c_ssize_t) + 2 * ctypes.sizeof(ctypes.c_void_p)
+</code></pre>
+<p>(which is <code>32</code> on x64)</p>
+<p>All put together:</p>
+<pre><code>import ctypes
+
+def bytes_per_char(s):
+    offset = 2 * ctypes.sizeof(ctypes.c_ssize_t) + 2 * ctypes.sizeof(ctypes.c_void_p)
+    kind = ctypes.c_uint8.from_address(id(s) + offset).value &gt;&gt; 2 &amp; 3
+    size = {0: ctypes.sizeof(ctypes.c_wchar), 1: 1, 2: 2, 3: 4}
+    return size[kind]
+</code></pre>
+<p>Gives:</p>
+<pre><code>&gt;&gt;&gt; bytes_per_char('test')
+1
+&gt;&gt;&gt; bytes_per_char('đžš')
+2
+&gt;&gt;&gt; bytes_per_char('😀')
+4
+</code></pre>
+<p>Note we had to handle the special case of <code>kind == 0</code>, because than the character type is exactly <code>wchar_t</code> (which is 16 or 32 bits, depending on the platform).</p>
+</div>
+<span class="comment-copy">Could you elaborate on why you want to do this? It seems like an odd thing to want to do unless you're trying to deconstruct the internal workings of the interpreter (in which case I'd say just look at the source code).</span>
+<span class="comment-copy">Maybe there is a ctypes hack?</span>
+<span class="comment-copy">@David: might be useful for estimating required space or debugging, I think.</span>
+<span class="comment-copy">I guess... well, I think the main thrust of what I'm asking is, are you trying to do this dynamically from within Python? Or is looking at the interpreter source code a valid solution? In the former case I'm not sure whether it's possible; in the latter case it's probably implementation-dependent.</span>

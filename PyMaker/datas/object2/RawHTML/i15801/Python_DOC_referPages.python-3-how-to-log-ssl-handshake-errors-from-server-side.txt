@@ -1,0 +1,138 @@
+<div class="post-text" itemprop="text">
+<p>I'm using HTTPServer for a basic HTTP server using SSL. I would like to log any time a client initiates an SSL Handshake (or perhaps any time a socket is accepted?) along with any associated errors. I imagine that I'd need to extend some class or override some method, but I'm not sure which or how to properly go about implementing it. I'd greatly appreciate any help. Thanks in advance!</p>
+<p>Trimmed down sample code:</p>
+<pre><code>from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from threading import Thread
+import ssl
+import logging
+import sys
+
+class MyHTTPHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        logger.info("%s - - %s" % (self.address_string(), format%args))
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write('test'.encode("utf-8"))
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    pass
+
+logger = logging.getLogger('myserver')
+handler = logging.FileHandler('server.log')
+formatter = logging.Formatter('[%(asctime)s] %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.DEBUG)
+
+server = ThreadedHTTPServer(('', 443), MyHTTPHandler)
+server.socket = ssl.wrap_socket (server.socket, keyfile='server.key', certfile='server.crt', server_side=True, cert_reqs=ssl.CERT_REQUIRED, ca_certs='client.crt')
+Thread(target=server.serve_forever).start()
+
+try: 
+    quitcheck = input("Type 'quit' at any time to quit.\n")
+    if quitcheck == "quit":
+        server.shutdown()
+except (KeyboardInterrupt) as error:
+    server.shutdown()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>From looking at the <code>ssl</code> module, most of the relevant magic happens in the <a href="https://github.com/python/cpython/blob/master/Lib/ssl.py#L604-988"><strong><code>SSLSocket</code></strong></a> class.</p>
+<p><a href="https://github.com/python/cpython/blob/master/Lib/ssl.py#L991-1003"><code>ssl.wrap_socket()</code></a> is just a tiny convenience function  that basically serves as a factory for an <code>SSLSocket</code> with some reasonable defaults, and wraps an existing socket.</p>
+<p>Unfortunately, <code>SSLSocket</code> does not seem to do any logging of its own, so there's no easy way to turn up a logging level, set a <code>debug</code> flag or register any handlers.</p>
+<p>So what you can do instead is to <strong>subclass</strong> <code>SSLSocket</code>, override the methods you're interested in with your own that do some logging, and create and use your own <code>wrap_socket</code> helper function. </p>
+<hr/>
+<h1>Subclassing <code>SSLSocket</code></h1>
+<p>First, copy over <a href="https://github.com/python/cpython/blob/master/Lib/ssl.py#L991-1003"><code>ssl.wrap_socket()</code></a> from your Python's <code>.../lib/python2.7/ssl.py</code> into your code. (Make sure that any code you copy and modify actually comes from the Python installation you're using - the code may have changed between different Python versions).</p>
+<p>Now adapt your copy of <code>wrap_socket()</code> to</p>
+<ul>
+<li>create an instance of a <code>LoggingSSLSocket</code> (which we'll implement below) instead of <code>SSLSocket</code></li>
+<li>and use constants from the <code>ssl</code> module where necessary (<code>ssl.CERT_NONE</code> and <code>ssl.PROTOCOL_SSLv23</code> in this example)</li>
+</ul>
+<pre><code>def wrap_socket(sock, keyfile=None, certfile=None,
+                server_side=False, cert_reqs=ssl.CERT_NONE,
+                ssl_version=ssl.PROTOCOL_SSLv23, ca_certs=None,
+                do_handshake_on_connect=True,
+                suppress_ragged_eofs=True,
+                ciphers=None):
+
+    return LoggingSSLSocket(sock=sock, keyfile=keyfile, certfile=certfile,
+                            server_side=server_side, cert_reqs=cert_reqs,
+                            ssl_version=ssl_version, ca_certs=ca_certs,
+                            do_handshake_on_connect=do_handshake_on_connect,
+                            suppress_ragged_eofs=suppress_ragged_eofs,
+                            ciphers=ciphers)
+</code></pre>
+<p>Now change your line</p>
+<pre><code>server.socket = ssl.wrap_socket (server.socket, ...)
+</code></pre>
+<p>to</p>
+<pre><code>server.socket = wrap_socket(server.socket, ...)
+</code></pre>
+<p>in order to use your own <code>wrap_socket()</code>.</p>
+<p>Now for subclassing <code>SSLSocket</code>. Create a class <code>LoggingSSLSocket</code> that subclasses <code>SSLSocket</code> by adding the following to your code:</p>
+<pre><code>class LoggingSSLSocket(ssl.SSLSocket):
+
+    def accept(self, *args, **kwargs):
+        logger.debug('Accepting connection...')
+        result = super(LoggingSSLSocket, self).accept(*args, **kwargs)
+        logger.debug('Done accepting connection.')
+        return result
+
+    def do_handshake(self, *args, **kwargs):
+        logger.debug('Starting handshake...')
+        result = super(LoggingSSLSocket, self).do_handshake(*args, **kwargs)
+        logger.debug('Done with handshake.')
+        return result
+</code></pre>
+<p>Here we override the <a href="https://github.com/python/cpython/blob/master/Lib/ssl.py#L960-970"><code>accept()</code></a> and <a href="https://github.com/python/cpython/blob/master/Lib/ssl.py#L915-924"><code>do_handshake()</code></a> methods of <code>ssl.SSLSocket</code> - everything else stays the same, since the class inherits from <code>SSLSocket</code>.</p>
+<hr/>
+<h1>Generic approach to overriding methods</h1>
+<p>I used a particular pattern for overriding these methods in order to make it easier to apply to pretty much any method you'll ever override:</p>
+<pre><code>    def methodname(self, *args, **kwargs):
+</code></pre>
+<p><code>*args, **kwargs</code> makes sure our method accepts any number of positional and keyword arguments, if any. <code>accept</code> doesn't actually take any of those, but it still works because of Python's <a href="https://docs.python.org/3/tutorial/controlflow.html#arbitrary-argument-lists">packing / unpacking of argument lists</a>.</p>
+<pre><code>        logger.debug('Before call to superclass method')
+</code></pre>
+<p>Here you get the opportunity to do your own thing before calling the superclass' method.</p>
+<pre><code>        result = super(LoggingSSLSocket, self).methodname(*args, **kwargs)
+</code></pre>
+<p>This is the actual call to the superclass' method. See the <a href="https://docs.python.org/3/library/functions.html#super">docs on <code>super()</code></a> for details on how this works, but it basically calls <code>.methodname()</code> on <code>LoggingSSLSocket</code>'s superclass (<code>SSLSocket</code>). Because we pass <code>*args, **kwargs</code> to the method, we just pass on any positional and keyword arguments our method got - we don't even need to know what they are, the method signatures will always match.</p>
+<p>Because some methods (like <a href="https://github.com/python/cpython/blob/master/Lib/ssl.py#L960-970"><code>accept()</code></a>) will return a result, we store that <code>result</code> and return it at the end of our method, just before doing our post-call work:</p>
+<pre><code>        logger.debug('After call.')
+        return result
+</code></pre>
+<hr/>
+<h1>Logging more details</h1>
+<p>If you want to include more information in your logging statements, you'll likely have to completely overwrite the respective methods. So copy them over and modify them as required, and make sure you satisfy any missing imports.</p>
+<p>Here's an example for <code>accept()</code> that includes the IP address and local port of the client that's trying to connect:</p>
+<pre><code>    def accept(self):
+        """Accepts a new connection from a remote client, and returns
+        a tuple containing that new connection wrapped with a server-side
+        SSL channel, and the address of the remote client."""
+
+        newsock, addr = socket.accept(self)
+        logger.debug("Accepting connection from '%s'..." % (addr, ))
+        newsock = self.context.wrap_socket(newsock,
+                    do_handshake_on_connect=self.do_handshake_on_connect,
+                    suppress_ragged_eofs=self.suppress_ragged_eofs,
+                    server_side=True)
+        logger.debug('Done accepting connection.')
+        return newsock, addr
+</code></pre>
+<p>(Make sure to include <code>from socket import socket</code> in your imports at the top of your code - refer to the <a href="https://github.com/python/cpython/blob/master/Lib/ssl.py#L139"><code>ssl</code> module's imports</a> to determine where you need to import missing names from if you get a <code>NameError</code>. An good text editor with <a href="https://pypi.python.org/pypi/pyflakes"><code>PyFlakes</code></a> configured is very helpful in pointing those missing imports out to you).</p>
+<p>This method will result in logging output like this:</p>
+<pre><code>[2014-10-24 22:01:40,299] Accepting connection from '('127.0.0.1', 64152)'...
+[2014-10-24 22:01:40,300] Done accepting connection.
+[2014-10-24 22:01:40,301] Accepting connection from '('127.0.0.1', 64153)'...
+[2014-10-24 22:01:40,302] Done accepting connection.
+[2014-10-24 22:01:40,306] Accepting connection from '('127.0.0.1', 64155)'...
+[2014-10-24 22:01:40,307] Done accepting connection.
+[2014-10-24 22:01:40,308] 127.0.0.1 - - "GET / HTTP/1.1" 200 - 
+</code></pre>
+<p>Because it involves quite a few changes scattered all over the place, here's a <a href="https://gist.github.com/lukasgraf/399b04e328a5ad318bb9">gist containing all the changes to your example code</a>.</p>
+</div>
+<span class="comment-copy">This was an amazing response, exactly what I was looking for. Thank you so much! I was trying to create an additional wrapper around the SSLSocket, but ultimately just made a mess of things. And another thank you for the thorough explanation on superclass. I was getting confused with what to pass, so that tidbit was also incredibly helpful.</span>
+<span class="comment-copy">Very helpful comment, thanks.</span>

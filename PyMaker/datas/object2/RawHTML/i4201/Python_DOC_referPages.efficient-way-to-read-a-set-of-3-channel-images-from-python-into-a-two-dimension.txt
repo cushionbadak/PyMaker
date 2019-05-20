@@ -1,0 +1,119 @@
+<div class="post-text" itemprop="text">
+<p>I am working on a project involving object detection through deep learning, with the underlying detection code written in C. Due to the requirements of the project, this code has a Python wrapper around it, which interfaces with the required C functions through ctypes. Images are read from Python, and then transferred into C to be processed as a batch.</p>
+<p>In its current state, the code is very unoptimized: the images (640x360x3 each) are read using <code>cv2.imread</code> then stacked into a numpy array. For example, for a batch size of 16, the dimensions of this array are (16,360,640,3). Once this is done, a pointer to this array is passed through ctypes into C where the array is parsed, pixel values are normalized and rearranged into a 2D array. The dimensions of the 2D array are 16x691200 (16x(640*360*3)), arranged as follows.</p>
+<pre><code>row [0]: Image 0: (B)r0(B)r1(B)r2.... (G)r0(G)r1(G)r2.... (R)r0(R)r1(R)r2....
+row [1]: Image 1: (B)r0(B)r1(B)r2.... (G)r0(G)r1(G)r2.... (R)r0(R)r1(R)r2....
+.
+.
+row [15]: Image 15: (B)r0(B)r1(B)r2.... (G)r0(G)r1(G)r2.... (R)r0(R)r1(R)r2....
+</code></pre>
+<p>`</p>
+<p>The C code for doing this currently looks like this, where the pixel values are accessed through strides and arranged sequentially per image. nb is the total number of images in the batch (usually 16); h, w, c are 360,640 and 3 respectively.</p>
+<pre><code>matrix ndarray_to_matrix(unsigned char* src, long* shape, long* strides)
+{
+int nb = shape[0];
+int h = shape[1];
+int w = shape[2];
+int c = shape[3];
+matrix X = make_matrix(nb, h*w*c);
+
+int step_b = strides[0];
+int step_h = strides[1];
+int step_w = strides[2];
+int step_c = strides[3];
+
+int b, i, j, k;
+int index1, index2 = 0;
+
+for(b = 0; b &lt; nb ; ++b) {
+    for(i = 0; i &lt; h; ++i) {
+        for(k= 0; k &lt; c; ++k) {
+            for(j = 0; j &lt; w; ++j) {
+                index1 = k*w*h + i*w + j;
+                index2 = step_b*b + step_h*i + step_w*j + step_c*k;
+                X.vals[b][index1] = src[index2]/255.;
+            }
+        }
+    }
+}
+return X;
+}
+</code></pre>
+<p>And the corresponding Python code that calls this function: (array is the original numpy array)</p>
+<pre><code>for i in range(start, end):
+    imgName = imgDir + '/' + allImageName[i]
+    img = cv2.imread(imgName, 1)
+    batchImageData[i-start,:,:] = img[:,:]
+
+data = batchImageData.ctypes.data_as(POINTER(c_ubyte))
+resmatrix = self.ndarray_to_matrix(data, batchImageData.ctypes.shape, batchImageData.ctypes.strides)
+</code></pre>
+<p>As of now, this ctypes implementation takes about 35 ms for a batch of 16 images. I'm working on a very FPS critical image processing pipeline, so is there a more efficient way of doing these operations? Specifically:</p>
+<ol>
+<li>Can I read the image directly as a 'strided' one dimensional array in Python from disk, thus avoiding the iterative access and copying? </li>
+<li>I have looked into numpy operations such as: 
+<code>np.ascontiguousarray(img.transpose(2,0,1).flat, dtype=float)/255.</code> which should achieve something similar, but this is actually taking more time possibly because of it being called in Python.</li>
+<li>Would Cython help anywhere during the read operation?</li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<p>Regarding the <code>ascontiguousarray</code> method, I'm assuming that it's pretty slow as python has to do some memory works to return a C-like contiguous array. </p>
+<p>EDIT 1: 
+I saw <a href="https://stackoverflow.com/a/33674655/3283333">this answer</a>, apparently openCV's <code>imread</code> function should already return a contiguous array.</p>
+<p>I am not very familiar with <code>ctypes</code>, but happen to use the <a href="https://github.com/pybind" rel="nofollow noreferrer">PyBind library</a> and can only recommend using it. It implements Python's <a href="https://docs.python.org/3/c-api/buffer.html" rel="nofollow noreferrer">buffer protocol</a> hence allowing you to interact with python data with almost no overhead.</p>
+<p>I've answered a <a href="https://stackoverflow.com/questions/49582252/pybind-numpy-access-2d-nd-arrays/49693704#49693704">question</a> explaining how to pass a <code>numpy</code> array from Python to C/C++, do something dummy to it in C++ and return a dynamically created array back to Python.</p>
+<p>EDIT 2 : I've added a simple example that receives a Numpy array, send it to C and prints it from C. You can find it <a href="https://github.com/cjaques/pybind_examples" rel="nofollow noreferrer">here</a>. Hope it helps!</p>
+<p>EDIT 3 :
+To answer your last comment, yes you can definitely do that.
+You could modify your code to (1) instantiate a 2D numpy array in C++, (2) pass its reference to the data to your C function that will modify it instead of declaring a Matrix and (3) return that instance to Python by reference.</p>
+<p>Your function would become:</p>
+<pre><code>void ndarray_to_matrix(unsigned char* src, double * x, long* shape, long* strides)
+{
+int nb = shape[0];
+int h = shape[1];
+int w = shape[2];
+int c = shape[3];
+
+int step_b = strides[0];
+int step_h = strides[1];
+int step_w = strides[2];
+int step_c = strides[3];
+
+int b, i, j, k;
+int index1, index2 = 0;
+
+for(b = 0; b &lt; nb ; ++b) {
+    for(i = 0; i &lt; h; ++i) {
+        for(k= 0; k &lt; c; ++k) {
+            for(j = 0; j &lt; w; ++j) {
+                index1 = k*w*h + i*w + j;
+                index2 = step_b*b + step_h*i + step_w*j + step_c*k;
+                X.vals[b][index1] = src[index2]/255.;
+            }
+        }
+    }
+}
+}
+</code></pre>
+<p>And you'd add, in your C++ wrapper code </p>
+<pre><code>// Instantiate the output array, assuming we know b, h, c,w
+py::array_t&lt;double&gt; x = py::array_t&lt;double&gt;(b*h*c*w);
+py::buffer_info bufx = x.request();
+double*ptrx = (double *) bufx.ptr;
+
+// Call to your C function with ptrx as input
+ndarray_to_matrix(src, ptrx, shape, strides);
+
+// now reshape x
+x.reshape({b, h*c*w});
+</code></pre>
+<p>Do not forget to modify the prototype of the C++ wrapper function to return a <code>numpy</code> array like:</p>
+<pre><code>py::array_t&lt;double&gt; read_matrix(...){}...
+</code></pre>
+<p>This should work, I didn't test it though :)</p>
+</div>
+<span class="comment-copy">It seems like pybind only works with C++ (according to the website)? Also, I know that the C++ version of imread() stores the data as a contiguous array, but Python seems to do it differently.</span>
+<span class="comment-copy">I'm using C code with PyBind, but you're right that the wrapper itself has to be C++. I include my C modules with the <code>Extern C</code> keyword. If I have time later I'll setup a quick example, that hopefully could be useful for you.</span>
+<span class="comment-copy">Could you check out the code I've put on github? (see EDIT 2 in my answer above)</span>
+<span class="comment-copy">Thank you for the code! I will test it and let you know how it works in terms of performance</span>
+<span class="comment-copy">You're welcome :) I'm very curious to see how it's going to work (you will be interested in the folder "example1" of the repo, that's the one including C code).</span>

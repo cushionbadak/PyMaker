@@ -1,0 +1,229 @@
+<div class="post-text" itemprop="text">
+<p>I'm struggling to understand some <a href="http://sourceforge.net/projects/cxx/" rel="nofollow">PyCXX</a> code (C++ Python wrapper) that revolves around PyCFunction_New.</p>
+<p>Could someone explain how this function works?</p>
+<p>(I can't figure it out from the CPython <a href="https://github.com/python/cpython/blob/master/Objects/methodobject.c#L19-L48" rel="nofollow">source code</a>.)</p>
+<hr/>
+<p>Here I will detail the problem I'm having. I've ruled a line above, because this probably won't be of such general use.</p>
+<p>Reason for asking is that I'm dealing with weird code. I've got a keyword-method handler function:</p>
+<pre><code>    static PyObject* keyword_handler( PyObject* _self_and_name_tuple, 
+                                      PyObject* _args, 
+                                      PyObject* _keywords ) { }
+</code></pre>
+<p>It is getting stored as:</p>
+<pre><code>PyMethodDef meth_def_ext;
+meth_def_ext.ml_meth = reinterpret_cast&lt;PyCFunction&gt;( _handler );
+meth_def.ml_flags = METH_VARARGS | METH_KEYWORDS;
+</code></pre>
+<p>Then it is getting bundled into a PyCFunction_New:</p>
+<pre><code>        MethodDefExt&lt;T&gt;* method_def_ext = ...;
+
+        Tuple args{2}; // Tuple wraps a CPython Tuple
+        args[0] = Object{ this };
+        args[1] = Object{ PyCapsule_New( (void*)method_def_ext, nullptr, nullptr ), true };
+
+        PyObject* func = PyCFunction_New( &amp; method_def_ext-&gt;meth_def, args.ptr() );
+
+        return Object(func, true);
+    }
+</code></pre>
+<p>Am I right in assuming that CPython will take care of typecasting it back to a 3-param function, where the first param is args (which matches the handler's _self_and_name_tuple first param)?</p>
+<p>And CPython would only know from the fact that it is having to parse: 'myFunc(7, a=1)' that it is in fact dealing with a keywords a.k.a. 3-param function?</p>
+<p>This doesn't look right.</p>
+<p>Maybe CPython is typecasting args<a href="http://sourceforge.net/projects/cxx/" rel="nofollow">1</a> back to a PyMethodDef, and then inspecting it's .ml_flags</p>
+<p>If that's happening then I need to know, because the code I'm working with simply has:</p>
+<pre><code>template&lt;class T&gt;
+class MethodDefExt //: public PyMethodDef &lt;-- I commented this out
+{
+    // ... Constructors ...
+
+    PyMethodDef               meth_def;
+
+    method_noargs_function_t  ext_noargs_function  = nullptr;
+    method_varargs_function_t ext_varargs_function = nullptr;
+    method_keyword_function_t ext_keyword_function = nullptr;
+
+    Object                    py_method;
+};
+</code></pre>
+<p>In its original form, I think it must have had two copies of PyMethodDef
+And the first one never got touched because it was the base class</p>
+<p>If this is really happening, i.e. If this class is indeed getting typecast back to PyMethodDef by the internals of PyCFunction_New, then this is dodgy.</p>
+<p>Surely someone could add a member variable at the front of MethodDefExt, and then the typecasting would break.  This is flimsy...</p>
+<hr/>
+<p>The class I am dealing with allows the future C++ coder to implement a custom Python Type, and within this type, to implement methods that can be called from Python.</p>
+<p>So they derive <strong><em>MyExt : CustomExt</em></strong> and write the method:</p>
+<pre><code>// one of these three
+MyExt::foo(){...} 
+MyExt::foo(PyObject* args){...}
+MyExt::foo(PyObject* args, PyObject* kw){...}
+</code></pre>
+<p>Now they have to store this method in a <strong><em>lookup</em></strong>, by calling the appropriate one of these three functions: </p>
+<pre><code>    typedef Object (T::*method_noargs_function_t)();
+    static void add_noargs_method( const char* name, 
+                                   method_noargs_function_t function ) {
+        lookup()[std::string{name}] = new MethodDefExt&lt;T&gt; 
+                                   {name,function,noargs_handler,doc};
+    }
+
+    typedef Object (T::*method_varargs_function_t)( const Tuple&amp; args );
+    static void add_varargs_method( const char* name, 
+                                    method_varargs_function_t function ) {
+        lookup()[std::string{name}] = new MethodDefExt&lt;T&gt; 
+                                    {name,function,varargs_handler,doc};
+    }
+
+    typedef Object (T::*method_keyword_function_t)( const Tuple&amp; args, const Dict&amp; kws );
+    static void add_keyword_method( const char* name, 
+                                    method_keyword_function_t function ) {
+        lookup()[std::string{name}] = new MethodDefExt&lt;T&gt; 
+                                    {name,function,keyword_handler,doc};
+    }
+</code></pre>
+<p>Notice there is an associated handler function for each. These handler functions are static methods of <strong><em>CustomExt</em></strong> -- because a pointer to a static method can be called from CPython, i.e. It is just a standard C style function pointer.</p>
+<p>So when  Python wants  the pointer for this <strong>foo</strong> function, we intercept here:</p>
+<pre><code>    // turn a name into function object
+    virtual Object getattr_methods( const char* _name )
+    {
+        std::string name{ _name };
+
+        // see if name exists and get entry with method
+        auto i = lookup().find( name );
+
+        DBG_LINE( "packaging relevant C++ method and extension object instance into PyCFunction" );
+
+        // assume name was found in the method map
+        MethodDefExt&lt;T&gt;* method_def_ext = i-&gt;second;
+
+        // this must be the _self_and_name_tuple that gets received
+        //   as the first parameter by the handler
+        Tuple args{2};
+
+        args[0] = Object{ this };
+        args[1] = Object{ PyCapsule_New( (void*)method_def_ext, nullptr, nullptr ), true };
+</code></pre>
+<p>Construct a Python function that will call the handler for this method
+(while passing in this object args[0] the details of the method itself args<a href="http://sourceforge.net/projects/cxx/" rel="nofollow">1</a>).
+The handler will take care of running the method while trapping errors.</p>
+<p>Note that we don t execute the handler at this point
+Instead we return this Python function back to the Python runtime
+Maybe the Python coder didn t want the function executed but just wanted to grab a pointer to it:
+                fp = MyExt.func; </p>
+<pre><code>        PyObject* func = PyCFunction_New( &amp; method_def_ext-&gt;meth_def, args.ptr() );
+</code></pre>
+<p>X (see below) &amp; method_def_ext-&gt;meth_def pulls out the handler function, which is one of three handlers
+However, thanks to MethodDefExt s constructors, they have all been typecast into PyCFunction objects
+Which means the parameter list is wrong for keywords handler.</p>
+<pre><code>        return Object(func, true);
+    }
+</code></pre>
+<p><em>(I had to break out the comments as SO's formatter was not handling them as code comments)</em></p>
+<p>What I'm struggling with is this: let's say <strong>foo</strong> is a function that takes keywords, so its signature will be:</p>
+<pre><code>MyExt::foo(PyObject* args, PyObject* kw)
+</code></pre>
+<p>The matching handler looks like this:</p>
+<pre><code>    static PyObject* noargs_handler( PyObject* _self_and_name_tuple, 
+                                     PyObject*  ) { }
+
+    static PyObject* varargs_handler( PyObject* _self_and_name_tuple, 
+                                      PyObject* _args ) { }
+
+    static PyObject* keyword_handler( PyObject* _self_and_name_tuple, 
+                                      PyObject* _args, 
+                                      PyObject* _keywords ) { }
+</code></pre>
+<p>i.e. The third one.  I've read Python supplies an extra first <strong><em>_self_and_name_tuple</em></strong> parameter.</p>
+<p>When we register foo into the lookup, we supply this handler:</p>
+<pre><code>    typedef                               Object (T::*method_keyword_function_t)( const Tuple&amp; args, const Dict&amp; kws );
+    static void add_keyword_method( const char* name, method_keyword_function_t function ) {
+        methods()[std::string{name}] = new MethodDefExt&lt;T&gt; {name,function,keyword_handler,doc};
+    }
+</code></pre>
+<p>And looking at the particular constructor of <strong><em>MethodDefExt</em></strong>,</p>
+<pre><code>    // VARARGS + KEYWORD
+    MethodDefExt (
+        const char* _name,
+        method_keyword_function_t _function,
+        method_keyword_call_handler_t _handler
+    )
+    {
+        meth_def.ml_name = const_cast&lt;char *&gt;( _name );
+        meth_def.ml_doc  = nullptr;
+        meth_def.ml_meth = reinterpret_cast&lt;PyCFunction&gt;( _handler );
+        meth_def.ml_flags = METH_VARARGS | METH_KEYWORDS;
+
+        ext_noargs_function = nullptr;
+        ext_varargs_function = nullptr;
+        ext_keyword_function = _function;
+    }
+</code></pre>
+<p>... It can be seen that it typecasts this handler into a <strong><em>PyCFunction</em></strong></p>
+<p>But a <strong><em>PyCFunction</em></strong> only takes two arguments!!!</p>
+<pre><code>typedef PyObject *(*PyCFunction)(PyObject *, PyObject *);
+</code></pre>
+<p>We are typecasting handlers into this.  And these handlers have 2 or 3 parameters.</p>
+<p>This looks really wrong.</p>
+<p>And then going back so when CPython wants to execute foo, as described above, it will fetch this <strong><em>meth_def.ml_meth</em></strong> and feed it into <strong><em>PyCFunction_New</em></strong>:</p>
+<pre><code>        Tuple args{2};
+
+        args[0] = Object{ this };
+        args[1] = Object{ PyCapsule_New( (void*)method_def_ext, nullptr, nullptr ), true };
+
+        PyObject* func = PyCFunction_New( &amp; method_def_ext-&gt;meth_def, args.ptr() ); // https://github.com/python/cpython/blob/master/Objects/methodobject.c#L19-L48
+</code></pre>
+<p>So I can make a guess:
+ * the first parameter of PyCFunction_New must be a PyCFunction function pointer
+ * the second parameter must be a PyObject* _self_and_name_tuple</p>
+<p>And we are feeding this back to CPython
+My guess is that when CPython wants to use 'foo(7, a=1,b=2)' it will package 7 into args, a=1,b=2 into kwds, and call:</p>
+<pre><code>[the PyCFunction function pointer](_self_and_name_tuple, args, kwds)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I will hazard an answer:</p>
+<pre><code>PyObject* PyCFunction_New(PyMethodDef* ml, PyObject* data)
+</code></pre>
+<p>PyCFunction_New probably creates a Callable-Type PyObject, primed with a function (wrapped in ml) and additional data (wrapped in self)</p>
+<p>The second parameter could be anything, in fact it doesn't even need to be a PyObject*. When Python executes the function packaged inside ml, this will be the first argument. Subsequent arguments depend on ml-&gt;ml_flags, as detailed below.</p>
+<p>The first parameter is a PyMethodDef object, which we can use to encapsulate a function.</p>
+<pre><code>struct PyMethodDef {
+    const char  *ml_name;   /* The name of the built-in function/method */
+    PyCFunction ml_meth;    /* The C function that implements it */
+    int         ml_flags;   /* Combination of METH_xxx flags, which mostly
+                               describe the args expected by the C func */
+    const char  *ml_doc;    /* The __doc__ attribute, or NULL */
+};
+typedef struct PyMethodDef PyMethodDef;
+</code></pre>
+<p>So, it contains a (specific) function pointer:</p>
+<pre><code>typedef PyObject *(*PyCFunction)(PyObject*, PyObject*);
+</code></pre>
+<p>... and a flag,</p>
+<pre><code>/* Flag passed to newmethodobject */
+/* #define METH_OLDARGS  0x0000   -- unsupported now */
+#define METH_VARARGS  0x0001
+#define METH_KEYWORDS 0x0002
+/* METH_NOARGS and METH_O must not be combined with the flags above. */
+#define METH_NOARGS   0x0004
+#define METH_O        0x0008
+</code></pre>
+<p><a href="https://docs.python.org/3.4/c-api/structures.html" rel="nofollow">https://docs.python.org/3.4/c-api/structures.html</a></p>
+<p>We can pass 3 kinds of function to Python in this way:</p>
+<pre><code>PyObject*foo( PyObject* data )                                 // ml_meth=METH_NOARGS
+PyObject*foo( PyObject* data, PyObject* args )                 // ml_meth=METH_VARARGS
+PyObject*foo( PyObject* data, PyObject* args, PyObject* kwds ) // ml_meth=METH_KEYWORDS
+</code></pre>
+<p>EDIT: <a href="https://docs.python.org/3/tutorial/classes.html#method-objects" rel="nofollow">https://docs.python.org/3/tutorial/classes.html#method-objects</a></p>
+<blockquote>
+<p>If you still don’t understand how methods work, a look at the
+  implementation can perhaps clarify matters. When an instance attribute
+  is referenced that isn’t a data attribute, its class is searched. If
+  the name denotes a valid class attribute that is a function object, a
+  method object is created by packing (pointers to) the instance object
+  and the function object just found together in an abstract object:
+  this is the method object. When the method object is called with an
+  argument list, a new argument list is constructed from the instance
+  object and the argument list, and the function object is called with
+  this new argument list.</p>
+</blockquote>
+</div>
+<span class="comment-copy">The second parameter MUST be <code>null</code> or a <code>PyObject</code> in Python 3.5 (don't know for other versions) (so anything is incorrect), because <code>PyCFunction_New</code> will try to invoke <code>Py_XINCREF</code> on it. If it is not one of the two, then it will probably result in undefined behavior. I know this answer is old, but I've found it just now while trying to figure this out myself.</span>

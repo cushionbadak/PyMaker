@@ -1,0 +1,191 @@
+<div class="post-text" itemprop="text">
+<p>I am aware that I can open multiple files with something like,</p>
+<pre><code>with open('a', 'rb') as a, open('b', 'rb') as b:
+</code></pre>
+<p>But I have a situation where I have a list of files to open and am wondering what the preferred method is of doing the same when the number of files is unknown in advance. Something like,</p>
+<pre><code>with [ open(f, 'rb') for f in files ] as fs:
+</code></pre>
+<p>(but this fails with an <code>AttributeError</code> since list doesn't implement <code>__exit__</code>)</p>
+<p>I don't mind using something like,</p>
+<pre><code>try:
+    fs = [ open(f, 'rb') for f in files ]
+
+    ....
+
+finally:
+    for f in fs:
+        f.close()
+</code></pre>
+<p>But am not sure what will happen if some files throw when trying to open them. Will <code>fs</code> be properly defined, with the files that did manage to open, in the <code>finally</code> block?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, your code wouldn't initialise <code>fs</code> unless all <code>open()</code> calls completed successfully. This should work though:</p>
+<pre><code>fs = []
+try:
+    for f in files:
+        fs.append(open(f, 'rb'))
+
+    ....
+
+finally:
+    for f in fs:
+        f.close()
+</code></pre>
+<p>Note also that f.close() could fail so you may want to catch and ignore (or otherwise handle) any failures there.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Sure, why not,  Here's a recipe that should do it.  Create a context manager 'pool' that can enter an arbitrary number of contexts (by calling it's <code>enter()</code> method) and they will be cleaned up at the end of the end of the suite.</p>
+<pre><code>class ContextPool(object):
+    def __init__(self):
+        self._pool = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        for close in reversed(self._pool):
+            close(exc_type, exc_value, exc_tb)
+
+    def enter(self, context):
+        close = context.__exit__
+        result = context.__enter__()
+        self._pool.append(close)
+        return result
+</code></pre>
+<p>For example:</p>
+<pre><code>&gt;&gt;&gt; class StubContextManager(object):
+...     def __init__(self, name):
+...         self.__name = name
+...     def __repr__(self):
+...         return "%s(%r)" % (type(self).__name__, self.__name)
+... 
+...     def __enter__(self):
+...          print "called %r.__enter__()" % (self)
+... 
+...     def __exit__(self, *args):
+...          print "called %r.__exit__%r" % (self, args)
+... 
+&gt;&gt;&gt; with ContextPool() as pool:
+...     pool.enter(StubContextManager("foo"))
+...     pool.enter(StubContextManager("bar"))
+...     1/0
+... 
+called StubContextManager('foo').__enter__()
+called StubContextManager('bar').__enter__()
+called StubContextManager('bar').__exit__(&lt;type 'exceptions.ZeroDivisionError'&gt;, ZeroDivisionError('integer division or modulo by zero',), &lt;traceback object at 0x02958648&gt;)
+called StubContextManager('foo').__exit__(&lt;type 'exceptions.ZeroDivisionError'&gt;, ZeroDivisionError('integer division or modulo by zero',), &lt;traceback object at 0x02958648&gt;)
+
+Traceback (most recent call last):
+  File "&lt;pyshell#67&gt;", line 4, in &lt;module&gt;
+    1/0
+ZeroDivisionError: integer division or modulo by zero
+&gt;&gt;&gt; 
+</code></pre>
+<p>Caveats: context managers aren't supposed to raise exceptions in their <code>__exit__()</code> methods, but if they do, this recipe doesn't do the cleanup for all the context managers.  Similarly, even if every context manager indicates that an exception should be ignored (by returning <code>True</code> from their exit methods), this will still allow the exception to be raised.  </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Errors can occur when attempting to open a file, when attempting to read from a file, and (very rarely) when attempting to close a file.</p>
+<p>So a basic error handling structure might look like:</p>
+<pre><code>try:
+    stream = open(path)
+    try:
+        data = stream.read()
+    finally:
+        stream.close()
+except EnvironmentError as exception:
+    print 'ERROR:', str(exception)
+else:
+    print 'SUCCESS'
+    # process data
+</code></pre>
+<p>This ensures that <code>close</code> will always be called if the <code>stream</code> variable exists. If <code>stream</code> doesn't exist, then <code>open</code> must have failed, and so there is no file to close (in which case, the except block will be executed immediately).</p>
+<p>Do you really need to have the files open in parallel, or can they be processed sequentially? If the latter, then something like the above file-processing code should be put in a function, which is then called for each path in the list.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Thanks for all your answers. Taking inspiration from all of you, I have come up with the following. I think (hope) it works as I intended. I wasn't sure whether to post it as an answer or an addition to the question, but thought an answer was more appropriate as then if it fails to do what I'd asked it can be commented on appropriately.</p>
+<p>It can be used for example like this ..</p>
+<pre><code>with contextlist( [open, f, 'rb'] for f in files ) as fs:
+    ....
+</code></pre>
+<p>or like this ..</p>
+<pre><code>f_lock = threading.Lock()
+with contextlist( f_lock, ([open, f, 'rb'] for f in files) ) as (lock, *fs):
+    ....
+</code></pre>
+<p>And here it is,</p>
+<pre><code>import inspect
+import collections
+import traceback
+
+class contextlist:
+
+    def __init__(self, *contexts):
+
+        self._args = []
+
+        for ctx in contexts:
+            if inspect.isgenerator(ctx):
+                self._args += ctx 
+            else:
+                self._args.append(ctx)
+
+
+    def __enter__(self):
+
+        if hasattr(self, '_ctx'):
+            raise RuntimeError("cannot reenter contextlist")
+
+        s_ctx = self._ctx = []
+
+        try:
+            for ctx in self._args:
+
+                if isinstance(ctx, collections.Sequence):
+                    ctx = ctx[0](*ctx[1:])
+
+                s_ctx.append(ctx)
+
+                try:
+                    ctx.__enter__()
+                except Exception:
+                    s_ctx.pop()
+                    raise
+
+            return s_ctx
+
+        except:
+            self.__exit__()
+            raise
+
+
+    def __exit__(self, *exc_info):
+
+        if not hasattr(self, '_ctx'):
+            raise RuntimeError("cannot exit from unentered contextlist")
+
+        e = []
+
+        for ctx in reversed(self._ctx):
+            try:
+                ctx.__exit__()
+            except Exception:
+                e.append(traceback.format_exc())
+
+        del self._ctx
+
+        if not e == []: 
+            raise Exception('\n&gt;   '*2+(''.join(e)).replace('\n','\n&gt;   '))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The class <a href="https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack" rel="nofollow noreferrer"><code>ExitStack</code></a> from the <a href="https://docs.python.org/3/library/contextlib.html#module-contextlib" rel="nofollow noreferrer"><code>contextlib</code></a> module provides the functionality you are looking for.
+The canonical use-case that is mentioned in the documentation is managing a dynamic number of files.</p>
+<pre><code>with ExitStack() as stack:
+    files = [stack.enter_context(open(fname)) for fname in filenames]
+    # All opened files will automatically be closed at the end of
+    # the with statement, even if attempts to open files later
+    # in the list raise an exception
+</code></pre>
+</div>
+<span class="comment-copy">Will you be accessing these files in parallel, or sequentially?</span>
+<span class="comment-copy">@EthanFurman In parallel.</span>

@@ -1,0 +1,215 @@
+<div class="post-text" itemprop="text">
+<p>I'm using Unix sockets to stream audio from my microphone (via an Electron NodeJS app) to a python program listening on the socket and sending the audio to PyAudio for playback.</p>
+<p><strong>Electron app <code>getUserMedia()</code> =&gt; WAV formatting =&gt; NodeJS socket =&gt; Unix Socket =&gt; Python Socket =&gt; PyAudio</strong></p>
+<p>I have it working, but there's a constant clicking sound when each chunk starts or ends. Where should I start debugging it? Here's the code:</p>
+<p>NodeJS app <strong>(sender)</strong>:</p>
+<pre class="lang-js prettyprint-override"><code>var net = require('net');
+const nodeWav = require("node-wav");
+
+var recorder = null;
+var volume = null;
+var audioInput = null;
+var sampleRate = null;
+var audioContext = null;
+var context = null;
+var outputElement = document.getElementById('output');
+var outputString;
+var bufferSize = 1024;
+
+var mediaSourceIn;
+
+// callback for navigator.mediaDevices.getUserMedia()
+function audioReceiver(e) {
+    // creates Socket
+    mediaSourceIn = e;
+    initSocket();
+}
+
+var audioSocket;
+function initSocket() {
+  audioSocket = net.connect('/tmp/audio_input', connected)
+  .catch(function(err) {
+    console.log("Could not connect...");
+    console.log(err);
+  });
+}
+
+function connected() {
+  console.log("CONNECTED TO UNIX SOCKET!");
+  audioSocket = this;
+  createRecordingTask();
+}
+
+function createRecordingTask() {
+  // creates the audio context
+    audioContext = window.AudioContext || window.webkitAudioContext;
+    context = new audioContext();
+
+    // retrieve the current sample rate to be used for WAV packaging
+    sampleRate = context.sampleRate;
+
+    // creates a gain node
+    volume = context.createGain();
+
+    // creates an audio node from the microphone incoming stream
+    audioInput = context.createMediaStreamSource(mediaSourceIn);
+
+    // connect the stream to the gain node
+    audioInput.connect(volume);
+
+    /* From the spec: This value controls how frequently the audioprocess event is
+    dispatched and how many sample-frames need to be processed each call.
+    Lower values for buffer size will result in a lower (better) latency.
+    Higher values will be necessary to avoid audio breakup and glitches */
+    recorder = context.createScriptProcessor(bufferSize, 2, 2);
+
+    recorder.onaudioprocess = function(e){
+        console.log ('recording');
+        var left = e.inputBuffer.getChannelData (0);
+        var right = e.inputBuffer.getChannelData (1);
+        var bf = createAudioBuffer(
+          new Float32Array (left),
+          new Float32Array (right));
+
+        upload(bf);
+    }
+
+    // we connect the recorder
+    volume.connect (recorder);
+    recorder.connect (context.destination);
+}
+
+function mergeBuffers(channelBuffer){
+  var result = new Float32Array(bufferSize);
+  result.set(channelBuffer); // make a copy?
+  return result;
+}
+
+function interleave(leftChannel, rightChannel){
+  var length = leftChannel.length + rightChannel.length;
+  var result = new Float32Array(length);
+
+  var inputIndex = 0;
+
+  for (var index = 0; index &lt; length; ){
+    result[index++] = leftChannel[inputIndex];
+    result[index++] = rightChannel[inputIndex];
+    inputIndex++;
+  }
+  return result;
+}
+
+function writeUTFBytes(view, offset, string){
+  var lng = string.length;
+  for (var i = 0; i &lt; lng; i++){
+    view.setUint8(offset + i, string.charCodeAt(i));
+  }
+}
+
+function createAudioBuffer(leftchannel, rightchannel) {
+
+  // we flat the left and right channels down
+  var leftBuffer = mergeBuffers ( leftchannel, bufferSize );
+  var rightBuffer = mergeBuffers ( rightchannel, bufferSize );
+
+  // we interleave both channels together
+  var interleaved = interleave ( leftBuffer, rightBuffer );
+
+  // we create our wav file
+  var buffer = new ArrayBuffer(44 + interleaved.length * 2);
+  //var buffer = new ArrayBuffer(interleaved.length * 2);
+  var view = new DataView(buffer);
+
+  // RIFF chunk descriptor
+  writeUTFBytes(view, 0, 'RIFF');
+  view.setUint32(4, 44 + interleaved.length * 2, true);
+  writeUTFBytes(view, 8, 'WAVE');
+  // FMT sub-chunk
+  writeUTFBytes(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  // stereo (2 channels)
+  view.setUint16(22, 2, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 4, true);
+  view.setUint16(32, 4, true);
+  view.setUint16(34, 16, true);
+  // data sub-chunk
+  writeUTFBytes(view, 36, 'data');
+  view.setUint32(40, interleaved.length * 2, true);
+  // write the PCM samples
+  var lng = interleaved.length;
+  //var index = 0;
+  var index = 44;
+  var volume = 0.6;
+  for (var i = 0; i &lt; lng; i++){
+      view.setInt16(index, interleaved[i] * (0x7FFF * volume), true);
+      index += 2;
+  }
+  // our final binary blob
+  return Buffer.from(view.buffer);
+}
+
+
+function upload(thatAudio) {
+  if (audioSocket.writable) {
+    audioSocket.write(thatAudio);
+  } else {
+    console.log("DISCONNECTED!");
+  }
+}
+</code></pre>
+<p>Python program <strong>(receiver)</strong>:</p>
+<pre><code>import socket
+import os
+import pyaudio
+from threading import Thread
+
+sockfile = "/tmp/audio_input"
+
+FORMAT = pyaudio.paInt16
+CHUNK = 1024
+CHANNELS = 2
+RATE = 44100
+frames = []
+
+if os.path.exists(sockfile):
+    os.remove(sockfile)
+
+print("Opening socket...")
+server = socket.socket( socket.AF_UNIX, socket.SOCK_STREAM )
+server.bind(sockfile)
+server.listen(5)
+conn, addr = server.accept()
+
+print("Creating PyAudio stream...")
+p = pyaudio.PyAudio()
+
+stream = p.open(format=FORMAT,
+                channels = CHANNELS,
+                rate = RATE,
+                output = True,
+                frames_per_buffer = CHUNK,
+                )
+
+print "Listening..."
+singleChunkSizeBytes = 44 + (CHUNK * CHANNELS*2)
+print singleChunkSizeBytes, "bytes at a time"
+while True:
+    soundData = conn.recv(singleChunkSizeBytes)
+    if soundData:
+        stream.write(soundData, CHUNK)
+
+server.close()
+os.remove( sockfile )
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>First you should check if <code>stream.write()</code> causes buffer underruns. This can probably be done with the <code>exception_on_underflow</code> option (see the <a href="https://people.csail.mit.edu/hubert/pyaudio/docs/#pyaudio.Stream.write" rel="nofollow noreferrer">docs</a>).
+If you want a non-throwing version of the <code>write()</code> function, you can try the <a href="http://python-sounddevice.readthedocs.io/" rel="nofollow noreferrer">sounddevice</a> module (see its <a href="http://python-sounddevice.readthedocs.io/en/latest/#sounddevice.Stream.write" rel="nofollow noreferrer"><code>write()</code> docs</a>).</p>
+<p>If there <em>are</em> underruns, that may mean that the socket doesn't provide the data fast enough. In this case, you should probably implement some buffering on the receiver side, e.g. using <a href="https://docs.python.org/3/library/queue.html#queue.Queue" rel="nofollow noreferrer">queue.Queue</a>.</p>
+<p>If there are no underruns, the error is probably on the sending side ...</p>
+</div>
+<span class="comment-copy">No exception was thrown when exception_on_underflow=true. So the WAV formatting is probably the culprit. I'll try to view header bytes of normal WAV files and see if they match what I'm sending out</span>
+<span class="comment-copy">OK, I see it now ... You are receiving the chunk including the WAV header. You'll have to remove the first 44 bytes before writing to the PyAudio stream! Apart from that, I guess <code>recv()</code> might return less bytes than requested, you should check for that to be sure.</span>
+<span class="comment-copy">And since you are not checking the header, it probably doesn't make a lot of sense to send it in the first place. You might as well just send raw data.</span>

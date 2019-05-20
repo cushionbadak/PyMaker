@@ -1,0 +1,125 @@
+<div class="post-text" itemprop="text">
+<p>I'm having trouble with some CPU-intensive tasks within an asyncio event loop. The troubles I have arise when dealing with maintaining a buffer of incoming data and building packets from it. I've tried using executors to do the CPU bound stuff, but then had trouble maintaining the ordering of the buffer when packets were removed from it.</p>
+<p>I'm looking for a best-practice method to achieve the following functionality without having the CPU-bound tasks executed within the event loop.</p>
+<pre><code>import asyncio
+import struct
+
+class Reader(asyncio.Protocol):
+    def __init__(self):
+        self.extra = bytearray()
+
+    def data_received(self, data):
+        self.extra.extend(data)
+        packet = get_packet(bytes(self.extra))
+        if packet:
+            del self.extra[:len(packet)]
+            if verify_hash(packet):  # CPU intensive
+                asyncio.async(distribute(packet))  # Some asyncio fan-out callback
+
+
+def get_packet(data):  # CPU intensive
+    if len(data) &gt; HEADER_SIZE:
+        payload_size, = struct.unpack_from(HEADER_FORMAT, data)
+        if len(data) &gt;= HEADER_SIZE + payload_size:
+            return data[:HEADER_SIZE + payload_size]
+    return None
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(loop.create_server(Reader, '0.0.0.0', 8000))
+loop.run_forever()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You want to be able to handle all the data coming into <code>Reader</code> as quickly as possible, but you also can't have multiple threads/processes try to process that data in parallel; that's how you ran into race conditions using executors before. Instead, you should start one worker process that can handle processing all the packet data, one at a time, using a <code>multiprocessing.Queue</code> to pass the data from the parent to the worker. Then, when the worker has a valid packet built, verified, and ready to be distributed, it uses another <code>multiprocessing.Queue</code> to send it back to a thread in the parent process, which can use the thread-safe <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.BaseEventLoop.call_soon_threadsafe" rel="noreferrer"><code>call_soon_threadsafe</code></a> method to schedule <code>distribute</code> to run.</p>
+<p>Here's an untested example that should give you an idea of how to do this:</p>
+<pre><code>import asyncio
+import struct
+from concurrent.futures.ProcessPoolExecutor
+import threading
+
+
+def handle_result_packets():
+    """ A function for handling packets to be distributed.
+
+    This function runs in a worker thread in the main process.
+
+    """
+    while True:
+        packet = result_queue.get()
+        loop.call_soon_threadsafe(asyncio.async, distribute(packet))
+
+def get_packet():  # CPU intensive
+    """ Handles processing all incoming packet data.
+
+    This function runs in a separate process.
+
+    """
+    extra = bytearray()
+    while True:
+        data = data_queue.get()
+        extra.extend(data)
+        if len(data) &gt; HEADER_SIZE:
+            payload_size, = struct.unpack_from(HEADER_FORMAT, data)
+            if len(data) &gt;= HEADER_SIZE + payload_size:
+                packet = data[:HEADER_SIZE + payload_size]
+                del extra[:len(packet)]
+                if verify_hash(packet):
+                    result_queue.put(packet)
+
+
+class Reader(asyncio.Protocol):
+    def __init__(self):
+        self.extra = bytearray()
+        self.t = threading.Thread(target=handle_result_packets)
+        self.t.start()
+
+    def data_received(self, data):
+        data_queue.put(data)
+
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    data_queue = multiprocessing.Queue()
+    result_queue = multiprocessing.Queue()
+    p = multiprocessing.Process(target=get_packet)
+    p.start()
+    loop.run_until_complete(loop.create_server(Reader, '0.0.0.0', 8000))
+    loop.run_forever()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I would try to wrap up the whole packet handling logic, and split the heavy task into pieces. Using MD5 hash for example:</p>
+<pre><code>@asyncio.coroutine
+def verify_hash(packet):
+    m = hashlib.md5()
+    for i in range(len(packet) // 4096 + 1):
+        yield m.update(packet[i:i+4096])
+    return m.digest() == signature
+
+
+@asyncio.coroutine
+def handle_packet(packet):
+    verified = yield from verify_hash(packet)
+    if verified:
+        yield from distribute(packet)
+
+
+class Reader(asyncio.Protocol):
+    def __init__(self):
+        self.extra = bytearray()
+
+    def data_received(self, data):
+        self.extra.extend(data)
+        packet = get_packet(bytes(self.extra))
+        if packet:
+            del self.extra[:len(packet)]
+            asyncio.async(handle_packet(packet))
+</code></pre>
+<p>Note that the packets can come in <strong>much</strong> faster than <code>Reader</code> can handle, so make sure to monitor system load &amp; stop receiving while needed. But that's another story :)</p>
+</div>
+<span class="comment-copy">Can you elaborate on the issues you had with executors? Because that's the most obvious solution here.</span>
+<span class="comment-copy">I had to register a callback to occur when the executor returned, but then the <code>del self.extra[:len(packet)]</code> could potentially cause a race condition with the other <code>data_received()</code> calls that had occurred after the executor was called.</span>
+<span class="comment-copy">The problem I have with this approach is that the reliability is lacking if either the spawned process or thread dies unexpectedly. I don't really want a lot of boiler plate process management code.</span>
+<span class="comment-copy">@Nathaniel If you want to do CPU-bound work in parallel with receiving I/O, you're going to need to use a worker process. It's a common pattern. What specifically are your reliability concerns? I wouldn't expect your worker process or thread  to unexpectedly die any more than your main process.</span>
+<span class="comment-copy">I'm trying to explore the differences in reliability and process management between Erlang and Python. I agree that the process is unlikely to die, but I'd rather have an individual task die that doesn't break everything else. Your answer does solve my question, but I'd like to leave it open a bit longer to gather more input before accepting it.</span>
+<span class="comment-copy">BTW, I'm from the Erlang world too. And I treat <code>asyncio.async(...)</code> like <code>erlang:spawn(...)</code> :)</span>

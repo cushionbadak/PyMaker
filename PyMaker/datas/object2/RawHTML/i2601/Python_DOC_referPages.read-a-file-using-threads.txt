@@ -1,0 +1,49 @@
+<div class="post-text" itemprop="text">
+<p>I try to write a python program that send files from one PC to another using python's sockets. But when file size increase it takes lots of time. Is it possible to read lines of a file sequentially using threads? </p>
+<p>The concepts which I think is as follows:
+Each thread separately and sequentially read lines from file and send it over socket. Is it possible to do? Or do you have any suggestion for it?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>First, if you want to speed this up as much as possible without using threads, reading and sending a line at a time can be pretty slow. Python does a great job of buffering up the file to give you a line at a time for reading, but then you're sending tiny 72-byte packets over the network. You want to try to send at least 1.5KB at a time when possible.</p>
+<p>Ideally, you want to use the <a href="https://docs.python.org/3/library/socket.html#socket.socket.sendfile" rel="nofollow noreferrer"><code>sendfile</code></a> method. Python will tell the OS to send the whole file over the socket in whatever way is most efficient, without getting your code involved at all. Unfortunately, this doesn't work on Windows; if you care about that, you may want to drop to the native APIs<sup>1</sup> directly with <code>pywin32</code> or switch to a higher-level networking library like <code>twisted</code> or <code>asyncio</code>.</p>
+<hr/>
+<p>Now, what about threading?</p>
+<p>Well, reading a line at a time in different threads is not going to help very much. The threads have to read sequentially, fighting over the read pointer (and buffer) in the file object, and they presumably have to write to the socket sequentially, and you probably even need a mutex to make sure they write things in order. So, whichever one of those is slowest, all of your threads are going to end up waiting for their turn.<sup>2</sup></p>
+<hr/>
+<p>Also, even forgetting about the sockets: Reading a file in parallel <em>can</em> be faster in some situations on modern hardware, but <em>in general</em> it's actually a lot slower. Imagine the file is on a slow magnetic hard drive. One thread is trying to read the first chunk, the next thread is trying to read the 64th chunk, the next thread is trying to read the 4th chunk… this means you spend more time seeking the disk head back and forth than actually reading data.</p>
+<p>But, if you think you might be in one of those situations where parallel reads might help, you can try it. It's not trivial, but it's not that hard.</p>
+<p>First, you want to do binary reads of fixed-size chunks. You're going to need to experiment with different sizes—maybe 4KB is fastest, maybe 1MB… so make sure to make it a constant you can easily change in just one place in the code.</p>
+<p>Next, you want to be able to send the data as soon as you can get it, rather than serializing. This means you have to send some kind of identifier, like the offset into the file, before each chunk.</p>
+<p>The function will look something like this:</p>
+<pre><code>def sendchunk(sock, lock, file, offset):
+    with lock:
+        sock.send(struct.pack('&gt;Q', offset)
+        sent = sock.sendfile(file, offset, CHUNK_SIZE)
+        if sent &lt; CHUNK_SIZE:
+            raise OopsError(f'Only sent {sent} out of {CHUNK_SIZE} bytes')
+</code></pre>
+<p>… except that (unless your files actually are all multiples of <code>CHUNK_SIZE</code>) you need to decide what you want to do for a legitimate EOF. Maybe send the total file size before any of the chunks, and pad the last chunk with null bytes, and have the receiver truncate the last chunk.</p>
+<p>The receiving side can then just loop reading 8+CHUNK_SIZE bytes, unpacking the offset, seeking, and writing the bytes.</p>
+<hr/>
+<p><sub>1. See <a href="https://docs.microsoft.com/en-us/windows/desktop/api/mswsock/nf-mswsock-transmitfile" rel="nofollow noreferrer"><code>TransmitFile</code></a>—but in order to use that, you have to know about how to go between Python-level <code>socket</code> objects and Win32-level <code>HANDLE</code>s, and so on; if you've never done that, there's a learning curve—and I don't know of a good tutorial to get you started..</sub></p>
+<p><sub>2. If you're really lucky, and, say, the file reads are only twice as fast as the socket writes, you might actually get a 33% speedup from pipelining—that is, only one thread can be writing at a time, but the threads waiting to write have mostly already done their reading, so at least you don't need to wait there.</sub></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Not Threads.  </p>
+<pre><code>source_path = r"\\mynetworkshare"
+dest_path = r"C:\TEMP"
+file_name = "\\myfile.txt"
+
+shutil.copyfile(source_path + file_name, dest_path + file_name)
+</code></pre>
+<p><a href="https://docs.python.org/3/library/shutil.html" rel="nofollow noreferrer">https://docs.python.org/3/library/shutil.html</a></p>
+<p>Shutil offers a high level copy function that uses the OS layer to copy.  It is your best bet for this scenario.  </p>
+</div>
+<span class="comment-copy">Threads almost certainly won't help here, because they'll all be fighting over access to the file and to the socket, plus to whatever mutex or other sync object you use to make sure the lines get sent in order, so whichever of those is slowest (probably the socket), you'll end up with everything synchronized on that.</span>
+<span class="comment-copy">What you <i>could</i> do is rewrite your program to send fixed-size (binary) chunks instead of lines. For each chunk, you send the offset within the file followed by the bytes. The receiver then reads each chunk, seeks to the appropriate offset, and writes it there. This <i>might</i> speed things up, but there's a good chance even this will instead slow things down (especially if, e.g., you're reading off a slow magnetic hard drive), so you'd have to test it both ways.</span>
+<span class="comment-copy">Meanwhile, the best way to speed this up <i>without</i> parallelizing (which might be the only speedup you can get) is probably to use <a href="https://docs.python.org/3/library/socket.html#socket.socket.sendfile" rel="nofollow noreferrer"><code>sendfile</code></a> (or maybe look on PyPI for a wrapper around native <code>sendfile</code> for mac/Linux/BSD or the Win32 function I forget the name of), where you just give it a socket and a filename/file object/file descriptor number and it tells the OS to send the bytes of that file as fast as possible without your code getting in the way.</span>
+<span class="comment-copy">Thanks @abarnert for your answers.I'll try each of them</span>
+<span class="comment-copy">Better to use <code>sendfile</code> than <code>copyfile</code>, especially if you're looking for optimization.</span>
+<span class="comment-copy">I think shutil work only for copy from one to another destination on a PC not send over socket.</span>
+<span class="comment-copy">@HamidAskarov Yeah, <code>copyfile</code> takes a filename, not a file object. But if you switch this to open the file and <code>copyfileobj</code> from the file to the socket, it will work. But still less efficient than <code>sendfile</code> and no simpler.</span>
+<span class="comment-copy">Anything sent over a network is via a socket.  It's the only way to communicate via IP.</span>

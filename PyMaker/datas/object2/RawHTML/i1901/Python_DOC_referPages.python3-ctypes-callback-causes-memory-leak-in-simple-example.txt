@@ -1,0 +1,129 @@
+<div class="post-text" itemprop="text">
+<p>While working on a complex program combining Python 3 code and C++ code using ctypes,  I found a memory leak that can easily be reproduced with the stripped down example below.</p>
+<p>My C++ code creates a Python object using a callback function. Next, it calls another callback on the Python object, that simply returns its argument.  The second callback causes the object's reference count to increase.  As a result,  the object never gets garbage-collected.</p>
+<p>This is the Python code (file bug.py):</p>
+<pre><code>import ctypes
+
+CreateObjectCallback = ctypes.CFUNCTYPE( ctypes.py_object )
+NoopCallback = ctypes.CFUNCTYPE( ctypes.py_object, ctypes.py_object )
+
+lib = ctypes.cdll.LoadLibrary("./libbug.so")
+
+lib.test.restype = ctypes.py_object
+lib.test.argtypes = [ CreateObjectCallback, NoopCallback ]
+
+class Foo:
+    def __del__(self):
+        print("garbage collect foo");
+
+def create():
+    return Foo()
+
+def noop(object):
+    return object
+
+lib.test(CreateObjectCallback(create), NoopCallback(noop))
+</code></pre>
+<p>This is the C++ code (file bug.cpp):</p>
+<pre><code>#include &lt;python3.6m/Python.h&gt;
+#include &lt;iostream&gt;
+#include &lt;assert.h&gt;
+
+extern "C" {
+
+  typedef void *(*CreateObjectCallback)();
+  typedef void *(*NoopCallback)(void *arg);
+
+  void *test(CreateObjectCallback create, NoopCallback noop)
+  {
+    void *object = create();
+    std::cerr &lt;&lt; "ref cnt = " &lt;&lt; ((PyObject*)(object))-&gt;ob_refcnt &lt;&lt; std::endl;
+    object = noop(object);
+    std::cerr &lt;&lt; "ref cnt = " &lt;&lt; ((PyObject*)(object))-&gt;ob_refcnt &lt;&lt; std::endl;
+    return object;
+  }
+}
+</code></pre>
+<p>And here are the commands I use to compile and run:</p>
+<pre><code>g++ -O3 -W -Wextra -Wno-return-type -Wall -Werror -fPIC -MMD   -c -o bug.o bug.cpp
+g++ -shared -Wl,-soname,libbug.so -o libbug.so bug.o 
+python3 bug.py
+</code></pre>
+<p>The output is:</p>
+<pre><code>ref cnt = 1
+ref cnt = 2
+</code></pre>
+<p>In other words,  the call to the noop function incorrectly increases the reference count, and the Foo object is not garbage collected.  Without the call to the noop function, the Foo object is garbage collected.  The expected output is:</p>
+<pre><code>ref cnt = 1
+ref cnt = 1
+garbage collect foo
+</code></pre>
+<p>Is this a known issue?  Does anyone know a work-around or solution? Is this caused by a bug in ctypes?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You're passing around Python objects.  One of your objects is passed into your C code, and not passed out, so <em>you</em> are responsible for that reference count.  Here's something that works, but I've changed <code>void*</code> to <code>PyObject*</code> since that is what they are:</p>
+<pre><code>#include &lt;Python.h&gt;
+#include &lt;iostream&gt;
+#include &lt;assert.h&gt;
+
+extern "C" {
+
+  typedef PyObject* (*CreateObjectCallback)();
+  typedef PyObject* (*NoopCallback)(PyObject* arg);
+
+  __declspec(dllexport) PyObject* test(CreateObjectCallback create, NoopCallback noop)
+  {
+    // Create the object, with one reference.
+    PyObject* object = create();
+    std::cerr &lt;&lt; "ref cnt = " &lt;&lt; object-&gt;ob_refcnt &lt;&lt; std::endl;
+
+    // Passing object back to Python increments its reference count
+    // because the parameter of the function is a new reference.
+    // That python function returns an object (the same one), but
+    // now you own deleting the reference.
+    PyObject* object2 = noop(object);
+    Py_DECREF(object2);
+
+    std::cerr &lt;&lt; "ref cnt = " &lt;&lt; object-&gt;ob_refcnt &lt;&lt; std::endl;
+
+    // Your return the created object, but now that Python knows
+    // it is a Python object instead of void*, it will decref it.
+    return object;
+  }
+}
+</code></pre>
+<p>Here's the Python script I used.  You can use the prototypes as decorators for the callback functions.  This really matters if the callback needs to live longer than the function it was passed into.  When you call the function as you did directly with the callback wrapper, the callback wrapper is destroyed after the function returns because there is no more reference.</p>
+<p>I also change to <code>ctypes.PyDLL</code>.  This doesn't release the GIL when calling into the C code.  Since you're passing around Python objects that seems a good idea.</p>
+<pre><code>import ctypes
+
+CreateObjectCallback = ctypes.CFUNCTYPE( ctypes.py_object )
+NoopCallback = ctypes.CFUNCTYPE( ctypes.py_object, ctypes.py_object )
+
+lib = ctypes.PyDLL('test')
+
+lib.test.restype = ctypes.py_object
+lib.test.argtypes = [ CreateObjectCallback, NoopCallback ]
+
+class Foo:
+    def __del__(self):
+        print("garbage collect foo");
+
+@CreateObjectCallback
+def create():
+    return Foo()
+
+@NoopCallback
+def noop(object):
+    return object
+
+lib.test(create,noop)
+</code></pre>
+<p>Output:</p>
+<pre><code>ref cnt = 1
+ref cnt = 1
+garbage collect foo
+</code></pre>
+</div>
+<span class="comment-copy">This is exactly the answer I was looking for,  and even more about PyDLL and decorators;  thank you.  Is there any public documentation on how ctypes.py_object handles reference counts?  For example,  it is not obvious to me that passing a Python object as parameter to a callback increments the reference count permanently; I would expect that returning from the callback decreases the reference count again.</span>
+<span class="comment-copy">@ygramoel <code>lib.test()</code> created an object (ref1) and <code>noop</code> was passed the object (ref2...the parameter name refers to it). <code>noop</code> returned the ref to the caller. The caller is responsible to decref the object when it is done with it.  <code>noop</code> was called from C by <code>lib.test</code>, so <code>lib.test</code> had to decrement it.  <code>lib.test</code> returned the object it created back to Python.  The Python code didn't assign it to a variable, so Python decremented the reference count.  If the Python code assigned it to a variable, it would have maintained the reference count and <code>Foo</code> wouldn't have been garbage collected.</span>
+<span class="comment-copy">@ygramoel <a href="https://docs.python.org/3/c-api/intro.html#objects-types-and-reference-counts" rel="nofollow noreferrer">Objects, Types and Reference Counts</a>.</span>

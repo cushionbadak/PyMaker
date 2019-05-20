@@ -1,0 +1,88 @@
+<div class="post-text" itemprop="text">
+<p>I have a python app written in the Tornado Asynchronous framework. When an HTTP request comes in, this method gets called:</p>
+<pre><code>@classmethod
+def my_method(cls, my_arg1):
+
+    # Do some Database Transaction #1
+    x = get_val_from_db_table1(id=1, 'x')
+    y = get_val_from_db_table2(id=7, 'y')
+    x += x + (2 * y) 
+
+    # Do some Database Transaction #2
+    set_val_in_db_table1(id=1, 'x', x)
+
+    return True
+</code></pre>
+<p>The three database operations are interrelated. And this is a concurrent application so multiple such HTTP calls can be happening concurrently and hitting the same DB.</p>
+<p>For data-integrity purposes, its important that the three database operations in this method are all called without another processes reading or writing to those database rows in between.</p>
+<p>How can I make sure this method has database atomicity? Does Tornado have a decorator for this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<h1>Synchronous database access</h1>
+<p>You haven't stated how you access your database. If, which is likely, you have synchronous DB access in <code>get_val_from_db_table1</code> and friends (e.g. with <a href="https://pypi.python.org/pypi/PyMySQL" rel="nofollow noreferrer">pymysql</a>) and <code>my_method</code> is blocking (doesn't return control to IO loop) then you block your server (which has implications on performance and responsiveness of your server) but effectively serialise your clients and only one can execute <code>my_method</code> at a time. So in terms of data consistency you don't need to do anything, but generally it's a bad design. You can solve both with @xyres's solution in short term (at cost of keeping in mind thread-safely concerns because most of Tornado's functionality <a href="http://www.tornadoweb.org/en/branch4.5/web.html#thread-safety-notes" rel="nofollow noreferrer">isn't thread-safe</a>).</p>
+<h1>Asynchronous database access</h1>
+<p>If you have asynchronous DB access in <code>get_val_from_db_table1</code> and friends (e.g. with <a href="https://pypi.python.org/pypi/Tornado-MySQL" rel="nofollow noreferrer">tornado-mysql</a>) then you can use <a href="http://www.tornadoweb.org/en/stable/locks.html#tornado.locks.Lock" rel="nofollow noreferrer"><code>tornado.locks.Lock</code></a>. Here's an example:</p>
+<pre><code>from tornado import web, gen, locks, ioloop
+
+
+_lock = locks.Lock()
+
+def synchronised(coro):
+    async def wrapper(*args, **kwargs):  
+        async with _lock:
+            return await coro(*args, **kwargs)
+
+    return wrapper
+
+
+class MainHandler(web.RequestHandler):
+
+    async def get(self):
+        result = await self.my_method('foo')
+        self.write(result)
+
+    @classmethod
+    @synchronised
+    async def my_method(cls, arg):
+        # db access
+        await gen.sleep(0.5)
+        return 'data set for {}'.format(arg)
+
+
+if __name__ == '__main__':
+    app = web.Application([('/', MainHandler)])
+    app.listen(8080)
+    ioloop.IOLoop.current().start()
+</code></pre>
+<hr/>
+<p>Note that the above is said about normal single-process Tornado application. If you use <code>tornado.process.fork_processes</code>, then you can only go with <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Lock" rel="nofollow noreferrer"><code>multiprocessing.Lock</code></a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since you want to run those three db operations one right after the other,  the function <code>my_method</code> must be <strong>non-asynchronous</strong>.</p>
+<p>But this would also mean that <code>my_method</code> will block the server. You definitely don't want that. One way that I can think of is to run this function in another thread. This won't block the server and will keep accepting new requests while the operations are running. And since, it's going to be non-async, db atomicity is guaranteed.</p>
+<p>Here's the relevant code to get you started:</p>
+<pre><code>import concurrent.futures
+
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+# Don't set `max_workers` more than 1, because then multiple 
+# threads will be able to perform db operations
+
+class MyHandler(...):
+    @gen.coroutine
+    def get(self):
+
+        yield executor.submit(MyHandler.my_method, my_arg1)
+        # above, `yield` is used to wait for 
+        # db operations to finish
+        # if you don't want to wait and return
+        # a response immediately remove the 
+        # `yield` keyword
+
+        self.write('Done')
+
+    @classmethod
+    def my_method(cls, my_arg1):
+        # do db stuff ...
+        return True
+</code></pre>
+</div>

@@ -1,0 +1,77 @@
+<div class="post-text" itemprop="text">
+<p>Is it possible to combine async context managers in python? Something similar to <code>asyncio.gather</code>, but able to be used with context managers. Something like this:</p>
+<pre><code>async def foo():
+    async with asyncio.gather_cm(start_vm(), start_vm()) as vm1, vm2:
+        await vm1.do_something()
+        await vm2.do_something()
+</code></pre>
+<p>Is this currently possible?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Something close to <code>gather_cm</code> can be achieved with <a href="https://docs.python.org/3/library/contextlib.html#contextlib.AsyncExitStack" rel="nofollow noreferrer"><code>AsyncExitStack</code></a>, introduced in Python 3.7:</p>
+<pre><code>async def foo():
+    async with AsyncExitStack() as stack:
+        vm1, vm2 = await asyncio.gather(
+            stack.enter_async_context(start_vm()),
+            stack.enter_async_context(start_vm()))
+        await vm1.do_something()
+        await vm2.do_something()
+</code></pre>
+<p>Unfortunately, <code>__aexit__</code>s will still be run sequentially. This is because <code>AsyncExitStack</code> simulates nested context managers, which have a well-defined order and cannot overlap. The outer context manager's <code>__aexit__</code> is given information on whether the inner one raised an exception. (A database handle's <code>__aexit__</code> might use this to roll back the transaction in case of exception and commit it otherwise.) Running <code>__aexit__</code>s in parallel would make the context managers overlap and the exception information unavailable or unreliable. So although <code>gather(...)</code> runs <code>__aenter__</code>s in parallel, <code>AsyncExitStack</code> records which one came first and runs the <code>__aexit__</code>s in reverse order.</p>
+<p>With async context managers an alternative like <code>gather_cm</code> would make perfect sense. One could drop the nesting semantics and provide an aggregate context manager that worked like an "exit pool" rather than a stack. The exit pool takes a number of context manager that are independent of each other, which allows their <code>__aenter__</code> and <code>__aexit__</code> methods to be run in parallel.</p>
+<p>The tricky part is handling exceptions correctly: If any <code>__aenter__</code> raises, the exception must be propagated to prevent the <code>with</code> block from being run. To ensure correctness, the pool must guarantee that <code>__aexit__</code> will be invoked on all the context managers whose <code>__aenter__</code> has completed.</p>
+<p>Here is an example implementation:</p>
+<pre><code>import asyncio
+import sys
+
+class gather_cm:
+    def __init__(self, *cms):
+        self._cms = cms
+
+    async def __aenter__(self):
+        futs = [asyncio.create_task(cm.__aenter__())
+                for cm in self._cms]
+        await asyncio.wait(futs)
+        # only exit the cms we've successfully entered
+        self._cms = [cm for cm, fut in zip(self._cms, futs)
+                     if not fut.cancelled() and not fut.exception()]
+        try:
+            return tuple(fut.result() for fut in futs)
+        except:
+            await self._exit(*sys.exc_info())
+            raise
+
+    async def _exit(self, *args):
+        # don't use gather() to ensure that we wait for all __aexit__s
+        # to complete even if one of them raises
+        done, _pending = await asyncio.wait(
+            [cm.__aexit__(*args)
+             for cm in self._cms if cm is not None])
+        return all(suppress.result() for suppress in done)
+
+    async def __aexit__(self, *args):
+        # Since exits are running in parallel, so they can't see each
+        # other exceptions.  Send exception info from `async with`
+        # body to all.
+        return await self._exit(*args)
+</code></pre>
+<p>This test program shows how it works:</p>
+<pre><code>class test_cm:
+    def __init__(self, x):
+        self.x = x
+    async def __aenter__(self):
+        print('__aenter__', self.x)
+        return self.x
+    async def __aexit__(self, *args):
+        print('__aexit__', self.x, args)
+
+async def foo():
+    async with gather_cm(test_cm('foo'), test_cm('bar')) as (cm1, cm2):
+        print('cm1', cm1)
+        print('cm2', cm2)
+
+asyncio.run(foo())
+</code></pre>
+</div>
+<span class="comment-copy">The AsyncExitStack approach seems unsafe; it looks like the AsyncExitStack may be unwound before all <code>__aenter__</code> calls terminate, leading to concurrent modification bugs and/or un-exited context managers.</span>
+<span class="comment-copy">@user2357112 If neither <code>__aenter__</code> raises, <code>await gather(...)</code> will wait until they both complete. But if one of them raises, the others will continue in the background, and the situation you describe can occur.</span>

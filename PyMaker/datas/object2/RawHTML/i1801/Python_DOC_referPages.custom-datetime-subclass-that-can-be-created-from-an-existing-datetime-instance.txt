@@ -1,0 +1,75 @@
+<div class="post-text" itemprop="text">
+<p>I need to have a method to easily create an instance of a <code>datetime.datetime</code> subclass, given an existing <code>datetime.datetime()</code> instance.</p>
+<p>Say I have the following contrived example:</p>
+<pre><code>class SerializableDateTime(datetime):
+    def serialize(self):
+        return self.strftime('%Y-%m-%d %H:%M')
+</code></pre>
+<p>I'm using a class like this (but a bit more complex), to use in a SQLAlchemy model; you can tell SQLAlchemy to map a custom class to a supported <code>DateTime</code> column value with a <a href="https://docs.sqlalchemy.org/en/latest/core/custom_types.html#augmenting-existing-types" rel="nofollow noreferrer"><code>TypeDecorator</code> class</a>; e.g.:</p>
+<pre><code>class MyDateTime(types.TypeDecorator):
+    impl = types.DateTime
+
+    def process_bind_param(self, value, dialect):
+        # from custom type to the SQLAlchemy type compatible with impl
+        # a datetime subclass is fine here, no need to convert
+        return value
+
+    def process_result_value(self, value, dialect):
+        # from SQLAlchemy type to custom type
+        # is there a way have this work without accessing a lot of attributes each time?
+        return SerializableDateTime(value)   # doesn't work
+</code></pre>
+<p>I can't use <code>return SerializableDateTime(value)</code> here because the default <code>datetime.datetime.__new__()</code> method doesn't accept a <code>datetime.datetime()</code> instance:</p>
+<pre><code>&gt;&gt;&gt; value = datetime.now()
+&gt;&gt;&gt; SerializableDateTime(value)
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+TypeError: an integer is required (got type datetime.datetime)
+</code></pre>
+<p>Is there a shortcut that avoids having to copy <code>value.year</code>, <code>value.month</code>, etc. all the way down to the timezone into a constructor?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Although you can give your subclass a <code>__new__</code> method that detects a single <code>datetime.datetime</code> instance then does all the copying there, I'd actually give the class a classmethod just to handle this case, so your SQLAlchemy code would look like:</p>
+<pre><code>return SerializableDateTime.from_datetime(value)
+</code></pre>
+<p>We can make use of the <code>pickle</code> support the <code>datetime.datetime()</code> class already implements; types implement the <a href="https://docs.python.org/3/library/pickle.html#object.__reduce_ex__" rel="nofollow noreferrer"><code>__reduce_ex__</code> hook</a> (usually building on higher-level methods like <a href="https://docs.python.org/3/library/pickle.html#object.__getnewargs__" rel="nofollow noreferrer"><code>__getnewargs__</code></a>), and for <code>datetime.datetime()</code> instances this hook returns just the <code>datetime.datetime</code> type and an <code>args</code> tuple, meaning that as long as you have a subclass with the same internal state we can create a new copy with the same state by applying the <code>args</code> tuple back to your new type. The <code>__reduce_ex__</code> method can vary output by pickle protocol, but as long as you pass in <a href="https://docs.python.org/3/library/pickle.html#pickle.HIGHEST_PROTOCOL" rel="nofollow noreferrer"><code>pickle.HIGHEST_PROTOCOL</code></a> you are guaranteed to get the full supported range of values.</p>
+<p>The <code>args</code> tuple consists of one or two values, the second being the timezone:</p>
+<pre><code>&gt;&gt;&gt; from pickle import HIGHEST_PROTOCOL
+&gt;&gt;&gt; value = datetime.now()
+&gt;&gt;&gt; value.__reduce_ex__(HIGHEST_PROTOCOL)
+(&lt;class 'datetime.datetime'&gt;, (b'\x07\xe2\n\x1f\x12\x06\x05\rd\x8f',))
+&gt;&gt;&gt; datetime.utcnow().astimezone(timezone.utc).__reduce_ex__(value.__reduce_ex__(HIGHEST_PROTOCOL))
+(&lt;class 'datetime.datetime'&gt;, (b'\x07\xe2\n\x1f\x12\x08\x14\n\xccH', datetime.timezone.utc))
+</code></pre>
+<p>That first value in the <code>args</code> tuple is a <code>bytes</code> value that represents all attributes of the object (excepting the timezone), and the constructor for <code>datetime</code> accepts that same bytes value (plus an optional timezone):</p>
+<pre><code>&gt;&gt;&gt; datetime(b'\x07\xe2\n\x1f\x12\x06\x05\rd\x8f') == value
+True
+</code></pre>
+<p>Since your subclass accepts the same arguments, you can make use of the <code>args</code> tuple to create a copy; we can use the first value to guard against changes in future Python versions by asserting it's still a parent class of ours: </p>
+<pre><code>from pickle import HIGHEST_PROTOCOL
+
+class SerializableDateTime(datetime):
+    @classmethod
+    def from_datetime(cls, dt):
+        """Create a SerializableDateTime instance from a datetime.datetime object"""
+        # (ab)use datetime pickle support to copy state across
+        factory, args = dt.__reduce_ex__(HIGHEST_PROTOCOL)
+        assert issubclass(cls, factory)
+        return cls(*args)
+
+    def serialize(self):
+        return self.strftime('%Y-%m-%d %H:%M')
+</code></pre>
+<p>This lets you create instances of your subclass as a copy:</p>
+<pre><code>&gt;&gt;&gt; SerializableDateTime.from_datetime(datetime.now())
+SerializableDateTime(2018, 10, 31, 18, 13, 2, 617875)
+&gt;&gt;&gt; SerializableDateTime.from_datetime(datetime.utcnow().astimezone(timezone.utc))
+SerializableDateTime(2018, 10, 31, 18, 13, 22, 782185, tzinfo=datetime.timezone.utc)
+</code></pre>
+<p>While using the pickle <code>__reduce_ex__</code> hook may seem somewhat hackish, this is the actual protocol used to create copies of <code>datetime.datetime</code> instances with the <a href="https://docs.python.org/3/library/copy.html" rel="nofollow noreferrer"><code>copy</code> module</a> as well, and by using <code>__reduce_ex__(HIGHEST_PROTOCOL)</code> you ensure that all relevant state is copied whatever the Python version you are using.</p>
+</div>
+<span class="comment-copy">@MartijnPieters The thing is that <code>value</code> is already of <code>datetime</code> type, but I can't initialize SerializableDateTime (which actually inherits <code>__init__</code> from <code>datetime</code>) with another <code>datetime</code> object. So <code>SerializableDateTime(value)</code> fails with <code>TypeError: an integer is required (got type datetime.datetime)</code></span>
+<span class="comment-copy">That's not a SQLAlchemy issue, that's purely an issue with your custom class.</span>
+<span class="comment-copy">@MartijnPieters definitely, I didn't suspect this could be sqlalchemy issue</span>
+<span class="comment-copy">Awesome, thanks a lot! I've never met the reduce hook before, really interesting</span>
+<span class="comment-copy">@OlehRybalchenko: heads-up: I checked the datetime source code and was reminded of the fact that in Python 3.6 and up, <a href="https://docs.python.org/3/whatsnew/3.6.html#pep-495-local-time-disambiguation" rel="nofollow noreferrer"><code>datetime</code> objects have new <code>.fold</code> attribute</a> that would not be pickled in older pickle values but you probably want to bring along on newer Python versions. I've updated the answer to make sure you are future-proofed for further such additions.</span>

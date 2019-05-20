@@ -1,0 +1,114 @@
+<div class="post-text" itemprop="text">
+<p>I'm attempting to create a centralized module to set up my log formatter to be shared across a number of python modules within my lambda function. This function will ultimately be run on AWS Greengrass on a local on-premise device. </p>
+<p>For some reason, when I add in my own handler to format the messages the logs are being outputted twice - once at the correct log level and the second time at an incorrect level.</p>
+<p>If I use the standard python logger without setting up any handlers it works fine e.g.</p>
+<p><code>main.py</code>:</p>
+<pre><code>import logging
+
+logging.debug("test1")
+</code></pre>
+<p><code>cloudwatch logs</code>:</p>
+<pre><code>12:28:42 [DEBUG]-main.py:38,test1
+</code></pre>
+<p>My objective is to have one formatter on my code which will format these log messages into JSON. They will then get ingested into a centralized logging database. However, when I do this I get the log messages twice.</p>
+<p><code>loghelper.py</code>:</p>
+<pre><code>def setup_logging(name):
+
+    formatter = logging.Formatter("%(name)s, %(asctime)s, %(message)s")
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+
+    logger = logging.getLogger(name)
+
+    if logger.handlers:
+        for handler in logger.handlers:
+            logger.removeHandler(handler)
+
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    return logger
+</code></pre>
+<p><code>main.py</code>:</p>
+<pre><code>import logging
+
+logger = loghelper.setup_logging('main.test_function')
+
+def test_function():
+    logger.debug("test function log statement")
+
+test_function()
+</code></pre>
+<p>When the lambda function is now run I get the debug message twice in the cloud watch logs as follows:</p>
+<p><code>cloudwatch logs</code>:</p>
+<pre><code>12:22:53 [DEBUG]-main.py:5, test function log statement
+12:22:53 [INFO]-__init__.py:880,main.test_function,2018-06-18 12:22:53,099, test function log statement
+</code></pre>
+<p>Notice that:</p>
+<ul>
+<li>The first entry is at the correct level but in the wrong format.</li>
+<li>The second entry reports the wrong level, the wrong module but is in the correct format.</li>
+</ul>
+<p>I cannot explain this behavior and would appreciate any thoughts on what could be causing it. I also don't know which constructor exists at line 880. This may shed some light on what is happening.</p>
+<p>References:</p>
+<ol>
+<li><p>Setting up a global formatter:
+<a href="https://stackoverflow.com/questions/50877387/how-to-define-a-logger-in-python-once-for-the-whole-program">How to define a logger in python once for the whole program?</a></p></li>
+<li><p>Clearing the default lambda log handlers:
+<a href="https://stackoverflow.com/questions/37703609/using-python-logging-with-aws-lambda">Using python Logging with AWS Lambda</a></p></li>
+<li><p>Creating a global logger:
+<a href="https://stackoverflow.com/questions/7621897/python-logging-module-globally">Python: logging module - globally</a></p></li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<p>AWS Lambda also sets up a handler, on the root logger, <em>and</em> anything written to <code>stdout</code> is captured and logged as level <code>INFO</code>. Your log message is thus captured twice:</p>
+<ul>
+<li>By the AWS Lambda handler on the root logger (as log messages <em>propagate</em> from nested child loggers to the root), and this logger has its own format configured.</li>
+<li>By the AWS Lambda stdout-to-INFO logger.</li>
+</ul>
+<p>This is why the messages all start with <code>(asctime) [(levelname)]-(module):(lineno),</code> information; the root logger is configured to output messages with that format and the information written to stdout is just another <code>%(message)</code> part in that output.</p>
+<p>Just don't set a handler when you are in the AWS environment, <em>or</em>, disable propagation of the output to the root handler and live with all your messages being recorded as <code>INFO</code> messages by AWS; in the latter case your own formatter could include the <code>levelname</code> level information in the output.</p>
+<p>You can disable log propagation with <code>logger.propagate = False</code>, at which point your message is only going to be passed to <em>your</em> handler, not to to the root handler as well.</p>
+<p>Another option is to just rely on the AWS root logger configuration. According to <a href="https://www.denialof.services/lambda/" rel="nofollow noreferrer">this excellent reverse engineering blog post</a> the root logger is configured with:</p>
+<pre><code>logging.Formatter.converter = time.gmtime
+logger = logging.getLogger()
+logger_handler = LambdaLoggerHandler()
+logger_handler.setFormatter(logging.Formatter(
+    '[%(levelname)s]\t%(asctime)s.%(msecs)dZ\t%(aws_request_id)s\t%(message)s\n',
+    '%Y-%m-%dT%H:%M:%S'
+))
+logger_handler.addFilter(LambdaLoggerFilter())
+logger.addHandler(logger_handler)
+</code></pre>
+<p>This replaces the <code>time.localtime</code> converter on <code>logging.Formatter</code> with <code>time.gmtime</code> (so timestamps use UTC rather than locatime), sets a custom handler that makes sure messages go to the Lambda infrastructure, configures a format, and adds a filter object that only adds <code>aws_request_id</code> attribute to records (so the above formatter can include it) but doesn't actually filter anything.</p>
+<p>You could alter the formatter on that handler by updating the attributes on the <code>handler.formatter</code> object:</p>
+<pre><code>for handler in logging.getLogger().handlers:
+    formatter = handler.formatter
+    if formatter is not None and 'aws_request_id' in formatter._fmt:
+        # this is the AWS Lambda formatter
+        # formatter.datefmt =&gt; '%Y-%m-%dT%H:%M:%S'
+        # formatter._style._fmt =&gt; 
+        #    '[%(levelname)s]\t%(asctime)s.%(msecs)dZ'
+        #    '\t%(aws_request_id)s\t%(message)s\n'
+</code></pre>
+<p>and then just drop your own logger handler entirely. You do want to be careful with this; AWS Lambda infrastructure could well be counting on a specific format being used. The output you show in your question doesn't include the date component (the <code>%Y-%m-%dT</code> part of the <code>formatter.datefmt</code> string) which probably means that the format has been parsed out and is being presented to you in a web application view of the data.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'm not sure whether this is the cause of your problem, but by default, Python's loggers propagate their messages up to logging hierarchy. As you probably know, Python loggers are organized in a tree, with the <code>root</code> logger at the top and other loggers below it. In logger names, a dot (<code>.</code>) introduces a new hierarchy level. So if you do</p>
+<pre><code>logger = logging.getLogger('some_module.some_function`)
+</code></pre>
+<p>then you actually have 3 loggers:</p>
+<pre><code>The root logger (`logging.getLogger()`)
+    A logger at module level (`logging.getLogger('some_module'))
+        A logger at function level (`logging.getLogger('some_module.some_function'))
+</code></pre>
+<p>If you emit a log message on a logger and it is not discarded based on the loggers minimum level, then the message is passed on to the logger's handlers <em>and</em> to its parent logger. See <a href="https://docs.python.org/2/howto/logging.html#logging-flow" rel="nofollow noreferrer">this flowchart</a> for more information.</p>
+<p>If that parent logger (or any logger higher up in the hierarchy) also has handlers, then they are called, too.</p>
+<p>I suspect that in your case, either the root logger or the <code>main</code> logger somehow ends up with some handlers attached, which leads to the duplicate messages. To avoid that, you can set <a href="https://docs.python.org/3/library/logging.html#logging.Logger.propagate" rel="nofollow noreferrer"><code>propagate</code></a> in your logger to <code>False</code> or only attach your handlers to the root logger.</p>
+</div>
+<span class="comment-copy">This seems to be absolutely correct. I'm now getting all my messages at INFO level now I've turned off propagation. Is there actually a solution where by I can set the root logger and use exactly my own format (and share that format throughout my code). I've attempted to remove any loggers that already exist. the fact that all the logs start with <code>(asctime)...</code> etc will cause problems for log ingestion.</span>
+<span class="comment-copy">Still looking at this. If I use the root logger can I change the format of that globally? Or can I stop logging to stdout. I think the thing I am not understanding is why adding a handler has caused output to both. Or is it that I am not using the root logger as I am naming it?</span>
+<span class="comment-copy">@Remotec: sure, AWS Lambda uses the standard logging infrastructure; see <a href="https://www.denialof.services/lambda/" rel="nofollow noreferrer">denialof.services/lambda</a>. The formatter they configure has <code>'%Y-%m-%dT%H:%M:%S'</code> set as the <code>datefmt</code> parameter, and the converter is set to <code>time.gmtime</code> (rather than <code>time.localtime</code>). You could just loop over all the handlers or the root logger (<code>for handler in logging.getLogger().handlers:</code>) and update the <code>.formatter</code> attribute of each (these are <a href="https://github.com/python/cpython/blob/v3.6.5/Lib/logging/__init__.py#L426-L592" rel="nofollow noreferrer"><code>Formatter</code> class instances</a>).</span>
+<span class="comment-copy">The extra logging comes from AWS Lamba's stdout capturing code. <i>Anything</i> written to stdout is going to be logged at INFO level.</span>
+<span class="comment-copy">This is useful information. If I do <code>root = logging.getLogger()</code> and then set it's <code>basicInfo(...)</code> does this propagate to the next logger e.g. <code>logger = logging.getLogger("some_module")</code> or does it need to be defined at that level as well?</span>
+<span class="comment-copy">The settings of the logger are not propagated to child loggers, so you have to configure the child loggers separately. Instead, the log messages are propagated upwards (from child loggers to their ancestors) unless you set <code>propagate</code> to <code>False</code>.</span>

@@ -1,0 +1,147 @@
+<div class="post-text" itemprop="text">
+<p>So the example code is very basic:</p>
+<pre><code>@mock.patch.object(BookForm, 'is_valid')
+def test_edit(self, mocked_is_valid):
+    create_superuser()
+    self.client.login(username="test", password="test")
+
+    book = Book()
+    book.save()
+
+    mocked_is_valid.side_effect = lambda: True
+
+    self.client.post(reverse('edit', args=[book.pk]), {})
+</code></pre>
+<p>This works well. But adding autospec keyword to the mock:</p>
+<pre><code>@mock.patch.object(BookForm, 'is_valid', autospec=True)
+</code></pre>
+<p>causes additional argument to be passed to the <code>side_effect</code> callable, which obviously results in error:</p>
+<pre><code>TypeError: &lt;lambda&gt;() takes 0 positional arguments but 1 was given
+</code></pre>
+<p>What I don't uderstand, is why autospeccing gives additional argument. I've read the <a href="https://docs.python.org/3/library/unittest.mock.html">docs</a>, but still can't find the explanation of this behaviour.</p>
+<p>Theoretically, it's written that </p>
+<blockquote>
+<p>In addition mocked functions / methods have the same call signature as the original so they raise a TypeError if they are called incorrectly.</p>
+</blockquote>
+<p>so it'd be okay (<code>is_valid</code> has <code>self</code> argument, which is probably what is being passed here), but on the other hand it's also written about <code>side_effect</code> that</p>
+<blockquote>
+<p>The function is called with the same arguments as the mock, and unless it returns DEFAULT, the return value of this function is used as the return value.</p>
+</blockquote>
+<p>So as far as I understand, <code>side_effect</code> should be called with the <code>self</code> argument even without autospeccing. But it is not.</p>
+<blockquote>
+<p>is called with the same arguments as the mock</p>
+</blockquote>
+<pre><code>if form.is_valid():  # the mock is_valid is called with the self argument, isn't it?
+</code></pre>
+<p>So if someone could explain it to me, preferably quoting the docs, I'd be thankful.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You are misunderstanding the documentation.  Without <code>autospec</code>, the <code>side_effect</code> that is being called is literally as is without inspecting the original declaration.  Let's create a better minimum example to demonstrate this issue.</p>
+<pre><code>class Book(object):
+    def __init__(self):
+        self.valid = False
+    def save(self):
+        self.pk = 'saved'
+    def make_valid(self):
+        self.valid = True
+
+class BookForm(object):
+    def __init__(self, book):
+        self.book = book
+    def is_valid(self):
+        return self.book.valid
+
+class Client(object):
+    def __init__(self, book):
+        self.form = BookForm(book)
+    def post(self):
+        if self.form.is_valid() is True:  # to avoid sentinel value
+            print('Book is valid')
+        else:
+            print('Book is invalid')
+</code></pre>
+<p>Now your original test should work about the same with some adjustments</p>
+<pre><code>@mock.patch.object(BookForm, 'is_valid')
+def test_edit(mocked_is_valid):
+    book = Book()
+    book.save()
+    client = Client(book)
+    mocked_is_valid.side_effect = lambda: True
+    client.post()
+</code></pre>
+<p>Running the test as is will cause <code>Book is valid</code> be printed to stdout, even though we haven't gone through the dance to set the Book.valid flag to true, as the <code>self.form.is_valid</code> being called in <code>Client.post</code> is replaced with the lambda which is invoked.  We can see this through a debugger:</p>
+<pre><code>&gt; /usr/lib/python3.4/unittest/mock.py(962)_mock_call()
+-&gt; ret_val = effect(*args, **kwargs)
+(Pdb) pp effect
+&lt;function test_edit.&lt;locals&gt;.&lt;lambda&gt; at 0x7f021dee6730&gt;
+(Pdb) bt
+...
+  /tmp/test.py(20)post()
+-&gt; if self.form.is_valid():
+  /usr/lib/python3.4/unittest/mock.py(896)__call__()
+-&gt; return _mock_self._mock_call(*args, **kwargs)
+  /usr/lib/python3.4/unittest/mock.py(962)_mock_call()
+-&gt; ret_val = effect(*args, **kwargs)
+</code></pre>
+<p>Also within the frame of the <code>Client.post</code> method call, it's not a bound method (we will get back to this later)</p>
+<pre><code>(Pdb) self.form.is_valid
+&lt;MagicMock name='is_valid' id='140554947029032'&gt;
+</code></pre>
+<p>So hmm, we might have a problem here: the <code>side_effect</code> could literally be any callable that could be different to what reality is, in our case the <code>is_valid</code> function signature (that is the argument list) could be different to the mock we provide.  What if the <code>BookForm.is_valid</code> method was modified to take in an additional argument:</p>
+<pre><code>class BookForm(object):
+    def __init__(self, book):
+        self.book = book
+    def is_valid(self, authcode):
+        return authcode &gt; 0 and self.book.valid
+</code></pre>
+<p>Rerun our test... and you will see that our test has <em>passed</em>, even though <code>Client.post</code> is still calling <code>BookForm.is_valid</code> <em>without</em> any arguments.  Your product will fail in production even though your test has passed.  This is why <code>autospec</code> argument is introduced, and we will apply that in our second test without replacing the callable through side_effect:</p>
+<pre><code>@mock.patch.object(BookForm, 'is_valid', autospec=True)
+def test_edit_autospec(mocked_is_valid):
+    book = Book()
+    book.save()
+    client = Client(book)
+    client.post()
+</code></pre>
+<p>This now happens when calling the function</p>
+<pre><code>Traceback (most recent call last):
+  ...
+  File "/tmp/test.py", line 49, in test_edit_autospec
+    client.post()
+  File "/tmp/test.py", line 20, in post
+    if self.form.is_valid():
+  ...
+  File "/usr/lib/python3.4/inspect.py", line 2571, in _bind
+    raise TypeError(msg) from None
+TypeError: 'authcode' parameter lacking default value
+</code></pre>
+<p>Which is what you want and what <code>autospec</code> intends to provide - a check before the mocks are called, and</p>
+<blockquote>
+<p>In addition mocked functions / methods have the same call signature as the original so they raise a TypeError if they are called incorrectly.</p>
+</blockquote>
+<p>So we have to fix the <code>Client.post</code> method by providing an authcode greater than <code>0</code>.</p>
+<pre><code>    def post(self):
+        if self.form.is_valid(123) is True:
+            print('Book is valid')
+        else:
+            print('Book is invalid')
+</code></pre>
+<p>Since our test didn't mock the <code>is_valid</code> function via the <code>side_effect</code> callable, the method will end up printing <code>Book is invalid</code>.</p>
+<p>Now if we want to provide the <code>side_effect</code>, it will have to match the same signature</p>
+<pre><code>@mock.patch.object(BookForm, 'is_valid', autospec=True)
+def test_edit_autospec(mocked_is_valid):
+    book = Book()
+    book.save()
+    client = Client(book)
+    mocked_is_valid.side_effect = lambda self, authcode: True
+    client.post()
+</code></pre>
+<p><code>Book is valid</code> will now be printed again.  Going through the debugger to inspect that <code>autospec</code>'d and mocked <code>is_valid</code> object within the frame of the <code>Client.post</code> method call</p>
+<pre><code>(Pdb) self.form.is_valid
+&lt;bound method BookForm.is_valid of &lt;__main__.BookForm object at 0x7fd57f43dc88&gt;&gt;
+</code></pre>
+<p>Ah, somehow the method signature is not a simple <code>MagicMock</code> object (recall the <code>&lt;MagicMock name='is_valid' id='140554947029032'&gt;</code> noted previously) and is a properly bound method, which means the <code>self</code> argument is now passed into the mock, solving this:</p>
+<blockquote>
+<p><em>side_effect</em>: A function to be called whenever the Mock is called. See the <a href="https://docs.python.org/3/library/unittest.mock.html#unittest.mock.Mock.side_effect" rel="nofollow"><code>side_effect</code></a> attribute. Useful for raising exceptions or dynamically changing return values. The function is called with the same arguments as the mock...</p>
+</blockquote>
+<p>The "same arguments as the mock" in this case means the same as whatever that was passed into the mock. To reiterate, the first case the <code>self.form.is_valid</code> was replaced with a naked, unbounded callable so <code>self</code> is never passed; and in the second case the callable is now bound to <code>self</code>, both the <code>self</code> AND <code>authcode</code> will be passed into the <code>side_effect</code> callable - just as what would happen in the real call. This should reconciled the perceived misbehavior of interactions with <code>autospec=True</code> for <code>mock.patch.object</code> and manually defined <code>side_effect</code> callable for a mock.</p>
+</div>

@@ -1,0 +1,78 @@
+<div class="post-text" itemprop="text">
+<p>I'm found the module <a href="https://github.com/wetneb/multiprocessing_generator" rel="nofollow noreferrer">multiprocessing_generator</a>.
+I tried that module with the code below :</p>
+<pre><code>from multiprocessing_generator import ParallelGenerator
+
+def my_generator():
+    yield (x*x for x in range(200))
+
+with ParallelGenerator(my_generator(), max_lookahead=100) as g:
+    for elem in g:
+        print(elem)
+</code></pre>
+<p>Here is the error I got (I ran my code in the console, the python file is in my desktop) :</p>
+<blockquote>
+<p>C:\Users\crd\Desktop&gt;python test.py Traceback (most recent call last):
+  File "test.py", line 69, in 
+      with ParallelGenerator(my_generator(), max_lookahead=100) as g:   File
+  "C:\Users\crd\AppData\Local\Programs\Python\Python37-32\lib\site-packages\multiprocessing_generator__init__.py",
+  line 62, in <strong>enter</strong>
+      self.process.start()   File "C:\Users\crd\AppData\Local\Programs\Python\Python37-32\lib\multiprocessing\process.py",
+  line 112, in start
+      self._popen = self._Popen(self)   File "C:\Users\crd\AppData\Local\Programs\Python\Python37-32\lib\multiprocessing\context.py",
+  line 223, in _Popen
+      return _default_context.get_context().Process._Popen(process_obj)   File
+  "C:\Users\crd\AppData\Local\Programs\Python\Python37-32\lib\multiprocessing\context.py",
+  line 322, in _Popen
+      return Popen(process_obj)   File "C:\Users\crd\AppData\Local\Programs\Python\Python37-32\lib\multiprocessing\popen_spawn_win32.py",
+  line 65, in <strong>init</strong>
+      reduction.dump(process_obj, to_child)   File "C:\Users\crd\AppData\Local\Programs\Python\Python37-32\lib\multiprocessing\reduction.py",
+  line 60, in dump
+      ForkingPickler(file, protocol).dump(obj) AttributeError: Can't pickle local object 'ParallelGenerator.<strong>init</strong>..wrapped'</p>
+<p>C:\Users\crd\Desktop&gt;Traceback (most recent call last):   File
+  "", line 1, in    File
+  "C:\Users\crd\AppData\Local\Programs\Python\Python37-32\lib\multiprocessing\spawn.py",
+  line 99, in spawn_main
+      new_handle = reduction.steal_handle(parent_pid, pipe_handle)   File
+  "C:\Users\crd\AppData\Local\Programs\Python\Python37-32\lib\multiprocessing\reduction.py",
+  line 87, in steal_handle
+      _winapi.DUPLICATE_SAME_ACCESS | _winapi.DUPLICATE_CLOSE_SOURCE) PermissionError: [WinError 5] Accès refusé</p>
+</blockquote>
+<p>I cleaned up the code from the multiprocessing_generator module (I deleted every try/exeption, I converted the context-manager into a basic function). But with the code below I got the same error :</p>
+<pre><code>from queue import Empty
+
+from multiprocessing import Process, Queue
+
+def ParallelGeneratorLight():
+    queue = Queue()
+
+    def wrapped():
+        for item in (x*x for x in range(200)):
+            queue.put(item)
+
+    process = Process(target=wrapped)
+
+    process.start()
+    queue.get()
+
+print(ParallelGeneratorLight())
+</code></pre>
+<p>What is wrong with that ?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>multiprocessing_generator</code> relies on the multiprocessing module using the <code>'fork'</code> start method, because it assumes that the <code>wrapped</code> nested function (defined in <code>ParallelGenerator</code>'s <code>__init__</code>) can be passed as the <code>target</code> of a <code>multiprocessing.Process</code> object. On a <code>fork</code>ing based platform, this is fine; the child process inherits the complete state of the parent (with a few small exceptions like threads), so it has equal access to the <code>wrapped</code> nested function (it inherited an exact copy after all).</p>
+<p>Problem is, on Windows, the only available start method is <code>'spawn'</code>, which requires the <code>target</code> (and all arguments) to be <code>pickle</code>able (it <code>pickle</code>s them, sends them to the child over IPC, and reconstructs them there), and nested functions are never <code>pickle</code>able (<code>pickle</code>ing a function involves pickling its qualified name to be imported and used on the other side, and the qualified name of a nested function involves unimportable components, in this case, <code>pickle</code>ing <code>ParallelGenerator.__init__.&lt;locals&gt;.wrapped</code> fails because <code>&lt;locals&gt;</code> is clearly not an importable name).</p>
+<p>Basically, <code>multiprocessing_generator</code> only works on UNIX-like systems, and only if you're using the default start method (<code>'fork'</code>); if you <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.set_start_method" rel="nofollow noreferrer">called <code>set_start_method</code></a> with some other value (<code>'forkserver'</code> or <code>'spawn'</code>), <code>multiprocessing_generator</code> can't be made to work.</p>
+<p>While this is a bug, it's not a particularly critical bug in most cases; there is very little benefit to the module if the generator must have its values pickled, because most such generators either aren't <code>pickle</code>able themselves (e.g. most file-like objects) or <code>pickle</code>ing them involves running them to completion (in which case you've lost all your parallelism).</p>
+<p>Sorry, but the simple answer here is: <strong>Don't use <code>multiprocessing_generator</code> on Windows.</strong></p>
+<p>That said, if your generator is I/O-bound, you <em>might</em> be able to benefit from the module by importing it, then immediately monkey-patching it to replace all <code>multiprocessing</code> components it relies on with their equivalent <code>multiprocessing.dummy</code> names (which are backed by threads, and don't rely on pickling), e.g.</p>
+<pre><code>from multiprocessing_generator import ParallelGenerator
+import multiprocessing.dummy, multiprocessing_generator
+
+# Monkey-patch to use threads
+multiprocessing_generator.Process = multiprocessing.dummy.Process
+multiprocessing_generator.Queue = multiprocessing.dummy.Queue
+</code></pre>
+<p>To be clear, I have not tested this; no warranties are expressed or implied as to whether this will work. It will also be completely pointless if the generator is CPU-bound, at least on the CPython reference interpreter, since CPU-bound generators will hold <a href="https://realpython.com/python-gil/" rel="nofollow noreferrer">the GIL</a> while running, preventing the main thread from performing work, so you may as well have iterated directly.</p>
+</div>
+<span class="comment-copy">great that worked ;)</span>

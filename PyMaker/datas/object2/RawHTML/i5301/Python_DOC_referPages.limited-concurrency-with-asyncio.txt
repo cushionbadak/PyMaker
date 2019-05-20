@@ -1,0 +1,197 @@
+<div class="post-text" itemprop="text">
+<p>Let's assume we have a bunch of links to download and each of the link may take a different amount of time to download. And I'm allowed to download using utmost 3 connections only. Now, I want to ensure that I do this efficiently using asyncio.</p>
+<p>Here's what I'm trying to achieve: At any point in time, try to ensure that I have atleast 3 downloads running.</p>
+<pre><code>Connection 1: 1---------7---9---
+Connection 2: 2---4----6-----
+Connection 3: 3-----5---8-----
+</code></pre>
+<p>The numbers represent the download links, while hyphens represent Waiting for download.</p>
+<p>Here is the code that I'm using right now</p>
+<pre><code>from random import randint
+import asyncio
+
+count = 0
+
+
+async def download(code, permit_download, no_concurrent, downloading_event):
+    global count
+    downloading_event.set()
+    wait_time = randint(1, 3)
+    print('downloading {} will take {} second(s)'.format(code, wait_time))
+    await asyncio.sleep(wait_time)  # I/O, context will switch to main function
+    print('downloaded {}'.format(code))
+    count -= 1
+    if count &lt; no_concurrent and not permit_download.is_set():
+        permit_download.set()
+
+
+async def main(loop):
+    global count
+    permit_download = asyncio.Event()
+    permit_download.set()
+    downloading_event = asyncio.Event()
+    no_concurrent = 3
+    i = 0
+    while i &lt; 9:
+        if permit_download.is_set():
+            count += 1
+            if count &gt;= no_concurrent:
+                permit_download.clear()
+            loop.create_task(download(i, permit_download, no_concurrent, downloading_event))
+            await downloading_event.wait()  # To force context to switch to download function
+            downloading_event.clear()
+            i += 1
+        else:
+            await permit_download.wait()
+    await asyncio.sleep(9)
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main(loop))
+    finally:
+        loop.close()
+</code></pre>
+<p>And the output is as expected:</p>
+<pre><code>downloading 0 will take 2 second(s)
+downloading 1 will take 3 second(s)
+downloading 2 will take 1 second(s)
+downloaded 2
+downloading 3 will take 2 second(s)
+downloaded 0
+downloading 4 will take 3 second(s)
+downloaded 1
+downloaded 3
+downloading 5 will take 2 second(s)
+downloading 6 will take 2 second(s)
+downloaded 5
+downloaded 6
+downloaded 4
+downloading 7 will take 1 second(s)
+downloading 8 will take 1 second(s)
+downloaded 7
+downloaded 8
+</code></pre>
+<p>But here are my questions:</p>
+<ol>
+<li><p>At the moment, I'm simply waiting for 9 seconds to keep the main function running till the downloads are complete. Is there an efficient way of waiting for the last download to complete before exiting the main function? (I know there's asyncio.wait, but I'll need to store all the task references for it to work)</p></li>
+<li><p>What's a good library that does this kind of task? I know javascript has a lot of async libraries, but what about Python?</p></li>
+</ol>
+<p>Edit:
+2. What's a good library that takes care of common async patterns? (Something like <a href="https://www.npmjs.com/package/async" rel="noreferrer">https://www.npmjs.com/package/async</a>)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You basically need a fixed-size <em>pool</em> of download tasks. <code>asyncio</code> doesn't come with such functionality out of the box, but it is easy to create one: simply keep a set of tasks and don't allow it to grow past the limit. Although the question states your reluctance to go down that route, the code ends up much more elegant:</p>
+<pre><code>async def download(code):
+    wait_time = randint(1, 3)
+    print('downloading {} will take {} second(s)'.format(code, wait_time))
+    await asyncio.sleep(wait_time)  # I/O, context will switch to main function
+    print('downloaded {}'.format(code))
+
+async def main(loop):
+    no_concurrent = 3
+    dltasks = set()
+    i = 0
+    while i &lt; 9:
+        if len(dltasks) &gt;= no_concurrent:
+            # Wait for some download to finish before adding a new one
+            _done, dltasks = await asyncio.wait(
+                dltasks, return_when=asyncio.FIRST_COMPLETED)
+        dltasks.add(loop.create_task(download(i)))
+        i += 1
+    # Wait for the remaining downloads to finish
+    await asyncio.wait(dltasks)
+</code></pre>
+<p>An alternative is to create a fixed number of coroutines doing the downloading, much like a fixed-size thread pool, and feed them work using an <code>asyncio.Queue</code>. This removes the need to manually limit the number of downloads, which will be automatically limited by the number of coroutines invoking <code>download()</code>:</p>
+<pre><code># download() defined as above
+
+async def download_from(q):
+    while True:
+        code = await q.get()
+        if code is None:
+            # pass on the word that we're done, and exit
+            await q.put(None)
+            break
+        await download(code)
+
+async def main(loop):
+    q = asyncio.Queue()
+    dltasks = [loop.create_task(download_from(q)) for _ in range(3)]
+    i = 0
+    while i &lt; 9:
+        await q.put(i)
+        i += 1
+    # Inform the consumers there is no more work.
+    await q.put(None)
+    await asyncio.wait(dltasks)
+</code></pre>
+<p>As for your other question, the obvious choice would be <a href="https://aiohttp.readthedocs.io/en/stable/" rel="nofollow noreferrer"><code>aiohttp</code></a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If I'm not mistaken you're searching for <a href="https://docs.python.org/3/library/asyncio-sync.html#asyncio.Semaphore" rel="noreferrer">asyncio.Semaphore</a>. Example of usage:</p>
+<pre><code>import asyncio
+from random import randint
+
+
+async def download(code):
+    wait_time = randint(1, 3)
+    print('downloading {} will take {} second(s)'.format(code, wait_time))
+    await asyncio.sleep(wait_time)  # I/O, context will switch to main function
+    print('downloaded {}'.format(code))
+
+
+sem = asyncio.Semaphore(3)
+
+
+async def safe_download(i):
+    async with sem:  # semaphore limits num of simultaneous downloads
+        return await download(i)
+
+
+async def main():
+    tasks = [
+        asyncio.ensure_future(safe_download(i))  # creating task starts coroutine
+        for i
+        in range(9)
+    ]
+    await asyncio.gather(*tasks)  # await moment all downloads done
+
+
+if __name__ ==  '__main__':
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+</code></pre>
+<p>Output:</p>
+<pre><code>downloading 0 will take 3 second(s)
+downloading 1 will take 3 second(s)
+downloading 2 will take 1 second(s)
+downloaded 2
+downloading 3 will take 3 second(s)
+downloaded 1
+downloaded 0
+downloading 4 will take 2 second(s)
+downloading 5 will take 1 second(s)
+downloaded 5
+downloaded 3
+downloading 6 will take 3 second(s)
+downloading 7 will take 1 second(s)
+downloaded 4
+downloading 8 will take 2 second(s)
+downloaded 7
+downloaded 8
+downloaded 6
+</code></pre>
+<p>Example of async downloading with <code>aiohttp</code> can be found <a href="https://stackoverflow.com/a/47172471/1113207">here</a>.</p>
+</div>
+<span class="comment-copy">The first approach works very well and I need not create and store all the task references in advance (I use a generator to lazily load the download links). I did not know asyncio.wait had a "return_when" parameter.</span>
+<span class="comment-copy">@Shridharshan In the second solution you only create the three coroutines for downloading in advance, the actual download links can also be generated lazily. But it's a matter of taste - I think I would also prefer the first solution in practice.</span>
+<span class="comment-copy">@OrangeDog Fixed, thanks!</span>
+<span class="comment-copy">Also, a <code>range</code> would be better than manual <code>while</code> loops.</span>
+<span class="comment-copy">@OrangeDog That is actually intentional, because the OP's code was using manual <code>while</code> loops. The idea was to adapt their existing code (preserving the non-conventional idiom) to the desired semantics.</span>
+<span class="comment-copy">Is there a good Python async library to deal with common async programming patterns? Like the famous async package for JavaScript.</span>
+<span class="comment-copy">@Shridharshan from my experience asyncio itself contains all you usually need. Take a look at <a href="https://docs.python.org/3/library/asyncio-sync.html#synchronization-primitives" rel="nofollow noreferrer">synchronization primitives</a> and at module's <a href="https://docs.python.org/3/library/asyncio-task.html#task-functions" rel="nofollow noreferrer">functions</a> in general.</span>
+<span class="comment-copy">@MikhailGerasimov calling <code>asyncio.ensure_future()</code> is redundant as <code>async.gather()</code> calls it internally anyway (<a href="https://github.com/python/cpython/blob/master/Lib/asyncio/tasks.py#L762" rel="nofollow noreferrer">source</a>). However then calling the variable <code>tasks</code> would be "wrong", because these are not tasks yet.</span>

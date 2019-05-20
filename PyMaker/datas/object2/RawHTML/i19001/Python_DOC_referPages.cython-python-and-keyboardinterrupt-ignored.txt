@@ -1,0 +1,135 @@
+<div class="post-text" itemprop="text">
+<p>Is there a way to interrupt (<code>Ctrl+C</code>) a Python script based on a loop that is embedded in a Cython extension?</p>
+<p>I have the following python script:</p>
+<pre><code>def main():
+
+    # Intantiate simulator
+    sim = PySimulator()
+    sim.Run()
+
+if __name__ == "__main__":
+    # Try to deal with Ctrl+C to abort the running simulation in terminal
+    # (Doesn't work...)
+    try:
+        sys.exit(main())
+    except (KeyboardInterrupt, SystemExit):
+        print '\n! Received keyboard interrupt, quitting threads.\n'
+</code></pre>
+<p>This runs a loop that is part of a C++ Cython extension.
+Then, while pressing <code>Ctrl+C</code>, the <code>KeyboardInterrupt</code> is thrown but ignored, and the program keeps going until the end of the simulation.</p>
+<p>The work around I found, is to handle the exception from within the extension by catching the <code>SIGINT</code> signal :</p>
+<pre><code>#include &lt;execinfo.h&gt;
+#include &lt;signal.h&gt;
+
+static void handler(int sig)
+{
+  // Catch exceptions
+  switch(sig)
+  {
+    case SIGABRT:
+      fputs("Caught SIGABRT: usually caused by an abort() or assert()\n", stderr);
+      break;
+    case SIGFPE:
+      fputs("Caught SIGFPE: arithmetic exception, such as divide by zero\n",
+            stderr);
+      break;
+    case SIGILL:
+      fputs("Caught SIGILL: illegal instruction\n", stderr);
+      break;
+    case SIGINT:
+      fputs("Caught SIGINT: interactive attention signal, probably a ctrl+c\n",
+            stderr);
+      break;
+    case SIGSEGV:
+      fputs("Caught SIGSEGV: segfault\n", stderr);
+      break;
+    case SIGTERM:
+    default:
+      fputs("Caught SIGTERM: a termination request was sent to the program\n",
+            stderr);
+      break;
+  }
+  exit(sig);
+
+}
+</code></pre>
+<p>Then :</p>
+<pre><code>signal(SIGABRT, handler);
+signal(SIGFPE,  handler);
+signal(SIGILL,  handler);
+signal(SIGINT,  handler);
+signal(SIGSEGV, handler);
+signal(SIGTERM, handler);
+</code></pre>
+<p>Can't I make this work from Python, or at least from Cython instead ? As I am about to port my extension under Windows/MinGW, I would appreciate to have something less Linux specific.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You have to periodically check for pending signals, for example, on every Nth iteration of the simulation loop:</p>
+<pre><code>from cpython.exc cimport PyErr_CheckSignals
+
+cdef Run(self):
+    while True:
+        # do some work
+        PyErr_CheckSignals()
+</code></pre>
+<p><code>PyErr_CheckSignals</code> will run signal handlers installed with <a href="http://docs.python.org/2/library/signal.html" rel="noreferrer">signal</a> module (this includes raising <code>KeyboardInterrupt</code> if necessary).</p>
+<p><code>PyErr_CheckSignals</code> is pretty fast, it's OK to call it often. Note that it should be called from the main thread, because Python runs signal handlers in the main thread. Calling it from worker threads has no effect.</p>
+<p><strong>Explanation</strong></p>
+<p>Since signals are delivered asynchronously at unpredictable times, it is problematic to run any meaningful code directly from the signal handler. Therefore, Python queues incoming signals. The queue is processed later as part of the interpreter loop.</p>
+<p>If your code is fully compiled, interpreter loop is never executed and Python has no chance to check and run queued signal handlers.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you are trying to handle <code>KeyboardInterrupt</code> in code that releases the GIL (for example, because it uses <code>cython.parallel.prange</code>), you will need to re-acquire the GIL to call <code>PyErr_CheckSignals</code>. The following snippet (adapted from @nikita-nemkin's answer above) illustrates what you need to do:</p>
+<pre><code>from cpython.exc cimport PyErr_CheckSignals
+from cython.parallel import prange
+
+cdef Run(self) nogil:
+    with nogil:
+        for i in prange(1000000)
+            # do some work but check for signals every once in a while
+            if i % 10000 == 0:
+                with gil:
+                    PyErr_CheckSignals()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Release GIL when Cython runs parts that do not interface with Python, run loop in the main thread (sleep or check the simulation status), and call <code>sim.Stop()</code> (that can set some flag that your simulation can check periodically) in the <code>except</code> close.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Yes, using the macros <a href="http://cysignals.readthedocs.io/en/latest/interrupt.html#using-sig-on-and-sig-off" rel="nofollow noreferrer"><code>sig_on</code> and <code>sig_off</code></a> from the package <a href="https://github.com/sagemath/cysignals" rel="nofollow noreferrer"><code>cysignals</code></a>:</p>
+<pre><code>from cysignals.signals cimport sig_on, sig_off
+
+def foo():
+    sig_on()
+    call_c_code_that_takes_long()
+    sig_off()
+</code></pre>
+<p>The macros <a href="https://github.com/sagemath/cysignals/blob/acc2ba9fcf8ffa3db1c0f1cf0da8deae7035f41d/src/cysignals/macros.h#L207" rel="nofollow noreferrer"><code>sig_on</code></a> and <a href="https://github.com/sagemath/cysignals/blob/acc2ba9fcf8ffa3db1c0f1cf0da8deae7035f41d/src/cysignals/macros.h#L209" rel="nofollow noreferrer"><code>sig_off</code></a> are declared as functions <a href="https://github.com/sagemath/cysignals/blob/acc2ba9fcf8ffa3db1c0f1cf0da8deae7035f41d/src/cysignals/signals.pxd#L27" rel="nofollow noreferrer">in <code>cysignals/signals.pxd</code></a>, and defined as macros <a href="https://github.com/sagemath/cysignals/blob/acc2ba9fcf8ffa3db1c0f1cf0da8deae7035f41d/src/cysignals/macros.h#L207" rel="nofollow noreferrer">in <code>cysignals/macros.h</code></a> in terms of the macro <a href="https://github.com/sagemath/cysignals/blob/acc2ba9fcf8ffa3db1c0f1cf0da8deae7035f41d/src/cysignals/macros.h#L114" rel="nofollow noreferrer"><code>_sig_on_</code></a> (defined in terms of the functions <a href="https://github.com/sagemath/cysignals/blob/acc2ba9fcf8ffa3db1c0f1cf0da8deae7035f41d/src/cysignals/macros.h#L119" rel="nofollow noreferrer"><code>_sig_on_prejmp</code></a> and <a href="https://github.com/sagemath/cysignals/blob/acc2ba9fcf8ffa3db1c0f1cf0da8deae7035f41d/src/cysignals/macros.h#L149" rel="nofollow noreferrer"><code>_sig_on_postjmp</code></a>) and the function <a href="https://github.com/sagemath/cysignals/blob/acc2ba9fcf8ffa3db1c0f1cf0da8deae7035f41d/src/cysignals/macros.h#L182" rel="nofollow noreferrer"><code>_sig_off_</code></a>. The signal handler for keyboard interrupts (<a href="https://docs.python.org/3/library/signal.html#general-rules" rel="nofollow noreferrer"><code>SIGINT</code></a>) is installed <a href="https://github.com/sagemath/cysignals/blob/acc2ba9fcf8ffa3db1c0f1cf0da8deae7035f41d/src/cysignals/implementation.c#L314" rel="nofollow noreferrer">here</a>, and the implementation rationale is outlined <a href="https://github.com/sagemath/cysignals/blob/acc2ba9fcf8ffa3db1c0f1cf0da8deae7035f41d/src/cysignals/macros.h#L58" rel="nofollow noreferrer">here</a>.</p>
+<p>As of <code>cysignals == 1.6.5</code>, only POSIX systems are supported. Cython's <a href="http://cython.readthedocs.io/en/latest/src/userguide/language_basics.html#conditional-compilation" rel="nofollow noreferrer">conditional compilation</a> can be used in order to follow this approach wherever <code>cysignals</code> is available, and allow compiling on non-POSIX systems too (without Ctrl-C working on those systems).</p>
+<p>In the script <code>setup.py</code>:</p>
+<pre><code>compile_time_env = dict(HAVE_CYSIGNALS=False)
+# detect `cysignals`
+if cysignals is not None:
+    compile_time_env['HAVE_CYSIGNALS'] = True
+...
+c = cythonize(...,
+              compile_time_env=compile_time_env)
+</code></pre>
+<p>and in the relevant <code>*.pyx</code> file:</p>
+<pre><code>IF HAVE_CYSIGNALS:
+    from cysignals.signals cimport sig_on, sig_off
+ELSE:
+    # for non-POSIX systems
+    noop = lambda: None
+    sig_on = noop
+    sig_off = noop
+</code></pre>
+<p>See also <a href="https://stackoverflow.com/a/27318256/1959808">this answer</a>.</p>
+</div>
+<span class="comment-copy">+1 for the explanation. Does <code>PyErr_CheckSignals()</code> handle Ctrl-C on Windows? I've opted out for the implicit signal checking by <code>while sim.running: time.sleep(1)</code> loop in the main thread that works as long as Cython code in another thread releases GIL periodically.</span>
+<span class="comment-copy">Yes, it works on Windows as expected.</span>
+<span class="comment-copy">I've used <code>"opt out"</code> wrong. I've meant the opposite: <code>s/opt out/choose to do/</code> above.</span>
+<span class="comment-copy">Thanks. I give it a try. And still want to benchmark it as performances are really crucial in my simulations (which can take hours, or even days). But this seems to be the kind of solution a was dreaming of...</span>
+<span class="comment-copy">Is this required for any long-running loop written in Cython, or just those that call out to external C functions?</span>
+<span class="comment-copy">It is pointless to call PyErr_CheckSignals unless you are in the main thread.</span>
+<span class="comment-copy">Ok, that sounds meaningful (even if I was secretly hopping there would be an effortless solution ;-). Thanks for the advice.</span>

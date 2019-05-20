@@ -1,0 +1,63 @@
+<div class="post-text" itemprop="text">
+<p>We are using the <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ProcessPoolExecutor" rel="noreferrer">ProcessPoolExecutor</a> from <code>concurrent.futures</code> in a service that asynchronously receives requests, and does the actual, synchronous processing in the process pool.</p>
+<p>Once we ran into the case that the process pool was exhausted, so new requests had to wait until some other processes were finished.</p>
+<p>Is there a way to interrogate the process pool for its current usage? That would allow us to monitor their state and do proper capacity planning.</p>
+<p>If there isn't, is there any good alternative process pool implementation with an asynchronous interface that supports such monitoring/capacity planning?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The simplest way would be to extend <code>ProcessPoolExecutor</code> with desired behaviour. The example below maintains stdlib interface and does not access implementation details:</p>
+<pre><code>from concurrent.futures import ProcessPoolExecutor
+
+
+class MyProcessPoolExecutor(ProcessPoolExecutor):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._running_workers = 0
+
+    def submit(self, *args, **kwargs):
+        future = super().submit(*args, **kwargs)
+        self._running_workers += 1
+        future.add_done_callback(self._worker_is_done)
+        return future
+
+    def _worker_is_done(self, future):
+        self._running_workers -= 1
+
+    def get_pool_usage(self):
+        return self._running_workers
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I have recently solved this question for myself in a slightly different way. Simplified, here’s what I did:</p>
+<ul>
+<li>I keep track of pending futures externally in a set that is defined in the scope of my main loop.</li>
+<li>I attach a callback to each future, and this callback is a closure over the set of futures, allowing it to remove the future from the set when done.</li>
+</ul>
+<p>So, given that <code>done()</code> is the <em>actual</em> callback function, defined elsewhere, the following is defined in the scope of my main loop:</p>
+<pre><code>bag = set()
+
+def make_callback(b):
+
+    def callback(f):
+        nonlocal b
+        b.remove(f)
+        done(f)
+
+    return callback
+</code></pre>
+<p>For each future <code>f</code> which I submit to the ProcessPoolExecutor, I add the callback:</p>
+<pre><code>f.add_done_callback(make_callback(bag))
+</code></pre>
+<p>At any time, it’s possible to see a list of pending and running futures by looking at the contents of <code>bag</code>, optionally filtered by the result of the future’s <code>running()</code> method. E.g.:</p>
+<pre><code>print(*bag, sep='\n')
+print('running:', *(f for f in bag if f.running()))
+</code></pre>
+<p>For many straightforward use cases, a module-level set variable would probably work just as well as the closure.</p>
+</div>
+<span class="comment-copy">Simply look at the length of the work queue <code>ProcessPoolExecutor._pending_work_items</code>. If it's greater than zero, you have work items waiting.</span>
+<span class="comment-copy">@fpbhb that's a private attribute, which is good reason not to use it, and it's also a binary signal, so not good for preventive measures. So, thanks, but I had hoped for something better.</span>
+<span class="comment-copy">This is Python, isn't it? But that aside: what do you want to achieve? Adjust the number of workers dynamically to <i>never</i> have a job waiting? That is neither supported by <code>concurrent.futures</code> nor by <code>multiprocessing.pool</code>. It's also kind of pointless, as once your hardware resources are exhausted something <i>has</i> to wait.</span>
+<span class="comment-copy">@fpbhb add more (virtual) hardware, for example</span>
+<span class="comment-copy">for that you’d need a pool of processes spread over more than one machine. That cannot be done using the process pool you’re using now. You’ll need a networked mechanism to distribute load, eg AMQP or similar.</span>
+<span class="comment-copy">I had to fix the argument list for <code>_worker_is_done</code> (already fixed in the text above), it receives the future as an argument, so needs one more parameter besides <code>self</code>. Now it works, thanks!</span>

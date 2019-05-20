@@ -1,0 +1,95 @@
+<div class="post-text" itemprop="text">
+<p>What is the best way to escape a string for safe usage as a command-line argument? I know that using <code>subprocess.Popen</code> takes care of this using <code>list2cmdline()</code>, but that doesn't seem to work correctly for paramiko. Example:</p>
+<pre><code>from subprocess import Popen
+Popen(['touch', 'foo;uptime']).wait()
+</code></pre>
+<p>This creates a file named literally <code>foo;uptime</code>, which is what I want. Compare:</p>
+<pre><code>from paramiko import SSHClient()
+from subprocess import list2cmdline
+ssh = SSHClient()
+#... load host keys and connect to a server
+stdin, stdout, stderr = ssh.exec_command(list2cmdline(['touch', 'foo;uptime']))
+print stdout.read()
+</code></pre>
+<p>This creates a file called <code>foo</code> and prints the uptime of the remote host. It has executed <code>uptime</code> as a second command instead of using it as part of the argument to the first command, <code>touch</code>. This is not what I want.</p>
+<p>I tried escaping the semicolon with a backslash before and after sending it to <code>list2cmdline</code>, but then I ended up with a file called <code>foo\;uptime</code>.</p>
+<p>Also, it works correctly if  instead of <code>uptime</code>, you use a command with a space:</p>
+<pre><code>stdin, stdout, stderr = ssh.exec_command(list2cmdline(['touch', 'foo;echo test']))
+print stdout.read()
+</code></pre>
+<p>This creates a file literally called <code>foo;echo test</code> because <code>list2cmdline</code> surrounded it with quotes.</p>
+<p>Also, I tried <code>pipes.quote()</code> and it had the same effect as <code>list2cmdline</code>.</p>
+<p>EDIT: To clarify, I need to make sure that only a single command gets executed on the remote host, regardless of the whatever input data I receive, which means escaping characters like <code>;</code>, <code>&amp;</code>,  and the backtick.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Assuming the remote user has a POSIX shell, this should work:</p>
+<pre><code>def shell_escape(arg):
+    return "'%s'" % (arg.replace(r"'", r"'\''"), )
+</code></pre>
+<h1>Why does this work?</h1>
+<p><a href="http://pubs.opengroup.org/onlinepubs/9699919799/utilities/V3_chap02.html#tag_18_02_02" rel="nofollow noreferrer">POSIX shell single quotes</a> are defined as:</p>
+<blockquote>
+<p>Enclosing characters in single-quotes ( '' ) shall preserve the literal value of each character within the single-quotes. A single-quote cannot occur within single-quotes.</p>
+</blockquote>
+<p>The idea here is that you enclose the string in single quotes. This, alone, is almost good enough --- every character except a single quote will be interpreted literally. For single quotes, you drop out of the single-quoted string (the first <code>'</code>), add a single quote (the <code>\'</code>), and then resume the single quoted string (the last <code>'</code>).</p>
+<h1>What does this work with?</h1>
+<p>This should work for any POSIX shell. I've tested it with dash and bash. Solaris 5.10's <code>/bin/sh</code> (which I believe is not POSIX-compatible, and I couldn't find a spec for) also seems to work.</p>
+<p>For arbitrary remote hosts, I believe this is impossible. I think <code>ssh</code> will execute your command with whatever the remote user's shell (as configured in <code>/etc/passwd</code> or equivalent). If the remote user might be running, say, <code>/usr/bin/python</code> or <code>git-shell</code> or something, not only is any quoting scheme probably going to run into cross-shell inconsistencies, but you command execution is probably going to fail too.</p>
+<h2>csh / tcsh</h2>
+<p>Slightly more problematic is the possibility that the remote user might be running <code>tcsh</code>, since some people actually do run that in the wild and might expect paramiko's <code>exec_command</code> to work. (Users of <code>/usr/bin/python</code> as a shell probably have no such expectations...)</p>
+<p>tcsh seems to mostly work. However, I can't figure out a way to quote a newline such that it will be happy. Including a newline in single-quoted string seems to make tcsh unhappy:</p>
+<pre><code>$ tcsh -c $'echo \'foo\nbar\''
+Unmatched '.
+Unmatched '.
+</code></pre>
+<p>Other than newlines, everything I've tried seems to work with tcsh (including single quotes, double quotes, backslashes, embedded tabs, asterisks, ...).</p>
+<h1>Testing shell escaping</h1>
+<p>If you have an escaping scheme, here are some things you might want to test with:</p>
+<ul>
+<li>Escape sequences (<code>\n</code>, <code>\t</code>, ...)</li>
+<li>Quotes (<code>'</code>, <code>"</code>, <code>\</code>)</li>
+<li>Globbing characters (<code>*</code>, <code>?</code>, <code>[]</code>, etc.)</li>
+<li>Job control and pipelines (<code>|</code>, <code>&amp;</code>, <code>||</code>, <code>&amp;&amp;</code>, ...)</li>
+<li>Newlines</li>
+</ul>
+<p>Newlines are worth a special note. The <a href="https://stackoverflow.com/a/3191503/1797496"><code>re.escape</code> solution</a> doesn't handle this right --- it escapes any non-alphanumeric character, and POSIX shell considers an escaped newline (ie, in Python, the two-letter string <code>"\\\n"</code>) to be zero characters, not a single newline character. I <em>think</em> <code>re.escape</code> handles all other cases correctly, though it scares me to use something designed for regular expressions to do escaping for shell. It might turn out to work, but I'd worry about a subtle case in <code>re.escape</code> or shell escaping rules (like newlines), or possible future changes in the API.</p>
+<p>You should also be aware that escape sequences can get processed at various stages, which complicates testing things --- you only care about what the shell passes to a program, not what the program does. Using <code>printf "%s\n" escaped-string-to-test</code> is probably the best bet. <code>echo</code> works surprisingly poorly: In dash, the <code>echo</code> built-in processes backslash escapes like <code>\n</code>. Using <code>/bin/echo</code> is usually safe, but on a Solaris 5.10 machine I tested on, it also handles sequences like <code>\n</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You are not having success with <code>list2cmdline()</code> because it targets the Microsoft command line, which has different rules than the POSIX command line with which you are communicating using SSH.</p>
+<p>Instead, use the native Python routine <code>pipes.quote()</code>, and be careful to apply it separately to each argument in the command. This will give you a working command line for SSH:</p>
+<pre><code>from pipes import quote
+command = ['touch', 'foo;uptime']
+print ' '.join(quote(s) for s in command)
+</code></pre>
+<p>The output carefully quotes the second argument to protect the <code>;</code> character:</p>
+<pre><code>touch 'foo;uptime'
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="http://docs.python.org/library/re.html#re.escape" rel="nofollow noreferrer"><code>re.escape()</code></a> is what I am looking for. </p>
+<blockquote>
+<p>re.<strong>*escape</strong>(**string*)</p>
+<p>Return **string* with all non-alphanumerics backslashed...</p>
+</blockquote>
+<p>Example:</p>
+<pre><code>from paramiko import SSHClient()
+from subprocess import list2cmdline
+import re
+ssh = SSHClient()
+#... load host keys and connect to a server
+stdin, stdout, stderr = ssh.exec_command(' '.join(['touch', re.escape('foo;uptime')]))
+</code></pre>
+<p>This creates a file on the server called <code>foo;uptime</code>, which is what I want.</p>
+<p>I have tried all of the shell meta-characters I can think of and it works :</p>
+<pre><code>stdin, stdout, stderr = ssh.exec_command(' '.join(['touch', re.escape('test;rm foo&amp;echo "Uptime: `uptime`"')]))
+</code></pre>
+</div>
+<span class="comment-copy">Well, I think you actually have a parsing problem, not an escaping problem.  You are taking 2 separate commands in shell syntax and executing them as one.  Presumably you would want to split that into 2 different commands.  However, when you have some raw data you want to make sure executes as one command, look at the <code>mkarg</code> function in the <code>commands</code> module.   &gt;&gt;&gt; import commands &gt;&gt;&gt; commands.mkarg("touch 'file with space'") ' "touch \'file with space\'"'   See also the <code>shlex</code> module and <code>shlex.split</code></span>
+<span class="comment-copy">No, I definitely want to make sure that regardless of the input data, only a single command gets executed. I see that the <code>commands</code> module is deprecated, so I don't want to rely on it. I don't see how <code>shlex</code> will help at all; it is for parsing command strings, not building them.</span>
+<span class="comment-copy">Because ' is escape to '\'', I also had to unescape it on the otherside by doing the reverse logic. Is there any reason for escaping ' to '\''? Also encapsulating it in "" doesn't seem necessary for using it a list of arguments, as used by popen. The following works for me with popen with no need to unescape on the other side: <code>return '%s' % (arg.replace(r"'", r"\'"),)</code></span>
+<span class="comment-copy">If you can use subprocess.Popen(shell=False), then you're in great shape. You don't need to do escaping, because nothing going to be parsing the command-line (except the command itself, of course) -- Python will pretty much just call execve(2) and the kernel will pass that directly to the command's argv. This question is about paramiko (which I believe executes things using the remote machine's shell), subprocess.Popen(shell=True), or similar tools.</span>
+<span class="comment-copy">In a shell context (paramiko, Popen(shell=True)), your arg.replace(r"'", r"\'") will probably break on escape basically everything except single quotes -- double quotes, escape sequences, globs, etc.. In my solution, we need the outer layer of '' to handle most characters (spaces, *, etc..), and then the \' handles quotes. We could try to use double quotes (but that does variable interpolation), or backslashes (but then we need to know what to backslash), so single quotes seem simplest.</span>
+<span class="comment-copy">If python 3 is an option, <a href="https://docs.python.org/3/library/shlex.html#shlex.quote" rel="nofollow noreferrer">shlex.quote</a> would probably be a good choice.</span>
+<span class="comment-copy">I found this escaped way too many characters which caused issues</span>
+<span class="comment-copy">no, this is <i>not</i> the solution.</span>

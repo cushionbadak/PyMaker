@@ -1,0 +1,253 @@
+<div class="post-text" itemprop="text">
+<p>I'm migrating from <code>tornado</code> to <code>asyncio</code>, and I can't find the <code>asyncio</code> equivalent of <code>tornado</code>'s <code>PeriodicCallback</code>. (A <code>PeriodicCallback</code> takes two arguments: the function to run and the number of milliseconds between calls.)</p>
+<ul>
+<li>Is there such an equivalent in <code>asyncio</code>?</li>
+<li>If not, what would be the cleanest way to implement this without running the risk of getting a <code>RecursionError</code> after a while?</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>For Python versions below 3.5:</p>
+<pre><code>import asyncio
+
+@asyncio.coroutine
+def periodic():
+    while True:
+        print('periodic')
+        yield from asyncio.sleep(1)
+
+def stop():
+    task.cancel()
+
+loop = asyncio.get_event_loop()
+loop.call_later(5, stop)
+task = loop.create_task(periodic())
+
+try:
+    loop.run_until_complete(task)
+except asyncio.CancelledError:
+    pass
+</code></pre>
+<p>For Python 3.5 and above:</p>
+<pre><code>import asyncio
+
+async def periodic():
+    while True:
+        print('periodic')
+        await asyncio.sleep(1)
+
+def stop():
+    task.cancel()
+
+loop = asyncio.get_event_loop()
+loop.call_later(5, stop)
+task = loop.create_task(periodic())
+
+try:
+    loop.run_until_complete(task)
+except asyncio.CancelledError:
+    pass
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>When you feel that something should happen "in background" of your asyncio program, <code>asyncio.Task</code> might be good way to do it. You can read <a href="https://stackoverflow.com/a/37345564/1113207">this post</a> to see how to work with tasks.</p>
+<p>Here's possible implementation of class that executes some function periodically:</p>
+<pre><code>import asyncio
+from contextlib import suppress
+
+
+class Periodic:
+    def __init__(self, func, time):
+        self.func = func
+        self.time = time
+        self.is_started = False
+        self._task = None
+
+    async def start(self):
+        if not self.is_started:
+            self.is_started = True
+            # Start task to call func periodically:
+            self._task = asyncio.ensure_future(self._run())
+
+    async def stop(self):
+        if self.is_started:
+            self.is_started = False
+            # Stop task and await it stopped:
+            self._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._task
+
+    async def _run(self):
+        while True:
+            await asyncio.sleep(self.time)
+            self.func()
+</code></pre>
+<p>Let's test it:</p>
+<pre><code>async def main():
+    p = Periodic(lambda: print('test'), 1)
+    try:
+        print('Start')
+        await p.start()
+        await asyncio.sleep(3.1)
+
+        print('Stop')
+        await p.stop()
+        await asyncio.sleep(3.1)
+
+        print('Start')
+        await p.start()
+        await asyncio.sleep(3.1)
+    finally:
+        await p.stop()  # we should stop task finally
+
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
+</code></pre>
+<p>Output:</p>
+<pre><code>Start
+test
+test
+test
+
+Stop
+
+Start
+test
+test
+test
+
+[Finished in 9.5s]
+</code></pre>
+<p>As you see on <code>start</code> we just start task that calls some functions and sleeps some time in endless loop. On <code>stop</code> we just cancel that task. Note, that task should be stopped at the moment program finished. </p>
+<p>One more important thing that your callback shouldn't take much time to be executed (or it'll freeze your event loop). If you're planning to call some long-running <code>func</code>, you possibly would need <a href="https://stackoverflow.com/a/29280606/1113207">to run it in executor</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There is no built-in support for periodic calls, no.</p>
+<p>Just create your own scheduler loop that sleeps and executes any tasks scheduled:</p>
+<pre><code>import math, time
+
+async def scheduler():
+    while True:
+        # sleep until the next whole second
+        now = time.time()
+        await asyncio.sleep(math.ceil(now) - now)
+
+        # execute any scheduled tasks
+        await for task in scheduled_tasks(time.time()):
+            await task()
+</code></pre>
+<p>The <code>scheduled_tasks()</code> iterator should produce tasks that are ready to be run at the given time. Note that producing the schedule and kicking off all the tasks could in theory take longer than 1 second; the idea here is that the scheduler yields all tasks that should have started since the last check.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Based on @A. Jesse Jiryu Davis response (with @Torkel Bjørnson-Langen and @ReWrite comments) this is an improvement which avoids drift.</p>
+<pre><code>import time
+import asyncio
+
+@asyncio.coroutine
+def periodic(period):
+    def g_tick():
+        t = time.time()
+        count = 0
+        while True:
+            count += 1
+            yield max(t + count * period - time.time(), 0)
+    g = g_tick()
+
+    while True:
+        print('periodic', time.time())
+        yield from asyncio.sleep(next(g))
+
+loop = asyncio.get_event_loop()
+task = loop.create_task(periodic(1))
+loop.call_later(5, task.cancel)
+
+try:
+    loop.run_until_complete(task)
+except asyncio.CancelledError:
+    pass
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Alternative version with decorator for python 3.7</p>
+<pre><code>import asyncio
+import time
+
+
+def periodic(period):
+    def scheduler(fcn):
+
+        async def wrapper(*args, **kwargs):
+
+            while True:
+                asyncio.create_task(fcn(*args, **kwargs))
+                await asyncio.sleep(period)
+
+        return wrapper
+
+    return scheduler
+
+
+@periodic(2)
+async def do_something(*args, **kwargs):
+    await asyncio.sleep(5)  # Do some heavy calculation
+    print(time.time())
+
+
+if __name__ == '__main__':
+    asyncio.run(do_something('Maluzinha do papai!', secret=42))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>A variant that may be helpful: if you want your recurring call to happen every n seconds instead of n seconds between the end of the last execution and the beginning of the next, and you don't want calls to overlap in time, the following is simpler:</p>
+<pre class="lang-py prettyprint-override"><code>async def repeat(interval, func, *args, **kwargs):
+    """Run func every interval seconds.
+
+    If func has not finished before *interval*, will run again
+    immediately when the previous iteration finished.
+
+    *args and **kwargs are passed as the arguments to func.
+    """
+    while True:
+        await asyncio.gather(
+            func(*args, **kwargs),
+            asyncio.sleep(interval),
+        )
+</code></pre>
+<p>And an example of using it to run a couple tasks in the background:</p>
+<pre><code>async def f():
+    await asyncio.sleep(1)
+    print('Hello')
+
+
+async def g():
+    await asyncio.sleep(0.5)
+    print('Goodbye')
+
+
+async def main():
+    t1 = asyncio.ensure_future(repeat(3, f))
+    t2 = asyncio.ensure_future(repeat(2, g))
+    await t1
+    await t2
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main())
+</code></pre>
+</div>
+<span class="comment-copy"><a href="https://gist.github.com/hirokiky/f4dae78b6d637f078e1c" rel="nofollow noreferrer">gist.github.com/hirokiky/f4dae78b6d637f078e1c</a></span>
+<span class="comment-copy">Why do you need to move from tornado?  They can work together, no?  <a href="http://www.tornadoweb.org/en/stable/asyncio.html" rel="nofollow noreferrer">tornadoweb.org/en/stable/asyncio.html</a></span>
+<span class="comment-copy">Just add <code>await asyncio.sleep(time)</code> to your function.</span>
+<span class="comment-copy">Same with Twisted, no <code>LoopingCall</code> implementation.</span>
+<span class="comment-copy">Even in Tornado, I'd recommend a loop like this instead of a <code>PeriodicCallback</code> for applications that make use of coroutines.</span>
+<span class="comment-copy">Just a quick note: Don’t directly create <code>Task</code> instances; use the <code>ensure_future()</code> function or the <code>AbstractEventLoop.create_task()</code> method. From the <a href="https://docs.python.org/3.5/library/asyncio-task.html#asyncio.Task" rel="nofollow noreferrer">asyncio documentation</a>.</span>
+<span class="comment-copy">A lambda may be used instead instead of the <code>stop</code> function. I.e.: <code>loop.call_later(5, lambda: task.cancel())</code></span>
+<span class="comment-copy">Or you can just call it like <code>loop.call_later(5, task.cancel)</code>.</span>
+<span class="comment-copy">Just a note for Python 3.7: From the <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.Task" rel="nofollow noreferrer">asyncio doc</a>,  we should use the high-level <code>asyncio.create_task()</code> to create <code>Task</code>s.</span>
+<span class="comment-copy">The most complete and clear answer so far! Thanks. Is it good idea to require the <code>func</code> to be a coroutine, so we can: <code>await self.func()</code> in the <code>_run</code> method?</span>
+<span class="comment-copy">@SergeyBelash, sure, it'll be ok. Note only that since we cancel task at random time, your func may be also cancelled at random time. It means every await line inside your function can potentially raise CancelledError. But it's actual for every async function at all (just like KeyboardInterrupt can be raised randomly in regular non-async code).</span>
+<span class="comment-copy">I worry with this (and other answers) that the repeat rate won't be exactly the time value. If func takes an appreciable time to execute it won't even be close, and over a long period it will drift even if func takes negligible time.</span>
+<span class="comment-copy">The <code>asyncio</code> event loop has a <code>time()</code> method that could be used in place of the <code>time</code> module.</span>
+<span class="comment-copy">@krs013: That's a <i>different clock</i>; it doesn't necessarily give you real-world time (it depends on the event loop implementation, and can measure CPU time ticks or another monotonically increasing clock measure). Because it is not guaranteed to provide a measure in seconds, it should <b>not</b> be used here.</span>
+<span class="comment-copy">Oh, good point, thanks. I figured that it would be good enough for interval timing, but it looks like no guarantee is made for accuracy in sleeping threads. The implementations I've seen seem to just use the machines uptime in nanoseconds, but yeah, you're right. I think I have some code to fix now...</span>
+<span class="comment-copy"><code>periodic</code> should probably use <code>loop.time()</code> in preference to <code>time.time()</code> because <code>loop.time()</code> is the time reference internally used by <code>asyncio.sleep()</code>. <code>loop.time()</code> returns monotonic time, while <code>time.time()</code> returns wallclock time. The two will differ e.g. when a system administrator modifies the date on the system, or when NTP adjusts wallclock time.</span>

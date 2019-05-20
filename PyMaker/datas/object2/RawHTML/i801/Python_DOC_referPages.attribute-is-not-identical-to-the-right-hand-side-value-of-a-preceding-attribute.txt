@@ -1,0 +1,140 @@
+<div class="post-text" itemprop="text">
+<p>This question might superficially look like a duplicate,
+but it is <em>not</em> about the usual <a href="https://nedbatchelder.com/text/names.html" rel="nofollow noreferrer">mutable surprise</a> with lists.</p>
+<p>More details later, but in a nutshell, just after</p>
+<pre><code>self.facts = facts
+print("facts: ", id(facts))
+print("self.facts: ", id(self.facts))
+</code></pre>
+<p>sometimes <code>self.facts</code> and <code>facts</code> were not identical.</p>
+<p>The app is single-threaded, and the difference lasts,
+so it does <em>not</em> seem to be a race condition or buffer delay.</p>
+<p>I did clear the cache:
+<code>find . -name "*.pyc" -delete</code></p>
+<p>I tried to come up with an <a href="https://stackoverflow.com/help/mcve">mcve</a>,
+but could not reproduce the bug. Here is an attempt.</p>
+<pre><code>class Fact():
+    def __init__(self, a):
+        self.a = a
+    def __eq__(self, other):
+        return self.a == self.b
+
+facts1 = [Fact(1), Fact(2), Fact(3)]
+id(facts1)
+facts2 = facts1
+id(facts2)
+# same as facts1
+facts3 = [Fact(1), Fact(2), Fact(3)]
+id(facts3)
+facts2 = facts3
+id(facts2)
+# same as fact3, as it should
+</code></pre>
+<p>A snapshot and steps to reproduce can be found in <a href="https://github.com/projecthamster/hamster/issues/381" rel="nofollow noreferrer">this issue</a>.</p>
+<p>As soon as the <code>__eq__</code> was <a href="https://github.com/projecthamster/hamster/pull/382/commits/9dc0d96a11077ba3cc18f3c9316c5906bc5084ca" rel="nofollow noreferrer">expanded</a> to check also fields that did change, both <code>facts</code> and <code>self.facts</code> held elements that were equal (in the sense of <code>__eq__</code>), so good enough, but not identical, which is still weird.</p>
+<p>Is that something known ? here is my python version:</p>
+<pre><code>Python 3.6.5 (default, Mar 31 2018, 19:45:04) [GCC] on linux
+on openSUSE Leap 15.0
+</code></pre>
+<p>What could be happening ?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Such behavior can be caused by many things, all of which control <em>how</em> an object's attributes are accessed.
+In that sense <code>self.x = y</code> is very much different from <code>x = y</code>. The former attempts to set the attribute <code>"x"</code> with <code>y</code>
+on the object <code>self</code> while the latter binds the name <code>"x"</code> to the object <code>y</code> in the local scope.</p>
+<h1>Descriptors</h1>
+<p><a href="https://docs.python.org/3/reference/datamodel.html#descriptors" rel="nofollow noreferrer">Descriptors</a> can control how attributes are
+dealt with by defining the special methods <code>__get__</code>, <code>__set__</code>, <code>__delete__</code>. An example:</p>
+<pre><code>from copy import copy
+
+class Descriptor:
+    def __get__(self, obj, cls):
+        return copy(self.list_obj)  # Return a copy -&gt; id changes.
+
+    def __set__(self, obj, val):
+        self.list_obj = copy(val)  # Store a copy -&gt; id changes.
+
+class Foo:
+    facts = Descriptor()
+
+facts = [1, 2, 3]
+obj = Foo()
+obj.facts = facts
+assert id(obj.facts) != id(facts)  # ids are different.
+</code></pre>
+<h2>Properties</h2>
+<p><a href="https://docs.python.org/3/library/functions.html#property" rel="nofollow noreferrer"><code>property</code></a> is probably one of the most prominent usage scenarios for
+data descriptors. Hence the workings are very similar:</p>
+<pre><code>from copy import copy
+
+class Foo:
+    @property
+    def facts(self):
+        return copy(self._facts)  # Return a copy -&gt; id changes.
+
+    @facts.setter
+    def facts(self, val):
+        self._facts = copy(val)  # Store a copy -&gt; id changes.
+
+facts = [1, 2, 3]
+obj = Foo()
+obj.facts = facts
+assert id(obj.facts) != id(facts)  # ids are different.
+</code></pre>
+<h1><code>__getattr__</code> and <code>__setattr__</code></h1>
+<p>By defining the methods <a href="https://docs.python.org/3/reference/datamodel.html#object.__getattribute__" rel="nofollow noreferrer"><code>__getattr__</code></a> and
+<a href="https://docs.python.org/3/reference/datamodel.html#object.__setattr__" rel="nofollow noreferrer"><code>__setattr__</code></a> a class can control the attribute access
+of its instances. For example:</p>
+<pre><code>from copy import copy
+
+class Foo:
+    def __getattr__(self, name):
+        return copy(super().__getattr__(name))  # Return a copy -&gt; id changes.
+
+    def __setattr__(self, name, val):
+        super().__setattr__(name, copy(val))  # Store a copy -&gt; id changes.
+
+facts = [1, 2, 3]
+obj = Foo()
+obj.facts = facts
+assert id(obj.facts) != id(facts)  # ids are different.
+</code></pre>
+<h1>How can I find out what intercepts the attribute access?</h1>
+<p>You can check <code>type(obj).facts</code> in order to find out whether <code>facts</code> is defined to be a descriptor.
+Similarly you can check <code>type(obj).__(get|set)attr__</code> to see whether <em>any</em> of the base classes defines
+this special method. Worth noting here is that any of the above described methods also works if it is defined
+on any of the classes sitting in the method resolution order (<code>__mro__</code>, i.e. the parent classes).
+So you would need to check for example:</p>
+<pre><code>any('__getattr__' in vars(cls) for cls in type(obj).__mro__)
+</code></pre>
+<h1>The OP's specific example</h1>
+<p>The class you linked inherits from
+<a href="https://github.com/projecthamster/hamster/blob/3245adbdbd85c7b4ee6c5ac93a0cf05132555968/src/hamster/lib/graphics.py#L1712" rel="nofollow noreferrer">this class</a> which defines
+<a href="https://github.com/projecthamster/hamster/blob/3245adbdbd85c7b4ee6c5ac93a0cf05132555968/src/hamster/lib/graphics.py#L1861" rel="nofollow noreferrer"><code>__setattr__</code></a>
+in a way that it checks
+for <em>equality</em> (<code>==</code>; not identity (<code>is</code>)) with an existing value and returns if they compare equal.
+That means especially if you have two lists that compare equal, i.e. <code>self.facts == facts</code>, then
+doing <code>self.facts = facts</code> will just return and not set the attribute. Hence nothing changed
+and the two objects (<code>self.facts</code> and <code>facts</code>) are still distinct. The code basically comes down to this:</p>
+<pre><code>class Foo:
+    def __setattr__(self, name, val):
+        if self.__dict__.get(name, None) == val:  # Could also use `getattr(self, name, None)`.
+            return
+        super().__setattr__(name, val)
+
+facts = [1, 2, 3]
+obj = Foo()
+obj.facts = [1, 2, 3]
+assert obj.facts == facts          # The two lists compare equal,
+obj.facts = facts                  # hence nothing will happen here,
+assert obj.facts == facts          # they still compare equal,
+assert id(obj.facts) != id(facts)  # but are still two distinct objects.
+</code></pre>
+</div>
+<span class="comment-copy">Shouldn't you use <code>self.a = a</code> instead of <code>a = a</code>?</span>
+<span class="comment-copy">What exactly do you mean by "identical"?</span>
+<span class="comment-copy">@ederag Many things could cause this but without the relevant code that generates <code>self</code> it's hard to pinpoint. For example <code>facts</code> could be a <code>property</code> and then do all sorts of things when you assign <code>self.facts = facts</code>. So you basically need to show the code of the class that <code>self</code> corresponds to.</span>
+<span class="comment-copy">@ederag I don't see how anyone can answer this unless you provide a genuine mcve.</span>
+<span class="comment-copy">@a_guest yes, any descriptor could potentially be causing all sorts of side-effects for <code>self.a = a</code>. We can only speculate about that, though.</span>
+<span class="comment-copy">Wow. I did not expect to see a believable explanation, but here it is anyway. Nice sleuthing, +1</span>
+<span class="comment-copy">Thanks for the masterpiece ! Perfect explanations both to debug the general case and to understand my specific example.</span>

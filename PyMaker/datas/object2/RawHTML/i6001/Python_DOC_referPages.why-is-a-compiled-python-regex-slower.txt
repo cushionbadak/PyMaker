@@ -1,0 +1,130 @@
+<div class="post-text" itemprop="text">
+<p>In <a href="https://stackoverflow.com/questions/4901523/whats-a-faster-operation-re-match-search-or-str-find">another SO question</a>, the performance of regexes and Python's <code>in</code> operator were compared. However, the accepted answer uses <code>re.match</code>, which only matches the beginning of a string, and thus behaves completely different to <code>in</code>. Also, I wanted to see the performance gain of not recompiling the RE each time.</p>
+<h3>Surprisingly, I see that the pre-compiled version seems to be <em>slower</em>.</h3>
+<p>Any ideas why?</p>
+<p>I am aware that there are quite a few other questions here that wonder about a similar issue. Most of them perform the way they do simply because they do not correctly reuse the compiled regex. If that is also my issue, please explain.</p>
+<pre><code>from timeit import timeit
+import re
+
+pattern = 'sed'
+text = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod' \
+       'tempor incididunt ut labore et dolore magna aliqua.'
+
+compiled_pattern = re.compile(pattern)
+
+def find():
+    assert text.find(pattern) &gt; -1
+
+def re_search():
+    assert re.search(pattern, text)
+
+def re_compiled():
+    assert re.search(compiled_pattern, text)
+
+def in_find():
+    assert pattern in text
+
+print('str.find     ', timeit(find))
+print('re.search    ', timeit(re_search))
+print('re (compiled)', timeit(re_compiled))
+print('in           ', timeit(in_find))
+</code></pre>
+<p>Output:</p>
+<pre><code>str.find      0.36285957560356435
+re.search     1.047689160564772
+re (compiled) 1.575113873320307
+in            0.1907925627077569
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<h1>Short answer</h1>
+<p>If you call <a href="https://docs.python.org/3/library/re.html#re.regex.search" rel="nofollow noreferrer"><code>compiled_pattern.search(text)</code></a> directly, it won't call <code>_compile</code> at all, it will be faster than <a href="https://docs.python.org/3/library/re.html#re.search" rel="nofollow noreferrer"><code>re.search(pattern, text)</code></a> and much faster than <code>re.search(compiled_pattern, text)</code>.</p>
+<p>This performance difference is due to <code>KeyError</code>s in cache and slow hash calculations for compiled patterns.</p>
+<hr/>
+<h1><code>re</code> functions and <code>SRE_Pattern</code> methods</h1>
+<p>Any time a <code>re</code> function with a <code>pattern</code> as 1st argument (e.g. <code>re.search(pattern, string)</code> or <code>re.findall(pattern, string)</code>) is called, Python tries to compile the <code>pattern</code> first with <code>_compile</code> and then calls the corresponding method on the compiled pattern. For <a href="https://github.com/python/cpython/blob/3.6/Lib/re.py#L179" rel="nofollow noreferrer">example</a>:</p>
+<pre><code>def search(pattern, string, flags=0):
+    """Scan through string looking for a match to the pattern, returning
+    a match object, or None if no match was found."""
+    return _compile(pattern, flags).search(string)
+</code></pre>
+<p>Note that <code>pattern</code> could be either a string or an already compiled pattern (an <code>SRE_Pattern</code> instance).</p>
+<h1>_compile</h1>
+<p>Here's a compact version of <a href="https://github.com/python/cpython/blob/3.6/Lib/re.py#L281" rel="nofollow noreferrer"><code>_compile</code></a>. I simply removed debug and flags check:</p>
+<pre><code>_cache = {}
+_pattern_type = type(sre_compile.compile("", 0))
+_MAXCACHE = 512
+
+def _compile(pattern, flags):
+    try:
+        p, loc = _cache[type(pattern), pattern, flags]
+        if loc is None or loc == _locale.setlocale(_locale.LC_CTYPE):
+            return p
+    except KeyError:
+        pass
+    if isinstance(pattern, _pattern_type):
+        return pattern
+    if not sre_compile.isstring(pattern):
+        raise TypeError("first argument must be string or compiled pattern")
+    p = sre_compile.compile(pattern, flags)
+    if len(_cache) &gt;= _MAXCACHE:
+        _cache.clear()
+    loc = None
+    _cache[type(pattern), pattern, flags] = p, loc
+    return p
+</code></pre>
+<h2><code>_compile</code> with String pattern</h2>
+<p>When <code>_compile</code> is called with a string pattern, the compiled pattern is saved in <code>_cache</code> dict. Next time the same function is called (e.g. during the many <code>timeit</code> runs), <code>_compile</code> simply checks in <code>_cache</code> if this string has already been seen and returns the corresponding compiled pattern.</p>
+<p>Using <code>ipdb</code> debugger in Spyder, it's easy to dive into <code>re.py</code> during execution.</p>
+<pre><code>import re
+
+pattern = 'sed'
+text = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod' \
+       'tempor incididunt ut labore et dolore magna aliqua.'
+
+compiled_pattern = re.compile(pattern)
+
+re.search(pattern, text)
+re.search(pattern, text)
+</code></pre>
+<p>With a breakpoint at the second <code>re.search(pattern, text)</code>, it can be seen that the pair:</p>
+<pre><code>{(&lt;class 'str'&gt;, 'sed', 0): (re.compile('sed'), None)}
+</code></pre>
+<p>is saved in <code>_cache</code>. The compiled pattern is returned directly.</p>
+<h2><code>_compile</code> with compiled pattern</h2>
+<h3>slow hash</h3>
+<p>What happens if <code>_compile</code> is called with an already compiled pattern?</p>
+<p>First, <code>_compile</code> checks if the pattern is in <code>_cache</code>. To do so, it needs to calculate its hash. This calculation is much slower for a compiled pattern than for a string:</p>
+<pre><code>In [1]: import re
+
+In [2]: pattern = "(?:a(?:b(?:b\\é|sorbed)|ccessing|gar|l(?:armists|ternation)|ngels|pparelled|u(?:daciousness's|gust|t(?:horitarianism's|obiographi
+   ...: es)))|b(?:aden|e(?:nevolently|velled)|lackheads|ooze(?:'s|s))|c(?:a(?:esura|sts)|entenarians|h(?:eeriness's|lorination)|laudius|o(?:n(?:form
+   ...: ist|vertor)|uriers)|reeks)|d(?:aze's|er(?:elicts|matologists)|i(?:nette|s(?:ciplinary|dain's))|u(?:chess's|shanbe))|e(?:lectrifying|x(?:ampl
+   ...: ing|perts))|farmhands|g(?:r(?:eased|over)|uyed)|h(?:eft|oneycomb|u(?:g's|skies))|i(?:mperturbably|nterpreting)|j(?:a(?:guars|nitors)|odhpurs
+   ...: 's)|kindnesses|m(?:itterrand's|onopoly's|umbled)|n(?:aivet\\é's|udity's)|p(?:a(?:n(?:els|icky|tomimed)|tios)|erpetuating|ointer|resentation|
+   ...: yrite)|r(?:agtime|e(?:gret|stless))|s(?:aturated|c(?:apulae|urvy's|ylla's)|inne(?:rs|d)|m(?:irch's|udge's)|o(?:lecism's|utheast)|p(?:inals|o
+   ...: onerism's)|tevedore|ung|weetest)|t(?:ailpipe's|easpoon|h(?:ermionic|ighbone)|i(?:biae|entsin)|osca's)|u(?:n(?:accented|earned)|pstaging)|v(?
+   ...: :alerie's|onda)|w(?:hirl|ildfowl's|olfram)|zimmerman's)"
+
+In [3]: compiled_pattern = re.compile(pattern)
+
+In [4]: % timeit hash(pattern)
+126 ns ± 0.358 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+
+In [5]: % timeit hash(compiled_pattern)
+7.67 µs ± 21 ns per loop (mean ± std. dev. of 7 runs, 100000 loops each)
+</code></pre>
+<p><code>hash(compiled_pattern)</code> is 60 times slower than <code>hash(pattern)</code> here.</p>
+<h3><code>KeyError</code></h3>
+<p>When a <code>pattern</code> is unknown, <code>_cache[type(pattern), pattern, flags]</code> fails with a <code>KeyError</code>.</p>
+<p>The <code>KeyError</code> gets handled and ignored. Only then does <code>_compile</code> check if the pattern is already compiled. If it is, it gets returned, without being written in cache.</p>
+<p>It means that the next time <code>_compile</code> is called with the same compiled pattern, it will calculate the useless, slow hash again, but will still fail with a <code>KeyError</code>.</p>
+<p>Error handling is expensive, and I suppose that's the main reason why <code>re.search(compiled_pattern, text)</code> is slower than <code>re.search(pattern, text)</code>.</p>
+<p>This weird behaviour might be a choice to speed up calls with string patterns, but it might have been a good idea to write a warning if <code>_compile</code> is called with an already compiled pattern.</p>
+</div>
+<span class="comment-copy">You should be doing <code>compiled_pattern.search(text)</code> not  <code>re.search(compiled_pattern, text)</code></span>
+<span class="comment-copy"><code>compiled_pattern.search(text)</code> will be 3x faster. Still odd, though, that <code>re.search(compiled_pattern, text)</code> seems not to do the same.</span>
+<span class="comment-copy">@tobias_k looking at the declaration, calling <code>re.search</code> simply does <code>return _compile(pattern, flags).search(string)</code>. There's no check if the pattern is already compiled.</span>
+<span class="comment-copy">It <i>does</i>. Look at <code>re.py:294</code>. (Line number for Py3.6).</span>
+<span class="comment-copy">FWIW, that question I linked has <a href="https://stackoverflow.com/a/42360900/4014959">an answer</a> by Python core developer, Raymond Hettinger, but it was added rather late, so it's not near the top of the page.</span>
+<span class="comment-copy">I just ran into this performance problem, thanks for the excellent explanation! It seems like the type check (i.e. <code>if isinstance(pattern, _pattern_type)</code>) would be relatively fast, so I wonder why they don't just put that first in <code>_compile</code></span>

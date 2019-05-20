@@ -1,0 +1,58 @@
+<div class="post-text" itemprop="text">
+<p>In CPython the following </p>
+<pre class="lang-py prettyprint-override"><code>import collections
+issubclass(dict, collections.Mapping)
+</code></pre>
+<p>returns <code>True</code>. This confuses me a bit, since <code>dict</code> is a builtin class defined in CTypes and the collections module explicitly relies on the existence of <code>dict</code> to accomplish some of its functionality. Something other than straightforward inheritance checks must be going on and I can't figure out why this works. Below I provide some of my reasoning that leads to my confusion.</p>
+<hr/>
+<p>If we look at the inheritance structure of <a href="https://github.com/python/cpython/blob/master/Lib/_collections_abc.py#L641" rel="nofollow noreferrer"><code>collections.Mapping</code></a> we see it inherits from <code>Collection</code>. <a href="https://github.com/python/cpython/blob/master/Lib/_collections_abc.py#L388" rel="nofollow noreferrer"><code>Collection</code>'s signature</a> shows that it inherits from <code>Sized</code>, <code>Iterable</code>, <code>Container</code> all of which inherit only from the metaclass <code>ABCmeta</code>.</p>
+<p>But <code>dict</code> is a builtin, which I thought meant that it was being defined directly as a CType which I thought meant it wouldn't be inheriting from anything.</p>
+<p>So, why is it that <code>issubclass(dict, collections.Mapping)</code> → <code>True</code>?</p>
+<hr/>
+<p>For more context about why this came up see <a href="https://github.com/jupyter/nbformat/pull/107#issuecomment-323230758" rel="nofollow noreferrer">this nbformat issue</a>, in which in attempting to recreate the signature &amp; functionality of <code>dict</code>'s <code>update</code> we need to know how <code>issubclass(foo, Mapping)</code> will behave. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>That's because metaclasses can customize what <a href="https://docs.python.org/reference/datamodel.html#class.__subclasscheck__" rel="nofollow noreferrer"><code>issubclass</code></a> and <a href="https://docs.python.org/reference/datamodel.html#class.__instancecheck__" rel="nofollow noreferrer"><code>isinstance</code></a> return. In case of <code>MutableMapping</code> this is done via <a href="https://docs.python.org/library/abc.html#abc.ABCMeta" rel="nofollow noreferrer"><code>abc.ABCMeta</code></a>, which allows to <a href="https://docs.python.org/library/abc.html#abc.ABCMeta.register" rel="nofollow noreferrer">register</a> "virtual subclasses".</p>
+<p>For example:</p>
+<pre><code>from collections import MutableMapping
+
+class A(object): pass
+MutableMapping.register(A)
+issubclass(A, MutableMapping)  # True
+</code></pre>
+<p>It even works for subclasses of registered subclasses:</p>
+<pre><code>class B(object): pass
+class C(B): pass
+MutableMapping.register(B)
+issubclass(C, MutableMapping)  # True
+</code></pre>
+<p>The same happens for <code>dict</code>. So even though it's not a real subclass of <code>MutableMapping</code> it's still a virtual subclass. Like the second example shows that means that all "real" subclasses of <code>dict</code> also will be "virtual" subclasses of <code>MutableMapping</code>.</p>
+<p>Note that even simpler ABCs implement subclass checks based on the presence of methods. For example <a href="https://github.com/python/cpython/blob/v3.6.2/Lib/_collections_abc.py#L368-L371" rel="nofollow noreferrer"><code>collections.Sized</code> checks if the class has a <code>__len__</code></a>:</p>
+<pre><code>from collections import Sized
+
+class D(object):
+    def __len__(self):
+        return 1
+
+issubclass(D, Sized)   # True
+</code></pre>
+<p>So even without explicit <code>register</code> this <code>D</code> will be recognized as valid subclass of <code>Sized</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://github.com/python/cpython/blob/3.6/Lib/_collections_abc.py#L859" rel="nofollow noreferrer">Because this:</a></p>
+<pre><code>MutableMapping.register(dict)
+</code></pre>
+<p>It's explicitly <code>register</code>ed with <code>MutableMapping</code>, and <code>abc.ABCMeta</code> defines <code>issubclass</code> checks so that registered classes are considered subclasses for the purpose of <code>isinstance</code> and <code>issubclass</code> checks, using the <a href="https://docs.python.org/3/reference/datamodel.html#class.__instancecheck__" rel="nofollow noreferrer"><code>__instancecheck__</code></a> and <a href="https://docs.python.org/3/reference/datamodel.html#class.__subclasscheck__" rel="nofollow noreferrer"><code>__subclasscheck__</code></a> hooks.</p>
+</div>
+<span class="comment-copy">Ignoring the magic: the equality check doesn’t run when the class is created. This sort of relationship is perfectly implementable in Python regardless of overrides.</span>
+<span class="comment-copy">Ok, I'll remove that bit about the equality check, I'm still confused about the original question though. Thanks @Ryan for pointing that out!</span>
+<span class="comment-copy">So I get why the subclasses of registered classes would work, but why would the check succeed for the superclasses on which the registered subclasses work (when this alternative logic has been provided for short-circuiting how <code>issubclass</code> works). Specifically, this is relevant for explaining why <code>issubclass(dict, Mapping)</code> is true given that <code>dict</code> is registered for <code>MutableMapping</code> and not <code>Mapping</code>? That is, I'd understand if it worked by using the standard inheritance check normally, but how does this "recreate" the recursion of standard subclass/inheritance checks?</span>
+<span class="comment-copy">I think that's just following the principle of least astonishment: Because a superclass of your superclass (<code>issubclass(MutableMapping, Mapping) == True</code>) is also your superclass. So why shouldn't <code>issubclass(dict, Mapping)</code> be true?</span>
+<span class="comment-copy">Because it's checking <code>for rcls in cls._abc_registry:; if issubclass(subclass, rcls):; cls._abc_cache.add(subclass); return True</code> and nothing other than explicitly registering a class with <code>register</code> seems to add anything to <code>_abc_registry. So, I don't get how </code>Mapping` "finds" <code>MutableMapping</code>'s <code>_abc_registry</code>.</span>
+<span class="comment-copy">Ah, you're interested in the internals. Basically it checks if it's a subclass of a subclass <a href="https://github.com/python/cpython/blob/v3.6.2/Lib/abc.py#L224-L228" rel="nofollow noreferrer">here</a>. You can run that code yourself if you copy it and run it with <code>cls = Mapping</code> and <code>subclass = dict</code>.</span>
+<span class="comment-copy">@mpacer <a href="https://gist.github.com/MSeifert04/7a71a6e0887f66f922341e09ef38ed96" rel="nofollow noreferrer">Here is that part of the code as a standalone script.</a></span>
+<span class="comment-copy">Could you explain how that registering happens &amp; where that <code>register</code> logic is defined?</span>
+<span class="comment-copy">@mpacer: <a href="https://github.com/python/cpython/blob/master/Lib/abc.py" rel="nofollow noreferrer">github.com/python/cpython/blob/master/Lib/abc.py</a></span>
+<span class="comment-copy">I meant in your answer, with exposition like you did for the rest… That will make it complete enough for someone to land here and understand the explanation of  "why" this happens. Context: the <a href="https://github.com/python/cpython/blob/master/Lib/abc.py#L151" rel="nofollow noreferrer">register function</a> has some complicated logic that requires comprehending much more than just fact that the register function "works" to accomplish this purpose. E.g., why does adding it to the WeakSet <code>ABCmeta._abc_registry</code> work to accomplish this?</span>
+<span class="comment-copy">On further inspection it seems <code>.register</code> only adds the class to a <code>WeakSet</code>. How exactly does <code>issubclass</code> figure out now that a relationship has been established?</span>
+<span class="comment-copy">@cᴏʟᴅsᴘᴇᴇᴅ: By looking at the <code>WeakSet</code>. It's not quite as simple as an <code>in</code> check, since it has to consider subclasses of registered classes and classes registered with subclasses, but it eventually reaches an <code>in</code> check.</span>

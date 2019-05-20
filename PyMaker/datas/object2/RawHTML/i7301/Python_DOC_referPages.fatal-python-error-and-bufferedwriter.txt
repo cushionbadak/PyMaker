@@ -1,0 +1,126 @@
+<div class="post-text" itemprop="text">
+<p>I've came across this paragraph in the Documentations which says: </p>
+<blockquote>
+<p>Binary buffered objects (instances of <code>BufferedReader</code>, <code>BufferedWriter</code>, <code>BufferedRandom</code> and <code>BufferedRWPair</code>) protect their internal structures using a lock; it is therefore safe to call them from multiple threads at once.</p>
+</blockquote>
+<p>I'm not sure why they need to "protect" their internal structures given the GIL is in action. Who cares? I didn't care much until I found out that this lock has some significance, consider this piece of code: </p>
+<pre><code>from _thread import start_new_thread
+import time
+
+def start():
+    for i in range(10):
+        print("SPAM SPAM SPAM!")
+
+for i in range(10):
+    start_new_thread(start, ())
+
+time.sleep(0.0001)
+print("main thread exited")
+</code></pre>
+<p>Output when run on Python 3.X: </p>
+<pre><code>...many SPAM...
+SPAM SPAM SPAM!
+SPAM SPAM SPAM!
+SPAM SPAM SPAM!
+main thread exited
+SPAM SPAM SPAM!
+SPAM SPAM SPAM!
+SPAM SPAM SPAM!
+SPAM SPAM SPAM!
+SPAM SPAM SPAM!
+Fatal Python error: could not acquire lock for 
+&lt;_io.BufferedWritername='&lt;stdout&gt;'&gt; at interpreter shutdown, possibly due to daemon threads
+</code></pre>
+<p>Under Python 2.7, no errors. I'm not aware why would this happen, however, I've been looking around in <a href="https://github.com/python/cpython/blob/master/Modules/_io/bufferedio.c#L268" rel="noreferrer">bufferedio.c</a>. Another code that behaves similarly to the above snippet that was tested on Python 3.X, sometimes I got <code>Fatal Python error</code> and sometimes I did not. Any threaded function with a loop plus <code>std[out][err].write</code> causes this fatal error. It's really hard to define the characteristics of this error and to the best of my knowledge the Documentation doesn't mention anything about it. I'm not sure even if it's a bug, I hope not. </p>
+<p>My explanation of this behavior goes like this, *I could be totally wrong:
+The main thread exited while its holding the lock of <code>sys.stdout.buffer</code>. However, this seems contrary to the fact that threads are terminated when the main thread exits on the system on which I'm running Python, Linux.</p>
+<hr/>
+<p>I'm posting this as answer, it just can't be done in the comment section.</p>
+<p>This behavior isn't just limited to <code>write</code> it affects <code>read</code> as well as <code>flush</code> calls on those objects <code>BufferedReader</code>, <code>BufferedWriter</code>, <code>BufferedRandom</code> and <code>BufferedRWPair</code>.</p>
+<p>1) On Linux and probably on Windows too, when the main thread exits, its child threads are terminated. How does this affect the mentioned behavior in question? If the main thread was able to exit during its time slice, before being context switched with another thread, no fatal error occurs as all threads get terminated. Nothing guarantees however, that the main thread will exit as soon as it starts.</p>
+<p>2) The fatal error takes place between the finalization process (shutdown) of the interpreter and the <code>read</code>, <code>write</code>, or <code>flush</code>  call and possibly other operations on the <code>Buffered*</code> object. The finalization process acquires the lock of the those objects, any <code>write</code> for example to the <code>BufferedWriter</code> object results in <code>Fatal Python error</code>.</p>
+<p><code>os._exit</code> terminates the interpreter without the finalization steps and hence the interpreter will not own the lock of the object that we are talking about, this is another example:</p>
+<pre><code>from _thread import start_new_thread
+import time, sys, os
+
+def start(myId):
+    for i in range(10):
+        sys.stdout.buffer.write(b"SPAM\n")
+
+for i in range(2):
+    start_new_thread(start, (i,))
+
+x = print("main thread")
+print(x)
+
+#os._exit(0)
+</code></pre>
+<p>In above code, if  the main thread exits as soon as it starts, that's it, no fatal error occurs and all spawned threads are terminated immediately (at least in Linux) this is platform-dependent though. If you're unlucky enough and another thread started to play on the field before the main threads exits, without <code>os._exit(0)</code> call the interpreter goes through its normal cycle of finalization to acquire the lock of  <code>sys.stdout.buffer</code> which results in fatal error. Run this code multiple times to notice its different behaviors. </p>
+</div>
+<div class="post-text" itemprop="text">
+<h1>TL;DR</h1>
+<p>Your issue is not strictly related to lock stuff, but with the fact you are trying to write to a no-more-existent <code>stdout</code> with a <code>daemon thread</code>.</p>
+<h1>A bit of explain</h1>
+<p>When you run your main script the Python interpreter starts and execute your code opening the <code>stdout</code> file descriptor.</p>
+<p>When your script ends without waiting for threads to finish:</p>
+<ul>
+<li>all the threads switch from <em>non-daemons</em> to <em>daemons</em></li>
+<li>the interpreter exits calling a <em>finalize</em> function which wypes the threads' globals including the <code>stdout</code></li>
+<li>the now-daemon threads try to aquire lock for <code>stdout</code> which is no more accessible due to the previous step</li>
+</ul>
+<p>To avoid this issue you could write to file instead of stdout (as a daemon thread should do) or just wait for threads to finish with something like:</p>
+<pre><code>from threading import Thread
+import time
+
+def start():
+    for i in range(10):
+        print("SPAM SPAM SPAM!")
+
+# create a thread list (you'll need it later)
+threads = [Thread(target=start, args=()) for i in range(10)]
+
+# start all the threads
+for t in threads:
+    t.start()
+# or [t.start() for t in threads] if you prefer the inlines
+
+time.sleep(0.0001)
+
+# wait for threads to finish
+for t in threads:
+    t.join()
+# or [t.join() for t in threads] for the inline version
+
+print("main thread exited")
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>When I ran the first code on windows (cygwin), I got the error on python3, but I also got an error on python2 </p>
+<pre><code>&gt; Unhandled exception in thread started by 
+&gt; sys.excepthook is missing
+&gt; lost sys.stderr
+</code></pre>
+<p>So it is possible that on your platform python2.x may have silently exited the threads when they fail to acquire the lock. Also I believe that <a href="https://docs.python.org/3/library/_thread.html" rel="noreferrer">_thread module</a> (thread in 2.7) is a low-level module and does not guarantee to avoid this behavior. From the <a href="https://docs.python.org/3/library/_thread.html" rel="noreferrer">module help</a> </p>
+<blockquote>
+<ul>
+<li>When the main thread exits, it is system defined whether the other    threads survive. On most systems, they are killed without executing 
+  try ... finally clauses or executing object destructors. </li>
+<li>When the main thread exits, it does not do any of its usual cleanup (except    that try ... finally clauses are honored), and the standard
+  I/O files    are not flushed.</li>
+</ul>
+</blockquote>
+<p>May be you should use higher level <a href="https://docs.python.org/3/library/threading.html#module-threading" rel="noreferrer">threading module</a> with proper synchronization between main and other threads. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think you just have an erroneous understanding of GIL.</p>
+<p>please think about when you have GIL and a list,then manipulate the list in different threads,what will happen?if you still confuse，test it.so does the <code>BufferedWriter</code>.</p>
+</div>
+<span class="comment-copy">The GIL does <i>not</i> apply, it is released for I/O code as those can't affect the Python interpreter state but could potentially be slow. By releasing the GIL there, that leaves the Python interpreter thread free to execute other Python code while waiting for I/O.</span>
+<span class="comment-copy">@MartijnPieters As I quoted the documentation, those objects have their own locks. The fatal error is confusing and tricky. For example, under Win 10 this doesn't occur, at least on my system. On Linux on the other hand, sometimes there's a fatal error and in some occasions there isn't. Either this is a bug or there's something wrong. I didn't expect a stupidly written Python code can crash Python fatally :\</span>
+<span class="comment-copy"><i>"all the threads switch from non-daemons to daemons"</i> that's just wrong, there's nothing like that.</span>
+<span class="comment-copy">It's not intended as a feature, but as a bug. By the way, I'm just reporting what I read in several python bug reports comments, I'm not a "<i>low-level python expert</i>"</span>
+<span class="comment-copy">You've been awarded the bounty by the system automatically. On one side you said, <i>"all the threads switch from non-daemons to daemons"</i> is incorrect. The main thread is considered non-daemonic in Python. Other threads started outside <code>threading</code> module are considered daemonic, including the ones started from C code. There's no implicit switching behind the scenes. On the other side, <i>"the now-daemon threads try to aquire lock for stdout which is no more accessible"</i>.  It's 90% likelihood that the main thread tries to acquire the lock, and to prevent a deadlock from happening...</span>
+<span class="comment-copy">during interpreter shutdown, the interpreter exits with error. I don't think the people who worked on implementing threads in Python are naive enough to not consider the scenario when a thread is scheduled to run at the time where the main thread is exiting. This has to do with <code>sys.stdout.buffer</code> 's lock. I appreciate your efforts, your answer doesn't address the problem at all.</span>
+<span class="comment-copy">As I already said, I'm not a low-level Python expert. I just read the question, get curious about that, searched for an answer, read several Python bug report about that, just reported what I read. nothing more, nothing less.</span>
+<span class="comment-copy">You could get the same error using<code>threading</code>. It's not about <code>_thread</code> versus <code>threading</code> the problem keeps regenerating with both modules.</span>
+<span class="comment-copy">I did not imply that <code>threading</code> module by itself solve these issues. I meant that these modules expect the module-user to take care of such behavior.</span>

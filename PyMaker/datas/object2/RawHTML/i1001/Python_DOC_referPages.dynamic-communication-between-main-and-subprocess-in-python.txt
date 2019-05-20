@@ -1,0 +1,122 @@
+<div class="post-text" itemprop="text">
+<p>I work in Python, and I want to find a workflow for enabling two processes (<em>main-process</em> and <em>sub-process</em>) to communicate with each other. By that, I mean the ability of <em>main-process</em> to send some data to <em>sub-process</em> (perhaps, by writing to <em>sub-process's</em> stdin) and the ability of <em>sub-process</em> to send some data back to the main one. This also implies that both can read the data sent to them (I was thinking of reading from stdin).</p>
+<p>I was trying to use <strong>subprocess</strong> library, but it seems that it's intended to work with processes that are designed to give an output only once and then terminate, whereas I want to <strong>exchange data dynamically</strong> and shut the sub-process down only when such a command is received.</p>
+<p>I've read lots of answers here on StackOverflow tackling problems closely related to mine, but none of them did I find satisfying, as the questions those answers were meant to were different from mine in one important detail: I need my <em>main-process</em> to be able to <strong>exchange</strong> data with its <em>sub-process</em> <strong>dynamically as many times as needed</strong>, not just once, which in turn implies that the <em>sub-process</em> should run until it receives a certain command from <em>main-process</em> to terminate. </p>
+<p>I'm open to using third-party libraries, but it would be much better if  you proposed a solution based solely on the Python Standard Library.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You want to make a <code>Popen</code> object with <code>subprocess.PIPE</code> for standard input and output and use its file objects to communicate—rather than using one of the <strong>cantrips</strong> like <code>run</code> (and the older, more specific ones like <code>check_output</code>).  The challenge is avoiding <strong>deadlock</strong>: it’s easy to land in a situation where each process is trying to write, the pipe buffers fill (because no one is reading from them), and everything hangs.  You also have to remember to <strong><code>flush</code></strong> in both processes, to avoid having a request or response stuck in a <code>file</code> object’s buffer.</p>
+<p><code>Popen.communicate</code> is provided to avoid these issues, but it supports only a <strong>single string</strong> (rather than an ongoing conversation).  The traditional solution is <code>select</code>, but it also works to use separate <strong>threads</strong> to send requests and read results.  (This is one of the reasons to use CPython threads in spite of the GIL: each exists to run while the other is blocked, so there’s very little contention.)  Of course, <strong>synchronization</strong> is then an issue, and you may need to do some work to make the multithreaded client act like a simple, synchronous function call on the outside.</p>
+<p>Note that <em>both</em> processes need to <code>flush</code>, but it’s enough if <strong>either</strong> implements such non-blocking I/O; one normally does that job in the process that starts the other because that’s where it’s known to be necessary (and such programs are the exception).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It seems like pipe might be a suitable choice for your use case. Beware though that under normal circumstance both reading and writing end expect data to be written or consumed resp. Also make sure you do not get surprised by buffering (nothing come through because buffer would not get automatically flushed unless on expected boundary unless set accordingly).</p>
+<p>A basic example of how two pipe (they are unidirectional) can be used between two processes:</p>
+<pre><code>import os
+
+def child():
+    """
+    This function is executed in a child process.
+    """
+    infile = os.fdopen(r1)
+    outfile = os.fdopen(w2, 'w', buffering=1)
+    for line in infile:
+        if line.rstrip() == 'quit':
+            break
+        outfile.write(line.upper())
+
+def parent():
+    """
+    This function is executed in a parent process.
+    """
+    outfile = os.fdopen(w1, 'w', buffering=1)
+    infile = os.fdopen(r2)
+    print('Foo', file=outfile)
+    print(infile.readline(), end='')
+    print('bar', file=outfile)
+    print(infile.readline(), end='')
+    print('quit', file=outfile)
+
+(r1, w1) = os.pipe()  # for parent -&gt; child writes
+(r2, w2) = os.pipe()  # for child -&gt; parent writes
+
+pid = os.fork()
+if pid == 0:
+    child()  # child code runs here.
+elif pid &gt; 0:
+    parent()  # parent code runs here.
+    os.waitpid(pid, 0)  # wait for child
+else:
+    raise RuntimeError("This should not have happened.")
+# Once returned from corresponding function, both processes exit
+</code></pre>
+<p>Indeed it'd be easier and more practical to use <code>subprocess</code> and you likely want to <code>exec</code> another binary/file. Former would need to be told to not close (at least the relevant pipe) file descriptors, latter would require the pipe file descriptors to be inheritable (not have <code>O_CLOEXEC</code> flag set). Otherwise same as above.</p>
+<p>Child code:</p>
+<pre><code>import os
+import sys
+
+infile = os.fdopen(int(sys.argv[1]))
+outfile = os.fdopen(int(sys.argv[2]), 'w', buffering=1)
+
+for line in infile:
+    if line.rstrip() == 'quit':
+        break
+    outfile.write(line.upper())
+</code></pre>
+<p>Parent script:</p>
+<pre><code>import os
+import subprocess
+
+(r1, w1) = os.pipe2(0)  # for parent -&gt; child writes
+(r2, w2) = os.pipe2(0)  # for child -&gt; parent writes
+
+child = subprocess.Popen(['./child.py', str(r1), str(w2)], pass_fds=(r1, w2))
+outfile = os.fdopen(w1, 'w', buffering=1)
+infile = os.fdopen(r2)
+print('Foo', file=outfile)
+print(infile.readline(), end='')
+print('bar', file=outfile)
+print(infile.readline(), end='')
+print('quit', file=outfile)
+child.wait()
+</code></pre>
+<p>Come to think of that, I forgot to ask, whether child needs stdin/out for anything, or it could be used to get information in/out of it. That would be even simpler:</p>
+<p>Child:</p>
+<pre><code>import sys
+
+for line in sys.stdin:
+    if line.rstrip() == 'quit':
+        break
+    print(line.upper(), end='', flush=True)
+</code></pre>
+<p>Parent:</p>
+<pre><code>import os
+import subprocess
+
+(r1, w1) = os.pipe2(0)  # for parent -&gt; child writes
+(r2, w2) = os.pipe2(0)  # for child -&gt; parent writes
+
+child = subprocess.Popen(['./child.py'], stdin=r1, stdout=w2)
+outfile = os.fdopen(w1, 'w', buffering=1)
+infile = os.fdopen(r2)
+print('Foo', file=outfile)
+print(infile.readline(), end='')
+print('bar', file=outfile)
+print(infile.readline(), end='')
+print('quit', file=outfile)
+child.wait()
+</code></pre>
+<p>As stated, it is not really python specific and these are just rough hints on how pipes as one option could be used.</p>
+</div>
+<span class="comment-copy">Possible duplicate of <a href="https://stackoverflow.com/questions/28532457/ipc-with-a-python-subprocess">IPC with a Python subprocess</a></span>
+<span class="comment-copy">@Omer Nope, it's not. First, the task in the question you're referring to is more specific in that the subprocess's standard streams can't be used as they're reserved for something else. Second, I was asking for dynamic exchange of data, while the implementation proposed there — as I understand — produces the result that is opposite to what I'm looking for.</span>
+<span class="comment-copy">Been a while since I worked with pipes but iirc they allow you to dynamically exchange data between processes, here's a non-python explanation: <a href="https://www.tldp.org/LDP/lpg/node7.html" rel="nofollow noreferrer">tldp.org/LDP/lpg/node7.html</a>  Pretty sure the linked thread talks about something similar, try re-examining it (I might be wrong though)</span>
+<span class="comment-copy">It still does sound like you're looking for good old IPC... for two Python processes. Which: a) Sort of makes the question not to be really Python specific; b) there are few bits missing to choose the most suitable IPC mechanism (before looking at how to use it in Python perhaps); We know the processes are expected to exchange data over longer period of time. Is this communication bi-directional? Is the sub-process only expected to live as long as the "main" process does or can it actually spin off life of its own? Nature of information passed?...</span>
+<span class="comment-copy">@OndrejK. Sorry if something in my question appeared to be vague to you, though I thought I put it as clearly as I could: I need the main-process to be able to spawn the sub-process and send data to it (it can be a plain text) while also be able to receive messages (can be a text as well) from it; the sub-process should run until the main-process says it to terminate (or, perhaps, until the main-process kills it). Thanks for reaching out.</span>
+<span class="comment-copy">Thanks for the response! I, actually, tried to use Popen, but communicate() — as you pointed out — supports only a single string, which is why I rejected this idea, although I didn't try to use Popen in a different manner (just reading/writing from std rather than using communicate()). Should I try this? Also, I was thinking of using Asyncio standard library as a way to get around the deadlock problem. Do you have any ideas?</span>
+<span class="comment-copy">@AntonReient: <code>communicate</code> is a specialized tool provided <i>because</i> it lets people solve one common problem without any (perceived) complexity.  My answer says to use the <code>Popen</code> streams, right?</span>
+<span class="comment-copy">This still has the crucial problem of deadlock (invisible until the transaction becomes larger in a real application) as well as flushing.</span>
+<span class="comment-copy">@DavisHerring Have you worked with Asyncio standard library? If so, do you think it will help? I understand the problem of deadlock that comes out of this implementation. NodeJs, for example, solves it by using listeners (asynchronous event-driven architecture) which work in a non-blocking manner. Would be cool to implement something like this in Python. Thoughts?</span>
+<span class="comment-copy">@DavisHerring I was really just out to get the basics covered. As for deadlock potential: yes the parent/child must not blindly assume someone is listening, let alone cross-write at once. Flushing: should be line buffered all across the examples and flushed on individual message or when buffer is full (4k I'd presume).</span>
+<span class="comment-copy">@OndrejK.: It’s true that certain reasonable protocols prevent deadlock; I should have said that.  Line-buffering, however, is automatic only on terminals.  One <i>can</i> use pseudo-terminals to make it happen (<i>cf.</i> <code>unbuffer</code>), but that’s rather more complicated than altering the server program (if you can).</span>
+<span class="comment-copy">The example uses higher level (python) interface to read/write through <a href="https://docs.python.org/3/library/io.html#io.TextIOWrapper" rel="nofollow noreferrer">io.TextIOWrapper</a> (with file-like object opened in text mode). <i>"If line_buffering is True, flush() is implied when a call to write contains a newline character or a carriage return."</i> I do not entirely disagree with you, but I am also trying to keep the complexity down.</span>

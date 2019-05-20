@@ -1,0 +1,206 @@
+<div class="post-text" itemprop="text">
+<p>What's the best way to write unit tests for code using the Python 3.4 <code>asyncio</code> library? Assume I want to test a TCP client (<code>SocketConnection</code>):</p>
+<pre><code>import asyncio
+import unittest
+
+class TestSocketConnection(unittest.TestCase):
+    def setUp(self):
+        self.mock_server = MockServer("localhost", 1337)
+        self.socket_connection = SocketConnection("localhost", 1337)
+
+    @asyncio.coroutine
+    def test_sends_handshake_after_connect(self):
+        yield from self.socket_connection.connect()
+        self.assertTrue(self.mock_server.received_handshake())
+</code></pre>
+<p>When running this test case with the default test runner, the test will always succeed as the method executes only up until the first <code>yield from</code> instruction, after which it returns before executing any assertions. This causes tests to always succeed.</p>
+<p>Is there a prebuilt test runner that is able to handle asynchronous code like this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I temporarily solved the problem using a decorator inspired by Tornado's <a href="http://www.tornadoweb.org/en/stable/testing.html#tornado.testing.gen_test">gen_test</a>:</p>
+<pre><code>def async_test(f):
+    def wrapper(*args, **kwargs):
+        coro = asyncio.coroutine(f)
+        future = coro(*args, **kwargs)
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(future)
+    return wrapper
+</code></pre>
+<p>Like J.F. Sebastian suggested, this decorator will block until the test method coroutine has finished. This allows me to write test cases like this:</p>
+<pre><code>class TestSocketConnection(unittest.TestCase):
+    def setUp(self):
+        self.mock_server = MockServer("localhost", 1337)
+        self.socket_connection = SocketConnection("localhost", 1337)
+
+    @async_test
+    def test_sends_handshake_after_connect(self):
+        yield from self.socket_connection.connect()
+        self.assertTrue(self.mock_server.received_handshake())
+</code></pre>
+<p>This solution probably misses some edge cases.</p>
+<p>I think a facility like this should added to Python's standard library to make <code>asyncio</code> and <code>unittest</code> interaction more convenient out of the box.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>async_test</code>, suggested by Marvin Killing, definitely can help -- as well as direct calling <code>loop.run_until_complete()</code></p>
+<p>But I also strongly recommend to recreate new event loop for every test and directly pass loop to API calls (at least <code>asyncio</code> itself accepts <code>loop</code> keyword-only parameter for every call that need it).</p>
+<p>Like</p>
+<pre><code>class Test(unittest.TestCase):
+    def setUp(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(None)
+
+    def test_xxx(self):
+        @asyncio.coroutine
+        def go():
+            reader, writer = yield from asyncio.open_connection(
+                '127.0.0.1', 8888, loop=self.loop)
+            yield from asyncio.sleep(0.01, loop=self.loop)
+        self.loop.run_until_complete(go())
+</code></pre>
+<p>that isolates tests in test case and prevents strange errors like longstanding coroutine that has been created in <code>test_a</code> but finished only on <code>test_b</code> execution time.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://github.com/pytest-dev/pytest-asyncio" rel="noreferrer">pytest-asyncio</a> looks promising:</p>
+<pre><code>@pytest.mark.asyncio
+async def test_some_asyncio_code():
+    res = await library.do_something()
+    assert b'expected result' == res
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Really like the <code>async_test</code> wrapper mentioned in <a href="https://stackoverflow.com/a/23036785/350195">https://stackoverflow.com/a/23036785/350195</a>, here is an updated version for Python 3.5+</p>
+<pre><code>def async_test(coro):
+    def wrapper(*args, **kwargs):
+        loop = asyncio.new_event_loop()
+        return loop.run_until_complete(coro(*args, **kwargs))
+    return wrapper
+
+
+
+class TestSocketConnection(unittest.TestCase):
+    def setUp(self):
+        self.mock_server = MockServer("localhost", 1337)
+        self.socket_connection = SocketConnection("localhost", 1337)
+
+    @async_test
+    async def test_sends_handshake_after_connect(self):
+        await self.socket_connection.connect()
+        self.assertTrue(self.mock_server.received_handshake())
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Use this class instead of <code>unittest.TestCase</code> base class:</p>
+<pre><code>import asyncio
+import unittest
+
+
+class AioTestCase(unittest.TestCase):
+
+    # noinspection PyPep8Naming
+    def __init__(self, methodName='runTest', loop=None):
+        self.loop = loop or asyncio.get_event_loop()
+        self._function_cache = {}
+        super(AioTestCase, self).__init__(methodName=methodName)
+
+    def coroutine_function_decorator(self, func):
+        def wrapper(*args, **kw):
+            return self.loop.run_until_complete(func(*args, **kw))
+        return wrapper
+
+    def __getattribute__(self, item):
+        attr = object.__getattribute__(self, item)
+        if asyncio.iscoroutinefunction(attr):
+            if item not in self._function_cache:
+                self._function_cache[item] = self.coroutine_function_decorator(attr)
+            return self._function_cache[item]
+        return attr
+
+
+class TestMyCase(AioTestCase):
+
+    async def test_dispatch(self):
+        self.assertEqual(1, 1)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can also use <a href="https://pypi.python.org/pypi/aiounittest" rel="nofollow noreferrer"><code>aiounittest</code></a> that takes similar approach as @Andrew Svetlov, @Marvin Killing answers and wrap it in easy to use <code>AsyncTestCase</code> class:</p>
+<pre><code>import asyncio
+import aiounittest
+
+
+async def add(x, y):
+    await asyncio.sleep(0.1)
+    return x + y
+
+class MyTest(aiounittest.AsyncTestCase):
+
+    async def test_async_add(self):
+        ret = await add(5, 6)
+        self.assertEqual(ret, 11)
+
+    # or 3.4 way
+    @asyncio.coroutine
+    def test_sleep(self):
+        ret = yield from add(5, 6)
+        self.assertEqual(ret, 11)
+
+    # some regular test code
+    def test_something(self):
+        self.assertTrue(true)
+</code></pre>
+<p>As you can see the async case is handled by <code>AsyncTestCase</code>. It supports also synchronous test. There is a possibility to provide custom event loop, just override <code>AsyncTestCase.get_event_loop</code>.</p>
+<p>If you prefer (for some reason) the other TestCase class (eg <code>unittest.TestCase</code>), you might use <code>async_test</code> decorator:</p>
+<pre><code>import asyncio
+import unittest
+from aiounittest import async_test
+
+
+async def add(x, y):
+    await asyncio.sleep(0.1)
+    return x + y
+
+class MyTest(unittest.TestCase):
+
+    @async_test
+    async def test_async_add(self):
+        ret = await add(5, 6)
+        self.assertEqual(ret, 11)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I usually define my async tests as coroutines and use a decorator for "syncing" them:</p>
+<pre><code>import asyncio
+import unittest
+
+def sync(coro):
+    def wrapper(*args, **kwargs):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(coro(*args, **kwargs))
+    return wrapper
+
+class TestSocketConnection(unittest.TestCase):
+    def setUp(self):
+        self.mock_server = MockServer("localhost", 1337)
+        self.socket_connection = SocketConnection("localhost", 1337)
+
+    @sync
+    async def test_sends_handshake_after_connect(self):
+        await self.socket_connection.connect()
+        self.assertTrue(self.mock_server.received_handshake())
+</code></pre>
+</div>
+<span class="comment-copy">you could use <code>loop.run_until_complete()</code> instead of <code>yield from</code>. See also <code>asyncio.test_utils</code>.</span>
+<span class="comment-copy">For python 3.5+ <code>async def</code> and <code>await</code> syntax, see: <a href="http://stackoverflow.com/questions/41263988/test-calling-a-python-coroutine-async-def-from-a-regular-function/" title="test calling a python coroutine async def from a regular function">stackoverflow.com/questions/41263988/…</a></span>
+<span class="comment-copy">Is there a way to modify this solution so the decorator uses a specific loop, not the threads default loop?</span>
+<span class="comment-copy">Yes, function annotations can take arguments in Python, so you can pass an event loop there. Note that writing annotations that take arguments is a <i>liitle</i> confusing at first: <a href="http://stackoverflow.com/a/5929165/823869">stackoverflow.com/a/5929165/823869</a></span>
+<span class="comment-copy">@JackO'Connor I think you mean function <i>decorators</i> not function <i>annotations</i> as function <i>annotations</i> has a specific meaning in Python:  <a href="https://docs.python.org/3/tutorial/controlflow.html#function-annotations" rel="nofollow noreferrer">docs.python.org/3/tutorial/…</a></span>
+<span class="comment-copy">Thank you, you're right.</span>
+<span class="comment-copy">I ran into issues with <code>asyncio.get_event_loop()</code> and used <code>asyncio.new_event_loop()</code></span>
+<span class="comment-copy">Is there any reason why you do <code>asyncio.set_event_loop(None)</code> and later pass <code>self.loop</code> explicitly to <code>asyncio.open_connection()</code> instead of just doing <code>asyncio.set_event_loop(self.loop)</code> right from the start?</span>
+<span class="comment-copy">Well, it's just my habit. When I working on asyncio and or aio-based libraries I use <code>asyncio.set_event_loop(None)</code> to directly specify the fact that the library should not relay on global loop existence and safely work by explicit loop passing. It's code style for asyncio tests itself, I use it in my libraries too.</span>
+<span class="comment-copy">This example should also mock <code>asyncio.open_connection</code> shouldn't it? Running it produces <code>ConnectionRefusedError: [Errno 61] Connect call failed ('127.0.0.1', 8888)</code></span>
+<span class="comment-copy">@terrycojones mock is not always required. In example I use local address, so I may setup test server on the address before test run or in <code>setUp</code> method. Concrete implementation depends on your needs.</span>
+<span class="comment-copy">Adds more boilterplate in place but definitively this is the way of make tests unitary and isolated</span>
+<span class="comment-copy">There is an issue with the pytest approach when using <code>unittest.TestCase</code>, that make very limited for me. <a href="http://jacobbridges.github.io/post/unit-testing-with-asyncio/" rel="nofollow noreferrer">jacobbridges.github.io/post/unit-testing-with-asyncio</a></span>
+<span class="comment-copy">Looks like an issue was filed with them here.  No solution yet. <a href="https://github.com/pytest-dev/pytest-asyncio/issues/15" rel="nofollow noreferrer">github.com/pytest-dev/pytest-asyncio/issues/15</a></span>
+<span class="comment-copy">Also mocking classes via mock.patch stops working. <a href="https://github.com/pytest-dev/pytest-asyncio/issues/42" rel="nofollow noreferrer">github.com/pytest-dev/pytest-asyncio/issues/42</a></span>

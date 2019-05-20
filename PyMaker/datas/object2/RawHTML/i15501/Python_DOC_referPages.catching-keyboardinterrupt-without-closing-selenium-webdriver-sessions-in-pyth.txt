@@ -1,0 +1,118 @@
+<div class="post-text" itemprop="text">
+<p>A Python program drives Firefox via Selenium WebDriver.  The code is embedded in a <code>try</code>/<code>except</code> block like this:</p>
+<pre><code>session = selenium.webdriver.Firefox(firefox_profile)
+try:
+    # do stuff
+except (Exception, KeyboardInterrupt) as exception:
+    logging.info("Caught exception.")
+    traceback.print_exc(file=sys.stdout)
+</code></pre>
+<p>If the program aborts because of an error, the WebDriver session is not closed and hence the Firefox window is left open.  But if the program aborts with a <code>KeyboardInterrupt</code> exception, the Firefox window gets closed (I suppose because the WebDriver sessions are released, too) and I would like to avoid this.</p>
+<p>I know that both exceptions go through the same handler because I see the <code>"Caught exception"</code> message in both cases.</p>
+<p>How could I avoid the closing of the Firefox window with <code>KeyboardInterrupt</code>?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I've got a solution, but it's pretty ugly.</p>
+<p>When Ctrl+C is pressed, python receives a Interrupt Signal (SIGINT), which is propagated throughout your process tree.
+Python also generates a KeyboardInterrupt, so you can try to handle something that is bound to the logic of <strong>your</strong> process, but logic that is coupled to child processes cannot be influenced.</p>
+<p>To influence which signals are passed on to your child processes, you'd have to specify how signals should be handled, before the process is spawned through <code>subprocess.Popen</code>.</p>
+<p>There are various options, this one is taken from <a href="https://stackoverflow.com/questions/5045771/python-how-to-prevent-subprocesses-from-receiving-ctrl-c-control-c-sigint#5050521">another answer</a>:</p>
+<pre><code>import subprocess
+import signal
+
+def preexec_function():
+    # Ignore the SIGINT signal by setting the handler to the standard
+    # signal handler SIG_IGN.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+my_process = subprocess.Popen(
+    ["my_executable"],
+    preexec_fn = preexec_function
+)
+</code></pre>
+<p>Problem is, you're not the one calling <code>Popen</code>, that is <a href="https://github.com/SeleniumHQ/selenium/blob/d1f4f5056e58121cea5b132081bec69e66a742dd/py/selenium/webdriver/common/service.py#L72" rel="nofollow noreferrer">delegated to selenium</a>. There are <a href="https://stackoverflow.com/questions/3791398/how-to-stop-python-from-propagating-signals-to-subprocesses">various discussions</a> on SO. From what I've gathered other solutions that try to influence signal masking are prone to failure when the masking is not executed right before the call to <code>Popen</code>.</p>
+<p>Also keep in mind, there is a <a href="https://docs.python.org/3/library/subprocess.html#popen-constructor" rel="nofollow noreferrer">big fat warning regarding the use of preexec_fn in the python documentation</a>, so use that at your own discretion.</p>
+<p>"Luckily" python allows to override functions at runtime, so we could do this:</p>
+<pre><code>&gt;&gt;&gt; import monkey
+&gt;&gt;&gt; import selenium.webdriver
+&gt;&gt;&gt; selenium.webdriver.common.service.Service.start = monkey.start
+&gt;&gt;&gt; ffx = selenium.webdriver.Firefox()
+&gt;&gt;&gt; # pressed Ctrl+C, window stays open.
+KeyboardInterrupt
+&gt;&gt;&gt; ffx.service.assert_process_still_running()
+&gt;&gt;&gt; ffx.quit()
+&gt;&gt;&gt; ffx.service.assert_process_still_running()
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+  File "/usr/lib/python3.6/site-packages/selenium/webdriver/common/service.py", line 107, in assert_process_still_running
+    return_code = self.process.poll()
+AttributeError: 'NoneType' object has no attribute 'poll'
+</code></pre>
+<p>with <strong>monkey.py</strong> as follows:</p>
+<pre><code>import errno
+import os
+import platform
+import subprocess
+from subprocess import PIPE
+import signal
+import time
+from selenium.common.exceptions import WebDriverException
+from selenium.webdriver.common import utils
+
+def preexec_function():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+def start(self):
+  """
+        Starts the Service.
+        :Exceptions:
+         - WebDriverException : Raised either when it can't start the service
+           or when it can't connect to the service
+        """
+  try:
+    cmd = [self.path]
+    cmd.extend(self.command_line_args())
+    self.process = subprocess.Popen(cmd, env=self.env,
+                                    close_fds=platform.system() != 'Windows',
+                                    stdout=self.log_file,
+                                    stderr=self.log_file,
+                                    stdin=PIPE,
+                                    preexec_fn=preexec_function)
+#                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  except TypeError:
+    raise
+  except OSError as err:
+    if err.errno == errno.ENOENT:
+      raise WebDriverException(
+        "'%s' executable needs to be in PATH. %s" % (
+          os.path.basename(self.path), self.start_error_message)
+      )
+    elif err.errno == errno.EACCES:
+      raise WebDriverException(
+        "'%s' executable may have wrong permissions. %s" % (
+          os.path.basename(self.path), self.start_error_message)
+      )
+    else:
+      raise
+  except Exception as e:
+    raise WebDriverException(
+      "The executable %s needs to be available in the path. %s\n%s" %
+      (os.path.basename(self.path), self.start_error_message, str(e)))
+  count = 0
+  while True:
+    self.assert_process_still_running()
+    if self.is_connectable():
+      break
+    count += 1
+    time.sleep(1)
+    if count == 30:
+      raise WebDriverException("Can not connect to the Service %s" % self.path)
+</code></pre>
+<p>the <a href="https://github.com/SeleniumHQ/selenium/blob/d1f4f5056e58121cea5b132081bec69e66a742dd/py/selenium/webdriver/common/service.py#L72" rel="nofollow noreferrer">code for start is from selenium</a>, with the added line as highlighted.
+It's a crude hack, it might as well bite you. Good luck :D</p>
+</div>
+<span class="comment-copy">Because you have included <code>Exception</code> which is a very general and wide exception clause in the <code>except</code> statement. Try restricting yourself to <code>KeyboardInterrupt</code> and tell me if it works.</span>
+<span class="comment-copy">I cannot reproduce this on Windows 7 with Firefox 52.1, geckodriver 0.16.1, and Selenium 3.9.0.  Can you please post what OS you are using and which versions of Firefox, geckodriver, and Selenium?</span>
+<span class="comment-copy">I can't reproduce this either. In my testing, the code you have already behaves as desired on Windows 7, using latest firefox, geckodriver, and selenium. Edit: However, chrome behaves differently in that it is closed in both cases.</span>
+<span class="comment-copy">You are missing this in the imports: <code>from selenium.common.exceptions import WebDriverException</code></span>
+<span class="comment-copy">Huh, I wonder why it worked previously. Thank you @xApple</span>

@@ -1,0 +1,88 @@
+<div class="post-text" itemprop="text">
+<p>The question <a href="https://stackoverflow.com/questions/12428026/safely-iterating-over-weakkeydictionary-and-weakvaluedictionary">Safely iterating over WeakKeyDictionary and WeakValueDictionary</a> did not put me at ease as I had hoped, and it's old enough that it's worth asking again rather than commenting.</p>
+<p>Suppose I have a class <code>MyHashable</code> that's hashable, and I want to build a <code>WeakSet</code>:</p>
+<pre><code>obj1 = MyHashable()
+obj2 = MyHashable()
+obj3 = MyHashable()
+
+obj2.cycle_sibling = obj3
+obj3.cycle_sibling = obj2
+
+ws = WeakSet([obj1, obj2, obj3])
+</code></pre>
+<p>Then I delete some local variables, and convert to a list in preparation for a later loop:</p>
+<pre><code>del obj2
+del obj3
+
+list_remaining = list(ws)
+</code></pre>
+<p>The question I cite seems to claim this is just fine, but even without any kind of explicit <code>for</code> loop, have I not <em>already</em> risked the cyclic garbage collector kicking in during the constructor of <code>list_remaining</code> and changing the size of the set?  I would expect this problem to be rare enough that it would be difficult to detect experimentally, but could crash my program once in a blue moon.</p>
+<p>I don't even feel like the various commenters on that post really came to an agreement whether something like</p>
+<pre><code>for obj in list(ws):
+    ...
+</code></pre>
+<p>was ok, but they did all seem to assume that <code>list(ws)</code> itself can run all the way through without crashing, and I'm not even convinced of that.  Does the <code>list</code> constructor avoid using iterators somehow and thus not care about set size changes?  Can garbage collection not occur during a <code>list</code> constructor because <code>list</code> is built-in?</p>
+<p>For the moment I've written my code to destructively <code>pop</code> items out of the <code>WeakSet</code>, thus avoiding iterators altogether.  I don't mind doing it destructively because at that point in my code I'm done with the <code>WeakSet</code> anyway.  But I don't know if I'm being paranoid.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The docs are frustratingly lacking in information on this, but looking at the <a href="https://github.com/python/cpython/blob/v3.7.0/Lib/_weakrefset.py" rel="nofollow noreferrer">implementation</a>, we can see that <code>WeakSet.__iter__</code> has a guard against this kind of problem.</p>
+<p>During iteration over a <code>WeakSet</code>, weakref callbacks will add references to a list of pending removals rather than removing references from the underlying set directly. If an element dies before iteration reaches it, the iterator won't yield the element, but you're not going to get a segfault or a <code>RuntimeError: Set changed size during iteration</code> or anything.</p>
+<p>Here's the guard (not threadsafe, despite what the comment says):</p>
+<pre><code>class _IterationGuard:
+    # This context manager registers itself in the current iterators of the
+    # weak container, such as to delay all removals until the context manager
+    # exits.
+    # This technique should be relatively thread-safe (since sets are).
+
+    def __init__(self, weakcontainer):
+        # Don't create cycles
+        self.weakcontainer = ref(weakcontainer)
+
+    def __enter__(self):
+        w = self.weakcontainer()
+        if w is not None:
+            w._iterating.add(self)
+        return self
+
+    def __exit__(self, e, t, b):
+        w = self.weakcontainer()
+        if w is not None:
+            s = w._iterating
+            s.remove(self)
+            if not s:
+                w._commit_removals()
+</code></pre>
+<p>Here's where <code>__iter__</code> uses the guard:</p>
+<pre><code>class WeakSet:
+    ...
+    def __iter__(self):
+        with _IterationGuard(self):
+            for itemref in self.data:
+                item = itemref()
+                if item is not None:
+                    # Caveat: the iterator will keep a strong reference to
+                    # `item` until it is resumed or closed.
+                    yield item
+</code></pre>
+<p>And here's where the weakref callback checks the guard:</p>
+<pre><code>def _remove(item, selfref=ref(self)):
+    self = selfref()
+    if self is not None:
+        if self._iterating:
+            self._pending_removals.append(item)
+        else:
+            self.data.discard(item)
+</code></pre>
+<p>You can also see the same guard used in <a href="https://github.com/python/cpython/blob/v3.7.0/Lib/weakref.py#L343" rel="nofollow noreferrer"><code>WeakKeyDictionary</code></a> and <a href="https://github.com/python/cpython/blob/v3.7.0/Lib/weakref.py#L90" rel="nofollow noreferrer"><code>WeakValueDictionary</code></a>.</p>
+<hr/>
+<p>On old Python versions (3.0, or 2.6 and earlier), this guard is not present. If you need to support 2.6 or earlier, it looks like it should be safe to use <code>keys</code>, <code>values</code>, and <code>items</code> with the weak dict classes; I list no option for WeakSet because WeakSet didn't exist back then. If there's a safe, non-destructive option on 3.0, I haven't found one, but hopefully no one needs to support 3.0.</p>
+</div>
+<span class="comment-copy"><i>"have I not already risked the cyclic garbage collector kicking in"</i> Yes, of course you have. If that's a problem, you either shouldn't be using a WeakSet or you shouldn't be dropping all references to <code>obj2</code> and <code>obj3</code>.</span>
+<span class="comment-copy">Then what's the point of a WeakSet?</span>
+<span class="comment-copy">That should be pretty obvious. The real mystery is why you're using one if you don't want elements to be removed from it.</span>
+<span class="comment-copy">Hmm, I think I misunderstood your question. Yes, you've risked changing the size of the set, but no, not <i>during</i> the construction of <code>list_remaining</code>.</span>
+<span class="comment-copy">Could you maybe also post an answer on the question the OP linked? It seems that none of the precautions recommended in the answer over there are actually necessary.</span>
+<span class="comment-copy">Fantastic.  So why the dire warning in the docs?  <a href="https://docs.python.org/3/library/weakref.html#weakref.WeakValueDictionary" rel="nofollow noreferrer">docs.python.org/3/library/…</a> Lacking information is one thing, but if I understand what you say correctly, the warning is incorrect in that there is no necessity to make sure the set/dict size doesn't change.</span>
+<span class="comment-copy">@EdKrohne: I think they just forgot to update the docs when they put in the guard.</span>
+<span class="comment-copy">@Aran-Fey: Answer posted.</span>
+<span class="comment-copy">Good answer, but note that the guard implementation is not, in fact, threadsafe (contrary to the comment in the code).</span>

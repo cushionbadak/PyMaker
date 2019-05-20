@@ -1,0 +1,79 @@
+<div class="post-text" itemprop="text">
+<p>Say you want to optimize a (byte) string compare intensive algorithm implemented in Python. Since a central code path contains this sequence of statements</p>
+<pre><code>if s &lt; t:
+    # less than ...
+elif t &lt; s:
+    # greater than ...
+else:
+    # equal ...
+</code></pre>
+<p>it would be great to optimize it to something like</p>
+<pre><code>r = bytes_compare(s, t)
+if r &lt; 0:
+    # less than ...
+elif r &gt; 0:
+    # greater than ...
+else:
+    # equal ...
+</code></pre>
+<p>where (the hypothetical) <code>bytes_compare()</code> ideally would just call the <a href="https://en.wikipedia.org/wiki/Three-way_comparison" rel="nofollow noreferrer">three-way comparison</a> C function <a href="http://en.cppreference.com/w/c/string/byte/memcmp" rel="nofollow noreferrer"><code>memcmp()</code></a> which is usually quite well optimized. This would reduce the number of string comparisons by half. A very feasible optimization unless the strings are ultra short.</p>
+<p>But how to get there with Python 3?</p>
+<p><strong>PS</strong>:</p>
+<p>Python 3 has removed the three way comparison global function <code>cmp()</code> and the magic method <code>__cmp__()</code>. And even with Python 2, the <code>bytes</code> class doesn't had a  <code>__cmp__()</code> member.</p>
+<p>With the <code>ctypes</code> package it's straight forward to call <code>memcmp()</code> but the foreign function call overhead with <code>ctypes</code> is prohibitively high.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Python 3 (including 3.6) simply doesn't include any three-way comparison support for strings. Although the internal implementation of the rich comparison operator <code>__lt__()</code>, <code>__eq__()</code> etc. do call <code>memcmp()</code> (in the C implementation of <code>bytes</code> - cf. <code>Objects/bytesobject.c</code>) there is no internal three-way comparison function that could be leveraged.</p>
+<p>Thus, writing a <a href="https://docs.python.org/3.6/extending/extending.html" rel="nofollow noreferrer">C extension</a> that provides a three-way comparison function by calling <code>memcmp()</code> is the next best thing:</p>
+<pre><code>#include &lt;Python.h&gt;
+static PyObject* cmp(PyObject* self, PyObject* args) {
+    PyObject *a = 0, *b = 0;
+    if (!PyArg_UnpackTuple(args, "cmp", 2, 2, &amp;a, &amp;b))
+        return 0;
+    if (!PyBytes_Check(a) || !PyBytes_Check(b)) {
+        PyErr_SetString(PyExc_TypeError, "only bytes() strings supported");
+        return 0;
+    }
+    Py_ssize_t n = PyBytes_GET_SIZE(a), m = PyBytes_GET_SIZE(b);
+    char *s = PyBytes_AsString(a), *t = PyBytes_AsString(b);
+    int r = 0;
+    if (n == m) {
+        r = memcmp(s, t, n);
+    } else if (n &lt; m) {
+        r = memcmp(s, t, n);
+        if (!r)
+            r = -1;
+    } else {
+        r = memcmp(s, t, m);
+        if (!r)
+            r = 1;
+    }
+    return PyLong_FromLong(r);
+}
+static PyMethodDef bytes_util_methods[] = {
+    { "cmp", cmp, METH_VARARGS, "Three way compare 2 bytes() objects." },
+    {0,0,0,0} };
+static struct PyModuleDef bytes_util_def = {
+    PyModuleDef_HEAD_INIT, "bytes_util", "Three way comparison for strings.",
+    -1, bytes_util_methods };
+PyMODINIT_FUNC PyInit_bytes_util(void) {
+    Py_Initialize();
+    return PyModule_Create(&amp;bytes_util_def);
+}
+</code></pre>
+<p>Compile with:</p>
+<pre><code>gcc -Wall -O3 -fPIC -shared bytes_util.c -o bytes_util.so -I/usr/include/python3.6m
+</code></pre>
+<p>Test:</p>
+<pre><code>&gt;&gt;&gt; import bytes_util
+&gt;&gt;&gt; bytes_util.cmp(b'foo', b'barx')
+265725
+</code></pre>
+<p>In contrast to calling <code>memcmp</code> via the <code>ctypes</code> package, this foreign call has the same overhead as the builtin bytes comparison operators (as they also are implemented as C extension with the standard Python version).</p>
+</div>
+<span class="comment-copy">It sounds like you're doing string comparisons in a loop in Python.  That will always be slow.  You'd be better off engineering a proper fast solution using related tools like Cython, Pandas, etc.  But doing that will require a holistic look at the surrounding code, not microbenchmarking a single string comparison.</span>
+<span class="comment-copy">How is <code>s &lt; t</code> comparison implemented atm, given that <code>s</code> and <code>t</code> are <code>bytes</code>?</span>
+<span class="comment-copy">@JohnZwinck, well, I did some profiling with pyflame and this verified that a significant amount of time is spend in these paired comparisons (<code>s</code> with <code>t</code> followed by <code>t</code> with <code>s</code>). Note that this pattern isn't unusual - for example, you also have this when you merge/join 2 sorted sequences of strings. Also, Python string comparison aren't slow in general - if you just need one comparison outcome for a pair <code>s</code> and <code>t</code> then they are fast, as is. Thus, this really isn't about isolated microbenchmarking.</span>
+<span class="comment-copy">@urban, with Python 3.6.5, there is <code>Objects/bytesobject.c</code> and it calls <code>memcmp()</code> in <code>bytes_compare_eq()</code> and <code>bytes_richcompare()</code> (for <code>&lt;</code> or <code>&gt;</code>).</span>
+<span class="comment-copy">From <a href="https://codegolf.stackexchange.com/a/49779">codegolf.stackexchange.com/a/49779</a> where they discuss <code>cmp()</code> in python 3, the suggested way is to do: <code>((a &gt; b) - (b &gt; a))</code>. This will give you the <code>r</code> but ... it is still 2 comparisons. I have tried a python-based implementation of <code>bytes_compare</code>... very bad idea :) at least 3x slower</span>
+<span class="comment-copy">Note: To make this significantly more reusable with near zero overhead, replacing explicit use of the <code>PyBytes</code> APIs with the more general buffer interface (<a href="https://docs.python.org/3/c-api/buffer.html#c.PyObject_GetBuffer" rel="nofollow noreferrer"><code>PyObject_GetBuffer</code></a> with <code>flags</code> <code>PyBUF_SIMPLE</code>) would allow this to work seamlessly with <code>bytearray</code>, <code>mmap</code>, <code>array.array('B')</code>, and all manner of other <code>bytes</code>-like objects. You'd just declare a pair of <code>Py_buffer</code> structures on the stack, populate them w/<code>PyObject_GetBuffer</code> and your inputs, then use <code>buf.buf</code> and <code>buf.len</code> where you currently use <code>s/t</code> and <code>m/n</code>.</span>

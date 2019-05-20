@@ -1,0 +1,69 @@
+<div class="post-text" itemprop="text">
+<p>This code prints a different string between Windows and Linux.</p>
+<p>test.py:</p>
+<pre class="lang-py prettyprint-override"><code>print(";".join([str(i) for i in range(10000)]))
+</code></pre>
+<p>Platform: x86_64 Linux 4.4 .0-17763 - Microsoft<br/>
+Python version: 3.7.2<br/>
+Terminals: bash, fish  </p>
+<p>Abbreviated output:</p>
+<pre class="lang-sh prettyprint-override"><code>$ python --version
+Python 3.7.2
+$ python test.py
+0;1;2;3;4;5;6....9997;9998;9999
+$ python -u test.py
+0;1;2;3;4;5;6....9997;9998;9999
+</code></pre>
+<p>Platform: Windows 10 1809<br/>
+Python version: 3.6.8, 3.7.0, 3.7.2<br/>
+Terminals: cmd, powershell</p>
+<p>Abbreviated output:</p>
+<pre class="lang-bsh prettyprint-override"><code>./python --version
+Python 3.6.8
+./python test.py
+0;1;2;3;4;5;6....9997;9998;9999
+./python -u test.py
+0;1;2;3;4;5;6....2663;2664;2665;26
+</code></pre>
+<pre class="lang-bsh prettyprint-override"><code>./python --version
+Python 3.7.0
+./python test.py
+0;1;2;3;4;5;6....9997;9998;9999
+./python -u test.py
+0;1;2;3;4;5;6....2663;2664;2665;26
+</code></pre>
+<pre class="lang-bsh prettyprint-override"><code>./python --version
+Python 3.7.2
+./python test.py
+0;1;2;3;4;5;6....9997;9998;9999
+./python -u test.py
+0;1;2;3;4;5;6....2663;2664;2665;26
+</code></pre>
+<p>So why, in Windows, does the <code>-u</code> arg cause the output be truncated (just from <code>0</code> to <code>2666</code>)?<br/>
+(When using <code>python -u test.py &gt; a.txt</code> to redirect the output to a file, it works correctly.)</p>
+<p>Maybe something about buffering?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The size of a console write via WINAPI <code>WriteFile</code> and <a href="https://web.archive.org/web/20181222101912/https://docs.microsoft.com/en-us/windows/console/writeconsole" rel="nofollow noreferrer"><code>WriteConsoleW</code></a> is documented to have a vaguely-defined limit, as follows: </p>
+<blockquote>
+<p><em>nNumberOfCharsToWrite</em> [in]<br/> 
+  The number of characters to be written. If the total size of the specified 
+  number of characters exceeds the available heap, the function fails with 
+  <strong>ERROR_NOT_ENOUGH_MEMORY</strong>.</p>
+</blockquote>
+<p>It's not documented to which "heap" this is referring. A process can have multiple heaps of various sizes (fixed or dynamic). The native heap implementation in the NT runtime library (e.g. <code>RtlCreateHeap</code>) can create a heap at a specified address, which allows convenient access to memory that's shared with other processes. Using a shared heap is often combined with <a href="https://en.wikipedia.org/wiki/Local_Inter-Process_Communication" rel="nofollow noreferrer">Local Inter-Process Communication</a> (LPC) ports -- or Asynchronous LPC in NT 6.0+. LPC ports are used to pass messages between applications and system services, such as the session manager (smss.exe), service control manager (services.exe), local security authority (lsass.exe), desktop session server (csrss.exe), and instances of the console host (conhost.exe). Messages queued  directly to an LPC port are limited to 256 bytes. Larger messages are passed by queuing a message to the port that references shared memory.</p>
+<p>It turns out that the old implementation of the console (prior to NT 6.3) uses LPC as an I/O channel, and the above-mentioned heap is <em>only 64 KiB</em>. This was a peculiar choice of design. I think someone was drinking too much of the user-mode subsystem, message-passing Kool-Aid. Proper NT I/O uses a device with I/O system services, including <code>NtCreateFile</code>, <code>NtReadFile</code>, <code>NtWriteFile</code>, and <code>NtDeviceIoControlFile</code>.</p>
+<p>A console application doesn't know how much of this heap is available for a write. Python could start at 64 KiB and work its way down, but its <a href="https://docs.python.org/3/library/io.html#raw-file-i-o" rel="nofollow noreferrer">raw file I/O</a> mandates one system call per call. Instead it caps writes at 32 KiB, which should succeed. This limit allows writing wide-character strings with up to 16K UTF-16 code points. A complication is that the console I/O stack uses UTF-8 in 3.6+, which has to be decoded via <code>MultiByteToWideChar</code>. Currently it just repeatedly divides the UTF-8 buffer in half until the resulting length is less than 16K. Thus, in the question's example, writing 48,889 characters gets halved to 24,444 characters and halved again to 12,222 characters. (IMO, it would be better to try writing up to 16K code points; get the number actually written, and call <code>WideCharToMultiByte</code> on the substring to determine the number of UTF-8 bytes written. The current design actually has a bug if a UTF-8 2-4 byte sequence overlaps a cut point.)</p>
+<p>In NT 6.3+ (Windows 8.1+), Console I/O doesn't have this size limit because it uses the ConDrv device and I/O system calls instead of LPC. However, it's not worth special casing the code just to support an unbuffered text I/O stack, as configured by the <code>-u</code> command-line option. We expect interactive console I/O to be buffered.  Unbuffered text I/O is actually disallowed with a normal <code>open</code> call. For example:</p>
+<pre><code>&gt;&gt;&gt; open('conout$', 'w', buffering=0)
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+ValueError: can't have unbuffered text I/O
+</code></pre>
+<p>Extended support for Windows 7 ends on 14 January 2020, so Python 3.8 will be the last version to support it. The console write limit should be removed in Python 3.9.</p>
+</div>
+<span class="comment-copy">I can confirm it - this is weird. <code>-u</code> does <code>forces the binary I/O layers of stdout/stderr to be unbuffered - stdin is always buffered; text I/O layer will be line-buffered</code> ..which applies to your output - so maxline size seems to be 12222 (which is the length of your output...) - linux seems to have bigger margins here...</span>
+<span class="comment-copy">Thanks for your reply. I have some more problems about this. What does <code>maxline</code> means? A const of Windows? What does the <code>stdout</code> actually do when no buffer? Where can I find more infomation about this?</span>
+<span class="comment-copy">maxline is just what I made up to signify the fact that console under windows seems to (in -u) stop writing to stdout at 12222 characters -although I was looking I am unable to confirm any "hard" limit - google did not help. Maybe some Windows-Crack can shed light on this ...</span>
+<span class="comment-copy">All right, thanks for your reply.</span>
+<span class="comment-copy">@eryksun Thanks for answering OhYee's find- if you want to make it a real answer ping me and Ill upvote it. Hopefully it will soon be a historical fact thats outlived ... who uses win7 anymore (beside some clients that are stuck in middleages) ;D</span>

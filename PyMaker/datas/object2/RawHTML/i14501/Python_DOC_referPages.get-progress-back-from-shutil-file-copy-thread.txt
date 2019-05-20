@@ -1,0 +1,233 @@
+<div class="post-text" itemprop="text">
+<p>I've got an application from which a file is copied from <code>src</code> to <code>dst</code>:</p>
+<pre><code>import shutil
+from threading import Thread
+
+t = Thread(target=shutil.copy, args=[ src, dst ]).start()
+</code></pre>
+<p>I wish to have the application query the progress of the copy every 5 seconds without locking up the application itself. Is this possible?</p>
+<p>My intention is to set this progress to a <code>QtGui.QLabel</code> to give the user feedback on the file copy.</p>
+<p>Can this be achieved when copying using a threaded shutil file copy?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>shutil.copy()</code> doesn't offer any options to track the progress, no. At most you could monitor the size of the destination file (using <code>os.*</code> functions on the target filename).</p>
+<p>The alternative would be to implement your own copy function. The implementation is really quite simple; <a href="https://hg.python.org/cpython/file/eb09f737120b/Lib/shutil.py#l215" rel="noreferrer"><code>shutil.copy()</code></a> is basically a <a href="https://hg.python.org/cpython/file/eb09f737120b/Lib/shutil.py#l84" rel="noreferrer"><code>shutil.copyfile()</code></a> plus <a href="https://hg.python.org/cpython/file/eb09f737120b/Lib/shutil.py#l113" rel="noreferrer"><code>shutil.copymode()</code></a> call; <code>shutil.copyfile()</code> in turn delegates the real work to <a href="https://hg.python.org/cpython/file/eb09f737120b/Lib/shutil.py#l64" rel="noreferrer"><code>shutil.copyfileobj()</code></a> (links to the Python source code).</p>
+<p>Implementing your own <code>shutil.copyfileobj()</code> to include progress should be trivial; inject support for a callback function to report inform your program each time another block has copied:</p>
+<pre><code>def copyfileobj(fsrc, fdst, callback, length=16*1024):
+    copied = 0
+    while True:
+        buf = fsrc.read(length)
+        if not buf:
+            break
+        fdst.write(buf)
+        copied += len(buf)
+        callback(copied)
+</code></pre>
+<p>and compare the <code>copied</code> size with the file size.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I combined <a href="https://stackoverflow.com/a/29967625/1639671">Martijn Pieters answer</a> with some progress bar code from <a href="https://stackoverflow.com/a/34325723/1639671">this answer</a> with modifications to work in PyCharm from <a href="https://stackoverflow.com/questions/34751441/when-writing-carriage-return-to-a-pycharm-console-the-whole-line-is-deleted">this answer</a> which gives me the following.  The function <code>copy_with_progress</code> was my goal.</p>
+<pre><code>import os
+import shutil
+
+
+def progress_percentage(perc, width=None):
+    # This will only work for python 3.3+ due to use of
+    # os.get_terminal_size the print function etc.
+
+    FULL_BLOCK = '█'
+    # this is a gradient of incompleteness
+    INCOMPLETE_BLOCK_GRAD = ['░', '▒', '▓']
+
+    assert(isinstance(perc, float))
+    assert(0. &lt;= perc &lt;= 100.)
+    # if width unset use full terminal
+    if width is None:
+        width = os.get_terminal_size().columns
+    # progress bar is block_widget separator perc_widget : ####### 30%
+    max_perc_widget = '[100.00%]' # 100% is max
+    separator = ' '
+    blocks_widget_width = width - len(separator) - len(max_perc_widget)
+    assert(blocks_widget_width &gt;= 10) # not very meaningful if not
+    perc_per_block = 100.0/blocks_widget_width
+    # epsilon is the sensitivity of rendering a gradient block
+    epsilon = 1e-6
+    # number of blocks that should be represented as complete
+    full_blocks = int((perc + epsilon)/perc_per_block)
+    # the rest are "incomplete"
+    empty_blocks = blocks_widget_width - full_blocks
+
+    # build blocks widget
+    blocks_widget = ([FULL_BLOCK] * full_blocks)
+    blocks_widget.extend([INCOMPLETE_BLOCK_GRAD[0]] * empty_blocks)
+    # marginal case - remainder due to how granular our blocks are
+    remainder = perc - full_blocks*perc_per_block
+    # epsilon needed for rounding errors (check would be != 0.)
+    # based on reminder modify first empty block shading
+    # depending on remainder
+    if remainder &gt; epsilon:
+        grad_index = int((len(INCOMPLETE_BLOCK_GRAD) * remainder)/perc_per_block)
+        blocks_widget[full_blocks] = INCOMPLETE_BLOCK_GRAD[grad_index]
+
+    # build perc widget
+    str_perc = '%.2f' % perc
+    # -1 because the percentage sign is not included
+    perc_widget = '[%s%%]' % str_perc.ljust(len(max_perc_widget) - 3)
+
+    # form progressbar
+    progress_bar = '%s%s%s' % (''.join(blocks_widget), separator, perc_widget)
+    # return progressbar as string
+    return ''.join(progress_bar)
+
+
+def copy_progress(copied, total):
+    print('\r' + progress_percentage(100*copied/total, width=30), end='')
+
+
+def copyfile(src, dst, *, follow_symlinks=True):
+    """Copy data from src to dst.
+
+    If follow_symlinks is not set and src is a symbolic link, a new
+    symlink will be created instead of copying the file it points to.
+
+    """
+    if shutil._samefile(src, dst):
+        raise shutil.SameFileError("{!r} and {!r} are the same file".format(src, dst))
+
+    for fn in [src, dst]:
+        try:
+            st = os.stat(fn)
+        except OSError:
+            # File most likely does not exist
+            pass
+        else:
+            # XXX What about other special files? (sockets, devices...)
+            if shutil.stat.S_ISFIFO(st.st_mode):
+                raise shutil.SpecialFileError("`%s` is a named pipe" % fn)
+
+    if not follow_symlinks and os.path.islink(src):
+        os.symlink(os.readlink(src), dst)
+    else:
+        size = os.stat(src).st_size
+        with open(src, 'rb') as fsrc:
+            with open(dst, 'wb') as fdst:
+                copyfileobj(fsrc, fdst, callback=copy_progress, total=size)
+    return dst
+
+
+def copyfileobj(fsrc, fdst, callback, total, length=16*1024):
+    copied = 0
+    while True:
+        buf = fsrc.read(length)
+        if not buf:
+            break
+        fdst.write(buf)
+        copied += len(buf)
+        callback(copied, total=total)
+
+
+def copy_with_progress(src, dst, *, follow_symlinks=True):
+    if os.path.isdir(dst):
+        dst = os.path.join(dst, os.path.basename(src))
+    copyfile(src, dst, follow_symlinks=follow_symlinks)
+    shutil.copymode(src, dst)
+    return dst
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, it can't be done this way, because <code>shutil.copy</code> doesn't have any means of providing progress.</p>
+<p>But you can write your own copy function (or even fork the code from <a href="https://docs.python.org/3/library/index.html" rel="nofollow"><code>shutil</code></a>--notice that it's one of the modules that includes a link to <a href="https://hg.python.org/cpython/file/3.4/Lib/shutil.py" rel="nofollow">the source</a> at the top, meaning it's meant to be as useful for sample code as for just using as-is). Your function can, e.g., take a progress callback function as an extra argument and calls it after each buffer (or each N buffers, or each N bytes, or each N seconds). Something like:</p>
+<pre><code>def copy(src, dst, progress):
+    # ...
+    for something:
+        progress(bytes_so_far, bytes_total)
+        # ...
+    progress(bytes_total, bytes_total)
+</code></pre>
+<p>Now, that callback is still going to be called in the background thread, not the main thread. With most GUI frameworks, that means it can't directly touch any GUI widgets. But most GUI frameworks have a way to post a message to the main thread's event loop from a background thread, so just make the callback do that. With Qt you do this with signals and slots, exactly the same way you do within the main thread; there's lots of great tutorials out there if you don't know how.</p>
+<p>Alternatively, you could do it the way you suggested: have the main thread signal the background thread (e.g., by posting on a <code>queue.Queue</code> or triggering an <code>Event</code> or <code>Condition</code>) and have your <code>copy</code> function check for that signal every time through the loop and respond. But that seems both more complicated and less responsive.</p>
+<p>One more thing: Qt has its own threading library, and you may want to use it instead of Python's native one, because you can attach a slot directly to <code>QThread</code> object and make that your callback. I'm not sure, but Qt might even have its own file-copy-with-progress methods in there somewhere; they try to wrap up <em>everything</em> that might be at all different between platforms and vaguely related to GUIs.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>In addition to Martijn Pieters excellent reply, if (like me, <a href="https://www.raywenderlich.com/165042/rwdevcon-2017-inspiration-talk-im-idiot-richard-turton" rel="nofollow noreferrer">I'm an idiot</a>) you need to figure out how to pass the actual callback into the <code>copyfileobj()</code> function, you can do it like this:</p>
+<pre><code>def myscopefunction():
+    ### Inside wherever you want to call the copyfileobj() function, you can
+    ### make a nested function like so:
+    def progress(bytescopied):
+        updateui(bytescopied) #update your progress bar or whatever
+
+    #and then call it like this
+    copyfileobj(source,destination,progress)
+    ...
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This might be a bit hacky but it works:</p>
+<pre><code>"""
+Copying a file and checking its progress while it's copying.
+"""
+
+import os
+import shutil
+import threading
+import time
+
+des = r'&lt;PATH/TO/SPURCE/FILE&gt;'
+src = r'&lt;PATH/TO/DESTINATION/FILE&gt;'
+
+
+def checker(source_path, destination_path):
+    """
+    Compare 2 files till they're the same and print the progress.
+
+    :type source_path: str
+    :param source_path: path to the source file
+    :type destination_path: str
+    :param destination_path: path to the destination file
+    """
+
+    # Making sure the destination path exists
+    while not os.path.exists(destination_path):
+        print "not exists"
+        time.sleep(.01)
+
+    # Keep checking the file size till it's the same as source file
+    while os.path.getsize(source_path) != os.path.getsize(destination_path):
+        print "percentage", int((float(os.path.getsize(destination_path))/float(os.path.getsize(source_path))) * 100)
+        time.sleep(.01)
+
+    print "percentage", 100
+
+
+def copying_file(source_path, destination_path):
+    """
+    Copying a file
+
+    :type source_path: str
+    :param source_path: path to the file that needs to be copied
+    :type destination_path: str
+    :param destination_path: path to where the file is going to be copied
+    :rtype: bool
+    :return: True if the file copied successfully, False otherwise
+    """
+    print "Copying...."
+    shutil.copyfile(source_path, destination_path)
+
+    if os.path.exists(destination_path):
+        print "Done...."
+        return True
+
+    print "Filed..."
+    return False
+
+
+t = threading.Thread(name='copying', target=copying_file, args=(src, des))
+# Start the copying on a separate thread
+t.start()
+# Checking the status of destination file on a separate thread
+b = threading.Thread(name='checking', target=checker, args=(src, des))
+b.start()
+</code></pre>
+</div>
+<span class="comment-copy">Hey I think I found your final solution: <a href="https://fredrikaverpil.github.io/2015/05/12/file-copy-progress-window-with-pyqt-pyside-and-shutil/" rel="nofollow noreferrer">fredrikaverpil.github.io/2015/05/12/…</a>. Good stuff!</span>
+<span class="comment-copy">Thanks for this! I implemented this with the other necessary functions from shutil and a progress bar function to create a complete solution which I posted as another answer.</span>

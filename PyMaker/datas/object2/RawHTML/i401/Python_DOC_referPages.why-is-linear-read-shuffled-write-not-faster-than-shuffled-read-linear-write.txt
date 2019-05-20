@@ -1,0 +1,410 @@
+<div class="post-text" itemprop="text">
+<p>I'm currently trying to get a better understanding of memory/cache related performance issues. I read somewhere that memory locality is more important for reading than for writing, because in the former case the CPU has to actually wait for the data whereas in the latter case it can just ship them out and forget about them.</p>
+<p>With that in mind, I did the following quick-and-dirty test: I wrote a script that creates an array of N random floats and a permutation, i.e. an array containing the numbers 0 to N-1 in random order. Then it repeatedly either (1) reads the data array linearly and writes it back to a new array in the random access pattern given by the permutation or (2) reads the data array in the permuted order and linearly writes it to a new array.</p>
+<p>To my surprise (2) seemed consistently faster than (1). There were, however, problems with my script</p>
+<ul>
+<li>The script is written in python/numpy. This being quite a high-level language it is not clear how pecisely the read/write are implemented.</li>
+<li>I probably did not balance the two cases properly.</li>
+</ul>
+<p>Also, some of the answers/comments below suggest that my original expectation isn't correct and that depending on details of the cpu cache either case might be faster.</p>
+<p>My question is:</p>
+<ul>
+<li>Which (if any) of the two should be faster?</li>
+<li>What are the relvant cache concepts here; how do they influence the result</li>
+</ul>
+<p>A beginner-friendly explanation would be appreciated. Any supporting code should be in C / cython / numpy / numba or python.</p>
+<p>Optionally:</p>
+<ul>
+<li>Explain why the absolute durations are nonlinear in problem size (cf. timings below).</li>
+<li>Explain the behavior of my clearly inadequate python experiments.</li>
+</ul>
+<p>For reference, my platform is <code>Linux-4.12.14-lp150.11-default-x86_64-with-glibc2.3.4</code>. Python version is 3.6.5.</p>
+<p>Here is the code I wrote:</p>
+<pre><code>import numpy as np
+from timeit import timeit
+
+def setup():
+    global a, b, c
+    a = np.random.permutation(N)
+    b = np.random.random(N)
+    c = np.empty_like(b)
+
+def fwd():
+    c = b[a]
+
+def inv():
+    c[a] = b
+
+N = 10_000
+setup()
+
+timeit(fwd, number=100_000)
+# 1.4942631321027875
+timeit(inv, number=100_000)
+# 2.531870319042355
+
+N = 100_000
+setup()
+
+timeit(fwd, number=10_000)
+# 2.4054739447310567
+timeit(inv, number=10_000)
+# 3.2365565397776663
+
+N = 1_000_000
+setup()
+
+timeit(fwd, number=1_000)
+# 11.131387163884938
+timeit(inv, number=1_000)
+# 14.19817715883255
+</code></pre>
+<p>As pointed out by @Trilarion and @Yann Vernier my snippets aren't properly balanced, so I replaced them with</p>
+<pre><code>def fwd():
+    c[d] = b[a]
+    b[d] = c[a]
+
+def inv():
+    c[a] = b[d]
+    b[a] = c[d]
+</code></pre>
+<p>where <code>d = np.arange(N)</code> (I shuffle everything both ways to hopefully reduce across trial caching effects). I also replaced <code>timeit</code> with <code>repeat</code> and reduced the numbers of repeats by a factor of 10.</p>
+<p>Then I get</p>
+<pre><code>[0.6757169323973358, 0.6705542299896479, 0.6702114241197705]    #fwd
+[0.8183442652225494, 0.8382121799513698, 0.8173762648366392]    #inv
+[1.0969422250054777, 1.0725746559910476, 1.0892365919426084]    #fwd
+[1.0284497970715165, 1.025063106790185, 1.0247828317806125]     #inv
+[3.073981977067888, 3.077839042060077, 3.072118630632758]       #fwd
+[3.2967213969677687, 3.2996009718626738, 3.2817375687882304]    #inv
+</code></pre>
+<p>So there still seems to be a difference, but it is much more subtle and can now go either way depending on the problem size.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is a complex problem closely related to architectural features of modern processors and your intuition that <em>random read are slower than random writes because the CPU has to wait for the read data</em>
+is not verified (most of the time). There are several reasons for that I will detail.</p>
+<ol>
+<li><p>Modern processors are very efficient to hide read latency</p></li>
+<li><p>while memory writes are more expensive than memory reads</p></li>
+<li><p>especially in a multicore environment</p></li>
+</ol>
+<p><strong>Reason #1 Modern processors are efficient to hide read latency.</strong></p>
+<p>Modern <a href="https://en.wikipedia.org/wiki/Superscalar_processor" rel="noreferrer">superscalar</a> can execute several instructions simultaneously, and change instruction execution order (<a href="https://en.wikipedia.org/wiki/Out-of-order_execution" rel="noreferrer">out of order execution</a>).
+While first reason for these features is to increase instruction thoughput, 
+one of the most interesting consequence is the ability of processors to hide latency of memory writes (or of complex operators, branches, etc).</p>
+<p>To explain that, let us consider  a simple code that copies array into another one.</p>
+<pre><code>for i in a:
+    c[i] = b[i]
+</code></pre>
+<p>One compiled, code executed by the processor will be somehow like that</p>
+<pre><code>#1. (iteration 1) c[0] = b[0]
+1a. read memory at b[0] and store result in register c0
+1b. write register c0 at memory address c[0]
+#2. (iteration 2) c[1] = b[1]
+2a. read memory at b[1] and store result in register c1
+2b. write register c1 at memory address c[1]
+#1. (iteration 2) c[2] = b[2]
+3a. read memory at b[2] and store result in register c2
+3b. write register c2 at memory address c[2]
+# etc
+</code></pre>
+<p>(this is terribly oversimplified and the actual code is more complex and has to deal with loop management, address computation, etc, but this simplistic model is presently sufficient).</p>
+<p>As said in the question, for reads, the processor has to wait for the actual data. Indeed, 1b need the data fetched by 1a and cannot execute as long as 1a is not completed. Such a constraint is called a <em>dependency</em> and we can say that 1b is dependent on 1a. Dependencies is a major notion in modern processors. Dependencies express the algorithm (eg I write b to c) and must absolutely be respected. But, if there is no dependency between instructions, processors will try to execute other pending instructions in order to keep there operative pipeline always active. This can lead to execution out-of-order, as long as dependencies are respected (similar to the as-if rule).</p>
+<p>For the considered code, there <em>no</em> dependency between high level instruction 2. and 1. (or between asm instructions 2a and 2b and previous instructions). Actually the final result would even be identical is 2. is executed before 1., and the processor will try to execute 2a and 2b, before completion of 1a and 1b. There is still a dependency between 2a and 2b, but both can be issued. And similarly for 3a. and 3b., and so on. This is a powerful mean to <em>hide memory latency</em>. If for some reason 2., 3. and 4. can terminate before 1. loads its data, you may even not notice at all any slowdown.</p>
+<p>This instruction level parallelism is managed by a set of "queues" in the processor.</p>
+<ul>
+<li><p>a queue of pending instructions in the reservation stations RS (type 128 μinstructions in recent pentiums). As soon as resources required by the instruction is available (for instance value of register c1 for instruction 1b), the instruction can execute.</p></li>
+<li><p>a queue of pending memory accesses in memory order buffer MOB before the L1 cache. This is required to deal with memory aliases and to insure sequentiality in memory writes or loads at the same address (typ. 64 loads, 32 stores)</p></li>
+<li><p>a queue to enforce sequentiality when writing back results in registers (reorder buffer or ROB of 168 entries) for similar reasons.</p></li>
+<li><p>and some other queues at instruction fetch, for μops generation, write and miss buffers in the cache, etc</p></li>
+</ul>
+<p>At one point execution of the previous program there will be many pending stores instructions in RS, several loads in MOB and instructions waiting to retire in the ROB. </p>
+<p>As soon as a data becomes available (for instance a read terminates) depending instructions can execute and that frees positions in the queues. But if no termination occurs, and one of these queues is full, the functional unit associated with this queue stalls (this can also happen at instruction issue if the processor is missing register names). Stalls are what creates performance loss and to avoid it, queue filling must be limited.</p>
+<p>This explains the difference between linear and random memory accesses.<br/>
+In a linear access, 1/ the number of misses will be smaller because of the better spatial locality and because caches can prefetch accesses with a regular pattern to reduce it further and 2/ whenever a read terminates, it will concern a complete cache line and can free several pending load instructions limiting the filling of instructions queues. This ways the processor is permanently busy and memory latency is hidden.<br/>
+For a random access, the number of misses will be higher, and only a single load can be served when data arrives. Hence instructions queues will saturate rapidly, the processor stalls and memory latency can no longer be hidden by executing other instructions.</p>
+<p>The processor architecture must be balanced in terms of throughput in order to avoid queue saturation and stalls. Indeed there are be generally tens of instructions at some stage of execution in a processor and global throughput (ie the ability to serve instruction requests by the memory (or functional units)) is the main factor that will determine performances.  The fact than some of these pending instructions are waiting for a memory value has a minor effect...</p>
+<p>...except if you have long dependency chains.</p>
+<p>There is a dependency when an instruction has to wait for the completion of a previous one. Using the result of a read is a dependency. And dependencies can be a problem when involved in a dependency chain.</p>
+<p>For instance, consider the code <code>for i in range(1,100000): s += a[i]</code>. All the memory reads are independent, but there is a dependency chain for the accumulation in <code>s</code>. No addition can happen until the previous one has terminated. These dependencies will make the reservation stations rapidly filled and create stalls in the pipeline.</p>
+<p>But reads are rarely involved in dependency chains.  It is still possible to imagine pathological code where all reads are dependent of the previous one (for instance <code>for i in range(1,100000): s = a[s]</code>), but they are uncommon in real code. And the problem comes from the dependency chain, not from the fact that it is a read; the situation would be similar (and even probably  worse) with compute bound dependent code like <code>for i in range(1,100000): x = 1.0/x+1.0</code>.</p>
+<p>Hence, except in some situations, computation time is more related to throughput than to read dependency, thanks to the fact that superscalar out or order execution hides latency. And for what concerns throughput, writes are worse then reads.</p>
+<p><strong>Reason #2: Memory writes (especially random ones) are more expensive than memory reads</strong></p>
+<p>This is related to the way <a href="https://en.wikipedia.org/wiki/CPU_cache" rel="noreferrer">caches</a> behave. Cache are fast memory that store a part of the memory (called a <em>line</em>) by the processor. Cache lines are presently 64 bytes and allow to exploit spatial locality of memory references: once a line is stored, all data in the line are immediately available. The important aspect here is that <em>all transfers between the cache and the memory are lines</em>.</p>
+<p>When a processor performs a read on a data, the cache checks if the line to which the data belongs is in the cache. If not, the line is fetched from memory, stored in the cache and the desired data is sent back to the processor.</p>
+<p>When a processor writes a data to memory, the cache also checks for the line presence. If the line is not present, the cache cannot send its data to memory (because <em>all</em> transfers are line based) and does the following steps:</p>
+<ol>
+<li>cache fetches the line from memory  and writes it in the cache line.</li>
+<li>data is written in the cache and the complete line is marked as modified (dirty)</li>
+<li>when a line is suppressed from the cache, it checks for the modified flag, and if the line has been modified, it writes it back to memory (write back cache)</li>
+</ol>
+<p>Hence, <em>every memory write must be preceded by a memory read</em> to get the line in the cache. This adds an extra operation, but is not very expensive for linear writes. There will be a cache miss and a memory read for the first written word, but successive writes will just concern the cache and be hits.</p>
+<p>But the situation is very different for random writes. If the number of misses is important, every cache miss implies a read followed by only a small number of writes before the line is ejected from the cache, which significantly increases write cost. If a line is ejected after a single write, we can even consider that a write is twice the temporal cost of a read.</p>
+<p>It is important to note that increasing the number of memory accesses (either reads or writes) tends to saturate the memory access path and to globally slow down all transfers between the processor and memory.</p>
+<p>In either case, writes are always more expensive than reads. And multicores augment this aspect.</p>
+<p><strong>Reason #3:  Random writes create cache misses in multicores</strong></p>
+<p>Not sure this really applies  to the situation of the question. While numpy BLAS routines are multithreaded, I do not think basic array copy is. But it is closely related and is another reason why writes are more expensive. </p>
+<p>The problem with multicores is to ensure proper <a href="https://en.wikipedia.org/wiki/Cache_coherence" rel="noreferrer">cache coherence</a> in such a way that a data shared by several processors is properly updated in the cache of every core. This is done by mean of a protocol such as <a href="https://en.wikipedia.org/wiki/MESI_protocol" rel="noreferrer">MESI</a> that updates a cache line before writing it, and invalidates other cache copies (read for ownership).</p>
+<p>While none of the data is actually shared between cores in the question (or a parallel version of it), note that the protocol applies to <em>cache lines</em>. Whenever a cache line is to be modified, it is copied from the cache holding the most recent copy, locally updated and all other copies are invalidated. Even if cores are accessing different parts of the cache line. Such a situation is called a <a href="https://en.wikipedia.org/wiki/False_sharing" rel="noreferrer">false sharing</a> and it is an important issue for multicore programming.</p>
+<p>Concerning the problem of random writes, cache lines are 64 bytes and can hold 8 int64, and if the computer has 8 cores, every core will process on the average 2 values. Hence there is an important false sharing that will slow down writes.</p>
+<hr/>
+<p>We did some performance evaluations. It was performed in C in order to include an evaluation of the impact of parallelization. We compared 5
+functions that process int64 arrays of size N.</p>
+<ol>
+<li><p>Just a copy of b to c (<code>c[i] = b[i]</code>) (implemented by the compiler with <code>memcpy()</code>)</p></li>
+<li><p>Copy with a linear index <code>c[i] = b[d[i]]</code> where <code>d[i]==i</code> (<code>read_linear</code>)</p></li>
+<li><p>Copy with a random index <code>c[i] = b[a[i]]</code> where <code>a</code> is a random
+permutation of 0..N-1 (<code>read_random</code> is equivalent to <code>fwd</code> in the original question)</p></li>
+<li><p>Write linear <code>c[d[i]] = b[i]</code> where <code>d[i]==i</code> (<code>write_linear</code>)</p></li>
+<li><p>Write random <code>c[a[i]] = b[i]</code> with <code>a</code> random
+permutation of 0..N-1 (<code>write_random</code> is equivalent to <code>inv</code> in the question)</p></li>
+</ol>
+<p>Code has been compiled with <code>gcc -O3 -funroll-loops -march=native -malign-double</code> on
+a skylake processor. Performances are measured with <code>_rdtsc()</code> and are
+given in cycles per iteration. The function are executed several times (1000-20000 depending on array size), 10 experiments are performed and the smallest time is kept.</p>
+<p>Array sizes range from 4000 to 1200000. All code has been measured with a sequential  and a parallel version with openmp.</p>
+<p>Here is a graph of the results. Functions are with different colors, with the sequential version in thick lines and the parallel one with thin ones.</p>
+<p><a href="https://i.stack.imgur.com/5uRog.png" rel="noreferrer"><img alt="enter image description here" src="https://i.stack.imgur.com/5uRog.png"/></a></p>
+<p>Direct copy is (obviously) the fastest and is implemented by gcc with
+the highly optimized <code>memcpy()</code>. It is a mean to get an estimation of data throughput with memory. It ranges from 0.8 cycles per iteration (CPI) for small matrices  to 2.0 CPI for large ones. </p>
+<p>Read linear  performances are approximately twice longer than memcpy, but there are 2 reads and a write, vs 1
+read and a write for the direct copy. More the index adds some dependency. Min value is 1.56 CPI and max value 3.8 CPI. Write linear is slightly longer (5-10%).</p>
+<p>Reads and writes with a random index are the purpose of the original question and deserve a longer comments. Here are the results.</p>
+<pre><code>size    4000    6000    9000    13496   20240   30360   45536   68304   102456  153680  230520  345776  518664  777992  1166984
+rd-rand 1.86821 2.52813 2.90533 3.50055 4.69627 5.10521 5.07396 5.57629 6.13607 7.02747 7.80836 10.9471 15.2258 18.5524 21.3811
+wr-rand 7.07295 7.21101 7.92307 7.40394 8.92114 9.55323 9.14714 8.94196 8.94335 9.37448 9.60265 11.7665 15.8043 19.1617 22.6785
+</code></pre>
+<ul>
+<li><p>small values (&lt;10k): L1 cache is 32k and can hold a 4k array of uint64. Note, that due to the randomness of the index, after ~1/8 of iterations L1 cache will be completely filled with values of the random index array (as cache lines are 64 bytes and can hold 8 array elements). Accesses to the other linear arrays we will rapidly generate many L1 misses and we have to use the L2 cache. L1 cache access is 5 cycles, but it is pipelined and can serve a couple of values per cycle.  L2 access is longer and requires 12 cycles. The amount of misses is similar for random reads and writes, but we see than we fully pay the double access required for writes when array size is small.</p></li>
+<li><p>medium values (10k-100k): L2 cache is 256k and it can hold a 32k int64 array. After that, we need to go to L3 cache (12Mo). As size increases, the number of misses in L1 and L2 increases and the computation time accordingly. Both algorithms have a similar number of misses, mostly due to random reads or writes (other accesses are linear and can be very efficiently prefetched by the caches). We retrieve the factor two between random reads and writes already noted in B.M. answer. It can be partly explained by the double cost of writes.</p></li>
+<li><p>large values (&gt;100k): the difference between methods is progressively reduced. For these sizes, a large part of information is stored in L3 cache. L3 size is sufficient to hold a full array of 1.5M and lines are less likely to be ejected. Hence, for writes, after the initial read, a larger number of writes can be done without line ejection, and the relative cost of writes vs read is reduced. For these large sizes, there are also many other factors that need to be considered. For instance, caches can only serve a limited number of misses (typ. 16) and when the number of misses is large, this may be the limiting factor.</p></li>
+</ul>
+<p>One word on parallel omp version of random reads and writes. Except for small sizes, where having the random index array spread over several caches may not be an advantage, they are systematically ~ twice faster. For large sizes, we clearly see that the gap between random reads and writes increases due to false sharing.</p>
+<p>It is almost impossible to do quantitative predictions with the complexity of present computer architectures, even for simple code, and even qualitative explanations of the behaviour  are difficult and must take into account many factors. As mentioned in other answers, software aspects related to python can also have an impact. But, while it may happen in some situations, most of the time, one cannot consider that reads are more expensive because of data dependency.</p>
+</div>
+<div class="post-text" itemprop="text">
+<ul>
+<li>First  a refutation of your intuition :  <code>fwd</code> beats <code>inv</code> even without numpy mecanism. </li>
+</ul>
+<p>It is the case for this <strong>numba</strong> version:  </p>
+<pre><code>import numba
+
+@numba.njit
+def fwd_numba(a,b,c):
+    for i in range(N):
+        c[a[i]]=b[i]
+
+@numba.njit
+def inv_numba(a,b,c):
+    for i in range(N):
+        c[i]=b[a[i]]
+</code></pre>
+<p>Timings for N= 10 000:</p>
+<pre><code>%timeit fwd()
+%timeit inv()
+%timeit fwd_numba(a,b,c)
+%timeit inv_numba(a,b,c)
+62.6 µs ± 3.84 µs per loop (mean ± std. dev. of 7 runs, 10000 loops each)
+144 µs ± 2 µs per loop (mean ± std. dev. of 7 runs, 10000 loops each)
+16.6 µs ± 1.52 µs per loop (mean ± std. dev. of 7 runs, 10000 loops each)
+34.9 µs ± 1.57 µs per loop (mean ± std. dev. of 7 runs, 100000 loops each)
+</code></pre>
+<ul>
+<li>Second, Numpy has to deal with fearsome problems of alignement and (cache-) locality. </li>
+</ul>
+<p>It's essentially a wrapper on low level procedures from <strong>BLAS/ATLAS/MKL</strong> tuned for that.
+Fancy indexing is a nice high-level tool but heretic for these problems; there is no direct traduction of this concept at low level. </p>
+<ul>
+<li>Third, <a href="https://www.numpy.org/devdocs/reference/internals.code-explanations.html#advanced-indexing" rel="nofollow noreferrer">numpy dev docs :</a> details fancy indexing. In particular:</li>
+</ul>
+<blockquote>
+<p>Unless there is only a single indexing array during item getting, the
+  validity of the indices is checked beforehand. Otherwise it is handled
+  in the inner loop itself for optimization.</p>
+</blockquote>
+<p>We are in this case here. I think this can explain the difference, and why set is slower than get.</p>
+<p>It explains also why hand made <strong>numba</strong> is often faster : it doesn't check anything and crashes on inconsistent index.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your two NumPy snippets <code>b[a]</code> and <code>c[a] = b</code> seem like reasonable heuristics for measuring shuffled/linear read/write speeds, as I'll try to argue by looking at the underlying NumPy code in the first section below.</p>
+<p>Regarding the question of which ought to be faster, it seems plausible that shuffled-read-linear-write could typically win (as the benchmarks seem to show), but the difference in speed may be affected by how "shuffled" the shuffled index is, and one or more of:</p>
+<ul>
+<li>The CPU cache read/update policies (<a href="http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.den0024a/ch11s03.html" rel="noreferrer">write-back vs. write-through</a>, etc.).</li>
+<li>How the CPU chooses to (re)order the instructions it needs to execute (pipelining).</li>
+<li>The CPU recognising memory access patterns and pre-fetching data.</li>
+<li>Cache eviction logic.</li>
+</ul>
+<p>Even making assumptions about which policies are in place, these effects are difficult to model and reason about analytically and so I'm not sure a general answer applicable to all processors is possible (although I am not an expert in hardware).</p>
+<p>Nevertheless, in the second section below I'll attempt to reason about why the shuffled-read-linear-write is apparently faster, given some assumptions.</p>
+<hr/>
+<h2>"Trivial" Fancy Indexing</h2>
+<p>The purpose of this section is to go through the NumPy source code to determine if there any obvious explanations for the timings, and also get as clear an idea as possible of what happens when <code>A[B]</code> or <code>A[B] = C</code> is executed.</p>
+<p>The iteration routine underpinning the fancy-indexing for <a href="https://github.com/numpy/numpy/blob/v1.16.0/numpy/core/src/multiarray/mapping.c#L1670-L1710" rel="noreferrer">getitem</a> and <a href="https://github.com/numpy/numpy/blob/v1.16.0/numpy/core/src/multiarray/mapping.c#L2022-L2057" rel="noreferrer">setitem</a> operations in this question is "<a href="https://github.com/numpy/numpy/blob/v1.16.0/numpy/core/src/common/lowlevel_strided_loops.h#L624-L700" rel="noreferrer">trivial</a>":</p>
+<ul>
+<li><code>B</code> is a single-indexing array with a single stride</li>
+<li><code>A</code> and <code>B</code> have the same memory order (both C-contiguous or both Fortran-contiguous)</li>
+</ul>
+<p>Furthermore, in our case both <code>A</code> and <code>B</code> are <a href="https://github.com/numpy/numpy/blob/4d0732220ee56fd251665c43b6d43272ad5edef6/doc/source/reference/alignment.rst#consequences-of-alignment" rel="noreferrer">Uint Aligned</a>:</p>
+<blockquote>
+<p>Strided copy code: Here, "uint alignment" is used instead. If the itemsize [N] of an array is equal to 1, 2, 4, 8 or 16 bytes and the array is uint aligned then instead [of using buffering] numpy will do <code>*(uintN*)dst) = *(uintN*)src)</code> for appropriate N. Otherwise numpy copies by doing <code>memcpy(dst, src, N)</code>.</p>
+</blockquote>
+<p>The point here is that use of an internal buffer to ensure alignment is avoided. The underlying copying implemented with <code>*(uintN*)dst) = *(uintN*)src)</code> is as straightfoward as "put the X bytes from offset src into the X bytes at offset dst".</p>
+<p>Compilers will likely translate this very simply into <code>mov</code> instructions (on x86 for example), or similar.</p>
+<p>The core low-level code which performs the getting and setting of items is in the functions <code>mapiter_trivial_get</code> and <code>mapiter_trivial_set</code>. These functions are produced in <a href="https://github.com/numpy/numpy/blob/v1.16.0/numpy/core/src/multiarray/lowlevel_strided_loops.c.src#L1350-L1466" rel="noreferrer">lowlevel_strided_loops.c.src</a>, where the templating and macros make it somewhat challenging to read (an occasion to be grateful for higher-level languages).</p>
+<p>Persevering, we can eventually see that there is little difference between getitem and setitem. Here is a simplified version of the main loop for exposition. The macro lines determine whether were running getitem or setitem:</p>
+<pre class="lang-C prettyprint-override"><code>    while (itersize--) {
+        char * self_ptr;
+        npy_intp indval = *((npy_intp*)ind_ptr);
+
+#if @isget@
+        if (check_and_adjust_index(&amp;indval, fancy_dim, 0, _save) &lt; 0 ) {
+            return -1;
+        }
+#else
+        if (indval &lt; 0) {
+            indval += fancy_dim;
+        }
+#endif
+
+        self_ptr = base_ptr + indval * self_stride; /* offset into array being indexed */
+
+#if @isget@
+        *(npy_uint64 *)result_ptr = *(npy_uint64 *)self_ptr;
+#else
+        *(npy_uint64 *)self_ptr = *(npy_uint64 *)result_ptr;
+#endif
+
+        ind_ptr += ind_stride;         /* move to next item of index array */
+        result_ptr += result_stride;   /* move to next item of result array */
+</code></pre>
+<p>As we might expect, this simply amounts to some arithmetic to get the correct offset into the arrays, and then copying bytes from one memory location to another.</p>
+<p><strong>Extra index checks for setitem</strong></p>
+<p>One thing worth mentioning is that for setitem, the validity of the indices (whether they are all inbounds for the target array) is <a href="https://github.com/numpy/numpy/blob/v1.16.0/numpy/core/src/multiarray/lowlevel_strided_loops.c.src#L1390-L1398" rel="noreferrer">checked before copying</a> begins (via <a href="https://github.com/numpy/numpy/blob/v1.16.0/numpy/core/src/multiarray/common.h#L95-L130" rel="noreferrer"><code>check_and_adjust_index</code></a>), which also replaces negative indices with corresponding positive indices. </p>
+<p>In the snippet above you can see <code>check_and_adjust_index</code> called for getitem in the main loop, while a simpler (possibly redundant) check for negative indices occurs for setitem. </p>
+<p>This extra preliminary check could conceivably have a small but negative impact on the speed of setitem (<code>A[B] = C</code>).</p>
+<hr/>
+<h2>Cache misses</h2>
+<p>Because the code for both code snippets is so similar, suspicion falls on the CPU and how it handles access to the underlying arrays of memory.</p>
+<p>The CPU caches small blocks of memory (cache lines) that have been recently accessed in the anticipation that it will probably soon need to access that region of memory again. </p>
+<p>For context, cache lines are generally 64 bytes. The L1 (fastest) data cache on my ageing laptop's CPU is 32KB (enough to hold around 500 int64 values from the array, but keep in mind that the CPU will be doing other things requiring other memory while the NumPy snippet executes):</p>
+<pre><code>$ cat /sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size
+64
+$ cat /sys/devices/system/cpu/cpu0/cache/index0/size
+32K
+</code></pre>
+<p>As you are probably already aware, for reading/writing memory sequentially caching works well because 64 bytes blocks of memory are fetched as needed and stored closer to the CPU. Repeated access to that block of memory is quicker than fetching from RAM (or a slower higher-level cache). In fact, the CPU may even preemptively fetch the next cache line before it is even requested by the program.</p>
+<p>On the other hand, randomly accessing memory is likely to cause frequent cache misses. Here, the region of memory with the required address is not in the fast cache near the CPU and instead must be accessed from a higher-level cache (slower) or the actual memory (much slower).</p>
+<p>So which is faster for the CPU to handle: frequent data read misses, or data write misses?</p>
+<p>Let's assume the CPU's write policy is write-back, meaning that a modified memory is written back to the cache. The cache is marked as being modified (or "dirty"), and the change will only be written back to main memory once the the line is evicted from the cache (the CPU can still read from a dirty cache line).</p>
+<p>If we are writing to random points in a large array, the expectation is that many of the cache lines in the CPU's cache will become dirty. A write through to main memory will be needed as each one is evicted which may occur often if the cache is full.</p>
+<p>However, this write through should happen less frequently when writing data sequentially and reading it at random, as we expect fewer cache lines to become dirty and data written back to main memory or slower caches less regularly.</p>
+<p>As mentioned, this is a simplified model and there may be many other factors that influence the CPU's performance. Someone with more expertise than me may well be able to improve this model.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your function <code>fwd</code> isn't touching the global variable <code>c</code>. You didn't tell it <a href="https://docs.python.org/3/reference/simple_stmts.html#global" rel="noreferrer"><code>global c</code></a> (only in <code>setup</code>), so it has its own local variable, and uses <code>STORE_FAST</code> in cpython:</p>
+<pre><code>&gt;&gt;&gt; import dis
+&gt;&gt;&gt; def fwd():
+...     c = b[a]
+...
+&gt;&gt;&gt; dis.dis(fwd)
+  2           0 LOAD_GLOBAL              0 (b)
+              3 LOAD_GLOBAL              1 (a)
+              6 BINARY_SUBSCR
+              7 STORE_FAST               0 (c)
+             10 LOAD_CONST               0 (None)
+             13 RETURN_VALUE
+</code></pre>
+<p>Now, let's try that with a global:</p>
+<pre><code>&gt;&gt;&gt; def fwd2():
+...     global c
+...     c = b[a]
+...
+&gt;&gt;&gt; dis.dis(fwd2)
+  3           0 LOAD_GLOBAL              0 (b)
+              3 LOAD_GLOBAL              1 (a)
+              6 BINARY_SUBSCR
+              7 STORE_GLOBAL             2 (c)
+             10 LOAD_CONST               0 (None)
+             13 RETURN_VALUE
+</code></pre>
+<p>Even so, it may differ in time compared to the <code>inv</code> function which calls <code>setitem</code> for a global. </p>
+<p>Either way, if you wanted it to write <em>into</em> <code>c</code>, you need something like <code>c[:] = b[a]</code> or <code>c.fill(b[a])</code>. The assignment replaces the variable (name) with the object from the right hand side, so the old <code>c</code> might be getting deallocated instead of the new <code>b[a]</code>, and that sort of memory shuffling can be costly. </p>
+<p>As for the effect I think you wanted to measure, basically whether forward or inverse permutations are more costly, that would be highly cache dependent. Forward permutation (storing at randomly ordered indices from a linear read) could in principle be faster because it can use write masking and never fetch the new array, assuming the cache system is smart enough to preserve byte masks in the write buffer. Backward runs a high risk of cache collisions while performing the random read if the array is large enough. </p>
+<p>That was my initial impression; results, as you say, are opposite. This could be a result of a cache implementation that doesn't have a large write buffer or can't exploit small writes. If out of cache accesses require the same memory bus time anyway, the read access will have a chance of loading data that won't be expunged from cache before it's needed. With a multiway cache, the partially written lines will also have a chance of not being chosen for expulsion; and only dirty cache lines require memory bus time to drop. A lower level program written with other knowledge (e.g. that the permutation is complete and non-overlapping) could improve the behaviour using hints such as non-temporal SSE writes. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The following experiment corroborates that random writes are faster than random reads. For small sizes of the data (when it entirely fits in caches) the random writing code is slower than the random reading one (probably because of certain implementation peculiarities in <code>numpy</code>), but as the data size grows the initial 1.7x difference in the execution time is almost completely eliminated (however, in case of <code>numba</code> there is a strange reversal of that trend in the end).</p>
+<pre><code>$ cat test.py 
+import numpy as np
+from timeit import timeit
+import numba
+
+def fwd(a,b,c):
+    c = b[a]
+
+def inv(a,b,c):
+    c[a] = b
+
+@numba.njit
+def fwd_numba(a,b,c):
+    for i,j in enumerate(a):
+        c[i] = b[j]
+
+@numba.njit
+def inv_numba(a,b,c):
+    for i,j in enumerate(a):
+        c[j] = b[i]
+
+
+for p in range(4, 8):
+    N = 10**p
+    n = 10**(9-p)
+    a = np.random.permutation(N)
+    b = np.random.random(N)
+    c = np.empty_like(b)
+    print('---- N = %d ----' % N)
+    for f in 'fwd', 'fwd_numba', 'inv', 'inv_numba':
+        print(f, timeit(f+'(a,b,c)', number=n, globals=globals()))
+
+$ python test.py 
+---- N = 10000 ----
+fwd 1.1199337750003906
+fwd_numba 0.9052993479999714
+inv 1.929507338001713
+inv_numba 1.5510062070025015
+---- N = 100000 ----
+fwd 1.8672701190007501
+fwd_numba 1.5000483989970235
+inv 2.509873716000584
+inv_numba 2.0653326050014584
+---- N = 1000000 ----
+fwd 7.639554155000951
+fwd_numba 5.673054756000056
+inv 7.685382894000213
+inv_numba 5.439735023999674
+---- N = 10000000 ----
+fwd 15.065879136000149
+fwd_numba 12.68919651500255
+inv 15.433822674000112
+inv_numba 14.862108078999881
+</code></pre>
+</div>
+<span class="comment-copy">Write could take much longer than read in general maybe. The non-linearity could come from the limited capacity of intermediate caches.</span>
+<span class="comment-copy">I also ran your code and interestingly I do not get the same pattern. My first 5 times are 40% above yours, but the very last "inv" test for N = 1e6 seems to be pretty fast here (50% shorter than the corresponding fwd test, consistently).</span>
+<span class="comment-copy">@Trilarion both snippets read <i>N</i> numbers and write <i>N</i> numbers, so barring some pecularities of <code>__setitem__/__getitem__</code> this should be balanced. But your cache size argument does actually seem to make a lot of sense.</span>
+<span class="comment-copy">@Trilarion interesting, indeed. Maybe I should try some more sizes?</span>
+<span class="comment-copy">It also depends on the number of repetitions in timeit. N=100_000 with 1_000 repetitions makes inv consistently faster than fwd in my case, while with 10_000 repetitions it's slower. Shouldn't happen if every run would take the same time.</span>
+<span class="comment-copy">Thanks, very educational! One question regarding the parallel version. Why is it faster at all? The task is I/O limited, not CPU limited, right? So, is it simply the larger combined capacity of the individual (per core) caches?</span>
+<span class="comment-copy">Only linear accesses are really IO limited. And for them the gain is either very small or even negative for memcpy(). For random accesses, using 4 processors multiplies by 4 the size of L1+L2 caches and that will reduce corresponding cache misses. The lower use of L3 and memory explains  the ~30% performance gain.</span>
+<span class="comment-copy">Very extensive answer. I do wish though the axes of the graphs would have labels and there would be a graph showing the ratio of the execution time of reading vs writing. Is the code public? If yes, one could let it run on more architectures.</span>
+<span class="comment-copy"><i>But reads are rarely involved in dependency chains.</i>  True for arrays, not true for data structure with pointers, like trees or linked lists.  (One case for arrays is binary search.  Using a control dependency instead of a <code>cmov</code> data dependency lets speculative execution work like a prefetch, and can be helpful if data is cold in cache so memory latency &gt; branch mispredict penalty.  <a href="//stackoverflow.com/a/54273248">About the branchless binary search</a>)</span>
+<span class="comment-copy">Nice answer, but the early part about OoO exec kind of overstates its capabilities.  HW prefetch very is important for hiding memory latency.  OoO exec even with Skylake's large 224-uop ROB can't hide DRAM latency of ~60 ns = ~240 clock cycles on a 4GHz CPU (<a href="https://www.7-cpu.com/cpu/Skylake.html" rel="nofollow noreferrer">7-cpu.com/cpu/Skylake.html</a>), especially in high-throughput code that could otherwise run 3 or 4 uops per clock.  And that needs OoO exec to hide some ALU latency and overlap independent loop iterations.</span>
+<span class="comment-copy">As you say, not technically an answer, but useful nonetheless. Thanks!</span>
+<span class="comment-copy">I try some explanations ....</span>
+<span class="comment-copy">Good documentation link, though I'll add that it excluded our case:  "The one-dimensional indexing approaches were implemented in a rather straightforward fashion, and so it is the general-purpose indexing code that will be the focus of this section."</span>
+<span class="comment-copy">I'm not sure I follow you last point. The index valid checks appear to be done for both reading and writing, so why would they explain the difference?</span>
+<span class="comment-copy">Thanks for that. I have to admit I don't understand much of your last two paragraphs my knowledge of how caches work is very limited. Would you mind elaborating a bit or maybe add a pointer or two?</span>
+<span class="comment-copy"><a href="https://www.quora.com/How-does-the-cache-memory-in-a-computer-work-How-is-the-data-managed-What-makes-it-%E2%80%9Chigh-speed%E2%80%9D-memory" rel="nofollow noreferrer">quora.com/…</a> has an introduction to the cache system. Another thing of note is that external RAM access frequently operates in large chunks, such as entire cache lines, and therefore it's more efficient to collect a whole cache line before it's written out.</span>
+<span class="comment-copy">Thanks! Let me see whether I understand roughly: The write cache acts as a buffer accepting writes from the CPU and then slowly passing them on to RAM while the CPU can do something else. But this only works if there is enough free space in the cache. If all lines contain modifications that have not yet been written back to RAM (is that what "dirty" means?) then the CPU if it wants to write to a not currently in cache position has to wait for some other line to be written back to RAM to free up the required space. Is that roughly correct?</span>
+<span class="comment-copy">Yes, though a typical cache has a limited set of addresses each line could map to (each address fits in as many cache lines as there are ways in the cache, 1 for direct mapped caches). So it's enough for all lines associated with an address to be dirty, or just for the eviction logic to have picked a line that was (that logic is frequently LRU or pseudorandom). A write buffer could hold arbitrary addresses, but would also be of limited size. So the fancy read has better odds of fitting more data into a cache line before it gets written out.</span>
+<span class="comment-copy">In the first sentence you write that random writes are faster and in the following sentences you write that random writes are initially slower but at the end rather less slower. The pasted numbers seem to suggests that random writes always take at least as long as random reads. This doesn't seem to be consistent.</span>
+<span class="comment-copy">@Trilarion I didn't write that <i>random writes</i> are initially slower - I wrote the <i>random writing code</i> is initially slower (probably because of the peculiarities of the numpy implementation). Then it catches up to the random reading code due to the fact that random writes are faster.</span>

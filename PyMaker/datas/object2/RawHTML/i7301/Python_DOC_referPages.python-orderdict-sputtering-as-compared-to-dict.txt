@@ -1,0 +1,57 @@
+<div class="post-text" itemprop="text">
+<p>This one has me entirely baffled.</p>
+<pre><code>asset_hist = []
+for key_host, val_hist_list in am_output.asset_history.items():
+    for index, hist_item in enumerate(val_hist_list):
+        #row = collections.OrderedDict([("computer_name", key_host), ("id", index), ("hist_item", hist_item)])
+        row = {"computer_name": key_host, "id": index, "hist_item": hist_item}
+        asset_hist.append(row)
+</code></pre>
+<p>This code works perfectly with the collections line commented out. However, when I comment out the row = dict line and remove the comment from the collections line things get very strange. There are about 4 million of these rows being generated and appended to asset_hist.</p>
+<p>So, when I use row=dict, the entire loop finishes in about 10 milliseconds, lightning fast. When I use the ordered dictionary, I've waited over 10 minutes and it still didn't finish. Now, I know OrderDict is supposed to be a little slower than a dict, but it's supposed to be about 10x slower at worst and by my math its actually about 100,000 times slower in this function.</p>
+<p>I decided to print the index in the lowest loop to see what was happening. Interestingly enough, I noticed a sputtering in console output. The index would print very fast on the screen and then stop for about 3-5 seconds before continuing on.</p>
+<p>am_output.asset_history is a dictionary which has one key, host, and every row is a list of strings. E.g.</p>
+<p>am_output.asset_history = {"host1": ["string1", "string2", ...], "host2": ["string1", "string2", ...], ...}</p>
+<p><strong>EDIT: Sputter Analysis with OrderedDict</strong></p>
+<p>Total Memory on this VM Server: Only 8GB... need to get more provissioned.</p>
+<p>LOOP NUM</p>
+<p>184796    (~5 second wait, ~60% memory usage)</p>
+<p>634481    (~5 second wait, ~65% memory usage)</p>
+<p>1197564   (~5 second wait, ~70% memory usage)</p>
+<p>1899247   (~5 second wait, ~75% memory usage)</p>
+<p>2777296   (~5 second wait, ~80% memory usage)</p>
+<p>3873730   (LONG WAIT... waited 20 minutes and gave up!, 88.3% memory usage, process is still running)</p>
+<p>Where the wait happens changes with each run.</p>
+<p><strong>EDIT</strong>: Ran it again, this time it stop on 3873333, close to the spot it stopped before. It stopped after forming the row, while trying to append... I didn't notice this last attempt but it was there then too... the problem is with the append line, not the row line... I'm still baffled. Here's the row it produced right before the long stop (added the row to the print statement)... hostname changed to protect the innocent:</p>
+<p>3873333: OrderedDict([('computer_name', 'bg-fd5612ea'), ('id', 1), ('hist_item', "sys1 Normalizer (sys1-4): Domain Name cannot be determined from sys1 Name 'bg-fd5612ea'.")])</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As your own tests prove, you're running out of memory. Even on CPython 3.6 (where plain <code>dict</code> is actually ordered, though not as a language guarantee yet), <code>OrderedDict</code> has significant memory overhead compared to <code>dict</code>; it's still implemented with a side-band linked list to preserve the order and support easy iteration, reordering with <code>move_to_end</code>, etc. You can tell just by checking with <code>sys.getsizeof</code> (exact results will differ by Python version and build bitwidth, 32 vs. 64 bit):</p>
+<pre><code>&gt;&gt;&gt; od = OrderedDict([("a", 1), ("b", 2), ("c", 3)])
+&gt;&gt;&gt; d = {**od}
+&gt;&gt;&gt; sys.getsizeof(od)
+464   # On 3.5 x64 it's 512
+&gt;&gt;&gt; sys.getsizeof(d)
+240   # On 3.5 x64 it's 288
+</code></pre>
+<p>Ignoring the data stored, the overhead for the <code>OrderedDict</code> here is nearly twice that of the plain <code>dict</code>. If you're making 4 million of these items, on my machine that would add overhead of a titch over 850 MB (on both 3.5 and 3.6).</p>
+<p>It's likely the combination of all the other programs on your system, plus your Python program, is exceeding the RAM allocated to your machine, and you're stuck swap thrashing. In particular, whenever <code>asset_hist</code> has to expand for new entries, it's likely needing to page in large parts of it (that got paged out for lack of use), and whenever a cyclic garbage collection run triggers (a full GC occurs roughly every 70,000 allocations and deallocations by default), all the <code>OrderedDict</code>s get paged back in to check if they're still referenced outside of cycles (you could check if the GC runs are the main problem by disabling cyclic GC <a href="https://docs.python.org/3/library/gc.html#gc.disable" rel="nofollow noreferrer">via <code>gc.disable()</code></a>).</p>
+<p>Given your particular use case, I'd strongly recommend avoiding both <code>dict</code> and <code>OrderedDict</code> though. The overhead of even <code>dict</code>, even the cheaper form on Python 3.6, is kind of extreme when you have a set of exactly three fixed keys over and over. Instead, <a href="https://docs.python.org/3/library/collections.html#collections.namedtuple" rel="nofollow noreferrer">use <code>collections.namedtuple</code></a>, which is designed for lightweight objects referenceable by either name or index (they act like regular <code>tuple</code>s, but also allow accessing each value as a named attribute), which would dramatically reduce the memory cost of your program (and likely speed it up even when memory is not an issue).</p>
+<p>For example:</p>
+<pre><code>from collections import namedtuple
+
+ComputerInfo = namedtuple('ComputerInfo', ['computer_name', 'id', 'hist_item'])
+
+asset_hist = []
+for key_host, val_hist_list in am_output.asset_history.items():
+    for index, hist_item in enumerate(val_hist_list):
+        asset_hist.append(ComputerInfo(key_host, index, hist_item))
+</code></pre>
+<p>Only difference in use is that you replace <code>row['computer_name']</code> with <code>row.computer_name</code>, or if you need all the values, you can unpack it like a regular <code>tuple</code>, e.g. <code>comphost, idx, hist = row</code>. If you need a true <code>OrderedDict</code> temporarily (don't store them for everything), you can call <code>row._asdict()</code> to get an <code>OrderedDict</code> with the same mapping as the <code>namedtuple</code>, but that's not normally needed. The memory savings are meaningful; on my system, the three element <code>namedtuple</code> drops the per-item overhead to 72 bytes, less than a third that of even the 3.6 <code>dict</code> and less than a sixth of a 3.6 <code>OrderedDict</code> (and three element <code>namedtuple</code> remains 72 bytes on 3.5, where <code>dict</code>/<code>OrderedDict</code> are larger pre-3.6). It may save even more than that; <code>tuple</code>s (and <code>namedtuple</code> by extension) are allocated as a single contiguous C <code>struct</code>, while <code>dict</code> and company are at least two allocations (one for the object structure, one or more for the dynamically resizable parts of the structure), each of which may pay allocator overhead and alignment costs.</p>
+<p>Either way, for your four million row scenario, using <code>namedtuple</code> would mean paying (beyond the cost of the values) overhead of around 275 MB total, vs. 915 (3.6) - 1100 (3.5) MB for <code>dict</code> and 1770 (3.6) - 1950 (3.5) MB for <code>OrderedDict</code>. When you're talking about an 8 GB system, shaving 1.5 GB off your overhead is a major improvement.</p>
+</div>
+<span class="comment-copy">I find it hard to believe that what you are observing is due to <code>dict</code> vs <code>OrderedDict</code> behavior, is it possible something else is changing? I also think someone will struggle to reproduce this</span>
+<span class="comment-copy">Yeah, they'd need to generate the huge dictionary first, probably random string generators would suffice fine. But I'm entirely serious, when I move the # down one line this happens. It's also worth noting: when it's stuck in this loop when using an ordered dict and I press control+C to stop the loop, it is like nothing happens... I have to press control+Z to get out.</span>
+<span class="comment-copy">Which Python version? In the newest, OrderedDict is simply an alias for dict, as the current implementation happens to be ordered by implementation detail.</span>
+<span class="comment-copy">python 3. I use OrderedDicts a lot in this software and they are great... it's something about this specific loop.</span>
+<span class="comment-copy">That's a lot of OrderedDicts, which aren't that compact compared to ordinary dicts.  Could you check your <i>memory</i> use while this is going on?</span>

@@ -1,0 +1,98 @@
+<div class="post-text" itemprop="text">
+<p>So I want to write some files that might be locked/blocked for write/delete by other processes and like to test that upfront.</p>
+<p>As I understand: <code>os.access(path, os.W_OK)</code> only looks for the permissions and will return true although a file cannot currently be written. So I have this little function:</p>
+<pre><code>def write_test(path):
+    try:
+        fobj = open(path, 'a')
+        fobj.close()
+        return True
+    except IOError:
+    return False
+</code></pre>
+<p>It actually works pretty well, when I try it with a file that I manually open with a Program. But as a wannabe-good-developer I want to put it in a test to automatically see if it works as expected.</p>
+<p>Thing is: If I just <code>open(path, 'a')</code> the file I can still <code>open()</code> it again no problem! Even from another Python instance. Although <strong>Explorer</strong> will actually tell me that the file is currently open in Python!</p>
+<p>I looked up other posts here &amp; there about locking. Most are suggesting to install a package. You migth understand that I don't wanna do that to test a handful lines of code. So I dug up the packages to see the actual spot where the locking is eventually done...</p>
+<p><a href="https://stackoverflow.com/a/30941681/469322">fcntl</a>? I don't have that. <a href="https://pypi.python.org/pypi/portalocker" rel="nofollow noreferrer">win32con</a>? Don't have it either... Now in <a href="https://github.com/dmfrey/FileLock/blob/master/filelock/filelock.py" rel="nofollow noreferrer">filelock</a> there is this:</p>
+<pre><code>self.fd = os.open(self.lockfile, os.O_CREAT|os.O_EXCL|os.O_RDWR)
+</code></pre>
+<p>When I do that on a file it moans that the <strong>file exists</strong>!! Ehhm ... yea! That's the idea! But even when I do it on a non-existing path. I can still <code>open(path, 'a')</code> it! Even from another python instance...</p>
+<p>I'm beginning to think that I fail to understand something very basic here. Am I looking for the wrong thing? Can someone point me into the right direction?
+<strong>Thanks!</strong></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You are trying to implement the file locking problem using just the system call <strong>open()</strong>. The Unix-like systems uses by default <a href="http://www.thegeekstuff.com/2012/04/linux-file-locking-types/" rel="nofollow">advisory file locking</a>. This means that cooperating processes may use locks to coordinate access to a file among themselves, but uncooperative processes are also free to ignore locks and access the file in any way they choose. In other words, file locks lock out other file lockers only, not I/O. See <a href="https://en.wikipedia.org/wiki/File_locking" rel="nofollow">Wikipedia</a>.</p>
+<p>As stated in <a href="http://www.tutorialspoint.com/unix_system_calls/open.htm" rel="nofollow">system call <strong>open()</strong> reference</a> the solution for performing atomic file locking using a lockfile is to create a unique file on the same file system (e.g., incorporating hostname and pid), use <strong>link(2)</strong> to make a link to the lockfile. If <strong>link()</strong> returns 0, the lock is successful. Otherwise, use <strong>stat(2)</strong> on the unique file to check if its link count has increased to 2, in which case the lock is also successful.</p>
+<p>That is why in <a href="https://github.com/benediktschmitt/py-filelock/blob/master/filelock.py" rel="nofollow">filelock</a> they also use the function <strong>fcntl.flock()</strong> and puts all that stuff in a module as it should be.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Alright! Thanks to those guys I actually have something now! So this is my function:</p>
+<pre><code>def lock_test(path):
+    """
+    Checks if a file can, aside from it's permissions, be changed right now (True)
+    or is already locked by another process (False).
+
+    :param str path: file to be checked
+    :rtype: bool
+    """
+    import msvcrt
+    try:
+        fd = os.open(path, os.O_APPEND | os.O_EXCL | os.O_RDWR)
+    except OSError:
+        return False
+
+    try:
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        os.close(fd)
+        return True
+    except (OSError, IOError):
+        os.close(fd)
+        return False
+</code></pre>
+<p>And the unittest could look something like this:</p>
+<pre><code>class Test(unittest.TestCase):
+
+    def test_lock_test(self):
+        testfile = 'some_test_name4142351345.xyz'
+        testcontent = 'some random blaaa'
+        with open(testfile, 'w') as fob:
+            fob.write(testcontent)
+
+        # test successful locking and unlocking
+        self.assertTrue(lock_test(testfile))
+        os.remove(testfile)
+        self.assertFalse(os.path.exists(testfile))
+
+        # make file again, lock and test False locking
+        with open(testfile, 'w') as fob:
+            fob.write(testcontent)
+        fd = os.open(testfile, os.O_APPEND | os.O_RDWR)
+
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        self.assertFalse(lock_test(testfile))
+
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        self.assertTrue(lock_test(testfile))
+        os.close(fd)
+
+        with open(testfile) as fob:
+            content = fob.read()
+            self.assertTrue(content == testcontent)
+        os.remove(testfile)
+</code></pre>
+<p>Works. Downsides are:</p>
+<ul>
+<li>It's kind of testing itself with itself</li>
+<li>so the initial <code>OSError</code> catch is not even tested, only locking again with <code>msvcrt</code></li>
+</ul>
+<p>But I dunno how to make it better now.</p>
+</div>
+<span class="comment-copy">What you're experiencing is probably a sharing violation (see <a href="https://msdn.microsoft.com/en-us/library/aa363874" rel="nofollow noreferrer">Creating and Opening Files</a>), which is implemented in the Windows I/O manager via <a href="https://msdn.microsoft.com/en-us/library/ff548341" rel="nofollow noreferrer"><code>IoCheckShareAccess</code></a>. Python opens files with read and write (but not delete) sharing. Other programs may open their files with only read sharing or no sharing at all.</span>
+<span class="comment-copy">Windows also supports file locking via <a href="https://msdn.microsoft.com/en-us/library/aa365203" rel="nofollow noreferrer"><code>LockFileEx</code></a> and <a href="https://msdn.microsoft.com/en-us/library/aa365716" rel="nofollow noreferrer"><code>UnlockFileEx</code></a>, which are available in Python via <a href="https://docs.python.org/3/library/msvcrt.html#msvcrt.locking" rel="nofollow noreferrer"><code>msvcrt.locking</code></a>.</span>
+<span class="comment-copy">Yay I saw msvcrt.locking‌​ already! But didn't understand the int Error... I was mixing up <code>open()</code> and <code>os.open()</code> before! Thank You eryksun!!! :D</span>
+<span class="comment-copy">Thank you! Seems it's the same on windows with <code>open()</code>. Ehmm ok. I tried the filelock package now but of course it <code>os.removes</code> my file when successful... How would I do the link thing on windows? Am I on the right way here?!?!</span>
+<span class="comment-copy">In  general the behavior of <code>O_EXCL</code> isn't defined if used without <code>O_CREAT</code>. On Windows it's ignored unless used with <code>O_CREAT</code>, in which case it's a <code>CREATE_NEW</code> open disposition.</span>
+<span class="comment-copy">Windows file locking applies to a region of a file. You're only checking that the first byte isn't locked. You should attempt to lock the entire file, based on the current file size.</span>
+<span class="comment-copy">Ah ok thanks! I changed the example accordingly. "lock the entire file, based on the current file size"? Ah alright, I got what you mean. passing the size to msvcrt.locking(fd, msvcrt.LK_NBLCK, <b>nbytes</b>)</span>
+<span class="comment-copy"><code>msvcrt.locking</code> locks a number of bytes starting at the current file pointer and allows locking beyond the current end of the file. The C runtime is limited to synchronous file access, so it can rely on using the file pointer for the lock offset. OTOH, the underlying Windows API <code>LockFileEx</code> requires explicitly setting the offset in the call's <code>lpOverlapped</code> struct because file access in Windows is asynchronous in general, which means file operations return immediately and can overlap each other, in which case the file pointer isn't updated.</span>
+<span class="comment-copy">In other words: Am I unable to simulate the behaviour of e.g. Photoshop locking it's Plugins?</span>

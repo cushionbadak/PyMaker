@@ -1,0 +1,99 @@
+<div class="post-text" itemprop="text">
+<p>I know this pattern to read the umask in Python:</p>
+<pre><code>current_umask = os.umask(0)  # line1
+os.umask(current_umask)      # line2
+return current_umask         # line3
+</code></pre>
+<p>But this is not thread-safe.</p>
+<p>A thread which executes between line1 and line2 will have a different umask.</p>
+<p>Is there a thread-safe way to read the umask in Python?</p>
+<p>Related: <a href="https://bugs.python.org/issue35275" rel="nofollow noreferrer">https://bugs.python.org/issue35275</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>if your system has <code>Umask</code> field in <code>/proc/[pid]/status</code>, you could read from on it:</p>
+<pre><code>import os
+
+def getumask():
+    pid = os.getpid()
+    with open(f'/proc/{pid}/status') as f:
+        for l in f:
+            if l.startswith('Umask'):
+                return int(l.split()[1])
+        return None
+</code></pre>
+<p>tested under CentOS 7.5, Debian 9.6.</p>
+<p>or, you could add a thread lock :)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>umask is inherited by child processes. You could create a pipe, fork a child process, get the umask there and write the result to the pipe so the parent can read it.</p>
+<p>Quite expensive, but without any special requirements like <code>/proc</code> virtual filesystem. An example with just low-level OS calls (all async-safe) and no error checking below:</p>
+<pre><code>import os
+import struct
+
+def get_umask():
+    pipe = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(pipe[0])
+        umask = os.umask(0)
+        os.write(pipe[1], struct.pack('H', umask))
+        os.close(pipe[1])
+        os._exit(0)
+    else:
+        os.close(pipe[1])
+        value = os.read(pipe[0], 2)
+        os.close(pipe[0])
+        os.waitpid(pid, 0)
+        return struct.unpack('H', value)[0]
+
+print("umask {:03o}".format(get_umask()))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The only truly, unambiguously thread-safe way I know is to call a new process.</p>
+<pre><code>import subprocess
+umask_cmd = ('python', '-c', 'import os; print(os.umask(0777))')
+umask = int(subprocess.check_output(umask_cmd))
+</code></pre>
+<p>Note that if you have bash or another shell, you could also call that. Since it might be on a weird system, I've chosen to use a python subprocess in <code>umask_cmd</code>, since you must have python. If you're on a non-weird *nix system, then you can use sh or bash instead.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It is possible to determine umask by creating a temporary file and checking its permissions. This should work on all *nix systems:</p>
+<pre><code>def get_umask():
+    import os, os.path, random, tempfile
+    while True:
+        # Generate a random name
+        name = 'test'
+        for _ in range(8):
+            name += chr(random.randint(ord('a'), ord('z')))
+        path = os.path.join(tempfile.gettempdir(), name)
+        # Attempt to create a file with full permissions
+        try:
+            fd = os.open(path, os.O_RDONLY|os.O_CREAT|os.O_EXCL, 0o777)
+        except FileExistsError:
+            # File exists, try again
+            continue
+        try:
+            # Deduce umask from the file's permission bits
+            return 0o777 &amp; ~os.stat(fd).st_mode
+        finally:
+            os.close(fd)
+            os.unlink(path)
+</code></pre>
+</div>
+<span class="comment-copy">Why do you need to call <code>os.umask()</code> in the first place? You usually do not always <i>need</i> to know the current umask.</span>
+<span class="comment-copy">(And on a separate note: using <code>os.umask(0)</code> in a threaded environment not only runs the risk of a race condition, it also opens your app up to security bugs. You'd <i>at least</i> set a restrictive mask, like <code>os.umask(0o777)</code>.</span>
+<span class="comment-copy">@MartijnPieters Why I want to know the umask? I want to compare two environments and check what's the difference between both. I want to improve my tool dumpenv: <a href="https://github.com/guettli/dumpenv" rel="nofollow noreferrer">github.com/guettli/dumpenv</a></span>
+<span class="comment-copy">That's a much better reason than most to inspect the current umask!</span>
+<span class="comment-copy">Rather than use <code>os.getpid()</code> and interpolation, you can just read from <code>/proc/self/status</code>.</span>
+<span class="comment-copy">And proc/../status includes the Umask as of Linux 4.7, if someone wanted to know how to test for this</span>
+<span class="comment-copy">@MartijnPieters redhat has this feature backported to its rhel7/centos7 3.10 kernel.</span>
+<span class="comment-copy">Nice solution! I like this.</span>
+<span class="comment-copy">This code is not safe. From <code>man fork(2)</code>: "After a <code>fork()</code> in a multithreaded program, the child can safely call only async-signal-safe functions (see <code>signal-safety(7)</code>) until such time as it calls <code>execve(2)</code>." The problem is that Python interpreter itself is not async-signal-safe. In particular, nearly any Python code may cause the interpreter to allocate memory, and most memory allocation functions are not async-signal-safe. Therefore, it is never safe to call <code>os.fork()</code> from a multithreaded program.</span>
+<span class="comment-copy">@abacabadabacaba I'm not sure. Interpreter's own memory operations should be protected by the GIL.</span>
+<span class="comment-copy">@VPfB Implementation of GIL is not async-signal-safe either.</span>
+<span class="comment-copy">3. Python attempts to make os.fork safe, even reinitializing various important locks inside the child process. This may actually provide safety with some pthread implementations, such as that used by glibc on Linux. However, this is not guaranteed with all implementations, because no use of functions that are not async-signal safe is guaranteed to be safe after fork.</span>
+<span class="comment-copy">The umask value is typically inherited by children, unless set by pythonrc.</span>
+<span class="comment-copy">@MartijnPieters <code>mkstemp</code> doesn't let you specify new file's permissions, so it doesn't work.</span>
+<span class="comment-copy">Duh, right, that indeed won’t fly.</span>
+<span class="comment-copy">Please use the python lib "tempfile", not this "TMPDIR = os.environ.get('TMPDIR', '/tmp')" <a href="https://docs.python.org/3/library/tempfile.html#tempfile.gettempdir" rel="nofollow noreferrer">docs.python.org/3/library/tempfile.html#tempfile.gettempdir</a></span>

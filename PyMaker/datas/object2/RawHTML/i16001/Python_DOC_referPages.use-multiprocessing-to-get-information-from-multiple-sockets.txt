@@ -1,0 +1,111 @@
+<div class="post-text" itemprop="text">
+<p>I'm working on developing a little irc client in python (ver 2.7).  I had hoped to use multiprocessing to read from all servers I'm currently connected to, but I'm running into an issue</p>
+<pre><code>import socket
+import multiprocessing as mp
+import types
+import copy_reg
+import pickle
+
+
+def _pickle_method(method):
+    func_name = method.im_func.__name__
+    obj = method.im_self
+    cls = method.im_class
+    return _unpickle_method, (func_name, obj, cls)
+
+def _unpickle_method(func_name, obj, cls):
+    for cls in cls.mro():
+        try:
+            func = cls.__dict__[func_name]
+        except KeyError:
+            pass
+        else:
+            break
+    return func.__get__(obj, cls)
+
+copy_reg.pickle(types.MethodType, _pickle_method, _unpickle_method)
+
+class a(object):
+
+    def __init__(self):
+        sock1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock1.connect((socket.gethostbyname("example.com"), 6667))
+        self.servers = {}
+        self.servers["example.com"] = sock1
+
+    def method(self, hostname):
+        self.servers[hostname].send("JOIN DAN\r\n")
+        print "1"
+
+    def oth_method(self):
+        pool = mp.Pool()
+        ## pickle.dumps(self.method)
+        pool.map(self.method, self.servers.keys())
+        pool.close()
+        pool.join()
+
+if __name__ == "__main__":
+    b = a()
+    b.oth_method()
+</code></pre>
+<p>Whenever it hits the line <code>pool.map(self.method, self.servers.keys())</code> I get the error</p>
+<pre><code>TypeError: expected string or Unicode object, NoneType found
+</code></pre>
+<p>From what I've read this is what happens when I try to pickle something that isn't picklable.  To resolve this I first made the <code>_pickle_method</code> and <code>_unpickle_method</code> as described <a href="http://bytes.com/topic/python/answers/552476-why-cant-you-pickle-instancemethods" rel="nofollow noreferrer">here</a>.  Then I realized that I was (originally) trying to pass <code>pool.map()</code> a list of sockets (very not picklable) so I changed it to the list of hostnames, as strings can be pickled.  I still get this error, however.</p>
+<p>I then tried calling <code>pickle.dumps()</code> directly on <code>self.method</code>, <code>self.servers.keys()</code>, and <code>self.servers.keys()[0]</code>.  As expected it worked fine for the latter two, but from the first I get</p>
+<pre><code>TypeError: a class that defines __slots__ without defining __getstate__ cannot be pickled.
+</code></pre>
+<p>Some more research lead me to <a href="https://stackoverflow.com/questions/2204155/why-am-i-getting-an-error-about-my-class-defining-slots-when-trying-to-pickl">this question</a>, which seems to indicate that the issue is with the use of sockets (and <a href="https://stackoverflow.com/a/2204177/3076272">gnibbler's answer</a> to that question would seem to confirm it).</p>
+<p>Is there a way that I can actually use multiprocessing for this?  From what I've (very briefly) read <a href="https://github.com/uqfoundation/pathos" rel="nofollow noreferrer"><code>pathos.multiprocessing</code></a> might be what I need, but I'd really like to stick to the standard library if at all possible.</p>
+<p>I'm also not set on using multiprocessing - if multithreading would work better and avoid this issue then I'm more than open to those solutions.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your root problem is that you can't pass sockets to child processes. The easy solution is to use threads instead.</p>
+<p>In more detail:</p>
+<hr/>
+<p>Pickling a bound method requires pickling three things: the function name, the object, and the class. (I think <code>multiprocessing</code> does this for you automatically, but you're doing it manually; that's fine.) To pickle the object, you have to pickle its members, which in your case includes a dict whose values are sockets.</p>
+<p>You can't pickle sockets with the default pickling protocol in Python 2.x. The answer to the question you linked explains why, and provides the simple workaround: don't use the default pickling protocol. But there's an additional problem with <code>socket</code>; it's just a wrapper around a type defined in a C extension module, which has its own problems with pickling. You might be able to work around that as well…</p>
+<p>But that still isn't going to help. Under the covers, that C extension class is itself just a wrapper around a file descriptor. A file descriptor is just a number. Your operating system keeps a mapping of file descriptors to open sockets (and files and pipes and so on) for each process; file #4 in one process isn't file #4 in another process. So, you need to actually migrate the socket's file descriptor to the child at the OS level. This is not a simple thing to do, and it's different on every platform. And, of course, on top of migrating the file descriptor, you'll also have to pass enough information to re-construct the <code>socket</code> object. All of this is doable; there might even be a library that wraps it up for you. But it's not easy.</p>
+<hr/>
+<p>One alternate possibility is to open all of the sockets before launching any of the children, and set them to be inherited by the children. But, even if you could redesign your code to do things that way, this only works on POSIX systems, not on Windows.</p>
+<hr/>
+<p>A much simpler possibility is to just use threads instead of processes. If you're doing CPU-bound work, threads have problems in Python (well, CPython, the implementation you're almost certainly using) because there's a global interpreter lock that prevents two threads from interpreting code at the same time. But when your threads spend all their time waiting on <code>socket.recv</code> and similar I/O calls, there is no problem using threads. And they avoid all the overhead and complexity of pickling data and migrating sockets and so forth.</p>
+<p>You may notice that the <code>threading</code> module doesn't have a nice <code>Pool</code> class like <code>multiprocessing</code> does. Surprisingly, however, there <em>is</em> a thread pool class in the stdlib—it's just in <code>multiprocessing</code>. You can access it as <a href="https://docs.python.org/2/library/multiprocessing.html#module-multiprocessing.dummy" rel="nofollow"><code>multiprocessing.dummy.Pool</code></a>.</p>
+<p>If you're willing to go beyond the stdlib, the <a href="https://docs.python.org/3/library/concurrent.futures.html" rel="nofollow"><code>concurrent.futures</code></a> module from Python 3 has a backport  named <a href="https://pypi.python.org/pypi/futures" rel="nofollow"><code>futures</code></a> that you can install off PyPI. It includes a <code>ThreadPoolExecutor</code> which is a slightly higher-level abstraction around a pool which may be simpler to use. But <code>Pool</code> should also work fine for you here, and you've already written the code.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you <strong>do</strong> want to try jumping out of the standard library, then the following code for <code>pathos.multiprocessing</code> (as you mention) should not throw pickling errors, as the <code>dill</code> serializer knows how to serialize sockets and file handles.</p>
+<pre><code>&gt;&gt;&gt; import socket
+&gt;&gt;&gt; import pathos.multiprocessing as mp
+&gt;&gt;&gt; import types
+&gt;&gt;&gt; import dill as pickle
+&gt;&gt;&gt;
+&gt;&gt;&gt; class a(object):
+...    def __init__(self):
+...        sock1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+...        sock1.connect((socket.gethostbyname("example.com"), 6667))
+...        self.servers = {}
+...        self.servers["example.com"] = sock1
+...    def method(self, hostname):
+...        self.servers[hostname].send("JOIN DAN\r\n")
+...        print "1"
+...    def oth_method(self):
+...        pool = mp.ProcessingPool()
+...        pool.map(self.method, self.servers.keys())
+...        pool.close()
+...        pool.join()
+...
+&gt;&gt;&gt; b = a()
+&gt;&gt;&gt; b.oth_method()
+</code></pre>
+<p>One issue however is that you need serialization with <code>multiprocessing</code>, and in many cases the sockets will serialize so that the deserialized socket is closed.  The reason is primarily because the file descriptor isn't copied as expected, it's copied by reference.  With <code>dill</code> you can customize the serialization of file handles, so that the content does get transferred as opposed to using a reference… however, this doesn't translate well for a socket (at least at the moment).</p>
+<p>I'm the <code>dill</code> and <code>pathos</code> author, and I'd have to agree with @abarnert that you probably don't want to do this with <code>multiprocessing</code> (at least not storing a map of servers and sockets).  If you want to use <code>multiprocessing's</code> threading interface, and you find you run into any serialization concerns, <code>pathos.multiprocessing</code> does have <code>mp.ThreadingPool()</code> instead of <code>mp.ProcessingPool()</code>, so that you can access a wrapper around <code>multiprocessing.dummy.Pool</code>, but still get the additional features that <code>pathos</code> provides (such as multi-argument pools for blocking or asynchronous pipes and maps, etc).</p>
+</div>
+<span class="comment-copy">Are you actually trying to pass a socket to the child process, or is that just something that's happening accidentally that you're trying to avoid? For the former, you need to migrate sockets, which has to be done at a lower level than Python pickling, and it's different for each platform, because under the covers a socket is just a wrapper around a file descriptor, and you need the OS to make the same file descriptor mean the same socket in your child process.</span>
+<span class="comment-copy">Meanwhile, is there a reason you're using multiprocessing instead of multithreading in the first place? "Reading from a bunch of servers" is about as close as you can get to a paradigm case for I/O-bound, which is exactly what threads are good for.</span>
+<span class="comment-copy">First, "threading is slow in Python" is not true. Threading is slow in Python <i>if you have CPU-bound code</i>, because only one thread can execute instructions at the same time. If your threads spend almost all of their time waiting on a socket recv or similar, there is no problem with threads, and processes just add overhead and complexity for no benefit.</span>
+<span class="comment-copy">Second, "I'm passing the child process the string key to the dictionary that refers to the socket". So… how does it get that dictionary? Is this Unix-specific code that depends on the child inheriting the parent's state at startup? If so, then why do you think the problem has anything to do with pickling sockets? If not, then why do you think socket migration isn't necessary?</span>
+<span class="comment-copy">Meanwhile, the answer to the question you linked says that using protocol -1 instead of the default will solve the problem. Have you tried that? If so, what happened?</span>
+<span class="comment-copy">Thanks, that makes sense.  I'll take a look at it in the morning and see if I can make it work</span>
+<span class="comment-copy">I'm curious how you're serializing file handles. It's not like <code>unix_sock.sendmsg(sock)</code> and <code>sock.share(pid)</code> are exactly hard to write, but wrapping them up in a process pool interface seems like a bit of a design headache. (Also, dealing with the fact that sockets and files are different things on Windows…) But that's probably off-topic to continue here, so I'll go download your module and read it instead. :)</span>
+<span class="comment-copy">@abarnert: there's nothing smart done for sockets yet.  There are several options (recently added on <a href="https://github.com/uqfoundation/dill" rel="nofollow noreferrer">github.com/uqfoundation/dill</a> and not in the current release) for dealing with serializing files… and it does need testing on Windows.  I'm aware of the differences between Windows and any other OS.   The fork of <code>multiprocessing</code> is pretty simple, I just replace the serializer and add a small convince layer over the top to, for example, allow <code>map</code> to take multiple arguments.</span>

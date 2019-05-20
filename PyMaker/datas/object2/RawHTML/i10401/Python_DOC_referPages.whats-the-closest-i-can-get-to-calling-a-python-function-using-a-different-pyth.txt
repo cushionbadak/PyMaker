@@ -1,0 +1,169 @@
+<div class="post-text" itemprop="text">
+<p>Say I have two files:</p>
+<pre><code># spam.py
+import library_Python3_only as l3
+
+def spam(x,y)
+    return l3.bar(x).baz(y)
+</code></pre>
+<p>and</p>
+<pre><code># beans.py
+import library_Python2_only as l2
+
+...
+</code></pre>
+<p>Now suppose I wish to call <code>spam</code> from within <code>beans</code>. It's not directly possible since both files depend on incompatible Python versions. Of course I can <code>Popen</code> a different python process, but how could I pass in the arguments and retrieve the results without too much stream-parsing pain?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here is a complete example implementation using <code>subprocess</code> and <code>pickle</code> that I actually tested. Note that you need to use protocol version 2 explicitly for pickling on the Python 3 side (at least for the combo Python 3.5.2 and Python 2.7.3).</p>
+<pre><code># py3bridge.py
+
+import sys
+import pickle
+import importlib
+import io
+import traceback
+import subprocess
+
+class Py3Wrapper(object):
+    def __init__(self, mod_name, func_name):
+        self.mod_name = mod_name
+        self.func_name = func_name
+
+    def __call__(self, *args, **kwargs):
+        p = subprocess.Popen(['python3', '-m', 'py3bridge',
+                              self.mod_name, self.func_name],
+                              stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE)
+        stdout, _ = p.communicate(pickle.dumps((args, kwargs)))
+        data = pickle.loads(stdout)
+        if data['success']:
+            return data['result']
+        else:
+            raise Exception(data['stacktrace'])
+
+def main():
+    try:
+        target_module = sys.argv[1]
+        target_function = sys.argv[2]
+        args, kwargs = pickle.load(sys.stdin.buffer)
+        mod = importlib.import_module(target_module)
+        func = getattr(mod, target_function)
+        result = func(*args, **kwargs)
+        data = dict(success=True, result=result)
+    except Exception:
+        st = io.StringIO()
+        traceback.print_exc(file=st)
+        data = dict(success=False, stacktrace=st.getvalue())
+
+    pickle.dump(data, sys.stdout.buffer, 2)
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>The Python 3 module (using the <code>pathlib</code> module for the showcase)</p>
+<pre><code># spam.py
+
+import pathlib
+
+def listdir(p):
+    return [str(c) for c in pathlib.Path(p).iterdir()]
+</code></pre>
+<p>The Python 2 module using <code>spam.listdir</code></p>
+<pre><code># beans.py
+
+import py3bridge
+
+delegate = py3bridge.Py3Wrapper('spam', 'listdir')
+py3result = delegate('.')
+print py3result
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Assuming the caller is Python3.5+, you have access to a nicer <a href="https://docs.python.org/3/library/subprocess.html">subprocess</a> module. Perhaps you could user <code>subprocess.run</code>, and communicate via pickled Python objects sent through stdin and stdout, respectively. There would be some setup to do, but no parsing on your side, or mucking with strings etc.</p>
+<p>Here's an example of Python2 code via subprocess.Popen</p>
+<pre><code>p = subprocess.Popen(python3_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+stdout, stderr = p.communicate(pickle.dumps(python3_args))
+result = pickle.load(stdout)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You could create a simple script as such :</p>
+<pre><code>import sys
+import my_wrapped_module
+import json
+
+params = sys.argv
+script = params.pop(0)
+function = params.pop(0)
+print(json.dumps(getattr(my_wrapped_module, function)(*params)))
+</code></pre>
+<p>You'll be able to call it like that :</p>
+<pre><code>pythonx.x wrapper.py myfunction param1 param2
+</code></pre>
+<p>This is obviously a security hazard though, be careful.</p>
+<p>Also note that if your params are anything else than string or integers, you'll have some issues, so maybe think about transmitting params as a json string, and convert it using <code>json.loads()</code> in the wrapper.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It's possible to use the <a href="https://docs.python.org/2/library/multiprocessing.html#managers" rel="nofollow"><code>multiprocessing.managers</code></a> module to achieve what you want. It does require a small amount of hacking though.</p>
+<p>Given a module that has functions you want to expose then you need to create a <code>Manager</code> that can create proxies for those functions.</p>
+<p>manager process that serves proxies to the py3 functions:</p>
+<pre><code>from multiprocessing.managers import BaseManager
+import spam
+
+class SpamManager(BaseManager):
+    pass
+# Register a way of getting the spam module.
+# You can use the exposed arg to control what is exposed.
+# By default only "public" functions (without a leading underscore) are exposed,
+# but can only ever expose functions or methods.
+SpamManager.register("get_spam", callable=(lambda: spam), exposed=["add", "sub"])
+
+# specifying the address as localhost means the manager is only visible to  
+# processes on this machine
+manager = SpamManager(address=('localhost', 50000), authkey=b'abc', 
+    serializer='xmlrpclib')
+server = manager.get_server()
+server.serve_forever()
+</code></pre>
+<p>I've redefined <code>spam</code> to contain two function called <code>add</code> and <code>sub</code>.</p>
+<pre><code># spam.py
+def add(x, y):
+    return x + y
+
+def sub(x, y):
+    return x - y
+</code></pre>
+<p>client process that uses the py3 functions exposed by the <code>SpamManager</code>.</p>
+<pre><code>from __future__ import print_function
+from multiprocessing.managers import BaseManager
+
+class SpamManager(BaseManager):
+    pass
+SpamManager.register("get_spam")
+
+m = SpamManager(address=('localhost', 50000), authkey=b'abc', 
+    serializer='xmlrpclib')
+m.connect()
+
+spam = m.get_spam()
+print("1 + 2 = ", spam.add(1, 2)) # prints 1 + 2 = 3
+print("1 - 2 = ", spam.sub(1, 2)) # prints 1 - 2 = -1
+spam.__name__ # Attribute Error -- spam is a module, but its __name__ attribute 
+# is not exposed
+</code></pre>
+<p>Once set up, this form gives an easy way of accessing functions and values. It also allows these functions and values to be used them in a similar way that you might use them if they were not proxies. Finally, it allows you to set a password on the server process so that only authorised processes can access the manager. That the manager is long running, also means that a new process doesn't have to be started for each function call you make.</p>
+<p>One limitation is that I've used the <code>xmlrpclib</code> module rather than <code>pickle</code> to send data back and forth between the server and the client. This is because python2 and python3 use different protocols for <code>pickle</code>. You could fix this by adding your own client to <code>multiprocessing.managers.listener_client</code> that uses an agreed upon protocol for pickling objects.</p>
+</div>
+<span class="comment-copy">Is your function in backports?</span>
+<span class="comment-copy">Excellent. I ran into some issues with environment variables (the Python2 environment is a local install embedded into another program, which overrides <code>PATH</code> etc.), but this could be fixed by replacing the direct <code>python3</code> Popen call with <code>[ 'env', '-i', 'bash', '-l', '-c', 'python3 -m py3bridge '+self.mod_name+' '+self.func_name ]</code>.</span>
+<span class="comment-copy">@leftaroundabout There is also the <code>env</code> parameter of <code>subprocess.Popen</code> where you can pass the environment variables for the child process.</span>
+<span class="comment-copy">Ah, but can that also be used to simply ignore given parameters / revert to the login defaults?</span>
+<span class="comment-copy">I don't know about login default, but you could do something like <code>env = dict(os.environ)</code>, <code>del env['HAZARDOUS_VAR']</code>.</span>
+<span class="comment-copy">Actually I wrote the versions the wrong way around in my example: I really hope to call python3 from python2. Anyway I hoped that this didn't really make the difference... surely pickling also works that direction? If not, an answer that only works if the caller is Python3 would also be helpful (perhaps I can in fact turn around the dependence).</span>
+<span class="comment-copy">The option of using pickled objects still stands, it will just be harder to setup the stdin and read the stdout of the child process, as you have to use subprocess.call or subprocess.Popen, which have a clunkier interface. You still avoid having do do manual parsing, since the meat of the problem will still be a call to pickle.dumps/loads, it's just a little bit more code.</span>
+<span class="comment-copy">@leftaroundabout The <a href="https://docs.python.org/2/library/subprocess.html" rel="nofollow noreferrer"><code>subprocess</code></a> module was added in Python 2.4, so there doesn't seem to be a reason why you can't use it in your case.</span>
+<span class="comment-copy">@ray Yes, the subprocess module is there, but it doesn't have the nicer 'run' method. I've added an example with 'Popen', and it's not that bad either. Just needs some exception handling thrown in.</span>
+<span class="comment-copy">Looks not bad. However I don't suppose this is suitable when the parameters contain a lot of data? For the application I have in mind right now, it might be ok, but generally I'd feel uncomfortable passing such large json-encoded strings through the command line.</span>
+<span class="comment-copy">I'd feel uncomfortable using this myself! haha. Maybe it can help, but the best solution would probably be to use <code>2to3</code> to convert your python2 libraries.</span>
+<span class="comment-copy">I'd definitely rather migrate everything to Python3, but that's not really an option since that particular Python2 engine is a modified version that's embedded in a third-party C++ project.</span>

@@ -1,0 +1,121 @@
+<div class="post-text" itemprop="text">
+<p>The following example from Boost.Python v1.56 shows how to embed the Python 3.4.2 interpreter into your own application. Unfortunately that example does not work out of the box on my configuration with MSVC2013 under Windows 8.1. And I have not found 1 working complete example about embedding, at least none that is younger than 10 years or so.</p>
+<p>I receive the following error running it: <strong>ImportError: 'embedded_hello' is not a built-in module</strong></p>
+<p>The code is here: <a href="http://pastebin.com/shTtdxT8" rel="nofollow">http://pastebin.com/shTtdxT8</a></p>
+<p>Any hints what I can do to let this run? And in general how to expose a c++ class in Python and vice versa?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The code is compiling with a Python 2 header configuration.  When compiling with a Python 3 header configuration, the <a href="https://github.com/boostorg/python/blob/0b8b88a/include/boost/python/module_init.hpp#L30-L31" rel="noreferrer"><code>boost/python/module_init.hpp</code></a> would have declared the <code>embedded_hello</code> module's initialization function as <code>PyInit_embedded_hello</code> rather than <code>initembedded_hello</code>.  I highly recommend verifying the proper header configuration, and performing a clean build of Boost.Python, as Boost.Python and modules built with the library need to use the same header configuration.</p>
+<p>Additionally, when adding modules to the built-in table, the <code>PyImport_AppendInittab()</code> calls need to occur before <a href="https://docs.python.org/3/c-api/init.html#c.Py_Initialize" rel="noreferrer"><code>Py_Initialize()</code></a>.  The <a href="https://docs.python.org/3/c-api/import.html#c.PyImport_AppendInittab" rel="noreferrer"><code>PyImport_AppendInittab()</code></a> documentation explicitly states:</p>
+<blockquote>
+<p>Add a single module to the existing table of built-in modules. ... This should be called before <code>Py_Initialize()</code>.</p>
+</blockquote>
+<p>Boost.Python uses the <a href="http://www.boost.org/doc/libs/1_57_0/libs/python/doc/v2/module.html#BOOST_PYTHON_MODULE-spec" rel="noreferrer"><code>BOOST_PYTHON_MODULE</code></a> macro to define a Python module.  Within the body of the module, the current <a href="http://www.boost.org/doc/libs/1_57_0/libs/python/doc/v2/scope.html#scope-spec" rel="noreferrer">scope</a> is the module itself.  Thus, when C++ types are exposed via type wrappers, such as when a C++ classes is exposed to Python via <a href="http://www.boost.org/doc/libs/1_57_0/libs/python/doc/v2/class.html#class_-spec" rel="noreferrer"><code>boost::python::class_</code></a>, the resulting Python class will be within the module defined by <code>BOOST_PYTHON_MODULE</code>.</p>
+<p>On the other hand, user-defined types declared in Python are first-class objects.  From a C++ perspective, they can be treated as though they are a factory function.  Hence, to use a Python defined class in C++, one needs to get a handle to the class object, then instantiate an instance of a class by calling the class object.</p>
+<hr/>
+<p>Here is a complete minimal example demonstrating embedding a Python 3 interpreter that:</p>
+<ul>
+<li>Imports a module (<code>example</code>) that has been built directly into the binary and exposes a basic C++ class (<code>spam_wrap</code>) to Python (<code>example.Spam</code>) that has virtual function/dispatching with a default.</li>
+<li>Demonstrates using the exposed Python class (<code>example.Spam</code>).</li>
+<li>Derives from the exposed Python class (<code>example.Spam</code>) within Python (<code>example.PySpam</code>) and uses the resulting class.</li>
+</ul>
+<pre class="lang-cpp prettyprint-override"><code>#include &lt;iostream&gt;
+#include &lt;boost/python.hpp&gt;
+
+/// @brief Mockup Spam model.
+struct spam
+  : boost::noncopyable
+{
+  virtual ~spam() {};
+  virtual std::string hello() { return "Hello from C++"; }
+};
+
+//@ brief Mockup Spam wrapper.
+struct spam_wrap
+  : spam,
+    boost::python::wrapper&lt;spam&gt;
+{
+  virtual std::string hello()
+  {
+#if BOOST_WORKAROUND(BOOST_MSVC, &lt;= 1300)
+    return boost::python::call&lt;std::string&gt;(
+      this-&gt;get_override("hello").ptr());
+#else
+    return this-&gt;get_override("hello")();
+#endif
+  }
+
+  std::string default_hello() { return this-&gt;spam::hello(); }
+};
+
+/// @brief Python example module.
+BOOST_PYTHON_MODULE(example)
+{
+  namespace python = boost::python;
+
+  // Expose C++ spam_wrap as Python Spam class.
+  python::class_&lt;spam_wrap, boost::noncopyable&gt;("Spam")
+    .def("hello", &amp;spam::hello, &amp;spam_wrap::default_hello)
+    ;
+}   
+
+int main()
+{
+  // Add example to built-in.
+  PyImport_AppendInittab("example", &amp;PyInit_example);
+
+  // Start the interpreter.
+  Py_Initialize();
+
+  namespace python = boost::python;
+  try
+  {
+    python::object main = python::import("__main__");
+    python::object global = main.attr("__dict__");
+
+    // Execute Python code, using the example module.
+    exec(
+      "from example import Spam          \n"
+      "spam = Spam()                     \n"
+      "                                  \n"
+      "class PySpam(Spam):               \n"
+      "    def hello(self):              \n"
+      "        return 'Hello from Python'\n",     
+      global, global);
+
+    /// Check the instance of the Python object using the C++ class.
+    // &gt;&gt;&gt; spam_object = spam
+    python::object spam_object = global["spam"];
+    assert(python::extract&lt;spam&gt;(spam_object).check());
+    // &gt;&gt;&gt; result = spam_object.hello()
+    python::object result = spam_object.attr("hello")();
+    // &gt;&gt;&gt; print(result)
+    std::cout &lt;&lt; python::extract&lt;std::string&gt;(result)() &lt;&lt; std::endl;
+    // &gt;&gt;&gt; assert("Hello from C++" == result)
+    assert("Hello from C++" == python::extract&lt;std::string&gt;(result)());
+
+    /// Create an instance using PySpam class.  It too is a Python object.
+    // &gt;&gt;&gt; py_spam_type = PySpam
+    python::object py_spam_type = global["PySpam"];
+    // &gt;&gt;&gt; py_spam_object = py_spam_type()
+    python::object py_spam_object = py_spam_type();
+    // &gt;&gt;&gt; result = py_spam_object()
+    result = py_spam_object.attr("hello")();
+    // &gt;&gt;&gt; print(result)
+    std::cout &lt;&lt; python::extract&lt;std::string&gt;(result)() &lt;&lt; std::endl;
+    // &gt;&gt;&gt; assert("Hello from Python" == result)
+    assert("Hello from Python" == python::extract&lt;std::string&gt;(result)());
+  }
+  catch (const python::error_already_set&amp;)
+  {
+    PyErr_Print();
+  }
+}
+</code></pre>
+<p>The program should run to completion without errors, resulting in the following output:</p>
+<pre class="lang-none prettyprint-override"><code>Hello from C++
+Hello from Python
+</code></pre>
+</div>
+<span class="comment-copy">Thanks a lot for your example. Yes I forgot to change the PyInit_ for Python3 in the code on PasteBin, corrected it. Your example works so far for a simple class. I have to find out if it will also work for derived from abstract classes with virtual function and all that stuff.  But now how can I get the class defined in Python back into C++? That part still doesn't work. :(</span>
+<span class="comment-copy">@patlecat Getting the module to load often tends to be the harder part.  The rest is just writing Python in C++ using Boost.Python.  I've updated the example to be a bit more complex, demonstrating how to use a class defined in Python within C++.  The C++ comments annotated with <code>&gt;&gt;&gt;</code> show the equivalent Python call.</span>

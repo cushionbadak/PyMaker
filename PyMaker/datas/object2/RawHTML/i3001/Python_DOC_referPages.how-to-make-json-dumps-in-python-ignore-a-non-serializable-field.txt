@@ -1,0 +1,138 @@
+<div class="post-text" itemprop="text">
+<p>I am trying to serialize the output of parsing some binary data with the Construct2.9 library. I want to serialize the result to JSON.</p>
+<p><code>packet</code> is an instance of a Construct class <code>Container</code>.</p>
+<p>Apparently it contains a hidden <code>_io</code> of type <code>BytesIO</code> - see output of <code>dict(packet)</code> below:</p>
+<pre><code>{
+'packet_length': 76, 'uart_sent_time': 1, 'frame_number': 42958, 
+'subframe_number': 0, 'checksum': 33157, '_io': &lt;_io.BytesIO object at 0x7f81c3153728&gt;, 
+'platform':661058, 'sync': 506660481457717506, 'frame_margin': 20642,
+'num_tlvs': 1, 'track_process_time': 593, 'chirp_margin': 78,
+'timestamp': 2586231182, 'version': 16908293
+}
+</code></pre>
+<p>Now, calling <code>json.dumps(packet)</code> obviously leads to a TypeError:</p>
+<pre><code>...
+
+File "/usr/lib/python3.5/json/__init__.py", line 237, in dumps
+    **kw).encode(obj)
+File "/usr/lib/python3.5/json/encoder.py", line 198, in encode
+    chunks = self.iterencode(o, _one_shot=True)
+File "/usr/lib/python3.5/json/encoder.py", line 256, in iterencode
+    return _iterencode(o, 0)
+File "/usr/lib/python3.5/json/encoder.py", line 179, in default
+    raise TypeError(repr(o) + " is not JSON serializable")
+TypeError: &lt;_io.BytesIO object at 0x7f81c3153728&gt; is not JSON serializable
+</code></pre>
+<p>However what I am confused about, is that running <code>json.dumps(packet, skipkeys=True)</code> results in the exact same error, while I would expect it to skip the <code>_io</code> field. What is the problem here? Why is <code>skipkeys</code> not allowing me to skip the <code>_io</code> field?</p>
+<p>I got the code to work by overriding <code>JSONEncoder</code> and returning <code>None</code> for fields of <code>BytesIO</code> type, but that means my serialized string contains loads of <code>"_io": null</code> elements, which I would prefer not to have at all...</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Keys with a leading <code>_</code> underscore are not really 'hidden', they are just more strings to JSON. The Construct <code>Container</code> class is just a dictionary with ordering, the <code>_io</code> key is not anything special to that class.</p>
+<p>You have two options:</p>
+<ul>
+<li>implement a <code>default</code> hook that just returns a replacement value.</li>
+<li>Filter out the key-value pairs that you know can't work <em>before</em> serialising.</li>
+</ul>
+<p>and perhaps a third, but a casual scan of the Construct project pages doesn't tell me if it is available: have Construct output JSON or at least a JSON-compatible dictionary, perhaps by using adapters.</p>
+<p>The default hook can't prevent the <code>_io</code> key from being added to the output, but would let you at least avoid the error:</p>
+<pre><code>json.dumps(packet, default=lambda o: '&lt;not serializable&gt;')
+</code></pre>
+<p>Filtering can be done recursively; the <a href="https://docs.python.org/3/library/functools.html#functools.singledispatch" rel="nofollow noreferrer"><code>@functools.singledispatch()</code> decorator</a> can help keep such code clean:</p>
+<pre><code>from functools import singledispatch
+
+_cant_serialize = object()
+
+@singledispatch
+def json_serializable(object, skip_underscore=False):
+    """Filter a Python object to only include serializable object types
+
+    In dictionaries, keys are converted to strings; if skip_underscore is true
+    then keys starting with an underscore ("_") are skipped.
+
+    """
+    # default handler, called for anything without a specific
+    # type registration.
+    return _cant_serialize
+
+@json_serializable.register(dict)
+def _handle_dict(d, skip_underscore=False):
+    converted = ((str(k), json_serializable(v, skip_underscore))
+                 for k, v in d.items())
+    if skip_underscore:
+        converted = ((k, v) for k, v in converted if k[:1] != '_')
+    return {k: v for k, v in converted if v is not _cant_serialize}
+
+@json_serializable.register(list)
+@json_serializable.register(tuple)
+def _handle_sequence(seq, skip_underscore=False):
+    converted = (json_serializable(v, skip_underscore) for v in seq)
+    return [v for v in converted if v is not _cant_serialize]
+
+@json_serializable.register(int)
+@json_serializable.register(float)
+@json_serializable.register(str)
+@json_serializable.register(bool)  # redudant, supported as int subclass
+@json_serializable.register(type(None))
+def _handle_default_scalar_types(value, skip_underscore=False):
+    return value
+</code></pre>
+<p>I have the above implementation an additional <code>skip_underscore</code> argument too, to explicitly skip keys that have a <code>_</code> character at the start. This would help skip all additional 'hidden' attributes the Construct library is using.</p>
+<p>Since <code>Container</code> is a <code>dict</code> subclass, the above code will automatically handle instances such as <code>packet</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://docs.python.org/3/library/json.html#json.dump" rel="nofollow noreferrer"><code>skipkeys</code></a> doesn't do what you might think it does - it instructs the <a href="https://docs.python.org/3/library/json.html#json.JSONEncoder" rel="nofollow noreferrer"><code>json.JSONEncoder</code></a> to skip keys that are not of a <em>basic</em> type, not the values of the keys - i.e. if your had a <code>dict</code> <code>{object(): "foobar"}</code> it would skip the <code>object()</code> key, whereas without <code>skipkeys</code> set to <code>True</code> it would raise a <code>TypeError</code>.</p>
+<p>You can overload <a href="https://docs.python.org/3/library/json.html#json.JSONEncoder.iterencode" rel="nofollow noreferrer"><code>JSONEncoder.iterencode()</code></a> (and its underbelly) and perform look-ahead filtering there, but you'll end up pretty much rewriting the <code>json</code> module, slowing it down in the process as you won't be able to benefit from the compiled parts. What I'd suggest you is to pre-process your data via iterative filtering and skip keys/types you don't want in your final JSON. Then the <code>json</code> module should be able to process it without any additional instructions. Something like:</p>
+<pre><code>import collections
+
+class SkipFilter(object):
+
+    def __init__(self, types=None, keys=None, allow_empty=False):
+        self.types = tuple(types or [])
+        self.keys = set(keys or [])
+        self.allow_empty = allow_empty  # if True include empty filtered structures
+
+    def filter(self, data):
+        if isinstance(data, collections.Mapping):
+            result = {}  # dict-like, use dict as a base
+            for k, v in data.items():
+                if k in self.keys or isinstance(v, self.types):  # skip key/type
+                    continue
+                try:
+                    result[k] = self.filter(v)
+                except ValueError:
+                    pass
+            if result or self.allow_empty:
+                return result
+        elif isinstance(data, collections.Sequence):
+            result = []  # a sequence, use list as a base
+            for v in data:
+                if isinstance(v, self.types):  # skip type
+                    continue
+                try:
+                    result.append(self.filter(v))
+                except ValueError:
+                    pass
+            if result or self.allow_empty:
+                return result
+        else:  # we don't know how to traverse this structure...
+            return data  # return it as-is, hope for the best...
+        raise ValueError
+</code></pre>
+<p>Then create your filter:</p>
+<pre><code>import io
+
+preprocessor = SkipFilter([io.BytesIO], ["_io"])  # double-whammy skip of io.BytesIO
+</code></pre>
+<p>In this case skipping just by type should suffice, but in case the <code>_io</code> key holds some other undesirable data this guarantees it won't be in the final result. Anyway, you can then just filter the data prior to passing it to the <code>JSONEncoder</code>:</p>
+<pre><code>import json
+
+json_data = json.dumps(preprocessor.filter(packet))  # no _io keys or io.BytesIO data...
+</code></pre>
+<p>Of course, if your structure contains some other exotic data or data that is represented in JSON differently based on its type, this approach might mess it up as it turns all mappings into <code>dict</code> and all sequences into <code>list</code>. However, for general usage this should be more than enough.</p>
+</div>
+<span class="comment-copy"><code>skipkeys</code> only ignores non-primitive keys, not values</span>
+<span class="comment-copy">@EdwardMinnix ah, I knew I was missing something... is there any way then to skip the encoding of a certain field altogether?</span>
+<span class="comment-copy">@mz8i did you find out why the changes in Construct2.9 produces <code>_io</code>? I've been using Construct for years and converting to json nicely now until the 2.9 update.</span>
+<span class="comment-copy">I always thought overloading would be nice in Python, but didn't know how to do it. This is pretty awesome. Are there mechanics to split the overload into dicts, iterables, and non-iterables? It feels bad to have to list <code>int</code>, <code>float</code>, <code>str</code>, <code>bool</code>, etc.</span>
+<span class="comment-copy">thanks Martijn, exactly what I was looking for. While that's fairly obvious after reading the documentation for <code>singledispatch</code>, you might want to add that in order to use this it's enough to call <code>json_serializable(packet, skip_underscore=True)</code></span>
+<span class="comment-copy">Single dispatch isn’t quite the same as overloading; it’s a switch choice based on the type of the first argument. I registered a separate function for supported types as that’s cleaner than manually testing each value. That also lets you trivially add more supported types later on or you can register new types with another dispatch function that converts that type to something that is JSON compatible.</span>

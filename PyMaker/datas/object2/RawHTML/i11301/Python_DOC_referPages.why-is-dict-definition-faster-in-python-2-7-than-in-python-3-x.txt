@@ -1,0 +1,157 @@
+<div class="post-text" itemprop="text">
+<p>I have encountered a (not very unusual) situation in which I had to either use a <code>map()</code> or a list comprehension expression. And then I wondered which one is faster.</p>
+<p><a href="https://stackoverflow.com/a/1247490/3120525">This</a> StackOverflow answer provided me the solution, but then I started to test it myself. Basically the results were the same, but I found an unexpected behavior when switching to Python 3 that I got curious about, and namely:</p>
+<pre><code>λ iulian-pc ~ → python --version
+Python 2.7.6
+λ iulian-pc ~ → python3 --version
+Python 3.4.3
+
+λ iulian-pc ~ → python -mtimeit '{}'                                                     
+10000000 loops, best of 3: 0.0306 usec per loop
+λ iulian-pc ~ → python3 -mtimeit '{}'                
+10000000 loops, best of 3: 0.105 usec per loop
+
+λ iulian-pc ~ → python -mtimeit 'dict()'
+10000000 loops, best of 3: 0.103 usec per loop
+λ iulian-pc ~ → python3 -mtimeit 'dict()'
+10000000 loops, best of 3: 0.165 usec per loop
+</code></pre>
+<p>I had the assumption that Python 3 is faster than Python 2, but it turned out in several posts (<a href="https://www.reddit.com/r/Python/comments/272bao/python_34_slow_compared_to_27_whats_your_mileage/" rel="nofollow noreferrer">1</a>, <a href="https://www.quora.com/How-fast-is-Python-3-x-compared-to-2-7" rel="nofollow noreferrer">2</a>) that it's not the case. Then I thought that maybe Python 3.5 will perform better at such a simple task, as they state in their <code>README</code>:</p>
+<blockquote>
+<p>The language is mostly the same, but many details, especially how
+  built-in objects like dictionaries and strings work, have changed
+  considerably, and a lot of deprecated features have finally been
+  removed.</p>
+</blockquote>
+<p>But nope, it performed even worse:</p>
+<pre><code>λ iulian-pc ~ → python3 --version
+Python 3.5.0
+
+λ iulian-pc ~ → python3 -mtimeit '{}'       
+10000000 loops, best of 3: 0.144 usec per loop
+λ iulian-pc ~ → python3 -mtimeit 'dict()'
+1000000 loops, best of 3: 0.217 usec per loop
+</code></pre>
+<p>I've tried to dive into the Python 3.5 source code for <code>dict</code>, but my knowledge of C language is not sufficient to find the answer myself (or, maybe I even don't search in the right place).</p>
+<h2>So, my question is:</h2>
+<p>What makes the newer version of Python slower comparing to an older version of Python on a relatively simple task such as a <code>dict</code> definition, as by the common sense it should be vice-versa? I'm aware of the fact that these differences are so small that in most cases they can be neglected. It was just an observation that made me curious about why the time increased and not remained the same at least?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Let's <a href="https://docs.python.org/3/library/dis.html#dis.dis">disassemble</a> <code>{}</code>:</p>
+<pre><code>&gt;&gt;&gt; from dis import dis
+&gt;&gt;&gt; dis(lambda: {})
+  1           0 BUILD_MAP                0
+              3 RETURN_VALUE
+</code></pre>
+<p><a href="https://hg.python.org/cpython/file/2.7/Python/ceval.c#l2498">Python 2.7 implementation of BUILD_MAP</a></p>
+<pre><code>TARGET(BUILD_MAP)
+{
+    x = _PyDict_NewPresized((Py_ssize_t)oparg);
+    PUSH(x);
+    if (x != NULL) DISPATCH();
+    break;
+}
+</code></pre>
+<p><a href="https://hg.python.org/cpython/file/3.5/Python/ceval.c#l2582">Python 3.5 implementation of BUILD_MAP</a></p>
+<pre><code>TARGET(BUILD_MAP) {
+    int i;
+    PyObject *map = _PyDict_NewPresized((Py_ssize_t)oparg);
+    if (map == NULL)
+        goto error;
+    for (i = oparg; i &gt; 0; i--) {
+        int err;
+        PyObject *key = PEEK(2*i);
+        PyObject *value = PEEK(2*i - 1);
+        err = PyDict_SetItem(map, key, value);
+        if (err != 0) {
+            Py_DECREF(map);
+            goto error;
+        }
+    }
+
+    while (oparg--) {
+        Py_DECREF(POP());
+        Py_DECREF(POP());
+    }
+    PUSH(map);
+    DISPATCH();
+}
+</code></pre>
+<p>It's little bit more code.</p>
+<h1>EDIT:</h1>
+<p>Python 3.4 implementation of BUILD_MAP id exactly the same as 2.7 (thanks @user2357112). I dig deeper and it's looks like Python 3 min size of dict is 8 <a href="https://hg.python.org/cpython/file/3.4/Objects/dictobject.c#l60">PyDict_MINSIZE_COMBINED const</a></p>
+<blockquote>
+<p>PyDict_MINSIZE_COMBINED is the starting size for any new, non-split dict. 8 allows dicts with no more than 5 active entries; experiments suggested this suffices for the majority of dicts (consisting mostly of usually-small dicts created to pass keyword arguments). Making this 8, rather than 4 reduces the number of resizes for most dictionaries, without any significant extra memory use.</p>
+</blockquote>
+<p>Look at <a href="https://hg.python.org/cpython/file/3.4/Objects/dictobject.c#l1031">_PyDict_NewPresized in Python 3.4</a></p>
+<pre><code>PyObject *
+_PyDict_NewPresized(Py_ssize_t minused)
+{
+    Py_ssize_t newsize;
+    PyDictKeysObject *new_keys;
+    for (newsize = PyDict_MINSIZE_COMBINED;
+         newsize &lt;= minused &amp;&amp; newsize &gt; 0;
+         newsize &lt;&lt;= 1)
+        ;
+    new_keys = new_keys_object(newsize);
+    if (new_keys == NULL)
+        return NULL;
+    return new_dict(new_keys, NULL);
+}
+</code></pre>
+<p>and in <a href="https://hg.python.org/cpython/file/2.7/Objects/dictobject.c#l685">2.7</a></p>
+<pre><code>PyObject *
+_PyDict_NewPresized(Py_ssize_t minused)
+{
+    PyObject *op = PyDict_New();
+
+    if (minused&gt;5 &amp;&amp; op != NULL &amp;&amp; dictresize((PyDictObject *)op, minused) == -1) {
+        Py_DECREF(op);
+        return NULL;
+    }
+    return op;
+}
+</code></pre>
+<p>In both cases <code>minused</code> has value 1.</p>
+<p>Python 2.7 create a empty dict and Python 3.4 create a 7-element dict.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><strong>Because nobody cares</strong></p>
+<p>The differences you are citing are on the order of tens or hundreds of nanoseconds.  A slight difference in how the C compiler optimizes register use could easily cause such changes (as could any number of other C-level optimization differences).  That, in turn, could be caused by any number of things, such as changes in the number and usage of local variables in the C implementation of Python (CPython), or even just switching C compilers.</p>
+<p>The fact is, nobody is actively optimizing for these small differences, so nobody is going to be able to give you a specific answer.  CPython is not designed to be fast in an absolute sense.  It is designed to be <em>scalable</em>.  So, for example, you can shove hundreds or thousands of items into a dictionary and it will continue to perform well.  But the absolute speed of creating a dictionary simply isn't a primary concern of the Python implementors, at least when the differences are this small.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As @Kevin already stated:</p>
+<blockquote>
+<p>CPython is not designed to be fast in an absolute sense. It is
+  designed to be scalable</p>
+</blockquote>
+<p>Try this instead:</p>
+<pre><code>$ python -mtimeit "dict([(2,3)]*10000000)"
+10 loops, best of 3: 512 msec per loop
+$
+$ python3 -mtimeit "dict([(2,3)]*10000000)"
+10 loops, best of 3: 502 msec per loop
+</code></pre>
+<p>And again:</p>
+<pre><code>$ python -mtimeit "dict([(2,3)]*100000000)"
+10 loops, best of 3: 5.19 sec per loop
+$
+$ python3 -mtimeit "dict([(2,3)]*100000000)"
+10 loops, best of 3: 5.07 sec per loop
+</code></pre>
+<p>That pretty shows that you can't benchmark Python3 as losing against Python2 on such an insignificant difference. From the look of things, Python3 should scale better.</p>
+</div>
+<span class="comment-copy">Note that <code>dict()</code> is a function call. This requires a lookup for the <code>dict</code> function and then calling it, which obviously has much more overhead than built-in syntax that requires no lookups.</span>
+<span class="comment-copy">@Bakuriu, I know, I just put it to show that both literal and constructor notation have an increase.</span>
+<span class="comment-copy">Now go ahead an find a reason why <code>python -m timeit 1</code> varies between cpython versions.</span>
+<span class="comment-copy">Neither loop actually runs because there are no arguments on the stack.  The 3.x code is <i>not materially different</i> from the 2.x code aside from a few extra not-taken branches and a <code>PUSH(map); DISPATCH();</code>.</span>
+<span class="comment-copy">@Kevin Yes, but the 3.x code have the branches and must analyze when do it and when not.</span>
+<span class="comment-copy">Two extra highly-predictable branches don't seem like they'd cause the observed effect. For the <code>{}</code> case, it takes 3 times as long! Two more branches out of all the branches and allocations already involved aren't going to do that. For the <code>dict()</code> case, none of this code even runs, but the absolute time increase is about the same as the <code>{}</code> case. To find the actual root of the slowdown, you need to dig deeper.</span>
+<span class="comment-copy">My hypothesis would be that the extra allocations involved in the <a href="https://www.python.org/dev/peps/pep-0412/" rel="nofollow noreferrer">split-table dict implementation</a> have a lot to do with the difference - for example, there's now a <code>PyDictKeysObject</code> that gets allocated separately through <code>PyMem_MALLOC</code> instead of through the free list - but to really confirm this, we'd have to compare the performance on 3.2 (the last version before the split-table implementation) and possibly compile some variant builds of 3.5 where we change or eliminate parts and see how they affect the timing.</span>
+<span class="comment-copy">Also, the differences you're pointing out <a href="https://hg.python.org/cpython/file/3.4/Python/ceval.c#l2377" rel="nofollow noreferrer">don't even exist on 3.4</a>; they were a 3.5 change.</span>
+<span class="comment-copy">Thank you for the answer, Kevin. I'm aware of the fact that these differences are tiny, but do you have any idea why the time increased in Python 3.x and not stayed the same?</span>
+<span class="comment-copy">@iulian: No one was <i>trying</i> to make it stay the same, so it's unsurprising that it went up.  It would be equally unsurprising if it went down.  Lots of stuff changed between 2.7 and 3.5.</span>
+<span class="comment-copy">The difference in pretty substantial and almost certainly not due to the number of local variables or register allocation by the compiler. Dict is quite fundamental to the internals of python with a whole bunch of special case optimizations. The difference is probably because of a change in the implementation.</span>
+<span class="comment-copy">@pvg: I <i>mentioned</i> a change in the implementation: "That, in turn, could be caused by any number of things, such as changes in the number <b>and usage</b> of local variables in the C implementation of Python..."  That is an implementation change.</span>
+<span class="comment-copy">@Kevin I think that's technically correct (the best kind of correct!) but the gist of your answer I think misrepresents the scale of both the time difference and implementation change. This didn't happen because they used a couple of more local vars.</span>

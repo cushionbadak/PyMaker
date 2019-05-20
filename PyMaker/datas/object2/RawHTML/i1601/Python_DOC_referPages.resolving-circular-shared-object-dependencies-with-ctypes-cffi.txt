@@ -1,0 +1,316 @@
+<div class="post-text" itemprop="text">
+<p>I would like to use <code>cffi</code> (or even <code>ctypes</code> if I must) to access a C ABI from Python 3 on Linux. The API is implemented by a number of <code>.so</code> files (let's call them <code>libA.so</code>, <code>libB.so</code> and <code>libC.so</code>), such that <code>libA</code> contains the main exported functions, and the other libs provide support for <code>libA</code>.</p>
+<p>Now, <code>libA</code> depends on <code>libB</code> and <code>libB</code> depends on <code>libC</code>. However, there's a problem. There's a global array defined by <code>libA</code> that <code>libC</code> expects to be present. So <code>libC</code> actually depends on <code>libA</code> - a circular dependency. Trying to use cffi or ctags equivalent to <code>dlopen</code> to load <code>libA</code> results in missing symbols from <code>libB</code> and <code>libC</code>, but trying to load <code>libC</code> first results in an error about the missing array (which is in <code>libA</code>).</p>
+<p>Since it's a variable, rather than a function, the RTLD_LAZY option doesn't seem to apply here.</p>
+<p>Oddly, <code>ldd libA.so</code> doesn't show <code>libB</code> or <code>libC</code> as dependencies so I'm not sure if that's part of the problem. I suppose that relies on any program that links with these libraries to explicitly specify them all.</p>
+<p>Is there a way to get around this? One idea was to create a new shared object (say, "all.so") that is dependent on <code>libA</code>, <code>libB</code> and <code>libC</code> so that <code>dlopen("all.so")</code> might load everything it needs in one go, but I can't get this to work either.</p>
+<p>What's the best strategy to handle this situation? In reality, the ABI I'm trying to access is pretty large, with perhaps 20-30 shared object files.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This (if I understood the problem correctly,) is a perfectly normal usecase on <em>Nix</em>, and should run without problems.</p>
+<p>When dealing with problems related to <em>ctypes</em> (<a href="https://docs.python.org/3/library/ctypes.html#module-ctypes" rel="nofollow noreferrer">[Python 3]: ctypes - A foreign function library for Python</a>), the best (generic) way to tackle them is:</p>
+<ul>
+<li>Write a (small) <em>C</em> application that does the required job (and of course, works)</li>
+<li>Only then move to <em>ctypes</em> (basically this is translating the above application)</li>
+</ul>
+<p>I prepared a small (and dummy) example:</p>
+<ul>
+<li><p><em>defines.h</em>:</p>
+<pre class="lang-c prettyprint-override"><code>#pragma once
+
+#include &lt;stdio.h&gt;
+
+#define PRINT_MSG_0() printf("From C: [%s] (%d) - [%s]\n", __FILE__, __LINE__, __FUNCTION__)
+</code></pre></li>
+<li><p><strong><em>libC</em></strong>:</p>
+<ul>
+<li><p><em>libC.h</em>:</p>
+<pre class="lang-c prettyprint-override"><code>#pragma once
+
+
+size_t funcC();
+</code></pre></li>
+<li><p><em>libC.c</em>:</p>
+<pre class="lang-c prettyprint-override"><code>#include "defines.h"
+#include "libC.h"
+#include "libA.h"
+
+
+size_t funcC() {
+    PRINT_MSG_0();
+    for (size_t i = 0; i &lt; ARRAY_DIM; i++)
+    {
+        printf("%zu - %c\n", i, charArray[i]);
+    }
+    printf("\n");
+    return ARRAY_DIM;
+}
+</code></pre></li>
+</ul></li>
+<li><p><strong><em>libB</em></strong>:</p>
+<ul>
+<li><p><em>libB.h</em>:</p>
+<pre class="lang-c prettyprint-override"><code>#pragma once
+
+
+size_t funcB();
+</code></pre></li>
+<li><p><em>libB.c</em>:</p>
+<pre class="lang-c prettyprint-override"><code>#include "defines.h"
+#include "libB.h"
+#include "libC.h"
+
+
+size_t funcB() {
+    PRINT_MSG_0();
+    return funcC();
+}
+</code></pre></li>
+</ul></li>
+<li><p><strong><em>libA</em></strong>:</p>
+<ul>
+<li><p><em>libA.h</em>:</p>
+<pre class="lang-c prettyprint-override"><code>#pragma once
+
+#define ARRAY_DIM 3
+
+
+extern char charArray[ARRAY_DIM];
+
+size_t funcA();
+</code></pre></li>
+<li><p><em>libA.c</em>:</p>
+<pre class="lang-c prettyprint-override"><code>#include "defines.h"
+#include "libA.h"
+#include "libB.h"
+
+
+char charArray[ARRAY_DIM] = {'A', 'B', 'C'};
+
+
+size_t funcA() {
+    PRINT_MSG_0();
+    return funcB();
+}
+</code></pre></li>
+</ul></li>
+<li><p><em>code.py</em>:</p>
+<pre class="lang-python prettyprint-override"><code>#!/usr/bin/env python3
+
+import sys
+from ctypes import CDLL, \
+    c_size_t
+
+
+DLL = "./libA.so"
+
+
+def main():
+    lib_a = CDLL(DLL)
+    func_a = lib_a.funcA
+    func_a.restype = c_size_t
+
+    ret = func_a()
+    print("{:s} returned {:d}".format(func_a.__name__, ret))
+
+
+if __name__ == "__main__":
+    print("Python {:s} on {:s}\n".format(sys.version, sys.platform))
+    main()
+</code></pre></li>
+</ul>
+<p><strong>Output</strong>:</p>
+<blockquote>
+<pre class="lang-c prettyprint-override"><code>[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; ls
+code.py  defines.h  libA.c  libA.h  libB.c  libB.h  libC.c  libC.h
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; gcc -fPIC -shared -o libC.so libC.c
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; gcc -fPIC -shared -o libB.so libB.c -L. -lC
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; gcc -fPIC -shared -o libA.so libA.c -L. -lB
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; ls
+code.py  defines.h  libA.c  libA.h  libA.so  libB.c  libB.h  libB.so  libC.c  libC.h  libC.so
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; LD_LIBRARY_PATH=. ldd libC.so
+        linux-vdso.so.1 =&gt;  (0x00007ffdfb1f4000)
+        libc.so.6 =&gt; /lib/x86_64-linux-gnu/libc.so.6 (0x00007f56dcf23000)
+        /lib64/ld-linux-x86-64.so.2 (0x00007f56dd4ef000)
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; LD_LIBRARY_PATH=. ldd libB.so
+        linux-vdso.so.1 =&gt;  (0x00007ffc2e7fd000)
+        libC.so =&gt; ./libC.so (0x00007fdc90a9a000)
+        libc.so.6 =&gt; /lib/x86_64-linux-gnu/libc.so.6 (0x00007fdc906d0000)
+        /lib64/ld-linux-x86-64.so.2 (0x00007fdc90e9e000)
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; LD_LIBRARY_PATH=. ldd libA.so
+        linux-vdso.so.1 =&gt;  (0x00007ffd20d53000)
+        libB.so =&gt; ./libB.so (0x00007fdbee95a000)
+        libc.so.6 =&gt; /lib/x86_64-linux-gnu/libc.so.6 (0x00007fdbee590000)
+        libC.so =&gt; ./libC.so (0x00007fdbee38e000)
+        /lib64/ld-linux-x86-64.so.2 (0x00007fdbeed5e000)
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; nm -S libC.so | grep charArray
+                 U charArray
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; nm -S libA.so | grep charArray
+0000000000201030 0000000000000003 D charArray
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; LD_LIBRARY_PATH=. python3 code.py
+Python 3.5.2 (default, Nov 12 2018, 13:43:14)
+[GCC 5.4.0 20160609] on linux
+
+From C: [libA.c] (9) - [funcA]
+From C: [libB.c] (7) - [funcB]
+From C: [libC.c] (7) - [funcC]
+0 - A
+1 - B
+2 - C
+
+funcA returned 3
+</code></pre>
+</blockquote>
+<p>But if your array is declared as <em>static</em> (<a href="https://en.cppreference.com/w/c/keyword/static" rel="nofollow noreferrer">[CPPReference]: C keywords: static</a>) (and thus, as a consequence it can't be <em>extern</em> as in the example), then you're kind of toasted.</p>
+<p><strong><em>@EDIT0</em></strong>: Extending the example so that it better fits the description.</p>
+<p>Since <em>ldd</em> doesn't show dependencies between the <em>.so</em>s, I'm going to assume that each is loaded dynamically.</p>
+<ul>
+<li><p><em>utils.h</em>:</p>
+<pre class="lang-c prettyprint-override"><code>#pragma once
+
+#include &lt;dlfcn.h&gt;
+
+
+void *loadLib(char id);
+</code></pre></li>
+<li><p><em>utils.c</em>:</p>
+<pre class="lang-c prettyprint-override"><code>#include "defines.h"
+#include "utils.h"
+
+
+void *loadLib(char id) {
+    PRINT_MSG_0();
+    char libNameFormat[] = "lib%c.so";
+    char libName[8];
+    sprintf(libName, libNameFormat, id);
+    int load_flags = RTLD_LAZY | RTLD_GLOBAL;  // !!! @TODO - @CristiFati: Note RTLD_LAZY: if RTLD_NOW would be here instead, there would be nothing left to do. Same thing if RTLD_GLOBAL wouldn't be specified. !!!
+    void *ret = dlopen(libName, load_flags);
+    if (ret == NULL) {
+        char *err = dlerror();
+        printf("Error loading lib (%s): %s\n", libName, (err != NULL) ? err : "(null)");
+    }
+    return ret;
+}
+</code></pre></li>
+</ul>
+<p>Below is a modified version of <em>libB.c</em>. Note that <strong>the same pattern should also be applied to the original <em>libA.c</em></strong>.</p>
+<ul>
+<li><p><em>libB.c</em>:</p>
+<pre class="lang-c prettyprint-override"><code>#include "defines.h"
+#include "libB.h"
+#include "libC.h"
+#include "utils.h"
+
+
+size_t funcB() {
+    PRINT_MSG_0();
+    void *mod = loadLib('C');
+    size_t ret = funcC();
+    dlclose(mod);
+    return ret;
+}
+</code></pre></li>
+</ul>
+<p><strong>Output</strong>:</p>
+<blockquote>
+<pre class="lang-c prettyprint-override"><code>[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; ls
+code.py  defines.h  libA.c  libA.h  libB.c  libB.h  libC.c  libC.h  utils.c  utils.h
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; gcc -fPIC -shared -o libC.so libC.c utils.c
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; gcc -fPIC -shared -o libB.so libB.c utils.c
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; gcc -fPIC -shared -o libA.so libA.c utils.c
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; ls
+code.py  defines.h  libA.c  libA.h  libA.so  libB.c  libB.h  libB.so  libC.c  libC.h  libC.so  utils.c  utils.h
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; ldd libA.so
+        linux-vdso.so.1 =&gt;  (0x00007ffe5748c000)
+        libc.so.6 =&gt; /lib/x86_64-linux-gnu/libc.so.6 (0x00007f4d9e3f6000)
+        /lib64/ld-linux-x86-64.so.2 (0x00007f4d9e9c2000)
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; ldd libB.so
+        linux-vdso.so.1 =&gt;  (0x00007ffe22fe3000)
+        libc.so.6 =&gt; /lib/x86_64-linux-gnu/libc.so.6 (0x00007fe93ce8a000)
+        /lib64/ld-linux-x86-64.so.2 (0x00007fe93d456000)
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; ldd libC.so
+        linux-vdso.so.1 =&gt;  (0x00007fffe85c3000)
+        libc.so.6 =&gt; /lib/x86_64-linux-gnu/libc.so.6 (0x00007f2d47453000)
+        /lib64/ld-linux-x86-64.so.2 (0x00007f2d47a1f000)
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; nm -S libC.so | grep charArray
+                 U charArray
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; nm -S libA.so | grep charArray
+0000000000201060 0000000000000003 D charArray
+[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; LD_LIBRARY_PATH=. python3 code.py
+Python 3.5.2 (default, Nov 12 2018, 13:43:14)
+[GCC 5.4.0 20160609] on linux
+
+Traceback (most recent call last):
+  File "code.py", line 22, in &lt;module&gt;
+    main()
+  File "code.py", line 12, in main
+    lib_a = CDLL(DLL)
+  File "/usr/lib/python3.5/ctypes/__init__.py", line 347, in __init__
+    self._handle = _dlopen(self._name, mode)
+OSError: ./libA.so: undefined symbol: funcB
+</code></pre>
+</blockquote>
+<p>I believe that this reproduces the problem. Now, if you modify (the 1<sup>st</sup> part of) <em>code.py</em> to:</p>
+<pre class="lang-python prettyprint-override"><code>#!/usr/bin/env python3
+
+import sys
+from ctypes import CDLL, \
+    RTLD_GLOBAL, \
+    c_size_t
+
+
+RTLD_LAZY = 0x0001
+
+DLL = "./libA.so"
+
+
+def main():
+    lib_a = CDLL(DLL, RTLD_LAZY | RTLD_GLOBAL)
+    func_a = lib_a.funcA
+    func_a.restype = c_size_t
+
+    ret = func_a()
+    print("{:s} returned {:d}".format(func_a.__name__, ret))
+
+
+if __name__ == "__main__":
+    print("Python {:s} on {:s}\n".format(sys.version, sys.platform))
+    main()
+</code></pre>
+<p>you'd get the following <strong>output</strong>:</p>
+<blockquote>
+<pre class="lang-c prettyprint-override"><code>[cfati@cfati-ubtu16x64-0:~/Work/Dev/StackOverflow/q053327620]&gt; LD_LIBRARY_PATH=. python3 code.py
+Python 3.5.2 (default, Nov 12 2018, 13:43:14)
+[GCC 5.4.0 20160609] on linux
+
+From C: [libA.c] (11) - [funcA]
+From C: [utils.c] (6) - [loadLib]
+From C: [libB.c] (8) - [funcB]
+From C: [utils.c] (6) - [loadLib]
+From C: [libC.c] (7) - [funcC]
+0 - A
+1 - B
+2 - C
+
+funcA returned 3
+</code></pre>
+</blockquote>
+<p><strong>Notes</strong>:</p>
+<ul>
+<li>It's very important that in <em>C</em> <code>RTLD_LAZY | RTLD_GLOBAL</code> are there. if <em>RTLD_LAZY</em> is replaced by <em>RTLD_NOW</em>, <strong>it won't work</strong>
+<ul>
+<li>Also, if <em>RTLD_GLOBAL</em> isn't specified, it won't work either. I didn't check  whether there are other <em>RTLD_</em> flags that could be specified instead of <em>RTLD_GLOBAL</em> for things to still work</li>
+</ul></li>
+<li>Creating that wrapper library that deals with all libraries loading and initialization, would be a good thing (workaround), especially if you plan to use them from multiple places (that way, the whole process would happen in one place only). But, previous bullet <strong>would still apply</strong></li>
+<li>For some reason, <em>ctypes</em> doesn't expose <em>RTLD_LAZY</em> (and many other related flags, as a matter of fact). Defining it in the <em>code.py</em>, is kind of a workaround, and on different (<em>Nix</em>) platforms (flavors), its value might differ</li>
+</ul>
+</div>
+<span class="comment-copy">How is the "<i>static array</i>" declared? Hopefully, without the <code>static</code> keyword.</span>
+<span class="comment-copy">Hmm, sorry, I guess I meant <i>global</i> - it's declared <code>extern</code> by libC, but not <code>static</code> in <code>libA</code>.</span>
+<span class="comment-copy">Of course it's not declared <i>static</i> by <i>libA</i> (beacauce then <i>libC</i> wouldn't "see" it). What doe <i>*global</i>" mean?</span>
+<span class="comment-copy">Uh, not static? :)  I mean it's available to anything that links with <code>libA</code> I guess.</span>
+<span class="comment-copy">Yeah, sorry, I didn't mean <code>static</code> in that sense, I meant global. My error. I'll edit my question.</span>
+<span class="comment-copy">In this example (thank you for putting it together), <code>ldd</code> shows the dependencies properly, so dlopening <code>libA</code> will result in the whole group of libraries being brought in "at once". For reasons that I don't understand, the libraries I'm actually dealing with (which are not open-source and under NDA so I can't provide details - but the provider is big and won't provide this kind of support to someone like me) don't seem to have their dependencies listed in <code>ldd</code>. I'm not sure how this is possible, frankly, but that's how it is. So I have to dlopen each one individually, hence the catch-22.</span>
+<span class="comment-copy">One idea I've been pursuing is to create a dummy library that is linked against all of the other libraries (<code>libA</code>, <code>libB</code>, <code>libC</code> in this example) and then try to dlopen that, with the hope that doing so will bring in <i>all</i> of the dependencies as a single group. I haven't got this working yet though because there must be 20 - 30 libraries to deal with.</span>
+<span class="comment-copy">I've read  the whole question. Bear in mind that on <i>Lnx</i> one can strip <i>.so</i>s of their symbol information, (<i>ldd</i> will show you squat, but the lib will be loaded and functions from it called).</span>
+<span class="comment-copy">Did the last part answer your question?</span>

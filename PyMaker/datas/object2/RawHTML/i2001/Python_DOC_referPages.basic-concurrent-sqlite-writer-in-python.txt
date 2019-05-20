@@ -1,0 +1,97 @@
+<div class="post-text" itemprop="text">
+<p>I have created a very basic script that periodically writes some data into a database:</p>
+<p><strong>test.py</strong></p>
+<pre><code>import sqlite3
+import sys
+import time
+
+DB_CREATE_TABLE = 'CREATE TABLE IF NOT EXISTS items (item TEXT)'
+DB_INSERT = 'INSERT INTO items VALUES (?)'
+FILENAME = 'test.db'
+
+
+def main():
+    index = int()
+    c = sqlite3.connect(FILENAME)
+    c.execute(DB_CREATE_TABLE)
+    c.commit()
+
+    while True:
+        item = '{name}_{index}'.format(name=sys.argv[1], index=index)
+        c.execute(DB_INSERT, (item,))
+        c.commit()
+        time.sleep(1)
+        index += 1
+
+    c.close()
+
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>Now I can achieve a simple concurrency by running the script several times:</p>
+<pre><code>python3 test.py foo &amp;
+python3 test.py bar &amp;
+</code></pre>
+<p>I have tried to read some articles about scripts writing into the same database file at same time but still I'm not sure how will my script handle such event and I didn't figure any way how to test it.</p>
+<p>My expectations are that in the unlikely event when the two instances of my script try to write to the database in the same millisecond, the later one will simply <strong>silently wait</strong> till the earlier finishes its job.</p>
+<p>Does my current implementation meet my expectations? If it does not, how does it behave in case of such event and how can I fix it?</p>
+</div>
+<div class="post-text" itemprop="text">
+<h1>TL;DR</h1>
+<p>This script <strong>will</strong> meet the expectations.</p>
+<h1>Explanation</h1>
+<p>When the unlikely event of two script instances trying to write at the same time happens, the first one locks the database and the second one silently waits for a while until the first one finishes its transaction so that the database is unlocked for writing again.</p>
+<p>More precisely, the second script instance waits for 5 seconds (by default) and then raises the <code>OperationalError</code> with the message <code>database is locked</code>. As @roganjosh commented, this behavior is actually specific for a Python SQLite wrapper. The documentation <a href="https://docs.python.org/3/library/sqlite3.html#sqlite3.connect" rel="nofollow noreferrer">states</a>:</p>
+<blockquote>
+<p>When a database is accessed by multiple connections, and one of the processes modifies the database, the SQLite database is locked until that transaction is committed. The timeout parameter specifies how long the connection should wait for the lock to go away until raising an exception. The default for the timeout parameter is 5.0 (five seconds).</p>
+</blockquote>
+<h1>Tests</h1>
+<p>To demonstrate the collision event of the two instances I modified the <code>main</code> function:</p>
+<pre><code>def main():
+    c = sqlite3.connect(FILENAME)
+    c.execute(DB_CREATE_TABLE)
+    c.commit()
+    print('{} {}: {}'.format(time.time(), sys.argv[1], 'trying to insert ...'))
+
+    try:
+        c.execute(DB_INSERT, (sys.argv[1],))
+    except sqlite3.OperationalError as e:
+        print('{} {}: {}'.format(time.time(), sys.argv[1], e))
+        return
+
+    time.sleep(int(sys.argv[2]))
+    c.commit()
+    print('{} {}: {}'.format(time.time(), sys.argv[1], 'done')) 
+    c.close()
+</code></pre>
+<p>The documentation states that the database is locked until the transaction is commited. So simply sleeping during the transaction should be enough to test it.</p>
+<h2>Test 1</h2>
+<p>We run the following command:</p>
+<pre><code>python3 test.py first 10 &amp; sleep 1 &amp;&amp; python3 test.py second 0
+</code></pre>
+<p>The first instance is being run and after 1s the second instance is being run. The first instance creates a 10s long transaction during which the second one tries to write to the database, waits and then raises an exception. The log demonstrates that:</p>
+<pre><code>1540307088.6203635 first: trying to insert ...
+1540307089.6155508 second: trying to insert ...
+1540307094.6333485 second: database is locked
+1540307098.6353421 first: done
+</code></pre>
+<h2>Test 2</h2>
+<p>We run the following command:</p>
+<pre><code>python3 test.py first 3 &amp; sleep 1 &amp;&amp; python3 test.py second 0
+</code></pre>
+<p>The first instance is being run and after 1s the second instance is being run. The first instance creates a 3s long transaction during which the second one tries to write to the database and waits. Since it has been created after 1s it has to wait 3s - 1s = 2s which is less than the default 5s so both transactions will finish successfully. The log demonstrates that:</p>
+<pre><code>1540307132.2834115 first: trying to insert ...
+1540307133.2811155 second: trying to insert ...
+1540307135.2912169 first: done
+1540307135.3217440 second: done
+</code></pre>
+<h1>Conclusion</h1>
+<p>The time needed for the transaction to finish is significantly smaller (milliseconds) than the lock time limit (5s) so in this scenario the script indeed meets the expectations. But as @HarlyH. commented, the transactions wait in a queue to be commited so for a heavily used or very large database this is not a good solution since the communication with the database will become slow.</p>
+</div>
+<span class="comment-copy">The default timeout for a locked database is 5 seconds, a lot longer than it would take to execute a single write. So, for your setup, you should be fine.</span>
+<span class="comment-copy">@roganjosh Thank you. I was worried that it would for example raise an exception immediately... Also, if you know where is this thing mentioned in the sqlite docs, it would be very helpful.</span>
+<span class="comment-copy">I think it's an implementation on the python wrapper rather than explicitly being part of SQLite: <a href="https://docs.python.org/2/library/sqlite3.html#sqlite3.connect" rel="nofollow noreferrer">docs.python.org/2/library/sqlite3.html#sqlite3.connect</a> and <a href="https://stackoverflow.com/a/15144547/4799172">stackoverflow.com/a/15144547/4799172</a></span>
+<span class="comment-copy">Please try to avoid using sqlite for concurrent applications. There's locking in place for a reason. And lock times will start increasing as the table starts growing, hence chances of multiple instances trying to edit the same table gro too...  And everything will exponetially start slowing down for all. There are multiple locking configuration or overrides possible but if data integrity is important then I really suggest you'd re-think your plan, as planning concurrenct usage patterns wth SQLite will sooner or later lead to a disaster. Seen this happening in many companies I worked for.</span>
+<span class="comment-copy">Nice, this is the first time I think I've seen a set of testing code around this issue on SO. There's already enough info here to satisfy me for my own applications. It <i>may</i> be interesting to see if we can find the default SQLite retry frequency (every 0.1 sec? or longer?) because, in theory, if it only tries every second and you have heavier use, you could potentially collide multiple times and just keep missing the points when it's not locked.</span>
+<span class="comment-copy">@roganjosh I tried to dig a bit and noticed that the Python wrapper uses a <a href="https://www.sqlite.org/c3ref/busy_timeout.html" rel="nofollow noreferrer">sqlite3_busy_timeout</a> function. So I digged a bit deeper and found in SQLite source code in <a href="https://sqlite.org/src/artifact/6275ece0699a957c" rel="nofollow noreferrer">src/main.c</a> a function called <code>sqliteDefaultBusyCallback</code>. It looks that the retry frequency gradually grows from 1ms up to 100 ms.</span>

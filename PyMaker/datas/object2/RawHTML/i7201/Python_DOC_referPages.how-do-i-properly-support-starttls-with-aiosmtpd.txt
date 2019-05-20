@@ -1,0 +1,160 @@
+<div class="post-text" itemprop="text">
+<p>I have the following server taken almost directly from the aiosmtpd docs:</p>
+<pre><code>import asyncio
+import ssl
+from aiosmtpd.controller import Controller
+
+
+class ExampleHandler:
+    async def handle_RCPT(self, server, session, envelope, address, rcpt_options):
+        if not address.endswith('@example.com'):
+            return '550 not relaying to that domain'
+        envelope.rcpt_tos.append(address)
+        return '250 OK'
+
+    async def handle_DATA(self, server, session, envelope):
+        print(f'Message from {envelope.mail_from}')
+        print(f'Message for {envelope.rcpt_tos}')
+        print(f'Message data:\n{envelope.content.decode("utf8", errors="replace")}')
+        print('End of message')
+        return '250 Message accepted for delivery'
+
+context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+controller = Controller(ExampleHandler(), port=8026, ssl_context=context)
+controller.start()
+
+input('Press enter to stop')
+controller.stop()
+</code></pre>
+<p>However, when I start this server and try to send an email to it using swaks:</p>
+<pre><code>echo 'Testing' | swaks --to wayne@example.com --from "something@example.org" --server localhost --port 8026 -tls
+</code></pre>
+<p>It times out after 30s. If I remove the <code>ssl_context=context</code> from the server and <code>-tls</code> from the client then it sends the mail fine.</p>
+<p>Additionally, when I try to connect via telnet and just send <code>EHLO whatever</code> then the server actually closes the connection.</p>
+<p>What's the correct way to implement an aiosmtpd server that supports tls?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Building upon Wayne's own answer, here's how to create a STARTTLS server with aiosmtpd.</p>
+<h2>1. Create an SSL context</h2>
+<p>For testing, use the following command to generate a self-signed certificate for <code>localhost</code>:</p>
+<p><code>openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'</code></p>
+<p>Load it into Python using the <code>ssl</code> module:</p>
+<pre><code>import ssl
+context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+context.load_cert_chain('cert.pem', 'key.pem')
+</code></pre>
+<h2>2. Pass SSL context to aiosmtpd</h2>
+<p>Create a subclass of aiosmtpd's Controller that passes this context as the <code>tls_context</code> to <code>SMTP</code>:</p>
+<pre><code>from aiosmtpd.smtp import SMTP
+from aiosmtpd.controller import Controller
+
+class ControllerTls(Controller):
+    def factory(self):
+        return SMTP(self.handler, require_starttls=True, tls_context=context)
+</code></pre>
+<h2>3. Run it</h2>
+<p>Instantiate this controller with a handler and start it. Here, I use aiosmtpd's own <code>Debugging</code> handler:</p>
+<pre><code>from aiosmtpd.handlers import Debugging
+controller = ControllerTls(Debugging(), port=1025)
+controller.start()
+input('Press enter to stop')
+controller.stop()
+</code></pre>
+<h2>4. Test it</h2>
+<p>Either configure a local mail client to send to <code>localhost:1025</code>, or use <code>swaks</code>:</p>
+<p><code>swaks -tls -t test --server localhost:1025</code></p>
+<p>... or use <code>openssl s_client</code> to talk to the server after the initial <code>STARTTLS</code> command has been issued:</p>
+<p><code>openssl s_client -crlf -CAfile cert.pem -connect localhost:1025 -starttls smtp</code></p>
+<h2>The full code</h2>
+<p>The code below additionally tests the server using swaks, and it also shows how to create a TLS-on-connect server (as in Wayne's answer).</p>
+<pre><code>import os
+import ssl
+import subprocess
+from aiosmtpd.smtp import SMTP
+from aiosmtpd.controller import Controller
+from aiosmtpd.handlers import Debugging
+
+# Create cert and key if they don't exist
+if not os.path.exists('cert.pem') and not os.path.exists('key.pem'):
+    subprocess.call('openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem ' +
+                    '-days 365 -nodes -subj "/CN=localhost"', shell=True)
+
+# Load SSL context
+context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+context.load_cert_chain('cert.pem', 'key.pem')
+
+# Pass SSL context to aiosmtpd
+class ControllerStarttls(Controller):
+    def factory(self):
+        return SMTP(self.handler, require_starttls=True, tls_context=context)
+
+# Start server
+controller = ControllerStarttls(Debugging(), port=1025)
+controller.start()
+# Test using swaks (if available)
+subprocess.call('swaks -tls -t test --server localhost:1025', shell=True)
+input('Running STARTTLS server. Press enter to stop.\n')
+controller.stop()
+
+# Alternatively: Use TLS-on-connect
+controller = Controller(Debugging(), port=1025, ssl_context=context)
+controller.start()
+# Test using swaks (if available)
+subprocess.call('swaks -tlsc -t test --server localhost:1025', shell=True)
+input('Running TLSC server. Press enter to stop.\n')
+controller.stop()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I was close. I figured from the fact that I could connect via telnet, but <code>EHLO hostname</code> would disconnect that the server was trying to require a TLS connection ahead of time.</p>
+<p>When I examined <code>swaks --help</code> I found that there was a slightly different option that would probably do what I wanted:</p>
+<pre><code>--tlsc, --tls-on-connect
+    Initiate a TLS connection immediately on connection.  Following common convention,
+    if this option is specified the default port changes from 25 to 465, though this can
+    still be overridden with the --port option.
+</code></pre>
+<p>When I tried that, I still got an error:</p>
+<pre><code>$ echo 'Testing' | swaks --to wayne@example.com --from "something@example.com" --server localhost --port 8026 -tlsc
+=== Trying localhost:8026...
+=== Connected to localhost.
+*** TLS startup failed (connect(): error:00000000:lib(0):func(0):reason(0))
+</code></pre>
+<p>Through some of my perusal of the Python ssl documentation, I noticed the <a href="https://docs.python.org/3/library/ssl.html#ssl.SSLContext.load_cert_chain" rel="nofollow noreferrer"><code>load_cert_chain</code></a> method. It turned out that this was exactly what I needed. Following <a href="https://stackoverflow.com/a/10176685/344286">these instructions</a> I generated a totally insecure self-signed certificate:</p>
+<pre><code>openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj '/CN=localhost'
+</code></pre>
+<p>Then I added this line:</p>
+<pre><code>context.load_cert_chain('cert.pem', 'key.pem')
+</code></pre>
+<p>And now I'm able to send email. For the <strike>lazy</strike>curious, here's the entire server code:</p>
+<pre><code>import asyncio
+import ssl
+from aiosmtpd.controller import Controller
+
+
+class ExampleHandler:
+    async def handle_RCPT(self, server, session, envelope, address, rcpt_options):
+        if not address.endswith('@example.com'):
+            return '550 not relaying to that domain'
+        envelope.rcpt_tos.append(address)
+        return '250 OK'
+
+    async def handle_DATA(self, server, session, envelope):
+        print(f'Message from {envelope.mail_from}')
+        print(f'Message for {envelope.rcpt_tos}')
+        print(f'Message data:\n{envelope.content.decode("utf8", errors="replace")}')
+        print('End of message')
+        return '250 Message accepted for delivery'
+
+context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+context.load_cert_chain('cert.pem', 'key.pem')
+controller = Controller(ExampleHandler(), port=8026, ssl_context=context)
+controller.start()
+
+input('Press enter to stop')
+controller.stop()
+</code></pre>
+<p>Which can be validated with:</p>
+<pre><code>echo 'Testing' | swaks --to someone@example.com --from "someone_else@example.org" --server localhost --port 8026 -tlsc
+</code></pre>
+</div>
+<span class="comment-copy">Note that this is not STARTTLS but regular TLS since the connection is not initially plaintext.</span>

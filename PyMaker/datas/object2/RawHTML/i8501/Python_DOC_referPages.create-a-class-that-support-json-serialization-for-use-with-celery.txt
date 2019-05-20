@@ -1,0 +1,199 @@
+<div class="post-text" itemprop="text">
+<p>I'm using Celery to run some background tasks. One of the tasks returns a python class I created. I want to use json to serialize and deserialize this class, given the warnings about using pickle.</p>
+<p>Is there a simple built in way to achieve this?</p>
+<p>The class is very simple, it contains 3 attributes all of which are lists of named tuples. It contains a couple of methods that performs some calculations on the attributes.</p>
+<p>My idea is to serialize/deserialize the 3 attributes, since that defines the class.</p>
+<p>This is my idea for the encoder, but I'm not sure how to decode the data again?</p>
+<pre><code>import json
+
+class JSONSerializable(object):
+    def __repr__(self):
+        return json.dumps(self.__dict__)
+
+class MySimpleClass(JSONSerializable):
+    def __init__(self, p1, p2, p3): # I only care about p1, p2, p3
+        self.p1 = p1
+        self.p2 = p2
+        self.p3 = p2
+        self.abc = p1 + p2 + p2
+
+    def some_calc(self):
+        ...
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>First but not least important: the warnings against pickle are mainly if you could have 3rd partis injecting pickled data on your worker stream. If you are certain your own system is creating all pickled data to be consumed, there is no security problem at all. And as for compatibility, it is relatively easy to handle, and automatic if you are on the same Python version for produers and consumers of your Pickle files.</p>
+<p>That said, for JSON, you have to create a subclass of <a href="https://docs.python.org/3/library/json.html#encoders-and-decoders" rel="nofollow noreferrer">Python's <code>json.JSONEncoder</code> and <code>json.JSONDecoder</code></a> - each of which will need to be passed as the <code>cls</code> argument to all your <code>json.dump(s)</code> and <code>json.load(s)</code> calls.</p>
+<p>A suggestion is that the <code>default</code> method on the encoder encodes the class <code>__module__</code>, its <code>__name__</code> and a identifier key, say <code>__custom__</code> to ensure it should be custom decoded, as keys to a dictionary, and the object's data as  a "data" key.</p>
+<p>And on the encoder, you check for the  <code>__custom__</code> key, and them instantiate a class using the <code>__new__</code> method, and populate its dict. Like for pickle, side-effects that are triggered on the class <code>__init__</code> won't run. </p>
+<p>You can later on enhance your decoder and encoder so that, for example, they search the class for a <code>__json_encode__</code> method that could handle only the desired attributes.  </p>
+<p>Sample implementation:</p>
+<pre><code>import json
+
+class GenericJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        try:
+            return super().default(obj)
+        except TypeError:
+            pass
+        cls = type(obj)
+        result = {
+            '__custom__': True,
+            '__module__': cls.__module__,
+            '__name__': cls.__name__,
+            'data': obj.__dict__ if not hasattr(cls, '__json_encode__') else obj.__json_encode__
+        }
+        return result
+
+
+class GenericJSONDecoder(json.JSONDecoder):
+    def decode(self, str):
+        result = super().decode(str)
+        if not isinstance(result, dict) or not result.get('__custom__', False):
+            return result
+        import sys
+        module = result['__module__']
+        if not module in sys.modules:
+            __import__(module)
+        cls = getattr(sys.modules[module], result['__name__'])
+        if hasattr(cls, '__json_decode__'):
+            return cls.__json_decode__(result['data'])
+        instance = cls.__new__(cls)
+        instance.__dict__.update(result['data'])
+        return instance
+</code></pre>
+<p>Interactive test on the console:</p>
+<pre><code>In [36]: class A:
+    ...:     def __init__(self, a):
+    ...:         self.a = a
+    ...:         
+
+In [37]: a = A('test')
+
+In [38]: b = json.loads(json.dumps(a, cls=GenericJSONEncoder),  cls=GenericJSONDecoder)
+
+In [39]: b.a
+Out[39]: 'test'
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here is an improved version of the great solution provided by @jsbueno which also works with nested custom types. </p>
+<pre><code>import json
+import collections
+import six
+
+def is_iterable(arg):
+    return isinstance(arg, collections.Iterable) and not isinstance(arg, six.string_types)
+
+
+class GenericJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        try:
+            return super().default(obj)
+        except TypeError:
+            pass
+        cls = type(obj)
+        result = {
+            '__custom__': True,
+            '__module__': cls.__module__,
+            '__name__': cls.__name__,
+            'data': obj.__dict__ if not hasattr(cls, '__json_encode__') else obj.__json_encode__
+        }
+        return result
+
+
+class GenericJSONDecoder(json.JSONDecoder):
+    def decode(self, str):
+        result = super().decode(str)
+        return GenericJSONDecoder.instantiate_object(result)
+
+    @staticmethod
+    def instantiate_object(result):
+        if not isinstance(result, dict):  # or
+            if is_iterable(result):
+                return [GenericJSONDecoder.instantiate_object(v) for v in result]
+            else:
+                return result
+
+        if not result.get('__custom__', False):
+            return {k: GenericJSONDecoder.instantiate_object(v) for k, v in result.items()}
+
+        import sys
+        module = result['__module__']
+        if module not in sys.modules:
+            __import__(module)
+        cls = getattr(sys.modules[module], result['__name__'])
+        if hasattr(cls, '__json_decode__'):
+            return cls.__json_decode__(result['data'])
+        instance = cls.__new__(cls)
+        data = {k: GenericJSONDecoder.instantiate_object(v) for k, v in result['data'].items()}
+        instance.__dict__.update(data)
+        return instance
+
+
+class C:
+
+    def __init__(self):
+        self.c = 133
+
+    def __repr__(self):
+        return "C&lt;" + str(self.__dict__) + "&gt;"
+
+
+class B:
+
+    def __init__(self):
+        self.b = {'int': 123, "c": C()}
+        self.l = [123, C()]
+        self.t = (234, C())
+        self.s = "Blah"
+
+    def __repr__(self):
+        return "B&lt;" + str(self.__dict__) + "&gt;"
+
+
+class A:
+    class_y = 13
+
+    def __init__(self):
+        self.x = B()
+
+    def __repr__(self):
+        return "A&lt;" + str(self.__dict__) + "&gt;"
+
+
+def dumps(obj, *args, **kwargs):
+    return json.dumps(obj, *args, cls=GenericJSONEncoder, **kwargs)
+
+
+def dump(obj, *args, **kwargs):
+    return json.dump(obj, *args, cls=GenericJSONEncoder, **kwargs)
+
+
+def loads(obj, *args, **kwargs):
+    return json.loads(obj, *args, cls=GenericJSONDecoder, **kwargs)
+
+
+def load(obj, *args, **kwargs):
+    return json.load(obj, *args, cls=GenericJSONDecoder, **kwargs)
+</code></pre>
+<p>Check it out:</p>
+<pre><code>e = dumps(A())
+print("ENCODED:\n\n", e)
+b = json.loads(e, cls=GenericJSONDecoder)
+b = loads(e)
+print("\nDECODED:\n\n", b)
+</code></pre>
+<p>Prints:</p>
+<pre><code> A&lt;{'x': B&lt;{'b': {'int': 123, 'c': C&lt;{'c': 133}&gt;}, 'l': [123, C&lt;{'c': 133}&gt;], 't': [234, C&lt;{'c': 133}&gt;], 's': 'Blah'}&gt;}&gt;
+</code></pre>
+<p>The original version only reconstructs the <code>A</code> correctly while all instances of <code>B</code> and <code>C</code> are not instantiated but left as dicts:</p>
+<pre><code>A&lt;{'x': {'__custom__': True, '__module__': '__main__', '__name__': 'B', 'data': {'b': {'int': 123, 'c': {'__custom__': True, '__module__': '__main__', '__name__': 'C', 'data': {'c': 133}}}, 'l': [123, {'__custom__': True, '__module__': '__main__', '__name__': 'C', 'data': {'c': 133}}], 't': [234, {'__custom__': True, '__module__': '__main__', '__name__': 'C', 'data': {'c': 133}}], 's': 'Blah'}}}&gt;
+</code></pre>
+<p>Note that if the type contains an collection like list or tuple, the actual type of the collection can not be restored during decoding. This is because all those collections will be converted into lists when encoded to json.</p>
+</div>
+<span class="comment-copy">Possible duplicate of <a href="http://stackoverflow.com/questions/21631878/celery-is-there-a-way-to-write-custom-json-encoder-decoder">Celery: is there a way to write custom JSON Encoder/Decoder?</a></span>
+<span class="comment-copy">Great, all the pickled data is within my control so I guess it's fine if I continue using pickle.</span>
+<span class="comment-copy">This is awesome! Thanks so much!</span>
+<span class="comment-copy">I want to <code>pip install jsbueno_serializer</code> is that on PyPI?</span>
+<span class="comment-copy">Not yet - I've pasted it as a gist: <a href="https://gist.github.com/jsbueno/9b2ea63fb16b84658281ec29b375283e" rel="nofollow noreferrer">gist.github.com/jsbueno/9b2ea63fb16b84658281ec29b375283e</a> we can package it later in the day.</span>

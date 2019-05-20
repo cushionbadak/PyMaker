@@ -1,0 +1,143 @@
+<div class="post-text" itemprop="text">
+<p>I wish to write a python program which reads files containing unicode text. These files are normally encoded with UTF-8, but might not be; if they aren't, the alternate encoding will be explicitly declared at the beginning of the file. More precisely, it will be declared using exactly the same rules as Python itself uses to allow Python source code to have an explicitly declared encoding (as in PEP 0263, see <a href="https://www.python.org/dev/peps/pep-0263/" rel="nofollow noreferrer" title="PEP 0263 -- Defining Python Source Code Encodings">https://www.python.org/dev/peps/pep-0263/</a> for more details). Just to be clear, the files being processed are not actually python source, but they do declare their encodings (when not in UTF-8) using the same rules.</p>
+<p>If one knows the encoding of a file before one opens it, Python provides a very easy way to read the file with automatic decoding: the <code>codecs.open</code> command; for instance, one might do:</p>
+<pre><code>import codecs
+f = codecs.open('unicode.rst', encoding='utf-8')
+for line in f:
+    print repr(line)
+</code></pre>
+<p>and each <code>line</code> we get in the loop will be a unicode string. Is there a Python library which does a similar thing, but choosing the encoding according to the rules above (which are Python 3.0's rules, I think)? (e.g. does Python expose the 'read file with self-declared encoding' it uses to read source to the language?) If not, what's the easiest way to achieve the desired effect?</p>
+<p>One thought is to open the file using the usual <code>open</code>, read the first two lines, interpret them as UTF-8, look for a coding declaration using the regexp in the PEP, and if one finds one start decoding all subsequent lines using the encoding declared. For this to be sure to work, we need to know that for all the encodings that Python allows in Python source, the usual Python <code>readline</code> will correctly split the file into lines - that is, we need to know that for all the encodings Python allows in Python source, the byte string '\n' always really mean newline, and isn't part of some multi-byte sequence encoding another character. (In fact I also need to worry about '\r\n' as well.) Does anyone know if this is true? The docs were not very specific. </p>
+<p>Another thought is to look in the Python sources. Does anyone know where in the Python source the source-code-encoding-processing is done?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You should be able to roll your own decoder in Python. If you're only supporting 8-bit encodings which are supersets of ASCII the code below should work as-is. </p>
+<p>If you need support 2-byte <a href="http://en.wikipedia.org/wiki/UTF-16/UCS-2" rel="noreferrer">encodings like UTF-16</a> you'd need to augment the pattern to match <code>\x00c\x00o..</code> or the reverse, depending on <a href="http://en.wikipedia.org/wiki/Byte_Order_Mark" rel="noreferrer">the byte order mark</a>. 
+First, generate a few test files which advertise their encoding:</p>
+<pre><code>import codecs, sys
+for encoding in ('utf-8', 'cp1252'):
+    out = codecs.open('%s.txt' % encoding, 'w', encoding)
+    out.write('# coding = %s\n' % encoding)
+    out.write(u'\u201chello se\u00f1nor\u201d')
+    out.close()
+</code></pre>
+<p>Then write the decoder:</p>
+<pre><code>import codecs, re
+
+def open_detect(path):
+    fin = open(path, 'rb')
+    prefix = fin.read(80)
+    encs = re.findall('#\s*coding\s*=\s*([\w\d\-]+)\s+', prefix)
+    encoding = encs[0] if encs else 'utf-8'
+    fin.seek(0)
+    return codecs.EncodedFile(fin, 'utf-8', encoding)
+
+for path in ('utf-8.txt','cp1252.txt'):
+    fin = open_detect(path)
+    print repr(fin.readlines())
+</code></pre>
+<p>Output:</p>
+<pre><code>['# coding = utf-8\n', '\xe2\x80\x9chello se\xc3\xb1nor\xe2\x80\x9d']
+['# coding = cp1252\n', '\xe2\x80\x9chello se\xc3\xb1nor\xe2\x80\x9d']
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I examined the sources of <code>tokenizer.c</code> (thanks to @Ninefingers for suggesting this in another answer and giving a link to the source browser). It seems that the exact algorithm used by Python is (equivalent to) the following. In various places I'll describe the algorithm as reading byte by byte---obviously one wants to do something buffered in practice, but it's easier to describe this way. The initial part of the file is processed as follows:</p>
+<ol>
+<li>Upon opening a file, attempt to recognize the UTF-8 BOM at the beginning of the file. If you see it, eat it and make a note of the fact you saw it. <em>Do not</em> recognize the UTF-16 byte order mark.</li>
+<li>Read 'a line' of text from the file. 'A line' is defined as follows: you keep reading bytes until you see one of the strings '\n', '\r' or '\r\n' (trying to match as long a string as possible---this means that if you see '\r' you have to speculatively read the next character, and if it's not a '\n', put it back). The terminator is included in the line, as is usual Python practice.</li>
+<li>Decode this string using the UTF-8 codec. Unless you have seen the UTF-8 BOM, generate an error message if you see any non-ASCII characters (i.e. any characters above 127).  (Python 3.0 does not, of course, generate an error here.) Pass this decoded line on to the user for processing.</li>
+<li>Attempt to interpret this line as a comment containing a coding declaration, using the regexp in <a href="http://www.python.org/dev/peps/pep-0263/" rel="nofollow">PEP 0263</a>. If you find a coding declaration, skip to the instructions below for 'I found a coding declaration'.</li>
+<li>OK, so you didn't find a coding declaration. Read another line from the input, using the same rules as in step 2 above.</li>
+<li>Decode it, using the same rules as step 3, and pass it on to the user for processing.</li>
+<li>Attempt again to interpred this line as a coding declaration comment, as in step 4. If you find one, skip to the instructions below for 'I found a coding declaration'.</li>
+<li>OK. We've now checked the first two lines. According to PEP 0263, if there was going to be a coding declaration, it would have been on the first two lines, so we now know we're not going to see one. We now read the rest of the file using the same reading instructions as we used to read the first two lines: we read the lines using the rules in step 2, decode using the rules in step 3 (making an error if we see non-ASCII bytes unless we saw a BOM).</li>
+</ol>
+<p>Now the rules for what to do when '<strong>I found a coding declaration</strong>':</p>
+<ol>
+<li>If we previously saw a UTF-8 BOM, check that the coding declaration says 'utf-8' in some form. Throw an error otherwise. (''utf-8' in some form' means anything which, after converting to lower case and converting underscores to hyphens, is either the literal string <code>'utf-8'</code>, or something beginning with <code>'utf-8-'</code>.)</li>
+<li>Read the rest of the file using the decoder associated to the given encoding in the Python <code>codecs</code> module. In particular, the division of the rest of the bytes in the file into lines is the job of the new encoding.</li>
+<li>One final wrinkle: universal newline type stuff. The rules here are as follows. If the encoding is anything except 'utf-8' in some form or 'latin-1' in some form, do no universal-newline stuff at all; just pass out lines exactly as they come from the decoder in the <code>codecs</code> module. On the other hand, if the encoding is 'utf-8' in some form or 'latin-1' in some form, transform lines ending '\r' or '\r\n' into lines ending '\n'. (''utf-8' in some form' means the same as before. ''latin-1' in some form' means means anything which, after converting to lower case and converting underscores to hyphens, is one of the literal strings <code>'latin-1'</code>, <code>'iso-latin-1'</code> or <code>'iso-8859-1'</code>, or any string beginning with one of <code>'latin-1-'</code>, <code>'iso-latin-1-'</code> or <code>'iso-8859-1-'</code>.</li>
+</ol>
+<p>For what I'm doing, fidelity to Python's behaviour is important. My plan is to roll an implementation of the algorithm above in Python, and use this. Thanks for everyone who answered!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>From said <a href="http://www.python.org/dev/peps/pep-0263/" rel="nofollow">PEP (0268)</a>:</p>
+<blockquote>
+<p>Python's tokenizer/compiler combo will
+  need to be updated to work as follows:</p>
+<ol>
+<li><p>read the file</p></li>
+<li><p>decode it into Unicode assuming a fixed per-file encoding</p></li>
+<li><p>convert it into a UTF-8 byte string</p></li>
+<li><p>tokenize the UTF-8 content</p></li>
+<li><p>compile it, creating Unicode objects from the given Unicode data
+        and creating string objects from the Unicode literal data
+        by first reencoding the UTF-8 data into 8-bit string data
+        using the given file encoding</p></li>
+</ol>
+</blockquote>
+<p>Indeed, if you check <code>Parser/tokenizer.c</code> in the Python source you'll find functions <a href="http://hg.python.org/cpython/file/bf5b974e7d32/Parser/tokenizer.c#l224" rel="nofollow"><code>get_coding_spec</code></a> and <a href="http://hg.python.org/cpython/file/bf5b974e7d32/Parser/tokenizer.c#l271" rel="nofollow"><code>check_coding_spec</code></a> which are responsible for finding this information on a line being examined in <a href="http://hg.python.org/cpython/file/bf5b974e7d32/Parser/tokenizer.c#l543" rel="nofollow"><code>decoding_fgets</code></a>.</p>
+<p>It doesn't look like this capability is being exposed anywhere to you as a python API (at least these specific functions aren't <code>Py</code> prefixed -, so your options are third party library and/or re-purposing these functions as an extension. I don't personally know of any third party libraries - I can't see this functionality in the standard library either.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Starting from Python 3.4 there is a function which allows you to do what you're asking for – <code>importlib.util.decode_source</code></p>
+<p>According to <a href="https://docs.python.org/3/library/importlib.html?highlight=importlib#importlib.util.decode_source" rel="nofollow">documentation</a>:</p>
+<blockquote>
+<p><code>importlib.util.decode_source(source_bytes)</code><br/>
+  Decode the given bytes representing source code and return it as a string with universal newlines (as required by <code>importlib.abc.InspectLoader.get_source()</code>).</p>
+</blockquote>
+<p>Brett Cannon <a href="https://youtu.be/R31NRWgoIWM?t=254" rel="nofollow">talks</a> about this function in his talk <em>From Source to Code: How CPython's Compiler Works</em>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There is support for this in the standard library, even in Python 2. Here is code you can use:</p>
+<pre><code>try:
+
+    # Python 3
+    from tokenize import open as open_with_encoding_check
+
+except ImportError:
+
+    # Python 2
+    from lib2to3.pgen2.tokenize import detect_encoding
+    import io
+
+
+    def open_with_encoding_check(filename):
+        """Open a file in read only mode using the encoding detected by
+        detect_encoding().
+        """
+        fp = io.open(filename, 'rb')
+        try:
+            encoding, lines = detect_encoding(fp.readline)
+            fp.seek(0)
+            text = io.TextIOWrapper(fp, encoding, line_buffering=True)
+            text.mode = 'r'
+            return text
+        except:
+            fp.close()
+            raise
+</code></pre>
+<p>Then personally I needed to parse and compile this source. In Python 2 it's an error to compile unicode text that includes an encoding declaration, so lines containing the declaration have to be made blank (not removed, as this changes line numbers) first. So I also made this function:</p>
+<pre><code>def read_source_file(filename):
+    from lib2to3.pgen2.tokenize import cookie_re
+
+    with open_with_encoding_check(filename) as f:
+        return ''.join([
+            '\n' if i &lt; 2 and cookie_re.match(line)
+            else line
+            for i, line in enumerate(f)
+        ])
+</code></pre>
+<p>I'm using these in my package, the latest source (in case I find I need to change them) can be found <a href="https://github.com/alexmojaki/birdseye/blob/master/birdseye/utils.py" rel="nofollow noreferrer">here</a>, while tests are <a href="https://github.com/alexmojaki/birdseye/blob/master/tests/test_utils.py" rel="nofollow noreferrer">here</a>.</p>
+</div>
+<span class="comment-copy">It seems Python 3.4 brings answer to your question – see my answer.</span>
+<span class="comment-copy">Thanks! This is nice and simple, and will work pretty well in practical examples. It is probably the best solution in most cases! For my own requirements, exact fidelity to what Python does is important, so I will end up doing something rather more elaborate, as described in my answer below, which I include just in case anyone else who cares about exact fidelity finds this question on StackOverflow.</span>
+<span class="comment-copy"><i>this means that if you see '\r' you have to speculatively read the next character, and if it's not a '\n', put it back</i> Why don't you treat <code>\r</code> as a valid EOL character? <i>Decode this string using the UTF-8 codec. Unless you have seen the UTF-8 BOM, generate an error message if you see any non-ASCII characters (...)</i> Shouldn't this be reversed?</span>
+<span class="comment-copy">@PiotrDobrogost : You do treat <code>\r</code> as a valid EOL character. The point is that if character immediately following the <code>\r</code> is a <code>\n</code>, then that <code>\n</code> must be 'eaten' as part of the line ending with the <code>\r</code> and <i>not</i> treated as part of the next line. If the character immediately following the <code>\r</code> is anything other than <code>\n</code>, then it should instead be left in the stream to be the first character of the next line. That's why you need the 'put back' logic described.</span>
+<span class="comment-copy">@PiotrDobrogost: "Unless you have seen the UTF-8 BOM, generate an error message if you see any non-ASCII characters". I think this is correct as written. The rule is: if you (a) see a non-ASCII character and (b) you have not seen a UTF-8 BOM, then you should generate an error. (If you see a non ASCII character but did see a UTF-8 BOM, then you don't make an error message; and obviously if all the characters are ASCII you don't make an error message.) Hope this clarifies things. Please ask more questions if I'm still being unclear and/or it looks like I am really mistaken here.</span>
+<span class="comment-copy">In regard to <code>\r</code> - I've read <i>if it's not a '\n', put it back</i> to mean put just read <code>\r</code> back while this applies not to <code>\r</code> but the next char. My fault.  As to seeing UTF-8 BOM what I mean is the first thing is to check if there's a BOM or not and only if it's present try to decode using UTF-8 codec. Thanks for clarification.</span>
+<span class="comment-copy">@PiotrDobrogost for the UTF8 decoding thing, you're right. It makes more sense to think about it the way you say (error if you see any bytes above <code>\x7f</code> unless you've seen the BOM, o'wise decode), but on the other hand I think that what I said (first decode, then error if you get any decode errors or if the result contains unicode chars above <code>\u7f</code>) is equivalent, and was as it happens the way I was thinking of things. BTW, would you like to see my Python code for this? (It's actually not 100% faithful to the algo above in that my code does recognize UTF16 BOMs, unlike python's interpreter).</span>
+<span class="comment-copy">Thanks for the link to the sources. I agree with you that it looks like the functionality is not exposed anywhere, which is what I was afraid of. I think I plan to analyze the algorithm in the python sources and then recode it in Python...</span>
+<span class="comment-copy">Thanks! It's useful that this has appeared. Better late than never :)</span>
+<span class="comment-copy">Thanks---that's a neat solution for Python 2. Also, your debugger looks really cool :)</span>

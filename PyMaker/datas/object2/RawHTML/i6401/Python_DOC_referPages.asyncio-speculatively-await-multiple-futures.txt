@@ -1,0 +1,104 @@
+<div class="post-text" itemprop="text">
+<h3>TL;DR</h3>
+<p>How can I await any future from a collection of futures, optionally notifying other futures "they are no longer needed"?</p>
+<hr/>
+<p>Here's why I need this.  I want to create a special kind of future / task that does timekeeping and may be used with other futures / tasks to cancel them if they cumulatively exceed some timeout (or are forced to stop after interacting with this timekeeping task).  If you are familiar with Go, it has a similar concept called <code>Context</code>.</p>
+<p>To make this even more concrete, imagine this.  You have a typical HTTP client.  It needs to perform several possibly forever blocking operations in succession in order to request a page from URL.  For example, these operations could be:</p>
+<ol>
+<li>Allocate a socket.</li>
+<li>Connect to server.</li>
+<li>Retrieve page in several chunks.</li>
+<li>Close connection.</li>
+<li>Deallocate socket.</li>
+</ol>
+<p>Suppose you allow for the entire operation to take a minute.  But you also know that allocating a socket should not take more than a millisecond, connecting may take up to a minute as well, same for retrieving chunks.  Disconnection and resource deallocation should take milliseconds.</p>
+<p>Suppose now you are made to wait full timeout on each bullet point--well, you've exceeded your quota more than twice.  So, you need to pass calculated delta from each call to its successor.  Also, suppose you couldn't deallocate the socket--well, no big deal, the application may recover from this error, so you also need to distinguish between kinds of timeouts.  I imagine this could be written like so (in some imaginary version of Python):</p>
+<pre><code>async def http_request(context, url):
+    socket = await min(allocate_socket(), context.timeout, socket_timeout)
+    await min(socket.connect(), context.timeout, connect_timeout)
+    async for chunk in min(socket.receive(), context.timeout, chunk_timeout):
+        print(chunk)
+    await min(socket.close(), context.timeout, close_timeout)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://pypi.python.org/pypi/async_timeout" rel="nofollow noreferrer">async_timeout</a> is exactly what you need, your code will look like:</p>
+<pre><code>from async_timeout import timeout
+
+
+async def http_request(url):
+    async with timeout(timeout_for_all):
+
+        async with timeout(socket_timeout):
+            socket = await allocate_socket()
+
+        async with timeout(connect_timeout):
+            await socket.connect()
+
+        async with timeout(chunk_timeout):
+            async for chunk in socket.receive():
+                print(chunk)
+
+        async with timeout(close_timeout):
+            await socket.close()
+</code></pre>
+<p>Let's examine the issues you named.</p>
+<blockquote>
+<p>Go's style Context can also have cancel() method which allows
+  canceling the process from the outside regardless of time spent
+  waiting.</p>
+</blockquote>
+<p><code>asyncio</code> has a way to cancel any running task regardless of timeout or anything else. You should call <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.Task.cancel" rel="nofollow noreferrer">cancel()</a> method on some task (asyncio.CancelledError would be raised inside it) and await task propagated it (probably suppressing exception):</p>
+<pre><code>task.cancel()
+with suppress(asyncio.CancelledError):
+    await task
+</code></pre>
+<p>It's a standard way to cancel thing before they done. You don't need anything more complex then that.</p>
+<blockquote>
+<p>Also it could expire based on either wall clock or the internal timer.</p>
+</blockquote>
+<p>I'm not sure I understood this, but <code>async_timeout</code> gives you exactly what you want - a way to limit task execution with some concrete time.</p>
+<blockquote>
+<p>Also, I'm afraid that if this is not implemented directly in asyncio
+  as a separate thread, then it will have to wait for the scheduled /
+  blocking coroutine to finish regardless of the timeout (it will only
+  be able to cancel the execution if the executed coroutine goes to
+  sleep).</p>
+</blockquote>
+<p><code>asyncio</code> module itself in some sense is created to avoid using multiple threads. Ideally your async program should use many coroutines managed by single event loop inside single thread.</p>
+<p>This common event loop manages things to happen at the time they should happen. This code will raise <code>TimeoutError</code> after 1 second of running:</p>
+<pre><code>async with timeout(1):
+    await asyncio.sleep(20)
+</code></pre>
+<p><strong>Upd:</strong></p>
+<blockquote>
+<p>A different example would be when I need to wait for multiple workers
+  to finish a certain task, when I only care about one of them
+  completing it, but I don't care about timeout at all.</p>
+</blockquote>
+<p>It can be done with standard asyncio functionality also:</p>
+<pre><code># Start 3 concurrent tasks (workers):
+task_1 = asyncio.ensure_future(coro())
+task_2 = asyncio.ensure_future(coro())
+task_3 = asyncio.ensure_future(coro())
+
+# Wait first of them done:
+tasks = (task_1, task_2, task_3,)
+done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+print('done', done.pop().result())
+
+# Cancel others since they're still running, 
+# but we don't need them to be finished:
+for task in pending:
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+</code></pre>
+</div>
+<span class="comment-copy">Would <a href="https://pypi.python.org/pypi/async_timeout" rel="nofollow noreferrer">pypi.python.org/pypi/async_timeout</a> be helpful? There's a nice usage example in the aiohttp docs, too: <a href="https://aiohttp.readthedocs.io/en/stable/client.html#timeouts" rel="nofollow noreferrer">aiohttp.readthedocs.io/en/stable/client.html#timeouts</a></span>
+<span class="comment-copy">@SimonFraser this is close, but even for my case it's not enough. Go's style <code>Context</code> can also have <code>cancel()</code> method which allows canceling the process from the outside regardless of time spent waiting. Also it could expire based on either wall clock or the internal timer. Also, I'm afraid that if this is not implemented directly in <code>asyncio</code> as a separate thread, then it will have to wait for the scheduled / blocking coroutine to finish regardless of the timeout (it will only be able to cancel the execution if the executed coroutine goes to sleep).</span>
+<span class="comment-copy">No, not really... I answered that in comments to Simon Fraser, but I'll elaborate. The example with the socket is just one example. A different example would be when I need to wait for multiple workers to finish a certain task, when I only care about one of them completing it, but I don't care about timeout at all.</span>
+<span class="comment-copy">@wvxvw I updated answer added example of how to solve it. Way to do things in asyncio may be different then in Go. I think it'll be easier to investigate into current tool then trying to apply concepts from another one.</span>
+<span class="comment-copy">OK, apparently <code>asyncio.wait</code> takes the list of futures as it's first argument (so your code won't run as written). Yes, that would work, but I need to experiment to make sure.</span>
+<span class="comment-copy">Another correction <code>done</code> in this example is a set, which you cannot index. So, for example, it could be <code>next(iter(done)).result()</code>.</span>
+<span class="comment-copy">@wvxvw yes, sorry. I fixed it.</span>

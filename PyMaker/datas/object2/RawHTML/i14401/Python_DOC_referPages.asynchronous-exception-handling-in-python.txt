@@ -1,0 +1,120 @@
+<div class="post-text" itemprop="text">
+<p>I've the following code using <code>asyncio</code> and <code>aiohttp</code> to make asynchronous HTTP requests.</p>
+<pre><code>import sys
+import asyncio
+import aiohttp
+
+@asyncio.coroutine
+def get(url):
+    try:
+        print('GET %s' % url)
+        resp = yield from aiohttp.request('GET', url)
+    except Exception as e:
+        raise Exception("%s has error '%s'" % (url, e))
+    else:
+        if resp.status &gt;= 400:
+            raise Exception("%s has error '%s: %s'" % (url, resp.status, resp.reason))
+
+    return (yield from resp.text())
+
+@asyncio.coroutine
+def fill_data(run):
+    url = 'http://www.google.com/%s' % run['name']
+    run['data'] = yield from get(url)
+
+def get_runs():
+    runs = [ {'name': 'one'}, {'name': 'two'} ]
+    loop = asyncio.get_event_loop()
+    task = asyncio.wait([fill_data(r) for r in runs])
+    loop.run_until_complete(task)   
+    return runs
+
+try:
+    get_runs()
+except Exception as e:
+    print(repr(e))
+    sys.exit(1)
+</code></pre>
+<p>For some reason, exceptions raised inside the <code>get</code> function are not caught:</p>
+<pre><code>Future/Task exception was never retrieved
+Traceback (most recent call last):
+  File "site-packages/asyncio/tasks.py", line 236, in _step
+    result = coro.send(value)
+  File "mwe.py", line 25, in fill_data
+    run['data'] = yield from get(url)
+  File "mwe.py", line 17, in get
+    raise Exception("%s has error '%s: %s'" % (url, resp.status, resp.reason))
+Exception: http://www.google.com/two has error '404: Not Found'
+</code></pre>
+<p>So, what is correct way to handle exceptions raised by couroutines?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>asyncio.wait</code> doesn't actually consume the <code>Futures</code> passed to it, it just waits for them to complete, and then returns the <code>Future</code> objects:</p>
+<blockquote>
+<p><em>coroutine</em> <strong><code>asyncio.wait(futures, *, loop=None, timeout=None,
+  return_when=ALL_COMPLETED)</code></strong></p>
+<p>Wait for the Futures and coroutine objects
+  given by the sequence futures to complete. Coroutines will be wrapped
+  in Tasks. Returns two sets of <code>Future</code>: (done, pending).</p>
+</blockquote>
+<p>Until you actually <code>yield from</code> the items in the <code>done</code> list, they'll remain unconsumed. Since your program exits without consuming the futures, you see the "exception was never retrieved" messages.</p>
+<p>For your use-case, it probably makes more sense to use <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.gather" rel="noreferrer"><code>asyncio.gather</code></a>, which will actually consume each <code>Future</code>, and then return a single <code>Future</code> that aggregates all their results (or raises the first <code>Exception</code> thrown by a future in the input list).</p>
+<pre><code>def get_runs():
+    runs = [ {'name': 'one'}, {'name': 'two'} ]
+    loop = asyncio.get_event_loop()
+    tasks = asyncio.gather(*[fill_data(r) for r in runs])
+    loop.run_until_complete(tasks)
+    return runs
+</code></pre>
+<p>Output:</p>
+<pre><code>GET http://www.google.com/two
+GET http://www.google.com/one
+Exception("http://www.google.com/one has error '404: Not Found'",)
+</code></pre>
+<p>Note that <code>asyncio.gather</code> actually lets you customize its behavior when one of the futures raises an exception; the default behavior is to raise the first exception it hits, but it can also just return each exception object in the output list:</p>
+<blockquote>
+<p><strong><code>asyncio.gather(*coros_or_futures, loop=None, return_exceptions=False)</code></strong></p>
+<p>Return a future aggregating results from the given coroutine objects
+  or futures.</p>
+<p>All futures must share the same event loop. If all the tasks are done
+  successfully, the returned future’s result is the list of results (in
+  the order of the original sequence, not necessarily the order of
+  results arrival). <strong>If <code>return_exceptions</code> is <code>True</code>, exceptions in the
+  tasks are treated the same as successful results, and gathered in the
+  result list; otherwise, the first raised exception will be immediately
+  propagated to the returned future.</strong></p>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<p>To debug or "handle" exceptions in <a href="https://docs.python.org/3.6/library/asyncio-task.html#asyncio.Future.add_done_callback" rel="nofollow noreferrer">callback</a>:</p>
+<p>Coroutine which return some result or raise exceptions:</p>
+<pre><code>@asyncio.coroutine
+def async_something_entry_point(self):
+    try:
+        return self.real_stuff_which_throw_exceptions()
+    except:
+        raise Exception(some_identifier_here + ' ' + traceback.format_exc())
+</code></pre>
+<p>And callback:</p>
+<pre><code>def callback(self, future: asyncio.Future):
+    exc = future.exception()
+    if exc:
+        # Handle wonderful empty TimeoutError exception
+        if type(exc) == TimeoutError:
+            self.logger('&lt;Some id here&gt; callback exception TimeoutError')
+        else:
+            self.logger("&lt;Some id here&gt; callback exception " + str(exc))
+
+    # store your result where you want
+    self.result.append(
+        future.result()
+    )
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>asyncio provides an API for customized error handling, please refer to the document <a href="https://docs.python.org/3/library/asyncio-eventloop.html#error-handling-api" rel="nofollow">https://docs.python.org/3/library/asyncio-eventloop.html#error-handling-api</a> </p>
+</div>
+<span class="comment-copy">Thanks for explanation, the documentation was not perfectly clear about exception handling</span>
+<span class="comment-copy">So how would one do it with <code>wait</code>? Is it something like <code>yield from asyncio.wait(...)</code>? Should <code>await asyncio.wait(...)</code> work too?</span>
+<span class="comment-copy">By the way, the same issue arises if one of the couroutine is never actually started. Happens for me with two coroutines opening some socket (manually) and try to <code>await &lt;loop&gt;.sock_recv(&lt;socket&gt;, &lt;size&gt;)</code>. If the socket is not switched to non-blocking (with <code>&lt;socket&gt;.setblocking()</code>), the second coroutine is not started and a <code>KeyboardInterrupt</code> results in "Task exception was never retrieved".</span>
+<span class="comment-copy">Just referring some documentation without any hint is not helpful.</span>

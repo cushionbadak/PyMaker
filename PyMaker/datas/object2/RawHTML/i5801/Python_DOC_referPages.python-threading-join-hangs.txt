@@ -1,0 +1,307 @@
+<div class="post-text" itemprop="text">
+<p>My problem is as follows:
+I have a class that inherits from <code>threading.Thread</code> that I want to be able to stop gracefully. This class also has a Queue it get's its work from.</p>
+<p>Since there are quite some classes in my project that should have this behaviour, I've created some superclasses to reduce duplicate code like this:</p>
+<p><strong>Thread related behaviour:</strong></p>
+<pre><code>class StoppableThread(Thread):
+def __init__(self):
+    Thread.__init__(self)
+    self._stop = Event()
+
+def stop(self):
+    self._stop.set()
+
+def stopped(self):
+    return self._stop.isSet()
+</code></pre>
+<p><strong>Queue related behaviour:</strong></p>
+<pre><code>class Queueable():
+    def __init__(self):
+        self._queue = Queue()
+
+    def append_to_job_queue(self, job):
+        self._queue.put(job)
+</code></pre>
+<p><strong>Combining the two above and adding queue.join() to the stop() call</strong></p>
+<pre><code>class StoppableQueueThread(StoppableThread, Queueable):
+    def __init__(self):
+        StoppableThread.__init__(self)
+        Queueable.__init__(self)
+
+    def stop(self):
+        super(StoppableQueueThread, self).stop()
+        self._queue.join()
+</code></pre>
+<p><strong>A base class for a datasource:</strong></p>
+<pre><code>class DataSource(StoppableThread, ABC):
+
+    def __init__(self, data_parser):
+        StoppableThread.__init__(self)
+        self.setName("DataSource")
+        ABC.__init__(self)
+        self._data_parser = data_parser
+
+    def run(self):
+        while not self.stopped():
+            record = self._fetch_data()
+            self._data_parser.append_to_job_queue(record)
+
+    @abstractmethod
+    def _fetch_data(self):
+        """implement logic here for obtaining a data piece
+            should return the fetched data"""
+</code></pre>
+<p><strong>An implementation for a datasource:</strong></p>
+<pre><code>class CSVDataSource(DataSource):
+    def __init__(self, data_parser, file_path):
+        DataSource.__init__(self, data_parser)
+        self.file_path = file_path
+        self.csv_data = Queue()
+        print('loading csv')
+        self.load_csv()
+        print('done loading csv')
+
+    def load_csv(self):
+        """Loops through csv and adds data to a queue"""
+        with open(self.file_path, 'r') as f:
+
+            self.reader = reader(f)
+            next(self.reader, None)  # skip header
+            for row in self.reader:
+                self.csv_data.put(row)
+
+    def _fetch_data(self):
+        """Returns next item of the queue"""
+        item = self.csv_data.get()
+        self.csv_data.task_done()
+        print(self.csv_data.qsize())
+        return item
+</code></pre>
+<p>Suppose there is a <code>CSVDataSource</code> instance called <code>ds</code>, if I want to stop the thread I call:</p>
+<pre><code>ds.stop()
+ds.join()
+</code></pre>
+<p>The <code>ds.join()</code> call however, never returns. I'm not sure why this is, because the <code>run()</code> method does check if the stop event is set.</p>
+<p>Any Ideas?</p>
+<h2>Update</h2>
+<p>A little more clarity as requested: the applications is build up out of several threads. The RealStrategy thread (below) is the owner of all the other threads and is responsible for starting and terminating them. I haven't set the daemon flag for any of the threads, so they should be non-daemonic by default.</p>
+<p>The main thread looks like this:</p>
+<pre><code>if __name__ == '__main__':
+    def exit_handler(signal, frame):
+        rs.stop_engine()
+        rs.join()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, exit_handler)
+
+
+
+    rs = RealStrategy()
+    rs.run_engine()
+</code></pre>
+<p>And here are the <code>rs.run_engine()</code> and <code>rs.stop_engine()</code> methods that are called in <strong>main</strong>:</p>
+<pre><code>class RealStrategy(Thread):
+.....
+.....
+    def run_engine(self):
+        self.on_start()
+        self._order_handler.start()
+        self._data_parser.start()
+        self._data_source.start()
+        self.start()
+
+    def stop_engine(self):
+        self._data_source.stop()
+        self._data_parser.stop()
+        self._order_handler.stop()
+
+        self._data_source.join()
+        self._data_parser.join()
+        self._order_handler.join()
+
+        self.stop()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you want to use <a href="https://docs.python.org/3/library/queue.html#queue.Queue.join" rel="nofollow noreferrer"><code>queue.Queue.join</code></a>, then you must also use <a href="https://docs.python.org/3/library/queue.html#queue.Queue.task_done" rel="nofollow noreferrer"><code>queue.Queue.task_done</code></a>. You can read the linked documentation or see the following copied from information available online:</p>
+<blockquote>
+<p>Queue.<strong>task_done()</strong></p>
+<p>Indicate that a formerly enqueued task is complete.
+  Used by queue consumer threads. For each get() used to fetch a task, a
+  subsequent call to task_done() tells the queue that the processing on
+  the task is complete.</p>
+<p>If a join() is currently blocking, it will resume when all items have
+  been processed (meaning that a task_done() call was received for every
+  item that had been put() into the queue).</p>
+<p>Raises a ValueError if called more times than there were items placed
+  in the queue.</p>
+</blockquote>
+<hr/>
+<blockquote>
+<p>Queue.<strong>join()</strong></p>
+<p>Blocks until all items in the queue have been gotten and processed.</p>
+<p>The count of unfinished tasks goes up whenever an item is added to the
+  queue. The count goes down whenever a consumer thread calls
+  task_done() to indicate that the item was retrieved and all work on it
+  is complete. When the count of unfinished tasks drops to zero, join()
+  unblocks.</p>
+</blockquote>
+<hr/>
+<p>To test your problem, an example implementation was created to find out what was going on. It is slightly different from how your program works but demonstrates a method to solving your problem:</p>
+<pre><code>#! /usr/bin/env python3
+import abc
+import csv
+import pathlib
+import queue
+import sys
+import threading
+import time
+
+
+def main():
+    source_path = pathlib.Path(r'C:\path\to\file.csv')
+    data_source = CSVDataSource(source_path)
+    data_source.start()
+    processor = StoppableThread(target=consumer, args=[data_source])
+    processor.start()
+    time.sleep(0.1)
+    data_source.stop()
+
+
+def consumer(data_source):
+    while data_source.empty:
+        time.sleep(0.001)
+    while not data_source.empty:
+        task = data_source.get_from_queue(True, 0.1)
+        print(*task.data, sep=', ', flush=True)
+        task.done()
+
+
+class StopThread(StopIteration):
+    pass
+
+
+threading.SystemExit = SystemExit, StopThread
+
+
+class StoppableThread(threading.Thread):
+    def _bootstrap(self, stop=False):
+        # noinspection PyProtectedMember
+        if threading._trace_hook:
+            raise RuntimeError('cannot run thread with tracing')
+
+        def terminate():
+            nonlocal stop
+            stop = True
+
+        self.__terminate = terminate
+
+        # noinspection PyUnusedLocal
+        def trace(frame, event, arg):
+            if stop:
+                raise StopThread
+
+        sys.settrace(trace)
+        super()._bootstrap()
+
+    def terminate(self):
+        try:
+            self.__terminate()
+        except AttributeError:
+            raise RuntimeError('cannot terminate thread '
+                               'before it is started') from None
+
+
+class Queryable:
+    def __init__(self, maxsize=1 &lt;&lt; 10):
+        self.__queue = queue.Queue(maxsize)
+
+    def add_to_queue(self, item):
+        self.__queue.put(item)
+
+    def get_from_queue(self, block=True, timeout=None):
+        return self.__queue.get(block, timeout)
+
+    @property
+    def empty(self):
+        return self.__queue.empty()
+
+    @property
+    def full(self):
+        return self.__queue.full()
+
+    def task_done(self):
+        self.__queue.task_done()
+
+    def join_queue(self):
+        self.__queue.join()
+
+
+class StoppableQueryThread(StoppableThread, Queryable):
+    def __init__(self, target=None, name=None, args=(), kwargs=None,
+                 *, daemon=None, maxsize=1 &lt;&lt; 10):
+        super().__init__(None, target, name, args, kwargs, daemon=daemon)
+        Queryable.__init__(self, maxsize)
+
+    def stop(self):
+        self.terminate()
+        self.join_queue()
+
+
+class DataSource(StoppableQueryThread, abc.ABC):
+    @abc.abstractmethod
+    def __init__(self, maxsize=1 &lt;&lt; 10):
+        super().__init__(None, 'DataSource', maxsize=maxsize)
+
+    def run(self):
+        while True:
+            record = self._fetch_data()
+            self.add_to_queue(record)
+
+    @abc.abstractmethod
+    def _fetch_data(self):
+        pass
+
+
+class CSVDataSource(DataSource):
+    def __init__(self, source_path):
+        super().__init__()
+        self.__data_parser = self.__build_data_parser(source_path)
+
+    @staticmethod
+    def __build_data_parser(source_path):
+        with source_path.open(newline='') as source:
+            parser = csv.reader(source)
+            next(parser, None)
+            yield from parser
+
+    def _fetch_data(self):
+        try:
+            return Task(next(self.__data_parser), self.task_done)
+        except StopIteration:
+            raise StopThread from None
+
+
+class Task:
+    def __init__(self, data, callback):
+        self.__data = data
+        self.__callback = callback
+
+    @property
+    def data(self):
+        return self.__data
+
+    def done(self):
+        self.__callback()
+
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+</div>
+<span class="comment-copy">Did my answer help you at all?</span>
+<span class="comment-copy">Hi there! Sorry for the delay, I've been busy and haven't found the time to test the code you posted. I am calling <code>self.csv_data.task_done()</code> in <code>CSVDataSource._fetch_data()</code> though. Also, I might not have been clear enough. This is part of a much larger codebase. The <code>data_parser</code> argument in DataSource's constructor is a reference a seperate thread that handles the parsing. I call <code>self._data_parser.append_to_job_queue(record)</code> to append work to that parser. I'll look into your code and post the results tomorrow, thank you!</span>
+<span class="comment-copy">Allright, this is a way nicer implementation of the code I posted above. But while running your code I run into the same problem. I noticed you never call <code>Thread.join()</code>, so when I try to terminate the program (ctrl-c) there are still exceptions being thrown. In the code I posted, the queue itself actually gets joined without any problems, but the thread itself never seems to end. I need the program (and all it's threads) to stop gracefully so I can save the data (elsewhere in the app) and be sure all data is processed before doing so. Any ideas on this? Thanks, it sure helps a lot!</span>
+<span class="comment-copy">@HighSociety Would you mind posting more of your code? Threads inherit the daemon flag of their creating threads unless specified. If none of your threads are daemons, they should run to completion. Terminating the program should raise a <code>KeyboardInterrupt</code> on the main thread. You should catch that exception in your main thread and implement your shutdown code in the exception handler.</span>
+<span class="comment-copy">Hi there! Thank you for your time and effort. Unfortunately I can't show a full code copy/paste (it would be massive) but I've updated the question with the relevant information. None of my threads are marked at daemonic so they in fact so raise a <code>KeyboardInterrupt</code>. I am not exactly catching the exception, but defined an <code>exit_handler()</code> in <code>__main__</code> that calls <code>rs.stop_engine()</code>. This method sends stop signals to all the other threads and joins them afterwards. This join operation is where the code hangs. I thought a exit handler would take care of the problem. Am I wrong?</span>
+<span class="comment-copy">@HighSociety You need to stop the producer thread but allow the consumer thread to run to completion. Otherwise, joining on the queue will never complete if it still contains data. Killing the consumer will leave data in the queue that will prevent a successful join. Allow the consumer to detect an empty queue, and use that as its termination condition.</span>

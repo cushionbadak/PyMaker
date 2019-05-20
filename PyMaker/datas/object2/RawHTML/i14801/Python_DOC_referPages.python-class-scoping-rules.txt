@@ -1,0 +1,199 @@
+<div class="post-text" itemprop="text">
+<p><strong>EDIT:</strong> Looks like this is a very old "bug" or, actually, feature. See, e.g., <a href="https://mail.python.org/pipermail/python-dev/2002-April/023428.html">this mail</a> </p>
+<p>I am trying to understand the Python scoping rules. More precisely, I thought that I understand them but then I found this code <a href="http://lackingrhoticity.blogspot.ch/2008/08/4-python-variable-binding-oddities.html">here</a>: </p>
+<pre><code>x = "xtop"
+y = "ytop"
+def func():
+    x = "xlocal"
+    y = "ylocal"
+    class C:
+        print(x)
+        print(y)
+        y = 1
+func()
+</code></pre>
+<p>In Python 3.4 the output is:</p>
+<pre><code>xlocal
+ytop
+</code></pre>
+<p>If I replace the inner class by a function then it reasonably gives <code>UnboundLocalError</code>. Could you explain me why it behaves this strange way with classes and what is the reason for such choice of scoping rules?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><strong>TL;DR</strong>: This behaviour has existed since Python 2.1 <a href="https://docs.python.org/3/whatsnew/2.1.html#pep-227-nested-scopes" rel="noreferrer">PEP 227: Nested Scopes</a>, and was known back then. If a name is assigned to within a class body (like <code>y</code>), then it is assumed to be a local/global variable; if it is not assigned to (<code>x</code>), then it also can potentially point to a closure cell. The lexical variables do not show up as local/global names to the class body.</p>
+<hr/>
+<p>On Python 3.4, <code>dis.dis(func)</code> shows the following:</p>
+<pre><code>&gt;&gt;&gt; dis.dis(func)
+  4           0 LOAD_CONST               1 ('xlocal')
+              3 STORE_DEREF              0 (x)
+
+  5           6 LOAD_CONST               2 ('ylocal')
+              9 STORE_FAST               0 (y)
+
+  6          12 LOAD_BUILD_CLASS
+             13 LOAD_CLOSURE             0 (x)
+             16 BUILD_TUPLE              1
+             19 LOAD_CONST               3 (&lt;code object C at 0x7f083c9bbf60, file "test.py", line 6&gt;)
+             22 LOAD_CONST               4 ('C')
+             25 MAKE_CLOSURE             0
+             28 LOAD_CONST               4 ('C')
+             31 CALL_FUNCTION            2 (2 positional, 0 keyword pair)
+             34 STORE_FAST               1 (C)
+             37 LOAD_CONST               0 (None)
+             40 RETURN_VALUE
+</code></pre>
+<p>The <code>LOAD_BUILD_CLASS</code> loads the <code>builtins.__build_class__</code> on the stack; this is called with arguments <code>__build_class__(func, name)</code>; where <code>func</code> is the class body, and <code>name</code> is <code>'C'</code>. The class body is the constant #3 for the function <code>func</code>:</p>
+<pre><code>&gt;&gt;&gt; dis.dis(func.__code__.co_consts[3])
+  6           0 LOAD_NAME                0 (__name__)
+              3 STORE_NAME               1 (__module__)
+              6 LOAD_CONST               0 ('func.&lt;locals&gt;.C')
+              9 STORE_NAME               2 (__qualname__)
+
+  7          12 LOAD_NAME                3 (print)
+             15 LOAD_CLASSDEREF          0 (x)
+             18 CALL_FUNCTION            1 (1 positional, 0 keyword pair)
+             21 POP_TOP
+
+  8          22 LOAD_NAME                3 (print)
+             25 LOAD_NAME                4 (y)
+             28 CALL_FUNCTION            1 (1 positional, 0 keyword pair)
+             31 POP_TOP
+
+  9          32 LOAD_CONST               1 (1)
+             35 STORE_NAME               4 (y)
+             38 LOAD_CONST               2 (None)
+             41 RETURN_VALUE
+</code></pre>
+<p>Within the class body, <code>x</code> is accessed with <code>LOAD_CLASSDEREF</code> (15) while <code>y</code> is load with <code>LOAD_NAME</code> (25). The <code>LOAD_CLASSDEREF</code> is a Python 3.4+ opcode for loading values from closure cells specifically within class bodies (in previous versions, the generic <code>LOAD_DEREF</code> was used); the <code>LOAD_NAME</code> is for loading values from <em>locals</em> and then <em>globals</em>. However closure cells show up neither as locals nor globals. </p>
+<p>Now, because the name <code>y</code> is stored to within the class body (35), it is consistently being used as not a closure cell but a local/global name.
+The closure cells do not show up as local variables to the class body. </p>
+<p>This behaviour has been true <a href="https://mail.python.org/pipermail/python-dev/2002-April/023428.html" rel="noreferrer">ever since implementing PEP 227 - nested scopes</a>. And back then BDFL stated that this should not be fixed - and thus it has been for these 13+ years.</p>
+<hr/>
+<p>The only change since PEP 227 is the addition of <code>nonlocal</code> in Python 3; if one uses it within the class body, the class body can set the values of the cells within the containing scope:</p>
+<pre><code>x = "xtop"
+y = "ytop"
+def func():
+    x = "xlocal"
+    y = "ylocal"
+    class C:
+        nonlocal y  # y here now refers to the outer variable
+        print(x)
+        print(y)
+        y = 1
+
+    print(y)
+    print(C.y)
+
+func()
+</code></pre>
+<p>The output now is</p>
+<pre><code>xlocal
+ylocal
+1
+Traceback (most recent call last):
+  File "test.py", line 15, in &lt;module&gt;
+    func()
+  File "test.py", line 13, in func
+    print(C.y)
+AttributeError: type object 'C' has no attribute 'y'
+</code></pre>
+<p>That is, <code>print(y)</code> read the value of the cell <code>y</code> of the containing scope, and <code>y = 1</code> set the value in that cell; in this case, no attribute was created for the class <code>C</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>First focus on the case of a closure -- a function within a function:</p>
+<pre><code>x = "xtop"
+y = "ytop"
+def func():
+    x = "xlocal"
+    y = "ylocal"
+    def inner():
+ #       global y
+        print(x)
+        print(y)
+        y='inner y'
+        print(y)
+    inner()  
+</code></pre>
+<p>Note the commented out <code>global</code> in <code>inner</code> If you run this, it replicates the <code>UnboundLocalError</code> you got. Why? </p>
+<p>Run dis.dis on it:</p>
+<pre><code>&gt;&gt;&gt; import dis
+&gt;&gt;&gt; dis.dis(func)
+  6           0 LOAD_CONST               1 ('xlocal')
+              3 STORE_DEREF              0 (x)
+
+  7           6 LOAD_CONST               2 ('ylocal')
+              9 STORE_FAST               0 (y)
+
+  8          12 LOAD_CLOSURE             0 (x)
+             15 BUILD_TUPLE              1
+             18 LOAD_CONST               3 (&lt;code object inner at 0x101500270, file "Untitled 3.py", line 8&gt;)
+             21 LOAD_CONST               4 ('func.&lt;locals&gt;.inner')
+             24 MAKE_CLOSURE             0
+             27 STORE_FAST               1 (inner)
+
+ 14          30 LOAD_FAST                1 (inner)
+             33 CALL_FUNCTION            0 (0 positional, 0 keyword pair)
+             36 POP_TOP
+             37 LOAD_CONST               0 (None)
+             40 RETURN_VALUE
+</code></pre>
+<p>Note the different access mode of <code>x</code> vs <code>y</code> inside of <code>func</code>. The use of <code>y='inner y'</code> inside of <code>inner</code> has created the <code>UnboundLocalError</code> </p>
+<p>Now uncomment <code>global y</code> inside of <code>inner</code>. Now you have unambiguously create <code>y</code> to be the top global version until resigned as <code>y='inner y'</code></p>
+<p>With <code>global</code> uncommented, prints:</p>
+<pre><code>xlocal
+ytop
+inner y
+</code></pre>
+<p>You <em>can</em> get a more sensible result with:</p>
+<pre><code>x = "xtop"
+y = "ytop"
+def func():
+    global y, x
+    print(x,y)
+    x = "xlocal"
+    y = "ylocal"
+    def inner():
+        global y
+        print(x,y)
+        y = 'inner y'
+        print(x,y)
+    inner()    
+</code></pre>
+<p>Prints:</p>
+<pre><code>xtop ytop
+xlocal ylocal
+xlocal inner y
+</code></pre>
+<hr/>
+<p>The analysis of the closure class is complicated by instance vs class variables and what / when a naked class (with no instance) is being executed. </p>
+<p>The bottom line is the same: If you reference a name outside the local namespace and then assign to the same name locally you get a surprising result. </p>
+<p>The 'fix' is the same: use the global keyword:</p>
+<pre><code>x = "xtop"
+y = "ytop"
+def func():
+    global x, y
+    x = "xlocal"
+    y = "ylocal"
+    class Inner:
+        print(x, y)
+        y = 'Inner_y'
+        print(x, y) 
+</code></pre>
+<p>Prints:</p>
+<pre><code>xlocal ylocal
+xlocal Inner_y
+</code></pre>
+<p>You can read more about Python 3 scope rules in <a href="https://www.python.org/dev/peps/pep-3104/" rel="nofollow">PEP 3104</a></p>
+</div>
+<span class="comment-copy">It wont give any error unless you call the inner function</span>
+<span class="comment-copy">Interesting; <code>y</code> should be an unbound exception in the case of <code>y</code>, but it isn't even when you make <code>C</code> a global. Corner cases FTW! Class bodies are special; they do not create a new scope of their own. As such <code>y = 1</code> would make it a local, but until that point it is a global <i>in class statements <b>only</b></i></span>
+<span class="comment-copy"><a href="https://docs.python.org/3/tutorial/classes.html#python-scopes-and-namespaces" rel="nofollow noreferrer">9.2. Python Scopes and Namespaces</a> and <a href="https://docs.python.org/3/reference/executionmodel.html#naming-and-binding" rel="nofollow noreferrer">4.1. Naming and binding</a> are a start, you might need to re-read them often till it sinks in.</span>
+<span class="comment-copy">if it's actual python3 code, then it should be <code>print(x)</code> and <code>print(y)</code>. <code>print x</code> is python2 code.</span>
+<span class="comment-copy">This question could be helpful <a href="http://stackoverflow.com/questions/4296677/creating-a-class-within-a-function-and-access-a-function-defined-in-the-containi" title="creating a class within a function and access a function defined in the containi">stackoverflow.com/questions/4296677/…</a></span>
+<span class="comment-copy">It seems that I understood your explanation. Since <code>y</code> is stored it "bypasses" the usual mechanism. But doesn't it look like a bug to you?</span>
+<span class="comment-copy">If Guido says it is not a bug, then it is a feature. ;)</span>
+<span class="comment-copy">@ivanl: it is a known 'feature' of the implementation; see the email Antti links to. Class scopes are not like function scopes.</span>
+<span class="comment-copy">I understand the behavior for functions you pointed out. But it is still not clear what is the reason for <i>classes</i> to behave differenly.</span>
+<span class="comment-copy">Classes will be similar but you need to further qualify instance vs class variables and nested class and nested instance variables. Bottom line is the same: The presence of the assignment of <code>y=1</code> make the reference <code>print(y)</code> above the assignment ambiguous inside the closure.</span>
+<span class="comment-copy">Downvoter: May I ask if you have a suggestion for an improvement?</span>
+<span class="comment-copy">There is a deference in how the interpreter treats each case, true. It is unusual to just have a class definition and execute code by its presence though.</span>
+<span class="comment-copy">PEP 3104 only introduces the <code>nonlocal</code> statement and doesn't actually explain the behaviour. The behaviour is a long-standing PEP 227 side-effect, 3104 never altered that.</span>

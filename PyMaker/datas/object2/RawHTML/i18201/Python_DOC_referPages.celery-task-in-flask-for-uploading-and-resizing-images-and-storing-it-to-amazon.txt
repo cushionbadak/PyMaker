@@ -1,0 +1,166 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to create a celery task for uploading and resizing an image before storing it to Amazon S3. But it doesn't work as expected. Without the task everything is working fine. This is the code so far:</p>
+<p>stacktrace</p>
+<pre><code>Traceback (most recent call last):
+  File "../myVE/lib/python2.7/site-packages/kombu/messaging.py", line 579, in _receive_callback
+    decoded = None if on_m else message.decode()
+  File "../myVE/lib/python2.7/site-packages/kombu/transport/base.py", line 147, in decode
+    self.content_encoding, accept=self.accept)
+  File "../myVE/lib/python2.7/site-packages/kombu/serialization.py", line 187, in decode
+    return decode(data)
+  File "../myVE/lib/python2.7/site-packages/kombu/serialization.py", line 74, in pickle_loads
+    return load(BytesIO(s))
+  File "../myVE/lib/python2.7/site-packages/werkzeug/datastructures.py", line 2595, in __getattr__
+    return getattr(self.stream, name)
+  File "../myVE/lib/python2.7/site-packages/werkzeug/datastructures.py", line 2595, in __getattr__
+    return getattr(self.stream, name)
+    ...
+RuntimeError: maximum recursion depth exceeded while calling a Python object
+</code></pre>
+<p>views.py</p>
+<pre><code>from PIL import Image
+
+from flask import Blueprint, redirect, render_template, request, url_for
+
+from myapplication.forms import UploadForm
+from myapplication.tasks import upload_task
+
+
+main = Blueprint('main', __name__)
+
+@main.route('/upload', methods=['GET', 'POST'])
+def upload():
+    form = UploadForm()
+    if form.validate_on_submit():
+        upload_task.delay(form.title.data, form.description.data,
+                          Image.open(request.files['image']))
+        return redirect(url_for('main.index'))
+    return render_template('upload.html', form=form)
+</code></pre>
+<p>tasks.py</p>
+<pre><code>from StringIO import StringIO
+
+from flask import current_app
+
+from myapplication.extensions import celery, db
+from myapplication.helpers import resize, s3_upload
+from myapplication.models import MyObject
+
+
+@celery.task(name='tasks.upload_task')
+def upload_task(title, description, source):
+    stream = StringIO()
+    target = resize(source, current_app.config['SIZE'])
+    target.save(stream, 'JPEG', quality=95)
+    stream.seek(0)
+    obj = MyObject(title=title, description=description, url=s3_upload(stream))
+    db.session.add(obj)
+    db.session.commit()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>It looks like you are attempting to pass the entire uploaded file as part of the Celery message. I imagine that is causing you some trouble. I would recommend seeing if you can save the file to the web server as part of the view, then have the message (the "delay" argument) contain the filename rather than entire file's data. The task can then read the file in from the hard drive, upload to s3, then delete it locally.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I know this is a very old question, but I was struggling with passing the file's contents to the celery task. I would keep getting errors trying to follow what others have done. So I wrote this up, hoping it may help others in the future.</p>
+<h1>TL;DR</h1>
+<ul>
+<li>Send the file contents to the celery task with base64 encoding</li>
+<li>Decode the data in the celery task and use <code>io.BytesIO</code> for the stream</li>
+</ul>
+<h1>Long answer</h1>
+<p>I was not interested in saving the image to disk and reading it again, so I wanted to pass the needed data to reconstruct the file in the background.</p>
+<p>Trying to follow what others suggest, I kept getting encoding errors.
+Some of the errors were:</p>
+<ul>
+<li><code>UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0: invalid start byte</code></li>
+<li><code>TypeError: initial_value must be str or None, not bytes</code></li>
+</ul>
+<p>The <code>TypeError</code> was thrown by the <code>io.StringIO</code>. Trying to decode the data to get rid of the <code>UnicodeDecodeError</code> did not make much sense. As the data is binary in the first place, I tried to use a <code>io.BytesIO</code> instance, and that worked perfectly. The only thing I needed to do was to encode the file's stream with base64 and then I would be able to pass the content to the celery task.</p>
+<h1>Code samples</h1>
+<p><em>images.py</em></p>
+<pre><code>import base64
+
+file_.stream.seek(0) # start from beginning of file
+# some of the data may not be defined
+data = {
+  'stream': base64.b64encode(file_.read()),
+  'name': file_.name,
+  'filename': file_.filename,
+  'content_type': file_.content_type,
+  'content_length': file_.content_length,
+  'headers': {header[0]: header[1] for header in file_.headers}
+}
+
+###
+# add logic to sanitize required fields
+###
+
+# define the params for the upload (here I am using AWS S3)
+bucket, s3_image_path = AWS_S3_BUCKET, AWS_S3_IMAGE_PATH
+# import and call the background task
+from async_tasks import upload_async_photo 
+upload_async_photo.delay(
+  data=data,
+  image_path=s3_image_path,
+  bucket=bucket)
+</code></pre>
+<p><em>async_tasks</em></p>
+<pre><code>import base64, io
+from werkzeug.datastructures import FileStorage
+
+@celery.task
+def upload_async_photo(data, image_path, bucket):
+    bucket = get_s3_bucket(bucket) # get bucket instance
+    try:
+        # decode the stream
+        data['stream'] = base64.b64decode(data['stream'])
+        # create a BytesIO instance
+        # https://docs.python.org/3/library/io.html#binary-i-o
+        data['stream'] = io.BytesIO(data['stream'])
+        # create the file structure
+        file_ = FileStorage(**data)
+        # upload image
+        bucket.put_object(
+                Body=file_,
+                Key=image_path,
+                ContentType=data['content_type'])
+    except Exception as e:
+        print(str(e))
+</code></pre>
+<h2>Edit</h2>
+<p>I also changed what content celery accepts and how it serializes data. To avoid having trouble passing the Bytes instance to the celery task, I had to add the following to my config:</p>
+<pre><code>CELERY_ACCEPT_CONTENT = ['pickle']
+CELERY_TASK_SERIALIZER = 'pickle'
+CELERY_RESULT_SERIALIZER = 'pickle'
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Old question, but I have just had the same problem. Accepted answer did not work for me (I'm using Docker instances so Celery does not have access to producers filesystem. Also, its slow to first save file to local filesystem). </p>
+<p>My solution keeps the file in the RAM. It's therefore much faster. 
+Only downside is if you need to handle large files (&gt;1GB), then you need a server with a lot of RAM. </p>
+<p>The doc_file is of type <code>werkzeug.datastructure.FileStorage</code> (<a href="http://werkzeug.pocoo.org/docs/0.11/datastructures/#werkzeug.datastructures.FileStorage" rel="nofollow">see docs here</a>)</p>
+<p>Sending the file to celery worker:</p>
+<pre><code>entry.delay(doc_file.read(), doc_file.filename, doc_file.name, doc_file.content_length, doc_file.content_type, doc_file.headers)
+</code></pre>
+<p>Receiving the file:</p>
+<pre><code>from werkzeug.datastructures import FileStorage
+from StringIO import StringIO
+
+@celery.task()
+def entry(stream, filename, name, content_length, content_type, headers):
+    doc = FileStorage(stream=StringIO(stream), filename=filename, name=name, content_type=content_type, content_length=content_length)
+    # Do something with the file (e.g save to Amazon S3)
+</code></pre>
+</div>
+<span class="comment-copy">Have you tried putting the lines of code you think you should go into a Celery task into a Celery task? Did it work?</span>
+<span class="comment-copy">Yes I have tried that. But it didn't work. I got:  "Can't decode message body: RuntimeError('maximum recursion depth extended while calling a Python object',)..."  venv/lib/python2.7/site-packages/werkzeug/datastructures.py", line 2595, in <b>getattr</b>     return getattr(self.stream, name)</span>
+<span class="comment-copy">I would recommend, then, that you modify this question to show the code that is actually causing your current trouble. Make sure to also include the stack trace in the question (you may need to cut out some of the middle, since it will probably be pretty long). Right now, your question is, "Could I make this a celery task", and the answer to that is yes, but that's not helpful for you. It is better you show us what you've tried and help you move forward in that respect.</span>
+<span class="comment-copy">@pkosel what was your workaround?</span>
+<span class="comment-copy">Now I'm getting this error message: Working outsite of application context... Any idea? Thank you</span>
+<span class="comment-copy">@PhilippKosel: <a href="http://flask.pocoo.org/docs/appcontext/" rel="nofollow noreferrer">Read this</a>. Also, <a href="http://stackoverflow.com/questions/18478953/flask-0-10-mongo-working-outside-of-application-context">this</a>. If you're still having problems, post a new question.</span>
+<span class="comment-copy">Is there any other workarounds besides this way? There is no setting in celery that can take file?</span>
+<span class="comment-copy">After follwing your code, I was getting the following error:  <code>EncodeError: 'utf8' codec can't decode byte 0xff in position 0: invalid start byte</code></span>
+<span class="comment-copy">Please try with another file.</span>
+<span class="comment-copy">If I were to do this in ipython for testing. How should I be loading entry.delay? how should doc_file.read() be loaded ? Do I just open('filename?')</span>
+<span class="comment-copy">Tried other files and getting same error. It has something to do with the doc_file.read()</span>

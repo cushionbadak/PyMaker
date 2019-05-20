@@ -1,0 +1,96 @@
+<div class="post-text" itemprop="text">
+<p>If you search Google or SO for 'unit test stdin stdout python' you will find very many questions, each and every one of which is answered in one way or another with</p>
+<blockquote>
+<p>Do you really need to unit test Python's builtin <code>input</code> / <code>sys.stdin</code> methods?</p>
+</blockquote>
+<p>My answer is <em>yes</em>, I emphatically do, because I'm essentially implementing my own <code>input</code> + poor-man's <code>libreadline</code> / <code>libcurses</code>, and I need to test using stdin and the contents of the terminal.</p>
+<p>I happen to use a Unix-derived OS so I have pipes <code>|</code> and shell redirection <code>&lt;</code>, so I could write a little shell script to do this alongside some Python helper code, and to test the terminal's actions (ANSI escape sequences, cursor movement, exactly what gets printed, etc) I could read from a known <code>/dev/tty/whatever</code>, but there are two main reasons I don't want to do this:</p>
+<ol>
+<li><p>Testing code should be as cross-platform as the code it's testing (and not so fragile!)</p></li>
+<li><p>I quite like <code>unittest</code>, thank you, and I don't want to resort to shell scripting and unix hackery (as much as I like unix hackery) just to test my module.</p></li>
+</ol>
+<p>There must be a better way to test things like <code>curses</code>, not when you're <em>using</em> <code>curses</code> but when you're <em>developing</em> a <code>curses</code>.</p>
+<hr/>
+<p>Since it was requested, here's some examples of what I'm looking to test: (<a href="https://github.com/catb0t/input_constrain" rel="nofollow">full code on github</a>)</p>
+<pre><code>def _Getch():
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
+
+class xyctl:
+    def _terminal_size():
+        import fcntl, struct
+        h, w, hp, wp = struct.unpack('HHHH',
+            fcntl.ioctl(0, termios.TIOCGWINSZ,
+            struct.pack('HHHH', 0, 0, 0, 0)))
+        return w, h, w * h
+
+    def _matrix_calc(adj_x, adj_y):
+        cur_x, cur_y = xyctl.getter()
+        new_x, new_y = (
+            (cur_x + adj_x),
+            (cur_y + adj_y)
+        )
+
+        if (new_x * new_y) &lt; (xyctl._terminal_size()[2]):
+            return new_x, new_y
+        else:
+            _writer(CHAR_BEL)
+
+    def getter():
+        _writer(CHAR_ESC + "[6n")
+        pos = until("R", raw=True)
+        _writer(CHAR_CRR + CHAR_SPC * (len(pos) + 1) + CHAR_CRR)
+        pos = pos[2:].split(";")
+        pos[0], pos[1] = int(pos[1]), int(pos[0])
+        return pos
+
+    def setter(new_x, new_y):
+        _writer(CHAR_ESC + "[{};{}H".format(new_x, new_y))
+
+    def adjust(adj_x, adj_y):
+        new_x, new_y = xyctl._matrix_calc(adj_x, adj_y)
+        xyctl.setter(new_x, new_y)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Late to the party here, but: I'm in exactly this situation, wanting to test the actual user-facing portions of the CLI, to be able to (i) ensure consistent behavior resulting from a given set of user keypresses, and (ii) inspect the actual content printed to console.</p>
+<p>I put together a couple of classes that achieve this in (what seems to me) a pretty nice way, originally implemented <a href="https://github.com/bskinn/sphobjinv/blob/5c5f43199c08594807a8b53ab2dd9a705478a1b1/sphobjinv/test/sphobjinv_base.py#L185-L251" rel="nofollow noreferrer">here</a> and, as of this writing, now published in v1.0 pre-release on PyPI as <a href="https://pypi.org/project/stdio-mgr/" rel="nofollow noreferrer">stdio-mgr</a>.  Most of it isn't especially novel, just a context manager to mock <code>stdout</code>/<code>stderr</code>/<code>stdin</code> over to temporary streams, as already described in answers like <a href="https://stackoverflow.com/a/3948399/4376000">this one</a>, <a href="https://stackoverflow.com/a/36491341/4376000">this one</a> and <a href="https://stackoverflow.com/a/16571630/4376000">this one</a>.</p>
+<p>The big difference from anything I've seen elsewhere is that <code>stdin</code> is mocked to a <a href="https://github.com/bskinn/stdio-mgr/blob/b424a169d9e584115b8f90a28e99497aeeb93a26/stdio_mgr/stdio_mgr.py#L36-L72" rel="nofollow noreferrer">custom <code>StringIO</code> subclass</a> which (a) automatically tees everything read from the stream over to the mocked <code>stdout</code>, and thus echoes the "typed input" to the "console"; and (b) implements an <code>.append()</code> helper method to allow addition of more content to the end of mock-<code>stdin</code> without changing the seek position.</p>
+<p>Example usage:</p>
+<pre class="lang-py prettyprint-override"><code>&gt;&gt;&gt; from stdio_mgr import stdio_mgr
+&gt;&gt;&gt; with stdio_mgr() as (in_, out_, err_):
+...     print('foobar')               # 'print' appends '\n'
+...     in_.append('bazquux\n')       # Don't forget trailing '\n'!
+...     inp_result = input('?')       # 'bazquux\n' is teed to 'out_' here
+...     out_result = out_.getvalue()  # Pull the whole 'out_' stream contents
+&gt;&gt;&gt; inp_result
+'bazquux'
+
+&gt;&gt;&gt; out_result
+'foobar\n?bazquux\n'
+</code></pre>
+<p>Note that even though the string appended to <code>in_</code> was newline-terminated (otherwise execution would hang), per the <a href="https://docs.python.org/3/library/functions.html#input" rel="nofollow noreferrer">standard behavior</a> <code>input</code> stripped that trailing <code>'\n'</code> before the string was stored in <code>inp_result</code>. As can be seen, the question mark used as the prompt for <code>input</code> <em>is</em> also stored in <code>out_</code>.</p>
+<p>However, since <code>TeeStdin</code> tees the content read from "<code>stdin</code>" <em>before</em> it's passed to <code>input</code>, <code>out_</code> received <code>?bazquux\n</code>, not <code>?bazquux</code>. While this newline handling has the potential to get somewhat confounded, I'm pretty sure there's not much to be done about it—any twiddles would probably break the transparency of the mock from the perspective of the wrapped code.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can use the <code>subprocess</code> module to call your script from within python. You can then send test input via <code>communicate</code></p>
+<pre><code>import subprocess as sp
+import sys
+
+interpreter_path = sys.executable
+p = sp.Popen([interpreter_path, script_to_test])
+(stdout, stderr) = p.communicate(input = testinput)
+</code></pre>
+<p><code>stdout</code> and <code>stderr</code> can then be tested for correct values</p>
+</div>
+<span class="comment-copy">@downvoter/s <code>please consider adding a comment if you think this post can be improved</code></span>
+<span class="comment-copy">Can you give a specific (maybe dumbed down to be simple enough) example of a code snipped you'd like to test? It can probably be done by mocking or stubbing <code>input</code> or <code>sys.stdin</code>, so that you don't test the builtin functions, but instead test what your code does with them.</span>
+<span class="comment-copy">@das-g I've edited my question</span>
+<span class="comment-copy">thanks, it'll probably come in handy in the future</span>
+<span class="comment-copy">hmm, interesting</span>

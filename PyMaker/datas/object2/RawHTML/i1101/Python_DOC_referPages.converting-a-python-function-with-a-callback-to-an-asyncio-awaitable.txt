@@ -1,0 +1,77 @@
+<div class="post-text" itemprop="text">
+<p>I want to use the <code>PyAudio</code> library in an async context, but the main entry point for the library only has a callback-based API:</p>
+<pre><code>    import pyaudio
+
+    def callback(in_data, frame_count, time_info, status):
+        # Do something with data
+
+    pa = pyaudio.PyAudio()
+    self.stream = self.pa.open(
+        stream_callback=callback
+    )
+</code></pre>
+<p>How I'm hoping to use it is something like this:</p>
+<pre><code>pa = SOME_ASYNC_COROUTINE()
+async def listen():
+    async for block in pa:
+        # Do something with block
+</code></pre>
+<p>The problem is, I'm not sure how to convert this callback syntax to a future that completes when the callback fires. In JavaScript I would use <a href="http://bluebirdjs.com/docs/api/promise.promisify.html" rel="nofollow noreferrer"><code>promise.promisify()</code></a>, but Python doesn't seem to have anything like that.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>An equivalent of <code>promisify</code> wouldn't work for this use case for two reasons:</p>
+<ul>
+<li>PyAudio's async API doesn't use the asyncio event loop - the documentation specifies that the callback is invoked from a background thread. This requires precautions to correctly communicate with asyncio.</li>
+<li>The callback cannot be modeled by a single future because it is invoked multiple times, whereas a future can only have one result. Instead, it must be converted to an async iterator, just as shown in your sample code.</li>
+</ul>
+<p>Here is one possible implementation:</p>
+<pre><code>async def make_iter():
+    loop = asyncio.get_event_loop()
+    queue = asyncio.Queue()
+    def put(*args):
+        loop.call_soon_threadsafe(queue.put_nowait, args)
+    async def get():
+        while True:
+            yield queue.get()
+    return get(), put
+</code></pre>
+<p><code>make_iter</code> returns a <strong>pair</strong> of &lt;async iterator, put-callback&gt;. The returned objects hold the property that invoking the callback causes the iterator to produce its next value (the arguments passed to the callback). The callback may be called to call from an arbitrary thread and is thus safe to pass to <code>pyaudio.open</code>, while the async iterator should be given to <code>async for</code> in an asyncio coroutine, which will be suspended while waiting for the next value:</p>
+<pre><code>async def main():
+    stream_get, stream_put = make_iter()
+    stream = pa.open(stream_callback=stream_put)
+    stream.start_stream()
+    async for in_data, frame_count, time_info, status in stream_get:
+        # ...
+
+asyncio.get_event_loop().run_until_complete(main())
+</code></pre>
+<p>Note that, according to the <a href="https://people.csail.mit.edu/hubert/pyaudio/docs/#example-callback-mode-audio-i-o" rel="nofollow noreferrer">documentation</a>, the callback must also <strong>return</strong> a meaningful value, a tuple of frames and a Boolean flag. This can be incorporated in the design by changing the <code>fill</code> function to also receive the data from the asyncio side. The implementation is not included because it might not make much sense without an understanding of the domain.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You may want to use a <a href="https://docs.python.org/3/library/asyncio-future.html#asyncio.Future" rel="nofollow noreferrer">Future</a></p>
+<blockquote>
+<p>class asyncio.Future(*, loop=None)¶</p>
+<p>A Future represents an eventual result of an asynchronous operation. Not thread-safe.</p>
+<p>Future is an awaitable object. Coroutines can await on Future objects until they either have a result or an exception set, or until they are cancelled.</p>
+<p>Typically Futures are used to enable <strong>low-level callback-based</strong> code (e.g. in protocols implemented using asyncio transports) to interoperate with high-level async/await code.</p>
+<p>The rule of thumb is to never expose Future objects in user-facing APIs, and the recommended way to create a Future object is to call loop.create_future(). This way alternative event loop implementations can inject their own optimized implementations of a Future object.</p>
+</blockquote>
+<p>A silly example:</p>
+<pre><code>def my_func(loop):
+    fut = loop.create_future()
+    pa.open(
+        stream_callback=lambda *a, **kw: fut.set_result([a, kw])
+    )
+    return fut
+
+
+async def main(loop):
+    result = await my_func(loop)  # returns a list with args and kwargs 
+</code></pre>
+<p>I assume that <code>pa.open</code> runs in a thread or a subprocess. If not, you may also need to wrap the call to <code>open</code> with <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.run_in_executor" rel="nofollow noreferrer">asyncio.loop.run_in_executor</a></p>
+</div>
+<span class="comment-copy">Thanks, this is very helpful! Although something that might make this clearer is making your example <code>make_iter()</code> use a class instead, because I had trouble grasping that it was a function that returns a tuple of functions initially.</span>
+<span class="comment-copy">@Miguel Because the callback will be invoked in a background thread managed by PyAudio and not the event loop thread. <code>call_soon_threadsafe</code> is designed for exactly that usage. It schedules the function to the event loop without breaking it (e.g. by corrupting its data structures without holding the proper locks), and wakes it up in case the event loop was sleeping at the time.</span>
+<span class="comment-copy">The event loop thread is also manipulating the queue, because the event loop removes stuff from the queue (and uses <code>call_soon</code> itself for its own needs). But even if there were no corruption risk, the event loop simply wouldn't wake if you don't use the threadsafe variant, because it wouldn't know it needs to. The typical symptom is that the presence of an unrelated heartbeat coroutine "fixes" the problem, as in <a href="https://stackoverflow.com/q/49906034/1600898">this question</a>.</span>
+<span class="comment-copy">Ohh it wakes the event loop! That explains why my tests hang forever when I remove the <code>call_soon_threadsafe</code>. Thank you!</span>
+<span class="comment-copy">Based on this answer, I've created an example for the <code>sounddevice</code> module: <a href="https://github.com/spatialaudio/python-sounddevice/blob/master/examples/asyncio_generators.py" rel="nofollow noreferrer">github.com/spatialaudio/python-sounddevice/blob/master/examples/…</a>. This seems to work quite well!</span>

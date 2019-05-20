@@ -1,0 +1,131 @@
+<div class="post-text" itemprop="text">
+<p>First look at the following code:</p>
+<pre><code>pool = multiprocessing.Pool(processes=N)
+batch = []
+for item in generator():
+    batch.append(item)
+    if len(batch) == 10:
+        pool.apply_async(my_fun, args=(batch,))
+        batch = []
+# leftovers
+pool.apply_async(my_fun, args=(batch,))
+</code></pre>
+<p>Essentially I'm retrieving data from a generator, collecting in into a list and then spawning a process that consumes the batch of data.</p>
+<p>This may look fine but when the consumers (aka the pool processes) are slower than the producer (aka the generator) memory usage of the main process grows until the generator stops or... the system runs out of memory.</p>
+<p>How can I avoid this problem?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You might want to use a limited-size queue in this case. </p>
+<pre><code>q = multiprocessing.Queue(maxSize).
+</code></pre>
+<p>When used with max. size, this will provide you with the necessary counting and block the thread that is calling q.put() when it is full, so you could never post more than a certain number of work items on it and thus limit the memory needed to store the pending items.</p>
+<p>Alternatively, you could use a counting semaphore (e.g., multiprocessing.BoundedSemaphore(maxSize)). Acquire it each time you get a work item from the generator and release it in your work function (my_fun) once the item is processed. This way, the maximum number of work items waiting to be processed will never exceed the initial value of the semaphore.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Use the <code>grouper</code> itertools recipe to <em>chunk</em> the data from your generator.  </p>
+<p>Use the infrastructure in <a href="https://docs.python.org/3/library/concurrent.futures.html" rel="nofollow noreferrer">concurrent futures</a> to handle task submission and retrieval with the processes.</p>
+<p>You could</p>
+<ul>
+<li>submit a group of tasks; wait for them to finish; then submit another group, or</li>
+<li>keep the pipeline full by submitting a new task each time one completes.</li>
+</ul>
+<hr/>
+<p>Setup (attempt to simulate your process):</p>
+<pre><code>import concurrent.futures
+import itertools, time, collections, random
+from pprint import pprint
+
+# from itertools recipes
+def grouper(iterable, n, fillvalue=None):
+    "Collect data into fixed-length chunks or blocks"
+    # grouper('ABCDEFG', 3, 'x') --&gt; ABC DEF Gxx"
+    args = [iter(iterable)] * n
+    return itertools.zip_longest(*args, fillvalue=fillvalue)
+
+# generator/iterator facsimile
+class G:
+    '''Long-winded range(n)'''
+    def __init__(self, n=108):
+        self.n = n
+        self.a = []
+    def __iter__(self):
+        return self
+    def __next__(self):
+        #self.a.append(time.perf_counter())
+        if self.n &lt; 0:
+            raise StopIteration
+        x = self.n
+        self.n -= 1
+        return x
+
+def my_func(*args):
+    time.sleep(random.randint(1,10))
+    return sum(*args)
+</code></pre>
+<hr/>
+<p>Wait for groups of tasks to complete</p>
+<pre><code>if __name__ == '__main__':
+    nworkers = 4
+    g = G()
+    # generate data three-at-a-time
+    data = grouper(g, 3, 0)
+    results = []
+    fs = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=nworkers) as executor:
+        for args in data:
+            print(f'pending:{len(executor._pending_work_items)}')
+            # block submission - limit pending tasks to conserve resources (memory) 
+            if len(executor._pending_work_items) == nworkers:
+                # wait till all complete and get the results
+                futures = concurrent.futures.wait(fs, return_when=concurrent.futures.ALL_COMPLETED)
+                #print(futures)
+                results.extend(future.result() for future in futures.done)
+                fs = list(futures.not_done)
+            # add a new task
+            fs.append(executor.submit(my_func, args))
+        # data exhausted - get leftover results as they finish
+        for future in concurrent.futures.as_completed(fs):
+            print(f'pending:{len(executor._pending_work_items)}')
+            result = future.result()
+            results.append(result)
+
+    pprint(results)
+</code></pre>
+<hr/>
+<p>Keep the process pool <em>full</em>.</p>
+<pre><code>if __name__ == '__main__':
+    nworkers = 4
+    g = G()
+    # generate data three-at-a-time
+    data = grouper(g, 3, 0)
+    results = []
+    fs = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=nworkers) as executor:
+        for args in data:
+            print(f'pending:{len(executor._pending_work_items)}')
+            # block submission - limit pending tasks to conserve resources (memory) 
+            if len(executor._pending_work_items) == nworkers:
+                # wait till one completes and get the result
+                futures = concurrent.futures.wait(fs, return_when=concurrent.futures.FIRST_COMPLETED)
+                #print(futures)
+                results.extend(future.result() for future in futures.done)
+                fs = list(futures.not_done)
+            # add a new task
+            fs.append(executor.submit(my_func, args))
+        # data exhausted - get leftover results as they finish
+        for future in concurrent.futures.as_completed(fs):
+            print(f'pending:{len(executor._pending_work_items)}')
+            result = future.result()
+            results.append(result)
+
+    pprint(results)
+</code></pre>
+</div>
+<span class="comment-copy">Have you tried to build a list of lists and use <code>pool.map_async()</code>? or maybe <code>starmap_async</code>??</span>
+<span class="comment-copy">see similar question <a href="https://stackoverflow.com/questions/17241663/filling-a-queue-and-managing-multiprocessing-in-python" title="filling a queue and managing multiprocessing in python">stackoverflow.com/questions/17241663/…</a> on how to use a queue with a process pool.</span>
+<span class="comment-copy"><code>apply_async</code> returns an <code>AsyncResult</code> object, I don't see that you are using it anywhere.</span>
+<span class="comment-copy">Thanks, I think the semaphore will do.</span>
+<span class="comment-copy">Well, the main problem is that the data does not fit into memory (hence the use of a generator) so I can't see how this avoids that.</span>
+<span class="comment-copy">I agree with @Manuel, this does not solve the memory issue (at least theoretically).</span>
+<span class="comment-copy">@Manuel - see edit.</span>
+<span class="comment-copy">@diningphil - Please see edit: is that better?</span>

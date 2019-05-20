@@ -1,0 +1,241 @@
+<div class="post-text" itemprop="text">
+<p>I have been using a <code>dict</code> to store key value pairs where the key and value are both sha256 hash digests. I need to be able to find out if a key exists in the list, and also be able to retrieve the value for that dict.</p>
+<p>At the moment I estimate I will need about 10Gb of memory to store 8,000,000 hashes based on some of my tests, where as the actual data being stored is only about 512MB (32 bytes per hash, so 64 bytes per record) </p>
+<p>Does anyone have any suggestions? </p>
+<p>UPDATE, based on some of the comments I thought I should update. I am storing the hashes as bytes, not as a hex string. I am using an sqlite database for permanent storage of the data, but inserting that many records with an index gets too slow after about 1,000,000 records, and without the index checking existence of a key gets exponentially slower as well. Thats why I want to use an in memory structure to do the lookup.</p>
+<p>UPDATE 2</p>
+<p>Could this work? <a href="http://atbrox.com/2012/04/25/atbr-large-scale-in-memory-hashtables-in-python/" rel="nofollow" title="atbr hashtable">atbr hashtable</a></p>
+<p>My Solution: (Should I put this as an answer?)
+What I ended up doing was taking lots of advice from @abarnert creating a new class that  implements 1024 lists of <code>[count, bytearray(8000 * 32), bytearray(8000 *32)]</code></p>
+<p>I use the first 10 bits of the hash as in index to which list I should store the hashes in. Then I just append the key to the next 32byte slot, and the value to the same slot in the other byte array.</p>
+<p>I can generate 16,000,000 hashes (one for the key and one for the value) and insert the 8,000,000 key value pairs into the structure in about 30 seconds.</p>
+<p>Searching is just the reverse I use the first 10 bits to find the list and then I just do a linear search for the hash until I find it.</p>
+<p>Searching for 200,000 hashes picked at random from the 8,000,000 takes 30 seconds, so 40 times slower than writing, but it should be fast enough for my needs. </p>
+<p>The bonus of it all, it now only consumes 519MB of RAM for all 8,000,000 hashes.</p>
+<p>Thank you everyone for your help.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>First, let's look at <em>why</em> this is so big.</p>
+<p>Each has is 32 bytes. That means it takes about 32 bytes to store in binary form in, e.g., the storage of a <code>bytes</code> or <code>bytearray</code> object. So far, so good.</p>
+<p>But all Python objects have headers, typically on the order of 24-64 bytes. From a quick check, it looks like <code>bytes</code> objects take up an extra 36 bytes on 32 bits (possibly plus alignment padding), and 48 on 64 bits, at least on the two versions of CPython I checked.</p>
+<p>So, how can you get rid of that 150% extra storage? Pack the bytes into one giant array, like a <code>bytes</code> or <code>bytearray</code>. Then you've got 48 bytes <em>total</em> plus 32 per hash, instead of 48+32 per hash. When you need to access a hash, if you've got the index, it's just the slice <code>[index*32:(index+1)*32]</code>.</p>
+<p>Also, depending on how you created the <code>bytes</code>, there can be some overflow slop. You can check that—if <code>sys.getsizeof(s) - sys.getsizeof(b'') &gt; len(s)</code>, you need to slice all of your objects to create new copies with no extra padding.</p>
+<p>Anyway, now you have 8M extra indexes. If those are transient, that's fine, but if you're storing <em>them</em> as <code>int</code>s in dict value slots, then each one of them <em>also</em> has a header. From a quick test, on top of the 4 bytes for actual storage (for an int under 1&lt;&lt;31), there's a 24-byte header in both 32- and 64-bit (although very small ints can apparently be crammed into the header). So, all this does is cut your 48 bytes of waste to 28 bytes, which isn't great.</p>
+<p>You could use some form of packed storage, like the <a href="http://docs.python.org/3/library/array.html" rel="nofollow"><code>array</code></a> module. An array type <code>I</code> only uses 4 bytes per integer. But then you need indices into the array, which… is the same problem you just solved.</p>
+<p>But you really don't even need the indices—if you store the keys themselves in an array, the index of any key is already the index of the hash in the byte string (divided by 32), right?</p>
+<p>This only works if you can store the keys in some sort of compact array. If they're all around the same size, you can do this by using the same "giantbytestring" trick again. And in your case, they are—the keys are <em>also</em> 32-byte hashes. So you just have to keep both giant byte strings sorted by the key values (see the <a href="http://docs.python.org/3/library/bisect.html" rel="nofollow"><code>bisect</code></a> module so you don't have to write that code yourself).</p>
+<p>Of course using binary search algorithms instead of hashing means that you're making the lookups and inserts logarithmic instead of constant. And, while log(8M) is only around 16, which is a lot better than 8M, it's still 16x as bad as 1. But this is effectively what you get from an ideally-tuned relational database, except that you don't need to do any tuning, and it's all in memory, and there's no extra overhead, so it has to be an improvement over what you've tried so far.</p>
+<p>You could of course build a custom hash table in Python, using the two giant byte arrays as your storage, and two <code>array('I')</code> as your indices. But that's a lot more work, so I'd try it the easy way first.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Use the <a href="http://docs.python.org/2/library/sqlite3.html" rel="nofollow"><code>sqlite3</code> library</a> to store your hashes in a database. The sqlite embedded database will take care of memory management for you using memory buffering and on-disk storage as best it can to satisfy your queries.</p>
+<p>A very simple table will suffice:</p>
+<pre><code>import sqlite3
+
+connection = sqlite3.connect('/tmp/hashes.db')
+connection.execute('CREATE TABLE hashes (key UNIQUE, value)')
+</code></pre>
+<p>then use:</p>
+<pre><code>with connection:
+    cursor = connection.cursor()
+    sql = 'INSERT INTO hashes VALUES (?, ?)'
+    cursor.executemany(sql, ((key1, hash1), (key2, hash2), ....))
+</code></pre>
+<p>and you can query the database with:</p>
+<pre><code>with connection:
+    cursor = connection.cursor()
+    sql = 'SELECT hash FROM hashes WHERE key=?'
+    cursor.execute(sql, (key,))
+    hash = cursor.fetchone()
+    if hash is not None:
+        hash = hash[0]
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you don't want to or can't use an external database, you can create an in memory database that is much closer to the information theoretic minimum in memory use while being extremely fast. You need to use lower-level tools than Python objects though.</p>
+<p>You could use an <code>array.array</code> or <code>bytearray</code> to store the keys and values without any overhead, which means 8M entries fit into 488 MiB. Then you can write a hash table atop of that. This is rather inconvenient though, so you may want to use an external library like <code>cffi</code> for working with tightly packed C structures and arrays.</p>
+<p>A simple open addressing hash table with linear probing could work very well for your data (take the lowest N bits of the key as hash) and is not too hard to implement, even easier if you don't need deletion. Just keep the load factor reasonable, between one half and two thirds. If you want to save space (each empty entry wastes half a kilobyte), pack the key-value pairs tightly into the array and only store a pointer/index in the hash table.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I wrote a more complicated answer separately, because I'm not sure if this will work for you, but:</p>
+<p>A <a href="http://docs.python.org/3/library/dbm.html" rel="nofollow"><code>dbm</code></a> is a key-value database that works almost exactly like a <code>dict</code> (whose keys and values are <code>bytes</code> strings), except that it's backed to disk and pages values in and out as needed.</p>
+<p>It's much simpler than a SQL database, which has three huge advantages.</p>
+<ul>
+<li><p>You don't need to change your code from <code>hash = hashes[thingy]</code> to <code>hash = db.execute('SELECT * FROM Hashes WHERE Thingy = ?', (thingy,)).fetchone()[0]</code>, you just continue to use <code>hashes[thingy]</code>.</p></li>
+<li><p>There are no indices to get right—the key hash is the one and only index for the one table in the database—and no other optimizations to do.</p></li>
+<li><p>A good chunk of the database will be cached in memory, making it fast.</p></li>
+</ul>
+<hr/>
+<p>Despite being called a "Unix database", at least one of the various <code>dbm</code> family of modules exists every platform. See <a href="http://stupidpythonideas.blogspot.com/2014/01/dbm-not-just-for-unix.html" rel="nofollow">dbm: not just for Unix</a> for details.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since it's a hash, you could implement a dictionary in a file using <code>seek()</code>/<code>tell()</code>.... You would need to pre-create the file to the given size though (10GB or whatever)...</p>
+<p>then it's just like any other hash table. you have to deal with collisions yourself, and it will be slower obviously because it's in a file... </p>
+<pre><code>offset = dict_hash(in_key)
+dict_file.seek(offset)
+hashval = dict_file.read(hash_len)
+</code></pre>
+<p>something like that (used to do things like this in C, haven't done it in python but the underlying file support is the same...) </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You don't actually need to store the Hash data at all. all you need to do is to properly index the hash.</p>
+<p>Heres my indexing functions for the Hash</p>
+<p>First We Have this fucntion for fast indexing of the hash.</p>
+<pre><code>ZequebaHashB[bvc_, yvc_, avc_] :=
+ {Drop[Flatten[Reap[
+  Module[{a34 = bvc, a35 = yvc, rt2 = avc, z75, zler},
+    z75 = 1;
+    zler = Total[BCC[Re[Floor[Px[a34, a35^2]]], a35^3]];
+    Label[Start5629];
+    Sow[Denominator[zler/FiveItt[a35, z75]], yvc];
+    z75 = z75 + 1;
+    If[z75 &gt;= rt2 + 1, Goto[end5629]];
+    Goto[Start5629];
+    Label[end5629];
+    ];]], 1], Total[BCC[Floor[Re[Px[bvc, yvc^2]]], yvc^3]], bvc};
+</code></pre>
+<p>Second we have this function for Getting a Rainbow Index of the hash</p>
+<pre><code>RainbowHashXG[zf_, xz_, zd_, fd_] := 
+Column[{Table[
+ Flatten[Drop[ZequebaHashB[zf + xf, xz, zd], -2]], {xf, 0, 
+  fd - 1}], zf}];
+</code></pre>
+<p>Now When you try these functions</p>
+<pre><code>Table[ZequebaHashB[Hash[xu, "SHA512"], 2, 5], {xu, 1, 10}]
+
+{{{1, 2, 3, 4, 5}, 427, 
+</code></pre>
+<p>12579926171497332473039920596952835386489858401292624452730263741969\
+1347390182282976402981790496477460666208142347425205936701161323553455\
+43156774710409041}, 
+{{1, 1, 1, 1, 5}, 396, 
+  37854471215291391986149267401049113295567628473597440675968265868739\
+3920246834469920751231286910611366704757913119360843344094113813460828\
+6029275267369625}, 
+{{1, 1, 1, 2, 5}, 378, 
+  71668700870008575285238318023246235316098096074289026150051114683524\
+8893999285271969471146596174190457020264703584540790263678736452792747\
+5984118971455163}, 
+{{1, 2, 3, 4, 5}, 377, 
+  33095966240281217830184164668404219514626500609945265788213543056523\
+6612792119604718913684957565086394439681603253709963629672412822522528\
+4694992131191098}, 
+{{1, 2, 1, 4, 5}, 363, 
+  86087420302049294430262146818103852368792727362988712093781053088200\
+5531339261473092981846995901587757487311471069416835834626804973821926\
+684090578667825}, 
+{{1, 1, 3, 2, 5}, 374, 
+  18586086601485268646467765285794047467027639305129763019055665664163\
+2819380637531124748570695025942793945139516664108034654512831533948189\
+743738184270224}, 
+{{1, 1, 3, 1, 1}, 380, 
+  72109882448403363840259529414390721196358024901859951350044294221621\
+3409708767088486766304397692430037767785681544787701437132358156239382\
+5256452011168475}, 
+{{1, 2, 3, 4, 5}, 397, 
+  22760214977694020069971224118591466739483553732805530503408373418535\
+1711847169063849360187954434350675389187296376543635586233555068331343\
+3001046271103001}, 
+{{1, 2, 1, 4, 5}, 369, 
+  11906459655144790308170064541982556680120578173098014909650827827844\
+2313493552143468785692756291539132782149145837942478466345517803751070\
+21641806135272354}, 
+{{1, 1, 3, 2, 5}, 382, 
+  88155955858214177781767282869972903505820511583564376117417944351446\
+8458315518532665921338085983977628624644833036888032312932654944528755\</p>
+<ol>
+<li><p>5410805140620789}}</p>
+<pre><code>Table[RainbowHashXG[Hash[xu, "SHA512"], 2, 5, 5], {xu, 1, 10}]
+</code></pre>
+<p>{{{{1, 1, 1, 1, 5}, {1, 2, 3, 4, 5}, {1, 1, 3, 2, 5}, {1, 2, 1, 4,
+1}, {1, 1, 3, 1, 5}},<br/>
+12579926171497332473039920596952835386489858401292624452730263741969\
+1347390182282976402981790496477460666208142347425205936701161323553455\
+43156774710409041},  {{{1, 2, 1, 4, 5}, {1, 1, 3, 2, 5}, {1, 2, 3,
+4, 1}, {1, 1, 1, 1, 5}, {1, 2, 3, 4, 5}},<br/>
+37854471215291391986149267401049113295567628473597440675968265868739\
+3920246834469920751231286910611366704757913119360843344094113813460828\
+6029275267369625},  {{{1, 2, 3, 4, 5}, {1, 1, 1, 1, 5}, {1, 2, 3, 4,
+5}, {1, 1, 3, 2, 5}, {1, 2, 1, 4, 1}},<br/>
+71668700870008575285238318023246235316098096074289026150051114683524\
+8893999285271969471146596174190457020264703584540790263678736452792747\
+5984118971455163},  {{{1, 2, 3, 4, 5}, {1, 1, 1, 1, 5}, {1, 2, 3, 4,
+5}, {1, 1, 3, 2, 1}, {1, 2, 1, 4, 5}},<br/>
+33095966240281217830184164668404219514626500609945265788213543056523\
+6612792119604718913684957565086394439681603253709963629672412822522528\
+4694992131191098},  {{{1, 2, 3, 4, 1}, {1, 1, 3, 1, 5}, {1, 2, 1, 4,
+5}, {1, 1, 3, 2, 5}, {1, 1, 3, 1, 5}},<br/>
+86087420302049294430262146818103852368792727362988712093781053088200\
+5531339261473092981846995901587757487311471069416835834626804973821926\
+684090578667825},  {{{1, 1, 1, 1, 5}, {1, 2, 3, 4, 5}, {1, 1, 3, 2,
+5}, {1, 2, 1, 4, 1}, {1, 1, 3, 1, 5}},<br/>
+18586086601485268646467765285794047467027639305129763019055665664163\
+2819380637531124748570695025942793945139516664108034654512831533948189\
+743738184270224},  {{{1, 2, 3, 4, 1}, {1, 1, 1, 2, 5}, {1, 2, 3, 4,
+5}, {1, 2, 3, 4, 5}, {1, 1, 3, 2, 5}},<br/>
+72109882448403363840259529414390721196358024901859951350044294221621\
+3409708767088486766304397692430037767785681544787701437132358156239382\
+5256452011168475},  {{{1, 1, 3, 1, 5}, {1, 2, 3, 4, 1}, {1, 1, 1, 2,
+5}, {1, 2, 3, 4, 5}, {1, 1, 3, 1, 5}},<br/>
+22760214977694020069971224118591466739483553732805530503408373418535\
+1711847169063849360187954434350675389187296376543635586233555068331343\
+3001046271103001},  {{{1, 1, 1, 2, 5}, {1, 2, 3, 4, 5}, {1, 1, 3, 1,
+1}, {1, 2, 1, 4, 5}, {1, 2, 1, 4, 1}},<br/>
+11906459655144790308170064541982556680120578173098014909650827827844\
+2313493552143468785692756291539132782149145837942478466345517803751070\
+21641806135272354},  {{{1, 2, 1, 4, 5}, {1, 1, 3, 1, 1}, {1, 2, 3,
+4, 5}, {1, 1, 1, 2, 5}, {1, 2, 3, 4, 5}},<br/>
+88155955858214177781767282869972903505820511583564376117417944351446\
+8458315518532665921338085983977628624644833036888032312932654944528755\
+5410805140620789}}</p>
+<pre><code>FiveItt[x98_, cc5_] :=
+DifferenceRoot[
+Function[{\[FormalY], \[FormalN]}, {-cc5 -
+cc5 \[FormalY][\[FormalN]] + \[FormalY][1 + \[FormalN]] == 0, \[FormalY][1] == 1, \[FormalY][2] == cc5}]][x98];
+</code></pre>
+<p>BCC[x55_, g77_] := Drop[Flatten[Reap[ Module[ {x45 = x55, z7 = 0, z8
+= 0, z9, g7 = g77, bell},</p>
+<p>z7 = If[x45/FiveItt[Length[IntegerDigits[x45, g7]], g7] &lt;= 1, If[x45
+== 1, 1, Length[IntegerDigits[x45, g7]] - 1], Length[IntegerDigits[x45,    g7]]]; bell = FiveItt[z7 - 1, g7]; z9 =
+g7^(z7 - 1);</p>
+<p>Label[SPo]; z8 = If[IntegerQ[x45/g7] &amp;&amp; x45 &gt; g7, Quotient[x45 -
+bell - (1/(2*g7)), z9], If[x45 &lt;= g7, x45, Quotient[x45 - bell,
+z9]]]; Sow[z8]; x45 = x45 - (z8*(z9)); z7 = z7 - 1; z9 = z9/g7; bell
+= bell - z9;</p>
+<p>If[z7 &lt; 1, Goto[EnD], Goto[SPo]];</p>
+<p>Label[EnD];</p>
+<p>] ]], 1];</p>
+<p>Px = Compile[ {{x1d, _Complex}, {si1d, _Real}} , Module[{x1c = x1d,
+si1c = si1d} , x1c + 1/2 (Floor[ Re[(-4 + si1c + Sqrt[(-4 + si1c)^2</p>
+<ul>
+<li>8 (-2 + si1c) (-1 + x1d)])/( 2 (-2 + si1c))]] + Floor[Im[(-4 + si1c +   Sqrt[(-4 + si1c)^2 + 8 (-2 + si1c) (-1 + x1d)])/( 2 (-2 +
+si1c))]] I) (-4 + si1c - (-2 + si1c) (Floor[ Re[(-4 + si1c +
+Sqrt[(-4 + si1c)^2 + 8 (-2 + si1c) (-1 + x1c)])/( 2 (-2 + si1c))]] +
+Floor[Im[(-4 + si1c + Sqrt[(-4 + si1c)^2 + 8 (-2 + si1c) (-1 +
+x1c)])/( 2 (-2 + si1c))]] I))] , CompilationTarget -&gt; "C",
+"RuntimeOptions" -&gt; "Speed"];</li>
+</ul></li>
+</ol>
+</div>
+<span class="comment-copy">One straightforward way to reduce memory consumption is to write your hash table in C.  You can still use it from Python.</span>
+<span class="comment-copy">Use a database. A <code>sqlite</code> library comes with Python.</span>
+<span class="comment-copy">I am afraid I am not that clever, that's why I am writing my code in python, it would take me too long to learn how to do that. But if I get really desperate I might have to learn.</span>
+<span class="comment-copy">I am using an sqlite database but as i need to keep inserting values I cant have an index, it takes longer and longer to insert records the more values that are in there. Without the index, checking if and item exists takes too long.</span>
+<span class="comment-copy">Are you storing the hash digest as bytes, or as hex strings? If the latter… that's the first thing you want to change.</span>
+<span class="comment-copy">@abarbert Thanks for the detailed reply, I will look into bisect and see what it looks like.</span>
+<span class="comment-copy">@abarbert From a memory aspect Byte Arrays will be perfect, but searching them is quite hard, I have looked at the bisect module and I cant work out how to use it with byte arrays. it seems simple enough with a normal list, but with a byte array you effectively have have a list of single bytes. How could you search in blocks of 32? Also is it possible to insert blocks of bytes into a byte array? or just single bytes? Thanks</span>
+<span class="comment-copy">@Deano123: OK, first you can implement a <code>ArrayOfByteArray32s</code> class by using a <code>bytearray</code> for storage, and implementing <code>__len__</code>/<code>__getitem__</code>/<code>__setitem__</code> by multiplying the index or slice members by 32 and then delegating to the underlying <code>bytearray</code>. Then it looks just like a sequence of <code>bytearrays</code>, so it can be used with <code>bisect</code>. If that doesn't make sense, I can slap together an implementation.</span>
+<span class="comment-copy">@Deano123: However… what does your use profile look like? If you do as many inserts as lookups, this implementation won't help enough (it makes searches logarithmic, but inserts are linear), so it's only appropriate if you're doing lots of lookups per insert.</span>
+<span class="comment-copy">@abarbert Worst case I will be doing as many inserts as lookups, i take a hash, see if it is in there already and if not then add it to the list. Would it help to allocate the entire array first? and then populate it with the data? I think I understand the the <code>__len__</code> <code>__getitem__</code> <code>__setitem__</code>, but dont want to do that if it wont help. I was looking at memcache, but dont really want to have to run an extra server as well as my app, would rather do it all "in house". If inserting into an indexed table wasn't so slow in sqlite that would be perfect. Any other ideas? Thanks for your help BTW</span>
+<span class="comment-copy">Sorry I have updated the question, I am already using sqlite in my application for permanent storage.</span>
+<span class="comment-copy">@Deano123: Have you considered temporarily disabling the index then recreating it <i>after</i> your insertions?</span>
+<span class="comment-copy">@Deano123: also see <a href="http://stackoverflow.com/q/788568">Sqlite3: Disabling primary key index while inserting?</a></span>
+<span class="comment-copy">Yes, I cant do that because I have to constantly insert new values, there is no way I can batch add them. Once my initial process is complete and all the values are loaded into the database, to get the data back out again I actually create an index so I can read them back faster.</span>
+<span class="comment-copy">Then it's the way you are inserting your hashes that is inefficient; is there no way you can collect batches of hashes for grouped insertions? Or do you need access to the already-produced hashes as you generate more?</span>
+<span class="comment-copy">He <i>does</i> need dynamic insertion. See his comments on Martijn's answer.</span>
+<span class="comment-copy">@abarnert Noted and adjusted answer.</span>
+<span class="comment-copy">Just for fun, <a href="https://github.com/abarnert/fixedhash" rel="nofollow noreferrer">here</a> is a sample implementation. It's probably got some bugs, and it's anywhere from 3x-278x slower than <code>dict</code> in my tests, but it should be easy to understand.</span>
+<span class="comment-copy">Thanks for the suggestion, I will have a look and see if that will help</span>
+<span class="comment-copy">Why build it yourself when there are modules in the stdlib that do the same thing, with nicer wrappers, with decades of testing and optimization behind them?</span>
+<span class="comment-copy">good point - i have looked at dbm once or twice, but got scared off by the doc page's unix orientation. that's a better idea.</span>
+<span class="comment-copy">I think you missed some formatting... the end of your answer makes no sense at all.</span>

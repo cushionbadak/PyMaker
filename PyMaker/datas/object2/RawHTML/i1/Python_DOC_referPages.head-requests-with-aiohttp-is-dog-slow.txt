@@ -1,0 +1,125 @@
+<div class="post-text" itemprop="text">
+<p>Given a list of 50k websites urls, I've been tasked to find out which of them are up/reachable. The idea is just to send a <code>HEAD</code> request to each URL and look at the status response. From what I hear an asynchronous approach is the way to go and for now I'm using <code>asyncio</code> with <code>aiohttp</code>.</p>
+<p>I came up with the following code but the speed is pretty abysmal. 1000 URLs takes approximately 200 seconds on my 10mbit connection. I don't know what speeds to expect but I'm new to asynchronous programming in Python so I figured I've stepped wrong somewhere. As you can see I've tried increasing the number of allowed simultaneous connections to 1000 (up from the default of 100) and the duration for which DNS resolves are kept in the cache; neither to any great effect. The environment has Python 3.6 and  <code>aiohttp</code> 3.5.4.</p>
+<p>Code review unrelated to the question is also appreciated.</p>
+<pre><code>import asyncio
+import time
+from socket import gaierror
+from typing import List, Tuple
+
+import aiohttp
+from aiohttp.client_exceptions import TooManyRedirects
+
+# Using a non-default user-agent seems to avoid lots of 403 (Forbidden) errors
+HEADERS = {
+    'user-agent': ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_5) '
+                   'AppleWebKit/537.36 (KHTML, like Gecko) '
+                   'Chrome/45.0.2454.101 Safari/537.36'),
+}
+
+
+async def get_status_code(session: aiohttp.ClientSession, url: str) -&gt; Tuple[int, str]:
+    try:
+        # A HEAD request is quicker than a GET request
+        resp = await session.head(url, allow_redirects=True, ssl=False, headers=HEADERS)
+        async with resp:
+            status = resp.status
+            reason = resp.reason
+        if status == 405:
+            # HEAD request not allowed, fall back on GET
+            resp = await session.get(
+                url, allow_redirects=True, ssl=False, headers=HEADERS)
+            async with resp:
+                status = resp.status
+                reason = resp.reason
+        return (status, reason)
+    except aiohttp.InvalidURL as e:
+        return (900, str(e))
+    except aiohttp.ClientConnectorError:
+        return (901, "Unreachable")
+    except gaierror as e:
+        return (902, str(e))
+    except aiohttp.ServerDisconnectedError as e:
+        return (903, str(e))
+    except aiohttp.ClientOSError as e:
+        return (904, str(e))
+    except TooManyRedirects as e:
+        return (905, str(e))
+    except aiohttp.ClientResponseError as e:
+        return (906, str(e))
+    except aiohttp.ServerTimeoutError:
+        return (907, "Connection timeout")
+    except asyncio.TimeoutError:
+        return (908, "Connection timeout")
+
+
+async def get_status_codes(loop: asyncio.events.AbstractEventLoop, urls: List[str],
+                           timeout: int) -&gt; List[Tuple[int, str]]:
+    conn = aiohttp.TCPConnector(limit=1000, ttl_dns_cache=300)
+    client_timeout = aiohttp.ClientTimeout(connect=timeout)
+    async with aiohttp.ClientSession(
+            loop=loop, timeout=client_timeout, connector=conn) as session:
+        codes = await asyncio.gather(*(get_status_code(session, url) for url in urls))
+        return codes
+
+
+def poll_urls(urls: List[str], timeout=20) -&gt; List[Tuple[int, str]]:
+    """
+    :param timeout: in seconds
+    """
+    print("Started polling")
+    time1 = time.time()
+    loop = asyncio.get_event_loop()
+    codes = loop.run_until_complete(get_status_codes(loop, urls, timeout))
+    time2 = time.time()
+    dt = time2 - time1
+    print(f"Polled {len(urls)} websites in {dt:.1f} seconds "
+          f"at {len(urls)/dt:.3f} URLs/sec")
+    return codes
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Right now you're launching all your requests at once. Thus probably bottleneck appeared somewhere. To avoid this situation <a href="https://docs.python.org/3/library/asyncio-sync.html#asyncio.Semaphore" rel="nofollow noreferrer">semaphore</a> can be used:</p>
+<pre><code># code
+
+sem = asyncio.Semaphore(200)
+
+
+async def get_status_code(session: aiohttp.ClientSession, url: str) -&gt; Tuple[int, str]:
+    try:
+        async with sem:
+            resp = await session.head(url, allow_redirects=True, ssl=False, headers=HEADERS)
+            # code
+</code></pre>
+<p>I tested it following way:</p>
+<pre><code>poll_urls([
+    'http://httpbin.org/delay/1' 
+    for _ 
+    in range(2000)
+])
+</code></pre>
+<p>And got:</p>
+<pre><code>Started polling
+Polled 2000 websites in 13.2 seconds at 151.300 URLs/sec
+</code></pre>
+<p>Although it requests a single host, it shows that asynchronous approach does the job: 13 sec. &lt; 2000 sec.</p>
+<p>Several more things can be done:</p>
+<ul>
+<li><p>You should play semaphore value to achieve better performance
+for your concrete environment and task.</p></li>
+<li><p>Try to lower timeout from <code>20</code> to, let's say, <code>5</code>
+seconds: since you're just doing head request it shouldn't take much
+time. If request hangs for 5 seconds there are good chances it won't
+be successful at all.</p></li>
+<li><p>Monitoring your system resources (network/CPU/RAM) while script running
+can help to find out if bottleneck is still present.</p></li>
+<li><p>By the way, did you install <code>aiodns</code> (as <a href="https://aiohttp.readthedocs.io/en/stable/#library-installation" rel="nofollow noreferrer">doc</a> suggests)?</p></li>
+<li><p>Does <a href="https://docs.aiohttp.org/en/stable/client_advanced.html#ssl-control-for-tcp-sockets" rel="nofollow noreferrer">disabling ssl</a> change anything?</p></li>
+<li><p>Try to enable debug level of <a href="http://docs.aiohttp.org/en/stable/logging.html" rel="nofollow noreferrer">logging</a> to see if there is any useful info there</p></li>
+<li><p>Try to setup <a href="http://docs.aiohttp.org/en/stable/client_advanced.html#client-tracing" rel="nofollow noreferrer">client tracing</a> and especially measure time for each request step to see which ones take most time</p></li>
+</ul>
+<p>It's difficult to say more without fully reproducible situation.</p>
+</div>
+<span class="comment-copy">Given that there's only a single eventloop on a single thread, is not using a semaphore of 200 the same as just initializing with <code>aiohttp.TCPConnector(limit=200)</code>? I'm getting 60 URLs/sec on polling httbin, which is low but wtihin range I suppose, but 10 URLs/sec (up from 5/sec since I'm also using <code>sock_read=20</code> timeout) when using my own data. I don't understand why there's a difference if I'm launching all requests at one. I've played around with the aforementioned limit and there's no significant difference between 200 and 1K given a list of 1K URLs.</span>
+<span class="comment-copy">To add, there's no significant load on my system. CPU cores stay below 20 %; no ram usage, up/down network speed below 70kb/s. I tried lowering both <code>sock_read</code> and <code>sock_connect</code> down from 20 sec to 5, but the speed on my own URLs is exactly the same, around 10/sec while the httpbin is around 120/sec. So httbin reacts to lower timeouts but my data (which has lots of difference errors, such as 404, reset by peer, unreachable, forbidden, what have you) does not.</span>
+<span class="comment-copy"><code>is not using a semaphore of 200 the same as just initializing with aiohttp.TCPConnector(limit=200)?</code> - can't say for sure, but intuition says that it's better not to start request before we want instead of relaying on underlying aiohttp connection pool. For example, without semaphore when DNS resolving timeout starts - when <code>session.head</code> invoked or when connection actually available? With semaphore you can be sure if won't start too soon. ||| I also updated answer with few more options you can try.</span>

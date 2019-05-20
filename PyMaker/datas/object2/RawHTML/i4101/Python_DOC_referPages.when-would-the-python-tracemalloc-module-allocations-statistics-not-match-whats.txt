@@ -1,0 +1,58 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to track down a memory leak, so I've done</p>
+<pre><code>import tracemalloc
+tracemalloc.start()
+
+&lt;function call&gt;
+
+# copy pasted this from documentation
+snapshot = tracemalloc.take_snapshot()
+top_stats = snapshot.statistics('lineno')
+
+print("[ Top 10 ]")
+for stat in top_stats[:10]:
+    print(stat)
+</code></pre>
+<p>This shows no major allocations, all memory allocations are pretty small, while I'm seeing 8+ GB memory allocated in <code>ps</code> and <code>pmap</code> (checking before and after running the command, and after running garbage collection). Furthermore, <code>tracemalloc.get_traced_memory</code> confirms that <code>tracemalloc</code> is not seeing many allocations. <code>pympler</code> also does not see the allocations.</p>
+<p>Does anyone know when this could be the case? Some modules are using cython, could this cause issues for tracemalloc?</p>
+<p>In pmap the allocation looks like:</p>
+<p><code>0000000002183000 6492008 6491876 6491876 rw---   [ anon ]</code> </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>From the documentation on <a href="https://docs.python.org/3/library/tracemalloc.html" rel="nofollow noreferrer">tracemalloc</a>:</p>
+<p><code>The tracemalloc module is a debug tool to trace memory blocks allocated by Python.</code></p>
+<p>In other words, memory not allocated by the python interpreter is not seen by tracemalloc. This would include anything not done by <code>PyMalloc</code> at the C-API level, including all standard libc <code>malloc</code> calls by native code used via extensions, or extension code using <code>malloc</code> directly. </p>
+<p>Whether that is the case here is impossible to tell for certain without code to reproduce. You can try running the native code part outside of python through, for example, valgrind, to detect memory leaks in the native code.</p>
+<p>If there is cython code doing <code>malloc</code>, that could be switched to <code>PyMalloc</code> to have it traced.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>An addition to @danny's answer, because it is too long for a comment.</p>
+<p>As explained in <a href="https://www.python.org/dev/peps/pep-0454/" rel="nofollow noreferrer">PEP-464</a>, <code>tracemalloc</code> uses functionality introduced in <a href="https://www.python.org/dev/peps/pep-0445/" rel="nofollow noreferrer">PEP-445</a> for tracking of the memory allocations.</p>
+<p>Normally, one would have to use <a href="https://github.com/python/cpython/blob/491bbedc209fea314a04cb3015da68fb0aa63238/Include/pymem.h#L15" rel="nofollow noreferrer"><code>PyMem_RawMalloc</code></a> instead of <code>malloc</code> in order to be able to use <code>tracemalloc</code> for a C-extension. However, since quite some time also using <a href="https://github.com/python/cpython/blob/491bbedc209fea314a04cb3015da68fb0aa63238/Include/pymem.h#L34" rel="nofollow noreferrer"><code>PyTraceMalloc_Track</code></a> and <a href="https://github.com/python/cpython/blob/491bbedc209fea314a04cb3015da68fb0aa63238/Include/pymem.h#L43" rel="nofollow noreferrer"><code>PyTraceMalloc_Untrack</code></a> from <a href="https://github.com/python/cpython/blob/491bbedc209fea314a04cb3015da68fb0aa63238/Include/pymem.h" rel="nofollow noreferrer">pymem.h</a> as addition to <code>malloc</code>(instead of replacing it by <code>PyMem_RawMalloc</code>).</p>
+<p>This is for example what is used in numpy, because in order to be able to wrap raw-c-pointers and take over its ownership numpy used <code>malloc</code> rather than the python-allocator, which is optimized for small objects - not the most crucial scenario for numpy, as can be seen <a href="https://github.com/numpy/numpy/blob/master/numpy/core/src/multiarray/alloc.c#L211" rel="nofollow noreferrer">here</a>:</p>
+<pre><code>/*NUMPY_API
+ * Allocates memory for array data.
+ */
+NPY_NO_EXPORT void *
+PyDataMem_NEW(size_t size)
+{
+    void *result;
+
+    result = malloc(size);
+    if (_PyDataMem_eventhook != NULL) {
+        NPY_ALLOW_C_API_DEF
+        NPY_ALLOW_C_API
+        if (_PyDataMem_eventhook != NULL) {
+            (*_PyDataMem_eventhook)(NULL, result, size,
+                                    _PyDataMem_eventhook_user_data);
+        }
+        NPY_DISABLE_C_API
+    }
+    PyTraceMalloc_Track(NPY_TRACE_DOMAIN, (npy_uintp)result, size);
+    return result;
+}
+</code></pre>
+<p>So basically, it is a responsibility of the C-extension to report memory allocations to the <code>tracemalloc</code>-module, on the other hand <code>tracemalloc</code> cannot be really trusted to register all memory allocations.</p>
+</div>
+<span class="comment-copy">This was correct--the issue was in a library that called code written in C.</span>
+<span class="comment-copy">This is one reason why it's a good idea to allocate memory with e.g. <code>np.empty</code> or <code>np.zeros</code> in cython code: tracemalloc will be able to track that memory and the garbage collector will also automatically take care of freeing it.</span>

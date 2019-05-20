@@ -1,0 +1,75 @@
+<div class="post-text" itemprop="text">
+<p>I have a Python app that runs multiple jobs in sub-processes launched by <code>multiprocessing.Process</code>. The parent app also launches a thread to report progress to a database. However, I've noticed that if any of the jobs launch sub-processes of their own, they duplicate this thread, causing data corruption in the database. e.g. when a grand-child subprocess completes, its thread marks the parent job as complete in the database, because it thinks it <em>is</em> the parent process, even though the parent process is still running.</p>
+<p>How would I use <code>multiprocess.Process</code> so that it doesn't copy any currently running threads? Is the simplest option to record the original PID in my thread, and if the "current" PID doesn't match this value, then to immediately exit?</p>
+<p>I saw this <a href="https://stackoverflow.com/questions/19320756/prevent-multiple-intances-of-threads-for-multiprocessing-python">similar question</a> posted last year, but it seems to have been ignored.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your description of the problem suggests that a background thread in the parent process continues to exist and execute in the child process.  That's not possible; at least, it isn't possible on POSIX systems.  What's happening in your case is something else.  I'll offer some speculation about that below, followed by a suggestion of how to avoid the issue.  Taking these points in turn...</p>
+<p><strong>1. Only one thread survives forking.</strong></p>
+<p>Only the thread that calls <code>fork()</code> is still alive after forking.  Here's a small example demonstrating that other threads don't continue execution in the child process:</p>
+<pre><code>def output():
+    time.sleep(3)
+    print "Thread executing in process: %d" % os.getpid()
+
+thread = threading.Thread(target=output)
+thread.start()
+os.fork()
+print "Pid: %d" % os.getpid()
+</code></pre>
+<p>You'll see both parent and child print their pid to stdout, but the second thread will produce output only in the parent.</p>
+<p>So having the monitor thread check its pid or in some other way condition on which process it's running in won't make a difference; that thread is only ever executing in one process.</p>
+<p><strong>2. Some ways in which forking can cause problems like what you're seeing.</strong></p>
+<p>Forking can cause corruption of program state in various ways.  For example:</p>
+<ul>
+<li>Objects referenced in a thread that dies as a result of forking can go out of scope and thus have their finalizers invoked.  This can cause problems if, say, such an object represents a network resource and invocation of its <code>del</code> method causes one end of a connection to be unexpectedly closed.</li>
+<li>Any buffered IO will cause problems, because the buffers are duplicated in the child process.</li>
+</ul>
+<p>Note that the second point doesn't even require threading.  Consider the following:</p>
+<pre><code>f = open("testfile", "w", 1024)
+f.write("a")
+os.fork()
+</code></pre>
+<p>We wrote one character to <code>testfile</code>, and we did so in the parent before forking.  But we forked while that content remained unflushed, and so:</p>
+<pre><code>alp:~ $ wc -c testfile
+      2 testfile
+</code></pre>
+<p>The file contains two characters because the output buffer was copied to the child, and both parent and child eventually flushed their buffers.</p>
+<p>I suspect your problems are caused by something like this second issue (although I happily admit that this is pure speculation).</p>
+<p><strong>3. Re-architecting to avoid such problems.</strong></p>
+<p>You mentioned in a comment that you can't start the monitor thread after spawning your workers because you need to repeatedly create new workers.  It might be easier than you think to restructure what you're doing so as to avoid that.  Instead of spawning a process for each new unit of work, create a set of long-lived workers managed by a controlling process: The controller feeds a queue with specifications of the jobs that need to be processed; it does so at its leisure.  Each worker loops indefinitely, drawing jobs from the queue when they arrive and executing them.  (The queue implementation from <code>multiprocessing</code> will guarantee that each job description is drawn by only one worker.) You thus only need to spawn workers once, early on, and can create the monitor thread after all forking is complete.</p>
+<p>Here's a schematic example of that kind of organization:</p>
+<pre><code>from multiprocessing import Process, Queue
+
+def work(q):
+    while True:
+        job = q.get()
+        if job is None:
+            # We've been signaled to stop.
+            break
+        do_something_with(job)
+
+queue = Queue()
+NUM_WORKERS = 3
+NUM_JOBS = 20
+
+# Start workers.
+for _ in range(NUM_WORKERS):
+    p = Process(target=work, args=(queue,))
+    p.start()
+
+# Create your monitor thread here.
+
+# Put work in the queue.  This continues as long as you want.
+for i in range(NUM_JOBS):
+    queue.put(i)
+
+# When there's no more work, put sentinel values in the queue so workers
+# know to gracefully exit.
+for _ in range(NUM_WORKERS):
+    queue.put(None)
+</code></pre>
+</div>
+<span class="comment-copy">The easy solution is to create the monitoring thread after spawning the subprocesses.  Is that not feasible?</span>
+<span class="comment-copy">In my case, that's not really feasible, since my parent process is continually spawning child processes for new jobs.</span>
+<span class="comment-copy">@Cerin: You could use a fork-server (a dedicated process that has no threads that forks new children). It is builtin in Python 3.4 see <a href="http://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods" rel="nofollow noreferrer"><code>multiprocessing.set_start_method()</code></a>.</span>
+<span class="comment-copy">+1. <a href="http://stackoverflow.com/questions/6078712/is-it-safe-to-fork-from-within-a-thread/6079669#6079669">It is almost impossible to <code>fork()</code> correctly in a multithreaded program</a>. Unrelated: the <code>while</code>- loop could be written: <code>for job in iter(q.get, None): do_something_with(job)</code>.</span>

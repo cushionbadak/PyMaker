@@ -1,0 +1,357 @@
+<div class="post-text" itemprop="text">
+<p>I have a path (including directory and file name).<br/>
+I need to test if the file-name is a valid, e.g. if the file-system will allow me to create a file with such a name.<br/>
+The file-name <em>has some unicode characters</em> in it.</p>
+<p>It's safe to assume the directory segment of the path is valid and accessible (<sup>I was trying to make the question more gnerally applicable, and apparently I wen too far</sup>).</p>
+<p>I very much do not want to have to escape anything unless I <em>have</em> to. </p>
+<p>I'd post some of the example characters I am dealing with, but apparently they get automatically removed by the stack-exchange system. Anyways, I want to keep standard unicode entities like <code>ö</code>, and only escape things which are invalid in a filename.</p>
+<hr/>
+<p>Here is the catch. <strong>There may (or may not) already be a file at the target of the path.</strong> I need to keep that file if it does exist, and not create a file if it does not.</p>
+<p>Basically I want to check if I <em>could</em> write to a path <strong>without actually opening the path for writing</strong> (and the automatic file creation/file clobbering that typically entails).</p>
+<p>As such:</p>
+<pre><code>try:
+    open(filename, 'w')
+except OSError:
+    # handle error here
+</code></pre>
+<p><a href="https://stackoverflow.com/questions/4102896/check-whether-a-path-is-valid-in-python">from here</a></p>
+<p>Is not acceptable, because it will overwrite the existent file, which I do not want to touch (if it's there), or create said file if it's not.</p>
+<p>I know I can do:</p>
+<pre><code>if not os.access(filePath, os.W_OK):
+    try:
+        open(filePath, 'w').close()
+        os.unlink(filePath)
+    except OSError:
+        # handle error here
+</code></pre>
+<p>But that will <em>create</em> the file at the <code>filePath</code>, which I would then have to <code>os.unlink</code>.</p>
+<p>In the end, it seems like it's spending 6 or 7 lines to do something that should be as simple as <code>os.isvalidpath(filePath)</code> or similar.</p>
+<hr/>
+<p>As an aside, I need this to run on (at least) Windows and MacOS, so I'd like to avoid platform-specific stuff.</p>
+<p>``</p>
+</div>
+<div class="post-text" itemprop="text">
+<h1>tl;dr</h1>
+<p>Call the <code>is_path_exists_or_creatable()</code> function defined below.</p>
+<p>Strictly Python 3. That's just how we roll.</p>
+<h1>A Tale of Two Questions</h1>
+<p>The question of "How do I test pathname validity and, for valid pathnames, the existence or writability of those paths?" is clearly two separate questions. Both are interesting, and neither have received a genuinely satisfactory answer here... or, well, <em>anywhere</em> that I could grep.</p>
+<p><a href="https://stackoverflow.com/users/790439/vikki">vikki</a>'s <a href="https://stackoverflow.com/a/9532915/2809027">answer</a> probably hews the closest, but has the remarkable disadvantages of:</p>
+<ul>
+<li>Needlessly opening (<em>...and then failing to reliably close</em>) file handles.</li>
+<li>Needlessly writing (<em>...and then failing to reliable close or delete</em>) 0-byte files.</li>
+<li>Ignoring OS-specific errors differentiating between non-ignorable invalid pathnames and ignorable filesystem issues. Unsurprisingly, this is critical under Windows. (<em>See below.</em>)</li>
+<li>Ignoring race conditions resulting from external processes concurrently (re)moving parent directories of the pathname to be tested. (<em>See below.</em>)</li>
+<li>Ignoring connection timeouts resulting from this pathname residing on stale, slow, or otherwise temporarily inaccessible filesystems. This <em>could</em> expose public-facing services to potential <a href="https://en.wikipedia.org/wiki/Denial-of-service_attack" rel="noreferrer">DoS</a>-driven attacks. (<em>See below.</em>)</li>
+</ul>
+<p>We're gonna fix all that.</p>
+<h1>Question #0: What's Pathname Validity Again?</h1>
+<p>Before hurling our fragile meat suits into the python-riddled moshpits of pain, we should probably define what we mean by "pathname validity." What defines validity, exactly?</p>
+<p>By "pathname validity," we mean the <strong>syntactic correctness</strong> of a pathname with respect to the <strong>root filesystem</strong> of the current system – regardless of whether that path or parent directories thereof physically exist. A pathname is syntactically correct under this definition if it complies with all syntactic requirements of the root filesystem.</p>
+<p>By "root filesystem," we mean:</p>
+<ul>
+<li>On POSIX-compatible systems, the filesystem mounted to the root directory (<code>/</code>).</li>
+<li>On Windows, the filesystem mounted to <code>%HOMEDRIVE%</code>, the colon-suffixed drive letter containing the current Windows installation (typically but <em>not</em> necessarily <code>C:</code>).</li>
+</ul>
+<p>The meaning of "syntactic correctness," in turn, depends on the type of root filesystem. For <code>ext4</code> (and most but <em>not</em> all POSIX-compatible) filesystems, a pathname is syntactically correct if and only if that pathname:</p>
+<ul>
+<li>Contains no null bytes (i.e., <code>\x00</code> in Python). <em>This is a hard requirement for all POSIX-compatible filesystems.</em></li>
+<li>Contains no path components longer than 255 bytes (e.g., <code>'a'*256</code> in Python). A path component is a longest substring of a pathname containing no <code>/</code> character (e.g., <code>bergtatt</code>, <code>ind</code>, <code>i</code>, and <code>fjeldkamrene</code> in the pathname <code>/bergtatt/ind/i/fjeldkamrene</code>).</li>
+</ul>
+<p>Syntactic correctness. Root filesystem. That's it.</p>
+<h1>Question #1: How Now Shall We Do Pathname Validity?</h1>
+<p>Validating pathnames in Python is surprisingly non-intuitive. I'm in firm agreement with <a href="https://stackoverflow.com/users/268006/fake-name">Fake Name</a> here: the official <code>os.path</code> package should provide an out-of-the-box solution for this. For unknown (and probably uncompelling) reasons, it doesn't. Fortunately, unrolling your own ad-hoc solution isn't <em>that</em> gut-wrenching...</p>
+<p><strong>O.K., it actually is.</strong> It's hairy; it's nasty; it probably chortles as it burbles and giggles as it glows. But what you gonna do? <em>Nuthin'.</em></p>
+<p>We'll soon descend into the radioactive abyss of low-level code. But first, let's talk high-level shop. The standard <code>os.stat()</code> and <code>os.lstat()</code> functions raise the following exceptions when passed invalid pathnames:</p>
+<ul>
+<li>For pathnames residing in non-existing directories, instances of <code>FileNotFoundError</code>.</li>
+<li>For pathnames residing in existing directories:
+
+<ul>
+<li>Under Windows, instances of <code>WindowsError</code> whose <code>winerror</code> attribute is <code>123</code> (i.e., <code>ERROR_INVALID_NAME</code>).</li>
+<li>Under all other OSes:</li>
+<li>For pathnames containing null bytes (i.e., <code>'\x00'</code>), instances of <code>TypeError</code>.</li>
+<li>For pathnames containing path components longer than 255 bytes, instances of <code>OSError</code> whose <code>errcode</code> attribute is:
+
+<ul>
+<li>Under SunOS and the *BSD family of OSes, <code>errno.ERANGE</code>. (This appears to be an OS-level bug, otherwise referred to as "selective interpretation" of the POSIX standard.)</li>
+<li>Under all other OSes, <code>errno.ENAMETOOLONG</code>.</li>
+</ul></li>
+</ul></li>
+</ul>
+<p>Crucially, this implies that <strong>only pathnames residing in existing directories are validatable.</strong> The <code>os.stat()</code> and <code>os.lstat()</code> functions raise generic <code>FileNotFoundError</code> exceptions when passed pathnames residing in non-existing directories, regardless of whether those pathnames are invalid or not. Directory existence takes precedence over pathname invalidity.</p>
+<p>Does this mean that pathnames residing in non-existing directories are <em>not</em> validatable? Yes – unless we modify those pathnames to reside in existing directories. Is that even safely feasible, however? Shouldn't modifying a pathname prevent us from validating the original pathname?</p>
+<p>To answer this question, recall from above that syntactically correct pathnames on the <code>ext4</code> filesystem contain no path components <strong>(A)</strong> containing null bytes or <strong>(B)</strong> over 255 bytes in length. Hence, an <code>ext4</code> pathname is valid if and only if all path components in that pathname are valid. This is true of <em>most</em> <a href="https://en.wikipedia.org/wiki/Comparison_of_file_systems#Limits" rel="noreferrer">real-world filesystems</a> of interest.</p>
+<p>Does that pedantic insight actually help us? Yes. It reduces the larger problem of validating the full pathname in one fell swoop to the smaller problem of only validating all path components in that pathname. Any arbitrary pathname is validatable (regardless of whether that pathname resides in an existing directory or not) in a cross-platform manner by following the following algorithm:</p>
+<ol>
+<li>Split that pathname into path components (e.g., the pathname <code>/troldskog/faren/vild</code> into the list <code>['', 'troldskog', 'faren', 'vild']</code>).</li>
+<li>For each such component:
+
+<ol>
+<li>Join the pathname of a directory guaranteed to exist with that component into a new temporary pathname (e.g., <code>/troldskog</code>) .</li>
+<li>Pass that pathname to <code>os.stat()</code> or <code>os.lstat()</code>. If that pathname and hence that component is invalid, this call is guaranteed to raise an exception exposing the type of invalidity rather than a generic <code>FileNotFoundError</code> exception. Why? <strong>Because that pathname resides in an existing directory.</strong> (Circular logic is circular.)</li>
+</ol></li>
+</ol>
+<p>Is there a directory guaranteed to exist? Yes, but typically only one: the topmost directory of the root filesystem (as defined above).</p>
+<p>Passing pathnames residing in any other directory (and hence not guaranteed to exist) to <code>os.stat()</code> or <code>os.lstat()</code> invites race conditions, even if that directory was previously tested to exist. Why? Because external processes cannot be prevented from concurrently removing that directory <em>after</em> that test has been performed but <em>before</em> that pathname is passed to <code>os.stat()</code> or <code>os.lstat()</code>. Unleash the dogs of mind-fellating insanity!</p>
+<p>There exists a substantial side benefit to the above approach as well: <strong>security.</strong> (Isn't <em>that</em> nice?) Specifically:</p>
+<blockquote>
+<p>Front-facing applications validating arbitrary pathnames from untrusted sources by simply passing such pathnames to <code>os.stat()</code> or <code>os.lstat()</code> are susceptible to Denial of Service (DoS) attacks and other black-hat shenanigans. Malicious users may attempt to repeatedly validate pathnames residing on filesystems known to be stale or otherwise slow (e.g., NFS Samba shares); in that case, blindly statting incoming pathnames is liable to either eventually fail with connection timeouts or consume more time and resources than your feeble capacity to withstand unemployment.</p>
+</blockquote>
+<p>The above approach obviates this by only validating the path components of a pathname against the root directory of the root filesystem. (If even <em>that's</em> stale, slow, or inaccessible, you've got larger problems than pathname validation.)</p>
+<p>Lost? <strong>Great.</strong> Let's begin. (Python 3 assumed. See "What Is Fragile Hope for 300, <a href="https://stackoverflow.com/users/2809027/cecil-curry">leycec</a>?")</p>
+<pre><code>import errno, os
+
+# Sadly, Python fails to provide the following magic number for us.
+ERROR_INVALID_NAME = 123
+'''
+Windows-specific error code indicating an invalid pathname.
+
+See Also
+----------
+https://msdn.microsoft.com/en-us/library/windows/desktop/ms681382%28v=vs.85%29.aspx
+    Official listing of all such codes.
+'''
+
+def is_pathname_valid(pathname: str) -&gt; bool:
+    '''
+    `True` if the passed pathname is a valid pathname for the current OS;
+    `False` otherwise.
+    '''
+    # If this pathname is either not a string or is but is empty, this pathname
+    # is invalid.
+    try:
+        if not isinstance(pathname, str) or not pathname:
+            return False
+
+        # Strip this pathname's Windows-specific drive specifier (e.g., `C:\`)
+        # if any. Since Windows prohibits path components from containing `:`
+        # characters, failing to strip this `:`-suffixed prefix would
+        # erroneously invalidate all valid absolute Windows pathnames.
+        _, pathname = os.path.splitdrive(pathname)
+
+        # Directory guaranteed to exist. If the current OS is Windows, this is
+        # the drive to which Windows was installed (e.g., the "%HOMEDRIVE%"
+        # environment variable); else, the typical root directory.
+        root_dirname = os.environ.get('HOMEDRIVE', 'C:') \
+            if sys.platform == 'win32' else os.path.sep
+        assert os.path.isdir(root_dirname)   # ...Murphy and her ironclad Law
+
+        # Append a path separator to this directory if needed.
+        root_dirname = root_dirname.rstrip(os.path.sep) + os.path.sep
+
+        # Test whether each path component split from this pathname is valid or
+        # not, ignoring non-existent and non-readable path components.
+        for pathname_part in pathname.split(os.path.sep):
+            try:
+                os.lstat(root_dirname + pathname_part)
+            # If an OS-specific exception is raised, its error code
+            # indicates whether this pathname is valid or not. Unless this
+            # is the case, this exception implies an ignorable kernel or
+            # filesystem complaint (e.g., path not found or inaccessible).
+            #
+            # Only the following exceptions indicate invalid pathnames:
+            #
+            # * Instances of the Windows-specific "WindowsError" class
+            #   defining the "winerror" attribute whose value is
+            #   "ERROR_INVALID_NAME". Under Windows, "winerror" is more
+            #   fine-grained and hence useful than the generic "errno"
+            #   attribute. When a too-long pathname is passed, for example,
+            #   "errno" is "ENOENT" (i.e., no such file or directory) rather
+            #   than "ENAMETOOLONG" (i.e., file name too long).
+            # * Instances of the cross-platform "OSError" class defining the
+            #   generic "errno" attribute whose value is either:
+            #   * Under most POSIX-compatible OSes, "ENAMETOOLONG".
+            #   * Under some edge-case OSes (e.g., SunOS, *BSD), "ERANGE".
+            except OSError as exc:
+                if hasattr(exc, 'winerror'):
+                    if exc.winerror == ERROR_INVALID_NAME:
+                        return False
+                elif exc.errno in {errno.ENAMETOOLONG, errno.ERANGE}:
+                    return False
+    # If a "TypeError" exception was raised, it almost certainly has the
+    # error message "embedded NUL character" indicating an invalid pathname.
+    except TypeError as exc:
+        return False
+    # If no exception was raised, all path components and hence this
+    # pathname itself are valid. (Praise be to the curmudgeonly python.)
+    else:
+        return True
+    # If any other exception was raised, this is an unrelated fatal issue
+    # (e.g., a bug). Permit this exception to unwind the call stack.
+    #
+    # Did we mention this should be shipped with Python already?
+</code></pre>
+<p><strong>Done.</strong> Don't squint at that code. (<em>It bites.</em>)</p>
+<h1>Question #2: Possibly Invalid Pathname Existence or Creatability, Eh?</h1>
+<p>Testing the existence or creatability of possibly invalid pathnames is, given the above solution, mostly trivial. The little key here is to call the previously defined function <em>before</em> testing the passed path:</p>
+<pre><code>def is_path_creatable(pathname: str) -&gt; bool:
+    '''
+    `True` if the current user has sufficient permissions to create the passed
+    pathname; `False` otherwise.
+    '''
+    # Parent directory of the passed path. If empty, we substitute the current
+    # working directory (CWD) instead.
+    dirname = os.path.dirname(pathname) or os.getcwd()
+    return os.access(dirname, os.W_OK)
+
+def is_path_exists_or_creatable(pathname: str) -&gt; bool:
+    '''
+    `True` if the passed pathname is a valid pathname for the current OS _and_
+    either currently exists or is hypothetically creatable; `False` otherwise.
+
+    This function is guaranteed to _never_ raise exceptions.
+    '''
+    try:
+        # To prevent "os" module calls from raising undesirable exceptions on
+        # invalid pathnames, is_pathname_valid() is explicitly called first.
+        return is_pathname_valid(pathname) and (
+            os.path.exists(pathname) or is_path_creatable(pathname))
+    # Report failure on non-fatal filesystem complaints (e.g., connection
+    # timeouts, permissions issues) implying this path to be inaccessible. All
+    # other exceptions are unrelated fatal issues and should not be caught here.
+    except OSError:
+        return False
+</code></pre>
+<p><strong>Done</strong> and <strong>done.</strong> Except not quite.</p>
+<h1>Question #3: Possibly Invalid Pathname Existence or Writability on Windows</h1>
+<p>There exists a caveat. Of course there does.</p>
+<p>As the official <a href="https://docs.python.org/3/library/os.html#os.access" rel="noreferrer"><code>os.access()</code> documentation</a> admits:</p>
+<blockquote>
+<p><strong>Note:</strong> I/O operations may fail even when <code>os.access()</code> indicates that they would succeed, particularly for operations on network filesystems which may have permissions semantics beyond the usual POSIX permission-bit model.</p>
+</blockquote>
+<p>To no one's surprise, Windows is the usual suspect here. Thanks to extensive use of Access Control Lists (ACL) on NTFS filesystems, the simplistic POSIX permission-bit model maps poorly to the underlying Windows reality. While this (arguably) isn't Python's fault, it might nonetheless be of concern for Windows-compatible applications.</p>
+<p>If this is you, a more robust alternative is wanted. If the passed path does <em>not</em> exist, we instead attempt to create a temporary file guaranteed to be immediately deleted in the parent directory of that path – a more portable (if expensive) test of creatability:</p>
+<pre><code>import os, tempfile
+
+def is_path_sibling_creatable(pathname: str) -&gt; bool:
+    '''
+    `True` if the current user has sufficient permissions to create **siblings**
+    (i.e., arbitrary files in the parent directory) of the passed pathname;
+    `False` otherwise.
+    '''
+    # Parent directory of the passed path. If empty, we substitute the current
+    # working directory (CWD) instead.
+    dirname = os.path.dirname(pathname) or os.getcwd()
+
+    try:
+        # For safety, explicitly close and hence delete this temporary file
+        # immediately after creating it in the passed path's parent directory.
+        with tempfile.TemporaryFile(dir=dirname): pass
+        return True
+    # While the exact type of exception raised by the above function depends on
+    # the current version of the Python interpreter, all such types subclass the
+    # following exception superclass.
+    except EnvironmentError:
+        return False
+
+def is_path_exists_or_creatable_portable(pathname: str) -&gt; bool:
+    '''
+    `True` if the passed pathname is a valid pathname on the current OS _and_
+    either currently exists or is hypothetically creatable in a cross-platform
+    manner optimized for POSIX-unfriendly filesystems; `False` otherwise.
+
+    This function is guaranteed to _never_ raise exceptions.
+    '''
+    try:
+        # To prevent "os" module calls from raising undesirable exceptions on
+        # invalid pathnames, is_pathname_valid() is explicitly called first.
+        return is_pathname_valid(pathname) and (
+            os.path.exists(pathname) or is_path_sibling_creatable(pathname))
+    # Report failure on non-fatal filesystem complaints (e.g., connection
+    # timeouts, permissions issues) implying this path to be inaccessible. All
+    # other exceptions are unrelated fatal issues and should not be caught here.
+    except OSError:
+        return False
+</code></pre>
+<p>Note, however, that even <em>this</em> may not be enough.</p>
+<p>Thanks to User Access Control (UAC), the ever-inimicable Windows Vista and all subsequent iterations thereof <a href="https://stackoverflow.com/questions/370837/why-does-my-application-allow-me-to-save-files-to-the-windows-and-system32-folder">blatantly lie</a> about permissions pertaining to system directories. When non-Administrator users attempt to create files in either the canonical <code>C:\Windows</code> or <code>C:\Windows\system32</code> directories, UAC superficially permits the user to do so while <em>actually</em> isolating all created files into a "Virtual Store" in that user's profile. (Who could have possibly imagined that deceiving users would have harmful long-term consequences?)</p>
+<p>This is crazy. This is Windows.</p>
+<h1>Prove It</h1>
+<p>Dare we? It's time to test-drive the above tests.</p>
+<p>Since NULL is the only character prohibited in pathnames on UNIX-oriented filesystems, let's leverage that to demonstrate the cold, hard truth – ignoring non-ignorable Windows shenanigans, which frankly bore and anger me in equal measure:</p>
+<pre><code>&gt;&gt;&gt; print('"foo.bar" valid? ' + str(is_pathname_valid('foo.bar')))
+"foo.bar" valid? True
+&gt;&gt;&gt; print('Null byte valid? ' + str(is_pathname_valid('\x00')))
+Null byte valid? False
+&gt;&gt;&gt; print('Long path valid? ' + str(is_pathname_valid('a' * 256)))
+Long path valid? False
+&gt;&gt;&gt; print('"/dev" exists or creatable? ' + str(is_path_exists_or_creatable('/dev')))
+"/dev" exists or creatable? True
+&gt;&gt;&gt; print('"/dev/foo.bar" exists or creatable? ' + str(is_path_exists_or_creatable('/dev/foo.bar')))
+"/dev/foo.bar" exists or creatable? False
+&gt;&gt;&gt; print('Null byte exists or creatable? ' + str(is_path_exists_or_creatable('\x00')))
+Null byte exists or creatable? False
+</code></pre>
+<p>Beyond sanity. Beyond pain. You will find Python portability concerns.</p>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>if os.path.exists(filePath):
+    #the file is there
+elif os.access(os.path.dirname(filePath), os.W_OK):
+    #the file does not exists but write privileges are given
+else:
+    #can not write there
+</code></pre>
+<p>Note that <code>path.exists</code> can fail for more reasons than just <code>the file is not there</code> so you might have to do finer tests like testing if the containing directory exists and so on.</p>
+<hr/>
+<p>After my discussion with the OP it turned out, that the main problem seems to be, that the file name might contain characters that are not allowed by the filesystem. Of course they need to be removed but the OP wants to maintain as much human readablitiy as the filesystem allows. </p>
+<p>Sadly I do not know of any good solution for this.
+However <strong><a href="https://stackoverflow.com/a/34102855">Cecil Curry's answer</a></strong> takes a closer look at detecting the problem.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>With Python 3, how about:</p>
+<pre><code>try:
+    with open(filename, 'x') as tempfile: # OSError if file exists or is invalid
+        pass
+except OSError:
+    # handle error here
+</code></pre>
+<p>With the 'x' option we also don't have to worry about race conditions. See documentation <a href="https://docs.python.org/3.6/library/functions.html#open" rel="noreferrer">here</a>.</p>
+<p>Now, this WILL create a very shortlived temporary file if it does not exist already - unless the name is invalid. If you can live with that, it simplifies things a lot.</p>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>open(filename,'r')   #2nd argument is r and not w
+</code></pre>
+<p>will open the file or give an error if it doesn't exist. If there's an error, then you can try to write to the path, if you can't then you get a second error</p>
+<pre><code>try:
+    open(filename,'r')
+    return True
+except IOError:
+    try:
+        open(filename, 'w')
+        return True
+    except IOError:
+        return False
+</code></pre>
+<p>Also have a look <a href="https://stackoverflow.com/questions/539133/python-test-directory-permissions">here</a> about permissions on windows</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>try <a href="http://docs.python.org/library/os.path.html#os.path.exists" rel="nofollow"><code>os.path.exists</code></a> this will check for the path and return <code>True</code> if exists and <code>False</code> if not.</p>
+</div>
+<span class="comment-copy">If you are wanting to test that the path exists and you can write to it, then simply create and delete some other file. Give it a unique name ( or as unique as you can), to avoid multi user / multi thread issues. Otherwise you are looking at checking out permssions which will drop you straight into the OS specific muddle.</span>
+<span class="comment-copy">@Tony Hopkinson - Basically I want to check if I <i>could</i> write to a path <b>without actually writing anything</b>.</span>
+<span class="comment-copy">If you don't have anything to write to the file, then why do you need to know if you're able to?</span>
+<span class="comment-copy">@Karl Knechtel - If I write to it, and there is already a file there, it will damage the existant file.</span>
+<span class="comment-copy">@FakeName - You're <b>always</b> going to have a subtle race condition here. Between checking that the file doesn't exist but could be created, and then creating the file, some other process could create it and you'll clobber the file anyway. Of course, it depends on your usage whether this is a realistic problem or not...</span>
+<span class="comment-copy"><b>Yup, it was me!</b> Attempting to kludge together a cross-portable pathname-validating regex is an exercise in futility and guaranteed to fail for common edge cases. Consider pathname length on Windows, for example: "The maximum path of 32,767 characters is approximate, because the '\\?\' prefix may be expanded to a longer string by the system at run time, and this expansion applies to the total length." Given that, it's actually <b>technically infeasible</b> to construct a regex matching only valid pathnames. It's much more reasonable just to defer to Python instead.</span>
+<span class="comment-copy"><b>Ah.</b> I (reluctantly) see. You're doing something even <i>stranger</i> than hacking up a regex. Yeah, <a href="https://stackoverflow.com/a/27852189/2809027">that</a> is guaranteed to fail even harder. That also completely fails to address the question in question, which is <i>not</i> "How do I strip invalid substrings from a Windows-specific basename?" (...which, by your own omission, you fail to solve – again due to edge cases) but "How do I cross-portably test pathname validity and, for valid pathnames, the existence or writability of those paths?"</span>
+<span class="comment-copy">Filesystem-specific constraints is definitely a valid concern – but it cuts both ways. For front-facing applications consuming arbitrary pathnames from untrusted sources, blindly performing reads is a dicey proposition at best; in this case, forcing root filesystem use is not only sensible but prudent. For other applications, however, the userbase may be trustworthy enough to grant uninhibited filesystem access. It's fairly context-dependent, I'd say. Thanks for astutely noting this, <a href="https://stackoverflow.com/users/760746/nobody">Nobody</a>! I'll add a caveat above.</span>
+<span class="comment-copy">As for nomenclature, I'm a pedantic fan of prefixing tester names by <code>is_</code>. This is my character flaw. Nonetheless, duly noted: you can't please everybody, and sometimes you can't please anybody. ;)</span>
+<span class="comment-copy">On Fedora 24, python 3.5.3, a path name with an embedded null characters throws: ValueError: embedded null byte … need to add: ```     except ValueError as exc:         return False ``` before or after the TypeError trap.</span>
+<span class="comment-copy">No. I need to return true if the file at the path exists, <b>or can be created</b>. I need to return false if the path in invalid (due to containing invalid characters on windows).</span>
+<span class="comment-copy"><code>or can be created</code> well I did not read that from your question. Reading the permissions will be platfrom-dependent to some extent.</span>
+<span class="comment-copy">Isn't the whole point of the <code>os</code> library to wrap all that stuff in a unified api? It seems like something that should already be available.</span>
+<span class="comment-copy">@Fake Name: Yes it will remove some of the platformdependencies but still some platforms offer things that others do not and there is no easy way to wrap that for all of them. I updated my answer, have a look there.</span>
+<span class="comment-copy">1) I think you mean <code>os.access</code>. There is no <code>os.path.access</code>. 2) <code>os.access(filePath, os.W_OK)</code> returns false if the file does not exist.</span>
+<span class="comment-copy">At this point, the project that needed this has moved so far beyond the point  where an answer is even relevant that I can't really accept an answer.</span>
+<span class="comment-copy">Ironically the practical answer is not good enough. Regardless I suppose you could see if the file existed. If it does, attempt to copy the file elsewhere, and then try to overwrite.</span>
+<span class="comment-copy">To avoid the need to explicitly unlink() the test file, you can use <code>tempfile.TemporaryFile()</code> which will automatically destroy the tempfile when it goes out of scope.</span>
+<span class="comment-copy">@FakeName The code is different, I could have used os.access on the second part but if you followed the link I gave you'd have seen that it's not a good idea, this leaves you with the option of trying to actually open the path for writing.</span>
+<span class="comment-copy">I'm building my paths with <code>os.path.join</code>, so I don't have `\` escaping issues. Furthermore, I'm not really having directory <i>permission</i> issues. I'm having directory (and filename) <i>name</i> issues.</span>
+<span class="comment-copy">@FakeName in that case you only need to try and open it(you don't need to write), python gives an error if the <code>filename</code> contains invalid characters. I've edited the answer</span>
+<span class="comment-copy">@HelgaIliashenko Opening for writing will overwrite an existing file (make it empty) even if you close it immediately without writing to it. That's why I was opening for reading first because that way, if you don't get an error then you know that there is an existing file.</span>
+<span class="comment-copy">No. I need to return true if the file at the path exists, <b>or can be created</b>. I need to return false if the path in invalid (due to containing invalid characters on windows).</span>
+<span class="comment-copy">which type of invalid character?</span>
+<span class="comment-copy">Dunno - that's platform specific.</span>
+<span class="comment-copy">File system specific, actually.</span>

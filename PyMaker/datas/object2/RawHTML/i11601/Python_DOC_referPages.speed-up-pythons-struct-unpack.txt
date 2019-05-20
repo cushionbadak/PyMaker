@@ -1,0 +1,79 @@
+<div class="post-text" itemprop="text">
+<p>I am trying to speed up my script. It basically reads a pcap file with Velodyne's Lidar HDL-32 information and allows me to get X, Y, Z, and Intensity values. I have profiled my script using <code>python -m cProfile ./spTestPcapToLas.py</code> and it is spending the most amount of time in my <code>readDataPacket()</code> function calls. In a small test (80 MB file) the unpacking portion takes around 56% of the execution time. </p>
+<p>I call the <code>readDataPacket</code> function like this (<code>chunk</code> refers to the pcap file):</p>
+<pre><code>packets = []
+for packet in chunk:
+    memoryView = memoryview(packet.raw())
+    udpDestinationPort = unpack('!h', memoryView[36:38].tobytes())[0]
+
+    if udpDestinationPort == 2368:
+        packets += readDataPacket(memoryView)
+</code></pre>
+<p>The <code>readDataPacket()</code> function itself is defined like this:</p>
+<pre><code>def readDataPacket(memoryView):
+    firingData = memoryView[42:]    
+    firingDataStartingByte = 0    
+    laserBlock = []
+
+    for i in xrange(firingBlocks):
+        rotational = unpack('&lt;H', firingData[firingDataStartingByte+2:firingDataStartingByte+4])[0]        
+        startingByte = firingDataStartingByte+4
+        laser = []
+        for j in xrange(lasers):   
+            distanceInformation = unpack('&lt;H', firingData[startingByte:(startingByte + 2)])[0] * 0.002
+            intensity = unpack('&lt;B', firingData[(startingByte + 2)])[0]   
+            laser.append([distanceInformation, intensity])
+            startingByte += 3
+        firingDataStartingByte += 100
+        laserBlock.append([rotational, laser])
+
+    return laserBlock
+</code></pre>
+<p>Any ideas on how I can speed up the process? By the way, I am using numpy for the X, Y, Z, Intensity calculations. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Numpy lets you do this very quickly. In this case I think the easiest way is to use the <a href="http://docs.scipy.org/doc/numpy/reference/generated/numpy.ndarray.html" rel="noreferrer"><code>ndarray</code></a> constructor directly: </p>
+<pre><code>import numpy as np
+
+def with_numpy(buffer):
+    # Construct ndarray with: shape, dtype, buffer, offset, strides.
+    rotational = np.ndarray((firingBlocks,), '&lt;H', buffer, 42+2, (100,))
+    distance = np.ndarray((firingBlocks,lasers), '&lt;H', buffer, 42+4, (100,3))
+    intensity = np.ndarray((firingBlocks,lasers), '&lt;B', buffer, 42+6, (100,3))
+    return rotational, distance*0.002, intensity
+</code></pre>
+<p>This returns separate arrays instead of the nested list, which should be much easier to process further. As input it takes a <code>buffer</code> object (in Python 2) or anything that exposes the buffer interface. Unfortunately, it depends on your Python version (2/3) what objects you can use exactly. But this method is very fast:</p>
+<pre><code>import numpy as np
+
+firingBlocks = 10**4
+lasers = 32
+packet_raw = np.random.bytes(42 + firingBlocks*100)
+
+%timeit readDataPacket(memoryview(packet_raw))
+# 1 loop, best of 3: 807 ms per loop
+%timeit with_numpy(packet_raw)
+# 100 loops, best of 3: 10.8 ms per loop
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Compile a <code>Struct</code> ahead of time, to avoid the Python level wrapping code using the module level methods. Do it outside the loops, so the construction cost is not paid repeatedly.</p>
+<pre><code>unpack_ushort = struct.Struct('&lt;H').unpack
+unpack_ushort_byte = struct.Struct('&lt;HB').unpack
+</code></pre>
+<p>The <code>Struct</code> methods themselves are implemented in C in CPython (and the module level methods are eventually delegating to the same work after parsing the format string), so building the <code>Struct</code> once and storing bound methods saves a non-trivial amount of work, particularly when unpacking a small number of values.</p>
+<p>You can also save some work by unpacking multiple values together, rather than one at a time:</p>
+<pre><code>distanceInformation, intensity = unpack_ushort_byte(firingData[startingByte:startingByte + 3])
+distanceInformation *= 0.002
+</code></pre>
+<p>As <a href="https://stackoverflow.com/a/36797525/364696">Dan notes</a>, you could further improve this with <code>iter_unpack</code>, which would further reduce the amount of byte code execution and small slice operations.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can unpack the raw <code>distanceInformation</code> and <code>intensity</code> values together in one call. Especially because you're just putting them into a list together: that's what <code>unpack()</code> does when it unpacks multiple values. In your case, you need to then multiple the <code>distanceInformation</code> by <code>0.002</code>, but you might save time by leaving this until later, because you can use <a href="https://docs.python.org/3/library/struct.html#struct.iter_unpack" rel="nofollow"><code>iter_unpack()</code></a> to parse the whole list of raw pairs in one call. That function gives you a generator, which can be sliced with <a href="https://docs.python.org/3/library/itertools.html#itertools.islice" rel="nofollow"><code>itertools.islice()</code></a> and then turned into a list. Something like this:</p>
+<pre><code>laser_iter = struct.iter_unpack('&lt;HB', firingData[firingDataStartingByte + 4])
+laser = [[d * 0.002, i] for d, i in itertools.islice(laser_iter, lasers)]
+</code></pre>
+<p>Unfortunately this is a little harder to read, so you might want to find a way to spread this out into more lines of code, with more descriptive variable names, or add a comment for the future when you forget why you wrote this…</p>
+</div>
+<span class="comment-copy">This resulted in ~30x increase in speed for that specific function. Thank you so much. :D</span>
+<span class="comment-copy">I'd suggest testing my <code>iter_unpack</code> method before being too certain it improves performance—it creates plenty of temporary objects, I think. Your method sounds more certain.</span>
+<span class="comment-copy">Unfortunately I can't use Python 3. I am using Python 2.7.11. Do you know of another solution?</span>

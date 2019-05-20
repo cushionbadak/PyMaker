@@ -1,0 +1,821 @@
+<div class="post-text" itemprop="text">
+<p>Here's the Python code to run an arbitrary command returning its <code>stdout</code> data, or raise an exception on non-zero exit codes:</p>
+<pre><code>proc = subprocess.Popen(
+    cmd,
+    stderr=subprocess.STDOUT,  # Merge stdout and stderr
+    stdout=subprocess.PIPE,
+    shell=True)
+</code></pre>
+<p><code>communicate</code> is used to wait for the process to exit:</p>
+<pre><code>stdoutdata, stderrdata = proc.communicate()
+</code></pre>
+<p>The <code>subprocess</code> module does not support timeout--ability to kill a process running for more than X number of seconds--therefore, <code>communicate</code> may take forever to run.</p>
+<p>What is the <strong>simplest</strong> way to implement timeouts in a Python program meant to run on Windows and Linux?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>In Python 3.3+:</p>
+<pre><code>from subprocess import STDOUT, check_output
+
+output = check_output(cmd, stderr=STDOUT, timeout=seconds)
+</code></pre>
+<p><code>output</code> is a byte string that contains command's merged stdout, stderr data. </p>
+<p>This code raises <code>CalledProcessError</code> on non-zero exit status as specified in the question's text unlike <code>proc.communicate()</code> method.</p>
+<p>I've removed <code>shell=True</code> because it is often used unnecessarily. You can  always add it back if <code>cmd</code> indeed requires it. If you add <code>shell=True</code> i.e., if the child process spawns its own descendants; <code>check_output()</code> can return much later than the timeout indicates, see <a href="https://stackoverflow.com/q/36952245/4279">Subprocess timeout failure</a>.</p>
+<p>The timeout feature is available on Python 2.x via the <a href="http://pypi.python.org/pypi/subprocess32/" rel="noreferrer"><code>subprocess32</code></a> backport of the 3.2+ subprocess module.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I don't know much about the low level details; but, given that in
+python 2.6 the API offers the ability to wait for threads and
+terminate processes, what about running the process in a separate
+thread?</p>
+<pre><code>import subprocess, threading
+
+class Command(object):
+    def __init__(self, cmd):
+        self.cmd = cmd
+        self.process = None
+
+    def run(self, timeout):
+        def target():
+            print 'Thread started'
+            self.process = subprocess.Popen(self.cmd, shell=True)
+            self.process.communicate()
+            print 'Thread finished'
+
+        thread = threading.Thread(target=target)
+        thread.start()
+
+        thread.join(timeout)
+        if thread.is_alive():
+            print 'Terminating process'
+            self.process.terminate()
+            thread.join()
+        print self.process.returncode
+
+command = Command("echo 'Process started'; sleep 2; echo 'Process finished'")
+command.run(timeout=3)
+command.run(timeout=1)
+</code></pre>
+<p>The output of this snippet in my machine is:</p>
+<pre><code>Thread started
+Process started
+Process finished
+Thread finished
+0
+Thread started
+Process started
+Terminating process
+Thread finished
+-15
+</code></pre>
+<p>where it can be seen that, in the first execution, the process
+finished correctly (return code 0), while the in the second one the
+process was terminated (return code -15).</p>
+<p>I haven't tested in windows; but, aside from updating the example
+command, I think it should work since I haven't found in the
+documentation anything that says that thread.join or process.terminate
+is not supported.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>jcollado's answer can be simplified using the <a href="https://docs.python.org/2/library/threading.html#threading.Timer" rel="noreferrer">threading.Timer</a> class:</p>
+<pre><code>import shlex
+from subprocess import Popen, PIPE
+from threading import Timer
+
+def run(cmd, timeout_sec):
+    proc = Popen(shlex.split(cmd), stdout=PIPE, stderr=PIPE)
+    timer = Timer(timeout_sec, proc.kill)
+    try:
+        timer.start()
+        stdout, stderr = proc.communicate()
+    finally:
+        timer.cancel()
+
+# Examples: both take 1 second
+run("sleep 1", 5)  # process ends normally at 1 second
+run("sleep 5", 1)  # timeout happens at 1 second
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you're on Unix,</p>
+<pre><code>import signal
+  ...
+class Alarm(Exception):
+    pass
+
+def alarm_handler(signum, frame):
+    raise Alarm
+
+signal.signal(signal.SIGALRM, alarm_handler)
+signal.alarm(5*60)  # 5 minutes
+try:
+    stdoutdata, stderrdata = proc.communicate()
+    signal.alarm(0)  # reset the alarm
+except Alarm:
+    print "Oops, taking too long!"
+    # whatever else
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here is Alex Martelli's solution as a module with proper process killing. The other approaches do not work because they do not use proc.communicate(). So if you have a process that produces lots of output, it will fill its output buffer and then block until you read something from it.</p>
+<pre><code>from os import kill
+from signal import alarm, signal, SIGALRM, SIGKILL
+from subprocess import PIPE, Popen
+
+def run(args, cwd = None, shell = False, kill_tree = True, timeout = -1, env = None):
+    '''
+    Run a command with a timeout after which it will be forcibly
+    killed.
+    '''
+    class Alarm(Exception):
+        pass
+    def alarm_handler(signum, frame):
+        raise Alarm
+    p = Popen(args, shell = shell, cwd = cwd, stdout = PIPE, stderr = PIPE, env = env)
+    if timeout != -1:
+        signal(SIGALRM, alarm_handler)
+        alarm(timeout)
+    try:
+        stdout, stderr = p.communicate()
+        if timeout != -1:
+            alarm(0)
+    except Alarm:
+        pids = [p.pid]
+        if kill_tree:
+            pids.extend(get_process_children(p.pid))
+        for pid in pids:
+            # process might have died before getting to this line
+            # so wrap to avoid OSError: no such process
+            try: 
+                kill(pid, SIGKILL)
+            except OSError:
+                pass
+        return -9, '', ''
+    return p.returncode, stdout, stderr
+
+def get_process_children(pid):
+    p = Popen('ps --no-headers -o pid --ppid %d' % pid, shell = True,
+              stdout = PIPE, stderr = PIPE)
+    stdout, stderr = p.communicate()
+    return [int(p) for p in stdout.split()]
+
+if __name__ == '__main__':
+    print run('find /', shell = True, timeout = 3)
+    print run('find', shell = True)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I've modified <strong>sussudio</strong> answer. Now function returns: (<code>returncode</code>, <code>stdout</code>, <code>stderr</code>, <code>timeout</code>) - <code>stdout</code> and <code>stderr</code> is decoded to utf-8 string</p>
+<pre><code>def kill_proc(proc, timeout):
+  timeout["value"] = True
+  proc.kill()
+
+def run(cmd, timeout_sec):
+  proc = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  timeout = {"value": False}
+  timer = Timer(timeout_sec, kill_proc, [proc, timeout])
+  timer.start()
+  stdout, stderr = proc.communicate()
+  timer.cancel()
+  return proc.returncode, stdout.decode("utf-8"), stderr.decode("utf-8"), timeout["value"]
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>surprised nobody mentioned using <code>timeout</code></p>
+<p><code>timeout 5 ping -c 3 somehost</code></p>
+<p>This won't for work for every use case obviously, but if your dealing with a simple script, this is hard to beat.</p>
+<p>Also available as gtimeout in coreutils via <code>homebrew</code> for mac users.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Another option is to write to a temporary file to prevent the stdout blocking instead of needing to poll with communicate(). This worked for me where the other answers did not; for example on windows.</p>
+<pre><code>    outFile =  tempfile.SpooledTemporaryFile() 
+    errFile =   tempfile.SpooledTemporaryFile() 
+    proc = subprocess.Popen(args, stderr=errFile, stdout=outFile, universal_newlines=False)
+    wait_remaining_sec = timeout
+
+    while proc.poll() is None and wait_remaining_sec &gt; 0:
+        time.sleep(1)
+        wait_remaining_sec -= 1
+
+    if wait_remaining_sec &lt;= 0:
+        killProc(proc.pid)
+        raise ProcessIncompleteError(proc, timeout)
+
+    # read temp streams from start
+    outFile.seek(0);
+    errFile.seek(0);
+    out = outFile.read()
+    err = errFile.read()
+    outFile.close()
+    errFile.close()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://docs.python.org/3/library/subprocess.html#subprocess.call" rel="noreferrer"><code>timeout</code> is now supported</a> by <code>call()</code> and <code>communicate()</code> in the subprocess module (as of Python3.3):</p>
+<pre><code>import subprocess
+
+subprocess.call("command", timeout=20, shell=True)
+</code></pre>
+<p>This will call the command and raise the exception</p>
+<pre><code>subprocess.TimeoutExpired
+</code></pre>
+<p>if the command doesn't finish after 20 seconds.</p>
+<p>You can then handle the exception to continue your code, something like:</p>
+<pre><code>try:
+    subprocess.call("command", timeout=20, shell=True)
+except subprocess.TimeoutExpired:
+    # insert code here
+</code></pre>
+<p>Hope this helps.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here is my solution, I was using Thread and Event:</p>
+<pre><code>import subprocess
+from threading import Thread, Event
+
+def kill_on_timeout(done, timeout, proc):
+    if not done.wait(timeout):
+        proc.kill()
+
+def exec_command(command, timeout):
+
+    done = Event()
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    watcher = Thread(target=kill_on_timeout, args=(done, timeout, proc))
+    watcher.daemon = True
+    watcher.start()
+
+    data, stderr = proc.communicate()
+    done.set()
+
+    return data, stderr, proc.returncode
+</code></pre>
+<p>In action:</p>
+<pre><code>In [2]: exec_command(['sleep', '10'], 5)
+Out[2]: ('', '', -9)
+
+In [3]: exec_command(['sleep', '10'], 11)
+Out[3]: ('', '', 0)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The solution I use is to prefix the shell command with <a href="http://devel.ringlet.net/sysutils/timelimit/" rel="nofollow noreferrer">timelimit</a>. If the comand takes too long, timelimit will stop it and Popen will have a returncode set by timelimit. If it is &gt; 128, it means timelimit killed the process.</p>
+<p>See also <a href="https://stackoverflow.com/questions/3575554/python-subprocess-with-timeout-and-large-output-64k">python subprocess with timeout and large output (&gt;64K)</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I added the solution with threading from <code>jcollado</code> to my Python module <a href="http://code.activestate.com/pypm/easyprocess/" rel="nofollow">easyprocess</a>.</p>
+<p>Install:</p>
+<pre><code>pip install easyprocess
+</code></pre>
+<p>Example:</p>
+<pre><code>from easyprocess import Proc
+
+# shell is not supported!
+stdout=Proc('ping localhost').call(timeout=1.5).stdout
+print stdout
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I don't know why it isn't mentionned but since Python 3.5, there's a new <a href="https://docs.python.org/3/library/subprocess.html#subprocess.run" rel="nofollow noreferrer"><code>subprocess.run</code></a> universal command (that is meant to replace <code>check_call</code>, <code>check_output</code> ...) and which has the <code>timeout</code> parameter as well.</p>
+<blockquote>
+<p>subprocess.run(args, *, stdin=None, input=None, stdout=None, stderr=None, shell=False, cwd=None, timeout=None, check=False, encoding=None, errors=None)</p>
+</blockquote>
+<pre><code>Run the command described by args. Wait for command to complete, then return a CompletedProcess instance.
+</code></pre>
+<p>It raises a <code>subprocess.TimeoutExpired</code> exception when the timeout is expired.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>if you are using python 2, give it a try</p>
+<pre><code>import subprocess32
+
+try:
+    output = subprocess32.check_output(command, shell=True, timeout=3)
+except subprocess32.TimeoutExpired as e:
+    print e
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I've implemented what I could gather from a few of these. This works in Windows, and since this is a community wiki, I figure I would share my code as well:</p>
+<pre><code>class Command(threading.Thread):
+    def __init__(self, cmd, outFile, errFile, timeout):
+        threading.Thread.__init__(self)
+        self.cmd = cmd
+        self.process = None
+        self.outFile = outFile
+        self.errFile = errFile
+        self.timed_out = False
+        self.timeout = timeout
+
+    def run(self):
+        self.process = subprocess.Popen(self.cmd, stdout = self.outFile, \
+            stderr = self.errFile)
+
+        while (self.process.poll() is None and self.timeout &gt; 0):
+            time.sleep(1)
+            self.timeout -= 1
+
+        if not self.timeout &gt; 0:
+            self.process.terminate()
+            self.timed_out = True
+        else:
+            self.timed_out = False
+</code></pre>
+<p>Then from another class or file:</p>
+<pre><code>        outFile =  tempfile.SpooledTemporaryFile()
+        errFile =   tempfile.SpooledTemporaryFile()
+
+        executor = command.Command(c, outFile, errFile, timeout)
+        executor.daemon = True
+        executor.start()
+
+        executor.join()
+        if executor.timed_out:
+            out = 'timed out'
+        else:
+            outFile.seek(0)
+            errFile.seek(0)
+            out = outFile.read()
+            err = errFile.read()
+
+        outFile.close()
+        errFile.close()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Once you understand full process running machinery in *unix, you will easily find simplier solution:</p>
+<p>Consider this simple example how to make timeoutable communicate() meth using select.select() (available alsmost everythere on *nix nowadays). This also can be written with epoll/poll/kqueue, but select.select() variant could be a good example for you. And major limitations of select.select() (speed and 1024 max fds) are not applicapable for your task.</p>
+<p>This works under *nix, does not create threads, does not uses signals, can be lauched from any thread (not only main), and fast enought to read 250mb/s of data from stdout on my machine (i5 2.3ghz).</p>
+<p>There is a problem in join'ing stdout/stderr at the end of communicate. If you have huge program output this could lead to big memory usage. But you can call communicate() several times with smaller timeouts.</p>
+<pre><code>class Popen(subprocess.Popen):
+    def communicate(self, input=None, timeout=None):
+        if timeout is None:
+            return subprocess.Popen.communicate(self, input)
+
+        if self.stdin:
+            # Flush stdio buffer, this might block if user
+            # has been writing to .stdin in an uncontrolled
+            # fashion.
+            self.stdin.flush()
+            if not input:
+                self.stdin.close()
+
+        read_set, write_set = [], []
+        stdout = stderr = None
+
+        if self.stdin and input:
+            write_set.append(self.stdin)
+        if self.stdout:
+            read_set.append(self.stdout)
+            stdout = []
+        if self.stderr:
+            read_set.append(self.stderr)
+            stderr = []
+
+        input_offset = 0
+        deadline = time.time() + timeout
+
+        while read_set or write_set:
+            try:
+                rlist, wlist, xlist = select.select(read_set, write_set, [], max(0, deadline - time.time()))
+            except select.error as ex:
+                if ex.args[0] == errno.EINTR:
+                    continue
+                raise
+
+            if not (rlist or wlist):
+                # Just break if timeout
+                # Since we do not close stdout/stderr/stdin, we can call
+                # communicate() several times reading data by smaller pieces.
+                break
+
+            if self.stdin in wlist:
+                chunk = input[input_offset:input_offset + subprocess._PIPE_BUF]
+                try:
+                    bytes_written = os.write(self.stdin.fileno(), chunk)
+                except OSError as ex:
+                    if ex.errno == errno.EPIPE:
+                        self.stdin.close()
+                        write_set.remove(self.stdin)
+                    else:
+                        raise
+                else:
+                    input_offset += bytes_written
+                    if input_offset &gt;= len(input):
+                        self.stdin.close()
+                        write_set.remove(self.stdin)
+
+            # Read stdout / stderr by 1024 bytes
+            for fn, tgt in (
+                (self.stdout, stdout),
+                (self.stderr, stderr),
+            ):
+                if fn in rlist:
+                    data = os.read(fn.fileno(), 1024)
+                    if data == '':
+                        fn.close()
+                        read_set.remove(fn)
+                    tgt.append(data)
+
+        if stdout is not None:
+            stdout = ''.join(stdout)
+        if stderr is not None:
+            stderr = ''.join(stderr)
+
+        return (stdout, stderr)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can do this using <code>select</code></p>
+<pre><code>import subprocess
+from datetime import datetime
+from select import select
+
+def call_with_timeout(cmd, timeout):
+    started = datetime.now()
+    sp = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    while True:
+        p = select([sp.stdout], [], [], timeout)
+        if p[0]:
+            p[0][0].read()
+        ret = sp.poll()
+        if ret is not None:
+            return ret
+        if (datetime.now()-started).total_seconds() &gt; timeout:
+            sp.kill()
+            return None
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Prepending the Linux command <code>timeout</code> isn't a bad workaround and it worked for me.</p>
+<pre><code>cmd = "timeout 20 "+ cmd
+subprocess.Popen(cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+(output, err) = p.communicate()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I've used <a href="http://benjamin.smedbergs.us/blog/2006-12-11/killableprocesspy/" rel="nofollow noreferrer">killableprocess</a> successfully on Windows, Linux and Mac. If you are using Cygwin Python, you'll need <a href="http://svn.osafoundation.org/chandler/trunk/chandler/tools/killableprocess.py" rel="nofollow noreferrer">OSAF's version of killableprocess</a> because otherwise native Windows processes won't get killed.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Although I haven't looked at it extensively, this <a href="http://code.activestate.com/recipes/307871-timing-out-function/" rel="nofollow">decorator</a> I found at ActiveState seems to be quite useful for this sort of thing. Along with <code>subprocess.Popen(..., close_fds=True)</code>, at least I'm ready for shell-scripting in Python.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There's an idea to subclass the Popen class and extend it with some simple method decorators. Let's call it ExpirablePopen.</p>
+<pre><code>from logging import error
+from subprocess import Popen
+from threading import Event
+from threading import Thread
+
+
+class ExpirablePopen(Popen):
+
+    def __init__(self, *args, **kwargs):
+        self.timeout = kwargs.pop('timeout', 0)
+        self.timer = None
+        self.done = Event()
+
+        Popen.__init__(self, *args, **kwargs)
+
+    def __tkill(self):
+        timeout = self.timeout
+        if not self.done.wait(timeout):
+            error('Terminating process {} by timeout of {} secs.'.format(self.pid, timeout))
+            self.kill()
+
+    def expirable(func):
+        def wrapper(self, *args, **kwargs):
+            # zero timeout means call of parent method
+            if self.timeout == 0:
+                return func(self, *args, **kwargs)
+
+            # if timer is None, need to start it
+            if self.timer is None:
+                self.timer = thr = Thread(target=self.__tkill)
+                thr.daemon = True
+                thr.start()
+
+            result = func(self, *args, **kwargs)
+            self.done.set()
+
+            return result
+        return wrapper
+
+    wait = expirable(Popen.wait)
+    communicate = expirable(Popen.communicate)
+
+
+if __name__ == '__main__':
+    from subprocess import PIPE
+
+    print ExpirablePopen('ssh -T git@bitbucket.org', stdout=PIPE, timeout=1).communicate()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I had the problem that I wanted to terminate a multithreading subprocess if it took longer than a given timeout length. I wanted to set a timeout in <code>Popen()</code>, but it did not work. Then, I realized that <code>Popen().wait()</code> is equal to <code>call()</code> and so I had the idea to set a timeout within the <code>.wait(timeout=xxx)</code> method, which finally worked. Thus, I solved it this way:</p>
+<pre><code>import os
+import sys
+import signal
+import subprocess
+from multiprocessing import Pool
+
+cores_for_parallelization = 4
+timeout_time = 15  # seconds
+
+def main():
+    jobs = [...YOUR_JOB_LIST...]
+    with Pool(cores_for_parallelization) as p:
+        p.map(run_parallel_jobs, jobs)
+
+def run_parallel_jobs(args):
+    # Define the arguments including the paths
+    initial_terminal_command = 'C:\\Python34\\python.exe'  # Python executable
+    function_to_start = 'C:\\temp\\xyz.py'  # The multithreading script
+    final_list = [initial_terminal_command, function_to_start]
+    final_list.extend(args)
+
+    # Start the subprocess and determine the process PID
+    subp = subprocess.Popen(final_list)  # starts the process
+    pid = subp.pid
+
+    # Wait until the return code returns from the function by considering the timeout. 
+    # If not, terminate the process.
+    try:
+        returncode = subp.wait(timeout=timeout_time)  # should be zero if accomplished
+    except subprocess.TimeoutExpired:
+        # Distinguish between Linux and Windows and terminate the process if 
+        # the timeout has been expired
+        if sys.platform == 'linux2':
+            os.kill(pid, signal.SIGTERM)
+        elif sys.platform == 'win32':
+            subp.terminate()
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Unfortunately, I'm bound by very strict policies on the disclosure of source code by my employer, so I can't provide actual code.  But for my taste the best solution is to create a subclass overriding <code>Popen.wait()</code> to poll instead of wait indefinitely, and <code>Popen.__init__</code> to accept a timeout parameter.  Once you do that, all the other <code>Popen</code> methods (which call <code>wait</code>) will work as expected, including <code>communicate</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://pypi.python.org/pypi/python-subprocess2" rel="nofollow">https://pypi.python.org/pypi/python-subprocess2</a> provides extensions to the subprocess module which allow you to wait up to a certain period of time, otherwise terminate. </p>
+<p>So, to wait up to 10 seconds for the process  to terminate, otherwise kill:</p>
+<pre><code>pipe  = subprocess.Popen('...')
+
+timeout =  10
+
+results = pipe.waitOrTerminate(timeout)
+</code></pre>
+<p>This is compatible with both windows and unix.  "results" is a dictionary, it contains "returnCode" which is the return of the app (or None if it had to  be killed), as well as "actionTaken". which will be "SUBPROCESS2_PROCESS_COMPLETED" if the process completed normally, or a mask of "SUBPROCESS2_PROCESS_TERMINATED" and SUBPROCESS2_PROCESS_KILLED depending on action taken (see documentation for full details)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This solution kills the process tree in case of shell=True, passes parameters to the process (or not), has a timeout and gets the stdout, stderr and process output of the call back (it uses psutil for the kill_proc_tree).  This was based on several solutions posted in SO including jcollado's. Posting in response to comments by Anson and jradice in jcollado's answer. Tested in Windows Srvr 2012 and Ubuntu 14.04.  Please note that for Ubuntu you need to change the parent.children(...) call to parent.get_children(...).</p>
+<pre><code>def kill_proc_tree(pid, including_parent=True):
+  parent = psutil.Process(pid)
+  children = parent.children(recursive=True)
+  for child in children:
+    child.kill()
+  psutil.wait_procs(children, timeout=5)
+  if including_parent:
+    parent.kill()
+    parent.wait(5)
+
+def run_with_timeout(cmd, current_dir, cmd_parms, timeout):
+  def target():
+    process = subprocess.Popen(cmd, cwd=current_dir, shell=True, stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    # wait for the process to terminate
+    if (cmd_parms == ""):
+      out, err = process.communicate()
+    else:
+      out, err = process.communicate(cmd_parms)
+    errcode = process.returncode
+
+  thread = Thread(target=target)
+  thread.start()
+
+  thread.join(timeout)
+  if thread.is_alive():
+    me = os.getpid()
+    kill_proc_tree(me, including_parent=False)
+    thread.join()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>for python 2.6+, use gevent</p>
+<pre><code> from gevent.subprocess import Popen, PIPE, STDOUT
+
+ def call_sys(cmd, timeout):
+      p= Popen(cmd, shell=True, stdout=PIPE)
+      output, _ = p.communicate(timeout=timeout)
+      assert p.returncode == 0, p. returncode
+      return output
+
+ call_sys('./t.sh', 2)
+
+ # t.sh example
+ sleep 5
+ echo done
+ exit 1
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>python 2.7</p>
+<pre><code>import time
+import subprocess
+
+def run_command(cmd, timeout=0):
+    start_time = time.time()
+    df = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    while timeout and df.poll() == None:
+        if time.time()-start_time &gt;= timeout:
+            df.kill()
+            return -1, ""
+    output = '\n'.join(df.communicate()).strip()
+    return df.returncode, output
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>import subprocess, optparse, os, sys, re, datetime, threading, time, glob, shutil, xml.dom.minidom, traceback
+
+class OutputManager:
+    def __init__(self, filename, mode, console, logonly):
+        self.con = console
+        self.logtoconsole = True
+        self.logtofile = False
+
+        if filename:
+            try:
+                self.f = open(filename, mode)
+                self.logtofile = True
+                if logonly == True:
+                    self.logtoconsole = False
+            except IOError:
+                print (sys.exc_value)
+                print ("Switching to console only output...\n")
+                self.logtofile = False
+                self.logtoconsole = True
+
+    def write(self, data):
+        if self.logtoconsole == True:
+            self.con.write(data)
+        if self.logtofile == True:
+            self.f.write(data)
+        sys.stdout.flush()
+
+def getTimeString():
+        return time.strftime("%Y-%m-%d", time.gmtime())
+
+def runCommand(command):
+    '''
+    Execute a command in new thread and return the
+    stdout and stderr content of it.
+    '''
+    try:
+        Output = subprocess.Popen(command, stdout=subprocess.PIPE, shell=True).communicate()[0]
+    except Exception as e:
+        print ("runCommand failed :%s" % (command))
+        print (str(e))
+        sys.stdout.flush()
+        return None
+    return Output
+
+def GetOs():
+    Os = ""
+    if sys.platform.startswith('win32'):
+        Os = "win"
+    elif sys.platform.startswith('linux'):
+        Os = "linux"
+    elif sys.platform.startswith('darwin'):
+        Os = "mac"
+    return Os
+
+
+def check_output(*popenargs, **kwargs):
+    try:
+        if 'stdout' in kwargs: 
+            raise ValueError('stdout argument not allowed, it will be overridden.') 
+
+        # Get start time.
+        startTime = datetime.datetime.now()
+        timeoutValue=3600
+
+        cmd = popenargs[0]
+
+        if sys.platform.startswith('win32'):
+            process = subprocess.Popen( cmd, stdout=subprocess.PIPE, shell=True) 
+        elif sys.platform.startswith('linux'):
+            process = subprocess.Popen( cmd , stdout=subprocess.PIPE, shell=True ) 
+        elif sys.platform.startswith('darwin'):
+            process = subprocess.Popen( cmd , stdout=subprocess.PIPE, shell=True ) 
+
+        stdoutdata, stderrdata = process.communicate( timeout = timeoutValue )
+        retcode = process.poll()
+
+        ####################################
+        # Catch crash error and log it.
+        ####################################
+        OutputHandle = None
+        try:
+            if retcode &gt;= 1:
+                OutputHandle = OutputManager( 'CrashJob_' + getTimeString() + '.txt', 'a+', sys.stdout, False)
+                OutputHandle.write( cmd )
+                print (stdoutdata)
+                print (stderrdata)
+                sys.stdout.flush()
+        except Exception as e:
+            print (str(e))
+
+    except subprocess.TimeoutExpired:
+            ####################################
+            # Catch time out error and log it.
+            ####################################
+            Os = GetOs()
+            if Os == 'win':
+                killCmd = "taskkill /FI \"IMAGENAME eq {0}\" /T /F"
+            elif Os == 'linux':
+                killCmd = "pkill {0)"
+            elif Os == 'mac':
+                # Linux, Mac OS
+                killCmd = "killall -KILL {0}"
+
+            runCommand(killCmd.format("java"))
+            runCommand(killCmd.format("YouApp"))
+
+            OutputHandle = None
+            try:
+                OutputHandle = OutputManager( 'KillJob_' + getTimeString() + '.txt', 'a+', sys.stdout, False)
+                OutputHandle.write( cmd )
+            except Exception as e:
+                print (str(e))
+    except Exception as e:
+            for frame in traceback.extract_tb(sys.exc_info()[2]):
+                        fname,lineno,fn,text = frame
+                        print "Error in %s on line %d" % (fname, lineno)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Was just trying to write something simpler.</p>
+<pre><code>#!/usr/bin/python
+
+from subprocess import Popen, PIPE
+import datetime
+import time 
+
+popen = Popen(["/bin/sleep", "10"]);
+pid = popen.pid
+sttime = time.time();
+waittime =  3
+
+print "Start time %s"%(sttime)
+
+while True:
+    popen.poll();
+    time.sleep(1)
+    rcode = popen.returncode
+    now = time.time();
+    if [ rcode is None ]  and  [ now &gt; (sttime + waittime) ] :
+        print "Killing it now"
+        popen.kill()
+</code></pre>
+</div>
+<span class="comment-copy">A related Python issue tracker entry: <a href="http://bugs.python.org/issue5673" rel="nofollow noreferrer">bugs.python.org/issue5673</a></span>
+<span class="comment-copy">Use <a href="https://pypi.python.org/pypi/subprocess32" rel="nofollow noreferrer">pypi.python.org/pypi/subprocess32</a> for Python2.x. It is a backport of Python 3.x. It has the timeout argument for call() and wait().</span>
+<span class="comment-copy">pypi.python.org/pypi/subprocess32 does not work on Windows :(</span>
+<span class="comment-copy">Indeed, and subprocess timeout support exists in the subprocess32 backport that I maintain for use on Python 2.  <a href="http://pypi.python.org/pypi/subprocess32/" rel="nofollow noreferrer">pypi.python.org/pypi/subprocess32</a></span>
+<span class="comment-copy">@gps Sridhar asked for cross platform solution, while your backport only supports POSIX : when I tried it out, MSVC complained (expected) about missing unistd.h :)</span>
+<span class="comment-copy">If you don't need the output, you can just use the subprocess.call.</span>
+<span class="comment-copy">+1 just for the <code>shell=True</code> comment.</span>
+<span class="comment-copy">+1 For being platform independent. I've run this on both linux and windows 7 (cygwin and plain windows python) -- works as expected in all three cases.</span>
+<span class="comment-copy">I've modified your code a bit in order to be able to pass native Popen kwargs and put it on gist. It is now ready to use multi purpose; <a href="https://gist.github.com/1306188" rel="nofollow noreferrer">gist.github.com/1306188</a></span>
+<span class="comment-copy">For anybody having the problem @redice was having, <a href="http://stackoverflow.com/questions/4789837/how-to-terminate-a-python-subprocess-launched-with-shell-true">this question</a> may help. In short, if you use shell=True, the shell becomes the child process which gets killed, and its command (child of the child process) lives on.</span>
+<span class="comment-copy">This answer does not provide the same functionality of the original since it doesn't return stdout.</span>
+<span class="comment-copy">thread.is_alive can lead to a race condition. See <a href="http://www.ostricher.com/2015/01/python-subprocess-with-timeout/" rel="nofollow noreferrer">ostricher.com/2015/01/python-subprocess-with-timeout</a></span>
+<span class="comment-copy">+1 for simple portable solution. You don't need <code>lambda</code>: <code>t = Timer(timeout, proc.kill)</code></span>
+<span class="comment-copy">+1 This should be the accepted answer, because it doesn't require the way in which the process is launched to be changed.</span>
+<span class="comment-copy">Why does it require the lambda? Couldn't the bound method p.kill be used without the lambda there?</span>
+<span class="comment-copy">// , Would you be willing to include an example of the use of this?</span>
+<span class="comment-copy">great solution, avoiding is_alive</span>
+<span class="comment-copy">Well, I am interested in a cross-platform solution that works at least on win/linux/mac.</span>
+<span class="comment-copy">I like this unix-based approach. Ideally, one would combine this with a windows-specific approach (using CreateProcess and Jobs) .. but for now, the solution below is simple, easy and works-so-far.</span>
+<span class="comment-copy">I have added a portable solution, see my answer</span>
+<span class="comment-copy">This solution would work <i>only_if</i> signal.signal(signal.SIGALARM, alarm_handler) is called from the main thread. See the documentation for signal</span>
+<span class="comment-copy">Unfortunately, when running (on linux) in the context of an Apache module (like mod_python, mod_perl, or mod_php), I've found the use of signals and alarms to be disallowed (presumably because they interfere with Apache's own IPC logic). So to achieve the goal of timing out a command I have been forced to write "parent loops" which launch a child process and then sit in a "sleep"y loop watching the clock (and possibly also monitoring output from the child).</span>
+<span class="comment-copy">This will not work on windows, plus the order of functions is reversed.</span>
+<span class="comment-copy">This sometimes results in exception when another handler registers itself on SIGALARM and kills the process before this one gets to "kill", added work-around. BTW, great recipe! I've used this to launch 50,000 buggy processes so far without freezing or crashing the handling wrapper.</span>
+<span class="comment-copy">How can this be modified to run in a Threaded application?  I am trying to use it from within worker threads and get <code>ValueError: signal only works in main thread</code></span>
+<span class="comment-copy">@Yaroslav Bulatov  Thanks for the info.  What was the workaround you added to deal with the issue mentioned?</span>
+<span class="comment-copy">Just added "try;catch" block, it's inside the code. BTW, in the long term, this turned out to give me problems because you can only set one SIGALARM handler, and other processes can reset it. One solution to this is given here -- <a href="http://stackoverflow.com/questions/6553423/multiple-subprocesses-with-timeouts" title="multiple subprocesses with timeouts">stackoverflow.com/questions/6553423/…</a></span>
+<span class="comment-copy">you mean: <code>proc = subprocess.Popen(['/usr/bin/timeout', str(timeout)] + cmd, ...)</code>. Is there <code>timeout</code> command on Windows as OP asks?</span>
+<span class="comment-copy">Seems incomplete - what is tempfile?</span>
+<span class="comment-copy">Include "import tempfile", "import time" and "shell=True" inside "Popen" call (beware with "shell=True")!</span>
+<span class="comment-copy"><a href="http://stackoverflow.com/a/12698328/4279">there is an existing answer that mentions the <code>timeout</code> parameter</a>. Though mentioning it once more wouldn't hurt.</span>
+<span class="comment-copy">// , I think OP's looking for a solution for the older Python.</span>
+<span class="comment-copy">I use a similar tool called <code>timeout</code> - <a href="http://packages.ubuntu.com/search?keywords=timeout" rel="nofollow noreferrer">packages.ubuntu.com/search?keywords=timeout</a> - but neither works on Windows, do they?</span>
+<span class="comment-copy">The easyprocess module (<a href="http://code.activestate.com/pypm/easyprocess/" rel="nofollow noreferrer">code.activestate.com/pypm/easyprocess</a>) worked for me, even using it from multiprocessing.</span>
+<span class="comment-copy">Probably not working on Windows, as asked in the initial question</span>
+<span class="comment-copy">Actually, this probably does not work. The <code>terminate()</code> function marks a thread as terminated, but does not actually terminate the thread! I can verify this in *nix, but I don't have a Windows computer to test on.</span>
+<span class="comment-copy">This only addresses the Unix half of the problem.</span>
+<span class="comment-copy">Looks like killableprocess doesn't add a timeout to the Popen.communicate() call.</span>
+<span class="comment-copy">This decorator uses signal.alarm, which is not available on Windows.</span>
+<span class="comment-copy">this is an abomination</span>
+<span class="comment-copy">time.sleep(1) is very bad idea - imagine you want to run many commands that would take about 0.002sec. You should rather wait while poll() (see select, for Linux epol recomended :)</span>

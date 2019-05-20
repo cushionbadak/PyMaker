@@ -1,0 +1,246 @@
+<div class="post-text" itemprop="text">
+<p>I want to write a decorator that inject custom local variable into function.</p>
+<p>interface may like this.</p>
+<pre><code>def enclose(name, value):
+    ...
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+</code></pre>
+<p>expectation:</p>
+<pre><code>@enclose('param1', 1)
+def f():
+   param1 += 1
+   print param1
+f() will compile and run without error
+</code></pre>
+<p>output:</p>
+<pre><code>2
+</code></pre>
+<p>Is it possible to do this in python? why?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I thought I'd try this out just to see how hard it would be. Pretty hard as it turns out.</p>
+<p>First thing was how do you implement this? Is the extra <code>parameter</code> an injected local variable, an additional argument to the function or a nonlocal variable. An injected local variable will be a fresh object each time, but how to create more complicated objects... An additional argument will record mutations to the object, but assignments to the name will be forgotten between function invocations. Additionally, this will require either parsing of the source to find where to place the argument, or directly manipulating code objects. Finally, declaring the variables nonlocal will record mutations to the object and assignments to the name. Effectively a nonlocal is global, but only reachable by the decorated function. Again, using a nonlocal will requiring parsing the source and finding where to place the nonlocal declaration or direct manipulation of a code object.</p>
+<p>In the end I decided with using a nonlocal variable and parsing the function source. Originally I was going to manipulate code objects, but it seemed too complicated.</p>
+<p>Here is the code for the decorator:</p>
+<pre><code>import re
+import types
+import inspect
+
+
+class DummyInject:
+
+    def __call__(self, **kwargs):
+        return lambda func: func
+
+    def __getattr__(self, name):
+        return self
+
+
+class Inject:
+
+    function_end = re.compile(r"\)\s*:\s*\n")
+    indent = re.compile("\s+")
+    decorator = re.compile("@([a-zA-Z0-9_]+)[.a-zA-Z0-9_]*")
+    exec_source = """
+def create_new_func({closure_names}):
+{func_source}
+{indent}return {func_name}"""
+    nonlocal_declaration = "{indent}nonlocal {closure_names};"
+
+    def __init__(self, **closure_vars):
+        self.closure_vars = closure_vars
+
+    def __call__(self, func):
+
+        lines, line_number = inspect.getsourcelines(func)
+        self.inject_nonlocal_declaration(lines)
+        new_func = self.create_new_function(lines, func)
+        return new_func 
+
+    def inject_nonlocal_declaration(self, lines):
+        """hides nonlocal declaration in first line of function."""
+        function_body_start = self.get_function_body_start(lines)
+        nonlocals = self.nonlocal_declaration.format(
+            indent=self.indent.match(lines[function_body_start]).group(),
+            closure_names=", ".join(self.closure_vars)
+        )
+        lines[function_body_start] = nonlocals + lines[function_body_start]
+        return lines
+
+    def get_function_body_start(self, lines):
+        line_iter = enumerate(lines)
+
+        found_function_header = False
+        for i, line in line_iter:
+            if self.function_end.search(line):
+                found_function_header = True
+                break
+        assert found_function_header
+
+        for i, line in line_iter:
+            if not line.strip().startswith("#"):
+                break
+
+        return i
+
+    def create_new_function(self, lines, func):
+        # prepares source -- eg. making sure indenting is correct
+        declaration_indent, body_indent = self.get_indent(lines)
+        if not declaration_indent:
+            lines = [body_indent + line for line in lines]
+        exec_code = self.exec_source.format(
+            closure_names=", ".join(self.closure_vars),
+            func_source="".join(lines),
+            indent=declaration_indent if declaration_indent else body_indent,
+            func_name=func.__name__
+        )
+
+        # create new func -- mainly only want code object contained by new func
+        lvars = {"closure_vars": self.closure_vars}
+        gvars = self.get_decorators(exec_code, func.__globals__)
+        exec(exec_code, gvars, lvars)
+        new_func = eval("create_new_func(**closure_vars)", gvars, lvars)
+
+        # add back bits that enable function to work well
+        # includes original global references and 
+        new_func = self.readd_old_references(new_func, func)
+        return new_func
+
+    def readd_old_references(self, new_func, old_func):
+        """Adds back globals, function name and source reference."""
+        func = types.FunctionType(
+            code=self.add_src_ref(new_func.__code__, old_func.__code__),
+            globals=old_func.__globals__,
+            name=old_func.__name__,
+            argdefs=old_func.__defaults__,
+            closure=new_func.__closure__
+        )
+        func.__doc__ = old_func.__doc__
+        return func
+
+    def add_src_ref(self, new_code, old_code):
+        return types.CodeType(
+            new_code.co_argcount,
+            new_code.co_kwonlyargcount,
+            new_code.co_nlocals,
+            new_code.co_stacksize,
+            new_code.co_flags,
+            new_code.co_code,
+            new_code.co_consts,
+            new_code.co_names,
+            new_code.co_varnames,
+            old_code.co_filename, # reuse filename
+            new_code.co_name,
+            old_code.co_firstlineno, # reuse line number
+            new_code.co_lnotab,
+            new_code.co_freevars,
+            new_code.co_cellvars
+        )
+
+    def get_decorators(self, source, global_vars):
+        """Creates a namespace for exec function creation in. Must remove
+        any reference to Inject decorator to prevent infinite recursion."""
+        namespace = {}
+        for match in self.decorator.finditer(source):
+            decorator = eval(match.group()[1:], global_vars)
+            basename = match.group(1)
+            if decorator is Inject:
+                namespace[basename] = DummyInject()
+            else:
+                namespace[basename] = global_vars[basename]
+        return namespace
+
+    def get_indent(self, lines):
+        """Takes a set of lines used to create a function and returns the 
+        outer indentation that the function is declared in and the inner
+        indentation of the body of the function.""" 
+        body_indent = None
+        function_body_start = self.get_function_body_start(lines)
+        for line in lines[function_body_start:]:
+            match = self.indent.match(line)
+            if match:
+                body_indent = match.group()
+                break
+        assert body_indent
+
+        match = self.indent.match(lines[0])
+        if not match:
+            declaration_indent = ""
+        else:
+            declaration_indent = match.group()
+
+        return declaration_indent, body_indent
+
+
+if __name__ == "__main__":  
+
+    a = 1
+
+    @Inject(b=10)
+    def f(c, d=1000):
+        "f uses injected variables"
+        return a + b + c + d
+
+    @Inject(var=None)
+    def g():
+        """Purposefully generate exception to show stacktraces are still
+        meaningful."""
+        create_name_error # line number 164
+
+    print(f(100)) # prints 1111
+    assert f(100) == 1111
+    assert f.__doc__ == "f uses injected variables" # show doc is retained
+
+    try:
+        g()
+    except NameError:
+        raise 
+    else:
+        assert False
+    # stack trace shows NameError on line 164
+</code></pre>
+<p>Which outputs the following:</p>
+<pre><code>1111
+Traceback (most recent call last):
+  File "inject.py", line 171, in &lt;module&gt;
+    g()
+  File "inject.py", line 164, in g
+    create_name_error # line number 164
+NameError: name 'create_name_error' is not defined
+</code></pre>
+<p>The whole thing is hideously ugly, but it works. It's also worth noting that if <code>Inject</code> is used for method, then any injected values are shared between all instances of the class.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can do it using globals but I don't recommend this approach.</p>
+<pre><code>def enclose(name, value):
+    globals()[name] = value
+
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+        return wrapper
+
+    return decorator
+
+@enclose('param1', 1)
+def f():
+    global param1
+    param1 += 1
+
+    print(param1)
+
+f()
+</code></pre>
+</div>
+<span class="comment-copy">It possibly might be, but why would you do this? If the function is expecting the argument - as it must be, because it is using it by name - then why not specify it as an actual argument? And if not, why not use the normal <code>*args/**kwargs</code> syntax?</span>
+<span class="comment-copy">It's possible, but not something you want to be doing. It will be the source of all sorts of weird bugs where to try to figure out where a variable name is coming from or why it doesn't exist.</span>
+<span class="comment-copy">Another key thing to consider if you were doing this is: what would the output of calling <code>f()</code> a second time be -- 2 or 3? Also, since you call it param, could you do something like <code>f(param1=10)</code>?</span>
+<span class="comment-copy">What is the point of this? You could move the details of the decorator two lines down, by adding <code>param1 = 1</code> as a statement in your function.  That would get you the same effect, without inventing bizarre and impossible-to-implement decorators.</span>
+<span class="comment-copy">There's a step between parsing the source and bytecode hacking: parsing the AST. And Python has helpers for this in the stdlib, notably <a href="https://docs.python.org/3/library/ast.html#ast.NodeTransformer" rel="nofollow noreferrer"><code>ast.NodeTransformer</code></a>. And, in 3.x, <a href="https://docs.python.org/3/library/importlib.html" rel="nofollow noreferrer"><code>importlib</code></a> makes it relatively easy to build an import hook that applies the transformer for you automatically in any modules you import. But if you really want to play with stuff like this, consider <a href="https://github.com/nikod/PyMacro" rel="nofollow noreferrer"><code>PyMacro</code></a>, which has a ton of cool helpful features.</span>
+<span class="comment-copy">Looks awesome. I knew a proper syntax tree parser would be the better way to go. But I do this to further my own understanding of Python mainly. For instance, the code in the answer took me ages, but I've just knocked up a direct code manipulation version in 30 minutes. Not because it was any easier, but I understand a lot more about what is happening under the hood now. Are you sure about PyMacro? Looks like a key rebinding project.</span>
+<span class="comment-copy">Oops, sorry, I meant <a href="https://github.com/lihaoyi/macropy" rel="nofollow noreferrer">MacroPy</a>, not PyMacro. MacroPy is one of the coolest things in the universe if you want to further your understanding of Python. (Especially because, if you get confused with something in the docs, Haoyi Li will often whip up a new 500-line script to explain it to you…) The only caveat is that if you want to learn to build import hooks yourself, and don't need backward compatibility, the way MacroPy does it is more complicated and clunky than the 3.4+ way. But just using it as a framework, that's not an issue.</span>
+<span class="comment-copy">By the way, if you didn't know about MacroPy, you might also not know about <a href="https://pypi.python.org/pypi?%3Aaction=search&amp;term=bytecode&amp;submit=search" rel="nofollow noreferrer">the 300-odd forks and rewrites of bytecodehacks and bytecodeasm</a> (which are dead projects from the 1.5 through 2.3 days), which make it easier to manipulate code objects. Also see <a href="https://github.com/abarnert/cpyasm" rel="nofollow noreferrer"><code>cpyasm</code></a>, which I wrote to be much easier to read and understand than <code>bytecodeasm</code> or <code>BytecodeAssembler</code> (but nowhere near as powerful or robust, so don't use it as anything but sample code).</span>

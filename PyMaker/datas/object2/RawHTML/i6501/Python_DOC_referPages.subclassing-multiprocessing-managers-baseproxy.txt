@@ -1,0 +1,78 @@
+<div class="post-text" itemprop="text">
+<p>I'm having some trouble trying to implement a new <code>defaultdict</code> proxy object. The <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.managers.BaseProxy" rel="noreferrer">documentation</a> is a bit scares, so I'm not sure how to go about this correctly.</p>
+<p>I want to add a <code>defaultdict</code> to the list of types that are available from the <code>Manager</code> instance. You cannot use the <code>Manager.register</code> method on the stock <code>multiprocessing.Manager</code> so I've made my own stub Manager from the <code>multiprocessing.mangers.BaseManager</code></p>
+<pre><code>class Manager(BaseManager):
+    pass
+</code></pre>
+<p>I then created my subclass of <code>multiprocessing.managers.BaseProxy</code> to house the <code>defaultdict</code> (I did initially try having anther stub which would subclass both <code>defaultdict</code> and <code>BaseProxy</code> but that didn't seem to work. Here's what I currently have:</p>
+<pre><code>class ProxyDefaultDict(BaseProxy):
+    def __init__(self, default_factory=None, *args, **kwargs):
+        self.__data = defaultdict(default_factory)
+        super().__init__(*args, **kwargs)
+
+    def _callmethod(self, methodname, args=(), kwds={}):
+        return getattr(self.__data, methodname)(*args, **kwds)
+
+    def _getvalue(self):
+        return self.__data.copy()
+
+    def __repr__(self):
+        return self.__data.__repr__()
+
+    def __str__(self):
+        return self.__data.__str__()
+
+Manager.register('defaultdict', ProxyDefaultDict)
+</code></pre>
+<p>The end goal is to have a shared dictionary which safely shares keyed Locks across processes and threads. Here's an example of how I image it would be initialised:</p>
+<pre><code>if __name__ == '__main__':
+    m = Manager()
+    d = m.defaultdict(m.Lock)
+    with d['named_lock']:
+        print('holding the lock')
+</code></pre>
+<p>However, I've hit a few problems:</p>
+<ol>
+<li><p>A subclass of BaseManager seems to be only initalizable via a context manager i.e. <code>with Manager() as m</code>. Which I would use <code>m = Manager()</code> in this case - as the <code>multiprocessing.Manager</code> allows. Not the end of the world but more curious why this is the case and if it's a sign I'm doing something incorrectly.</p></li>
+<li><p>Subclassing <code>multiprocessing.managers.BaseManager</code> also menas you loose the default registered values from <code>multiprocessing.Manager</code>. In this case I need to re-register a ProxyLock for my manager (which I'm also unsure of the expected way to do this). Is it safe to just subclass <code>multiprocessing.Manager</code> directly.</p></li>
+<li><p>Finally, my <code>ProxyDefaultDict</code> doesn't seem to allow my to cleanly override its <code>__init__</code>. And I'm weary of not calling the <code>BaseProxy.__init__</code> when subclassing. The problem is that BaseProxy also accepts positional arguments. I guess the way round this is to make the <code>default_factory</code> argument a keyed argument only, but that changes the expected interface to <code>defaultdict</code> and makes me assume I'm doing something incorrectly here again. The other types like <code>Manager.Lock</code> seem to be able to accept positional arguments.</p></li>
+</ol>
+<p>Thanks for any help.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>After viewing the source code, a little modification of it works for me to get a defaultdict type proxy without issue (based on how the built in DictProxy is created). </p>
+<pre><code>from collections import defaultdict
+
+from multiprocessing.managers import MakeProxyType, SyncManager
+
+DefaultDictProxy = MakeProxyType("DefaultDictProxy", [
+    '__contains__', '__delitem__', '__getitem__', '__len__',
+    '__setitem__', 'clear', 'copy', 'default_factory', 'fromkeys',
+    'get', 'items', 'keys', 'pop', 'popitem', 'setdefault',
+    'update', 'values'])
+
+SyncManager.register("defaultdict", defaultdict, DefaultDictProxy)
+# Can also create your own Manager here, just using built in for simplicity
+
+if __name__ == '__main__':
+    with SyncManager() as sm:
+        dd = sm.defaultdict(list)
+        print(dd['a'])
+        # []
+</code></pre>
+<p>Personally I find it handy that by using the tools already provided, don't even need to worry about how to subclass it yourself.</p>
+<p>However, I don't think that will allow you to create the default locks scenario you are looking for. Multiprocessing locks are designed to be inherited only, and in general Locks cannot be pickled, which is a requirement for data types being transferred through the proxies. Example: </p>
+<pre><code>    from multiprocessing import Lock
+
+    m = SyncManager()
+    m.start()
+    d = m.defaultdict(Lock)
+    print(d['named_lock'])
+    m.shutdown()
+</code></pre>
+<p>Will raise a runtime error:</p>
+<pre><code>RuntimeError: Lock objects should only be shared between processes through inheritance
+</code></pre>
+</div>
+<span class="comment-copy">Ah yeah, looks like you can call <code>register</code> on <code>SyncManager</code> but not <code>Manager</code>, thanks. I get a different error to yourself when I try and use a lock as a default. When trying to use a managed lock e.g. <code>m.defaultdict(m.Lock)</code> I get a <code>TypeError: Pickling an AuthenticationString object is disallowed for security reasons</code> error. With a unmanaged lock I get <code>Unserializable message: ('#RETURN', &lt;Lock(owner=None)&gt;)</code>. Running on Python 3.4. I would have thought if a Lock could be peroxided it could be pickled.</span>
+<span class="comment-copy">Yeah I think 3.6 just has an updated error / method of detection. I get that same error if I try using threading locks. There are some other ideas <a href="https://stackoverflow.com/questions/17960296/trouble-using-a-lock-with-multiprocessing-pool-pickling-error" title="trouble using a lock with multiprocessing pool pickling error">stackoverflow.com/questions/17960296/…</a> to get around that.</span>

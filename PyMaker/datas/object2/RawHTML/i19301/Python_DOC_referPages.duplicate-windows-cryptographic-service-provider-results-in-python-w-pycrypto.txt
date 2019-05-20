@@ -1,0 +1,189 @@
+<div class="post-text" itemprop="text">
+<h2><strong>Edits and Updates</strong></h2>
+<p>3/24/2013:<br/>
+My output hash from Python is now matching the hash from c++ after converting to utf-16 and stoping before hitting any 'e' or 'm' bytes.  However the decrypted results do not match.  I know that my SHA1 hash is 20 bytes = 160 bits and RC4 keys can vary in length from 40 to 2048 bits so perhaps there is some default salting going on in WinCrypt that I will need to mimic.  CryptGetKeyParam KP_LENGTH or KP_SALT</p>
+<p>3/24/2013:<br/>
+CryptGetKeyParam KP_LENGTH is telling me that my key ength is 128bits. I'm feeding it a 160 bit hash. So perhaps it's just discarding the last 32 bits...or 4 bytes. Testing now.</p>
+<p>3/24/2013:
+Yep, that was it.  If I discard the last 4 bytes of my SHA1 hash in python...I get the same decryption results.</p>
+<h2><strong>Quick Info:</strong></h2>
+<p>I have a c++ program to decrypt a datablock. It uses the Windows Crytographic Service Provider so it only works on Windows.  I would like it to work with other platforms.  </p>
+<h2><strong>Method Overview:</strong></h2>
+<p>In Windows Crypto API
+ An ASCII encode password of bytes is converted to a wide character representation and then hashed with SHA1 to make a key for an RC4 stream cipher. </p>
+<p>In Python PyCrypto
+  An ASCII encoded byte string is decoded to a python string.  It is truncated based on empircally obsesrved bytes which cause mbctowcs to stop converting in c++.  This truncated string is then enocoded in utf-16, effectively padding it with 0x00 bytes between the characters.  This new truncated, padded  byte string is passed to a SHA1 hash and the first 128 bits of the digest are passed to a PyCrypto RC4 object.</p>
+<p><strong>Problem [SOLVED]</strong><br/>
+I can't seem to get the same results with Python 3.x w/ PyCrypto</p>
+<p><strong>C++ Code Skeleton:</strong> </p>
+<pre><code>HCRYPTPROV hProv      = 0x00;
+HCRYPTHASH hHash      = 0x00;
+HCRYPTKEY  hKey       = 0x00;
+wchar_t    sBuf[256]  = {0};
+
+CryptAcquireContextW(&amp;hProv, L"FileContainer", L"Microsoft Enhanced RSA and AES Cryptographic Provider", 0x18u, 0);
+
+CryptCreateHash(hProv, 0x8004u, 0, 0, &amp;hHash);
+//0x8004u is SHA1 flag
+
+int len = mbstowcs(sBuf, iRec-&gt;desc, sizeof(sBuf));
+//iRec is my "Record" class
+//iRec-&gt;desc is 33 bytes within header of my encrypted file
+//this will be used to create the hash key. (So this is the password)
+
+CryptHashData(hHash, (const BYTE*)sBuf, len, 0);
+
+CryptDeriveKey(hProv, 0x6801, hHash, 0, &amp;hKey);
+
+DWORD dataLen = iRec-&gt;compLen;  
+//iRec-&gt;compLen is the length of encrypted datablock
+//it's also compressed that's why it's called compLen
+
+CryptDecrypt(hKey, 0, 0, 0, (BYTE*)iRec-&gt;decrypt, &amp;dataLen);
+// iRec is my record that i'm decrypting
+// iRec-&gt;decrypt is where I store the decrypted data
+//&amp;dataLen is how long the encrypted data block is.
+//I get this from file header info
+</code></pre>
+<p><strong>Python Code Skeleton:</strong></p>
+<pre><code>from Crypto.Cipher import ARC4
+from Crypto.Hash import SHA
+
+#this is the Decipher method from my record class
+def Decipher(self):
+
+    #get string representation of 33byte password
+    key_string= self.desc.decode('ASCII')
+
+    #so far, these characters fail, possibly others but
+    #for now I will make it a list
+    stop_chars = ['e','m']
+
+    #slice off anything beyond where mbstowcs will stop
+    for char in stop_chars:
+        wc_stop = key_string.find(char)
+        if wc_stop != -1:
+            #slice operation
+            key_string = key_string[:wc_stop]
+
+    #make "wide character"
+    #this is equivalent to padding bytes with 0x00
+
+    #Slice off the two byte "Byte Order Mark" 0xff 0xfe 
+    wc_byte_string = key_string.encode('utf-16')[2:]
+
+    #slice off the trailing 0x00
+    wc_byte_string = wc_byte_string[:len(wc_byte_string)-1] 
+
+    #hash the "wchar" byte string
+    #this is the equivalent to sBuf in c++ code above
+    #as determined by writing sBuf to file in tests
+    my_key = SHA.new(wc_byte_string).digest()
+
+    #create a PyCrypto cipher object
+    RC4_Cipher = ARC4.new(my_key[:16])
+
+    #store the decrypted data..these results NOW MATCH
+    self.decrypt = RC4_Cipher.decrypt(self.datablock)
+</code></pre>
+<p><strong>Suspected [EDIT: Confirmed] Causes</strong><br/>
+1.  mbstowcs conversion of the password resulted in the "original data" being fed to the SHA1 hash was not the same in python and c++. mbstowcs was stopping conversion at 0x65 and 0x6D bytes. Original data ended with a wide_char encoding of only part of the original 33 byte password.</p>
+<ol start="2">
+<li>RC4 can have variable length keys. In the Enhanced Win Crypt Sevice provider, the default length is 128 bits.  Leaving the key length unspecified was taking the first 128 bits of the 160 bit SHA1 digest of the "original data"</li>
+</ol>
+<p><strong>How I investigated</strong>
+edit: based on my own experimenting and the suggestions of @RolandSmith, I now know that one of my problems was mbctowcs behaving in a way I wasn't expecting.  It seems to stop writing to sBuf on "e" (0x65) and "m"(0x6d) (probably others).  So the passoword "Monkey" in my description (Ascii encoded bytes), would look like "M o n k" in sBuf because mbstowcs stopped at the e, and placed 0x00 between the bytes based on the 2 byte wchar typedef on my system.  I found this by writing the results of the conversion to a text file.</p>
+<pre><code>BYTE pbHash[256];  //buffer we will store the hash digest in 
+DWORD dwHashLen;  //store the length of the hash
+DWORD dwCount;
+dwCount = sizeof(DWORD);  //how big is a dword on this system?
+
+
+//see above "len" is the return value from mbstowcs that tells how
+//many multibyte characters were converted from the original
+//iRec-&gt;desc an placed into sBuf.  In some cases it's 3, 7, 9
+//and always seems to stop on "e" or "m"
+
+fstream outFile4("C:/desc_mbstowcs.txt", ios::out | ios::trunc | ios::binary);
+outFile4.write((const CHAR*)sBuf, int(len));
+outFile4.close();
+
+//now get the hash size from CryptGetHashParam
+//an get the acutal hash from the hash object hHash
+//write it to a file.
+if(CryptGetHashParam(hHash, HP_HASHSIZE, (BYTE *)&amp;dwHashLen, &amp;dwCount, 0)) {
+  if(CryptGetHashParam(hHash, 0x0002, pbHash, &amp;dwHashLen,0)){
+
+    fstream outFile3("C:/test_hash.txt", ios::out | ios::trunc | ios::binary);
+    outFile3.write((const CHAR*)pbHash, int(dwHashLen));
+    outFile3.close();
+  }
+}
+</code></pre>
+<p><strong>References:</strong><br/>
+wide characters cause problems depending on environment definition<br/>
+<a href="https://stackoverflow.com/questions/9820431/difference-in-windows-cryptography-service-between-vc-6-0-and-vs-2008">Difference in Windows Cryptography Service between VC++ 6.0 and VS 2008</a></p>
+<p>convert a utf-8 to utf-16 string<br/>
+<a href="https://stackoverflow.com/questions/2746426/python-converting-wide-char-strings-from-a-binary-file-to-python-unicode-strin">Python - converting wide-char strings from a binary file to Python unicode strings</a></p>
+<p>PyCrypto RC4 example<br/>
+<a href="https://www.dlitz.net/software/pycrypto/api/current/Crypto.Cipher.ARC4-module.html" rel="nofollow noreferrer">https://www.dlitz.net/software/pycrypto/api/current/Crypto.Cipher.ARC4-module.html</a></p>
+<p><a href="https://stackoverflow.com/questions/12416249/hashing-a-string-with-sha256">Hashing a string with Sha256</a></p>
+<p><a href="http://msdn.microsoft.com/en-us/library/windows/desktop/aa379916(v=vs.85).aspx" rel="nofollow noreferrer">http://msdn.microsoft.com/en-us/library/windows/desktop/aa379916(v=vs.85).aspx</a></p>
+<p><a href="http://msdn.microsoft.com/en-us/library/windows/desktop/aa375599(v=vs.85).aspx" rel="nofollow noreferrer">http://msdn.microsoft.com/en-us/library/windows/desktop/aa375599(v=vs.85).aspx</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can test the size of <code>wchar_t</code> with a small test program (in C):</p>
+<pre><code>#include &lt;stdio.h&gt; /* for printf */
+#include &lt;stddef.h&gt; /* for wchar_t */
+
+int main(int argc, char *argv[]) {
+    printf("The size of wchar_t is %ld bytes.\n", sizeof(wchar_t));
+    return 0;
+}
+</code></pre>
+<p>You could also use <code>printf()</code> calls in your C++ code to write e.g. <code>iRec-&gt;desc</code> and the result of the hash in <code>sbuf</code> to the screen if you can run the C++ program from a terminal. Otherwise use <code>fprintf()</code> to dump them to a file.</p>
+<p>To better mimic the behavior of the C++ program, you could even use <a href="http://docs.python.org/3/library/ctypes.html" rel="nofollow"><code>ctypes</code></a> to call <code>mbstowcs()</code> in your Python code.</p>
+<p><strong>Edit:</strong> You wrote:</p>
+<blockquote>
+<p>One problem is definitely with mbctowcs. It seems that it's transferring an unpredictable (to me) number of bytes into my buffer to be hashed.</p>
+</blockquote>
+<p>Keep in mind that <code>mbctowcs</code> returns the number of wide characters converted. In other words, a 33 byte buffer in a multi-byte encoding
+can contain anything from 5 (UTF-8 6-byte sequences) up to 33 characters depending on the encoding used. </p>
+<p><strong>Edit2:</strong> You are using 0 as the <code>dwFlags</code> parameter for <code>CryptDeriveKey</code>. According to its <a href="http://msdn.microsoft.com/en-us/library/windows/desktop/aa379916%28v=vs.85%29.aspx" rel="nofollow">documentation</a>, the upper 16 bits should contain the key length. You should check <code>CryptDeriveKey</code>'s return value to see if the call succeeded.</p>
+<p><strong>Edit3</strong>: You could test <code>mbctowcs</code> in Python (I'm using <a href="http://ipython.org/" rel="nofollow">IPython</a> here.):</p>
+<pre><code>In [1]: from ctypes import *
+
+In [2]: libc = CDLL('libc.so.7')
+
+In [3]: monkey = c_char_p(u'Monkey')
+
+In [4]: test = c_char_p(u'This is a test')
+
+In [5]: wo = create_unicode_buffer(256)
+
+In [6]: nref = c_size_t(250)
+
+In [7]: libc.mbstowcs(wo, monkey, nref)
+Out[7]: 6
+
+In [8]: print wo.value
+Monkey
+
+In [9]: libc.mbstowcs(wo, test, nref)
+Out[9]: 14
+
+In [10]: print wo.value
+This is a test
+</code></pre>
+<p>Note that in Windows you should probably use <code>libc = cdll.msvcrt</code> instead of <code>libc = CDLL('libc.so.7')</code>.</p>
+</div>
+<span class="comment-copy">my first order of business is to write/print out the results from CryptGetHashParam and CryptGetProvParam to inspect the hash and the generated RC4 key.  <a href="http://msdn.microsoft.com/en-us/library/windows/desktop/aa380196(v=vs.85).aspx" rel="nofollow noreferrer">msdn.microsoft.com/en-us/library/windows/desktop/…</a> <a href="http://msdn.microsoft.com/en-us/library/windows/desktop/aa379947(v=vs.85).aspx" rel="nofollow noreferrer">msdn.microsoft.com/en-us/library/windows/desktop/…</a></span>
+<span class="comment-copy">One problem is definitely with mbctowcs.  It seems that it's transferring an unpredictable (to me) number of bytes into my buffer to be hashed.  Sometimes it only grabs 6 of the 33 desc bytes, other times it grabs 9.  Very strange.</span>
+<span class="comment-copy"><code>wchar_t</code> is usually 2 bytes or more, but it <i>can</i> be only one. For my compiler it is <code>typedef</code>-ed as an <code>int</code> (4 bytes). You can check what it is for your compiler with <code>sizeof</code>.</span>
+<span class="comment-copy">it appears to be 2 byes for me as "Roland" in iRec-&gt;desc will become "R o l a n d" in sBuf.  Not sure why there is not a trailing 0x00 but if I do the "same" in python by decoding the bytes to string using utf-8, then re-encoding them in utf-16, pass that to SHA1, I get the same hash.</span>
+<span class="comment-copy">Two bytes is standard on Microsoft platforms, IIRC.</span>
+<span class="comment-copy">Thanks Roland.  This is more less exactly what I have done and I can now examine the bytes transfered into sBuf from iRec-&gt;desc and I'm using CryptGetHashParam to compare my c++ and python hashes.  It's interesting you mention ctypes because the dll's I'm producing I'm using with ctypes.  My whole goal is to move away from having to compile different dll's for different platforms.  Using ctypes as part of my investigation is a great easy way to help me test.</span>
+<span class="comment-copy">Based on your edit, I realize that my "multibyte" string is just an ASCII encoded string of bytes. I should have been more clear in that description.</span>
+<span class="comment-copy">re: Edit 3.  Interesting, your results show that mbctowcs has no problem with the "bad bytes" I'm experiencing.  I should note that it's the c++ decryption that IS working.  So the truncated byte strings and hashes are what my c++ dll is outputing and because I am successfully decrypting files made by a 3rd party with this dll, it's the correct method.</span>
+<span class="comment-copy">I'm giving you the bounty since your nudges essentially pushed me to where I found the rest of the problems on my own. Thanks for the help/encouragement.</span>
+<span class="comment-copy">You're welcome. And thanks. :-)</span>

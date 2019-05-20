@@ -1,0 +1,100 @@
+<div class="post-text" itemprop="text">
+<p>I've read some blogs and docs that when access an instance attribute <code>obj.a</code>:</p>
+<ol>
+<li>try accessing data descriptor (named <code>a</code>) in current class <code>__dict__</code> <strong>and base class __dict__</strong></li>
+<li>find <code>a</code> in <code>obj.__dict__</code></li>
+<li>find non-data descriptor (named <code>a</code>) in current class <code>__dict__</code> and base class <code>__dict__</code></li>
+<li>find attribute (named <code>a</code>) in current class <code>__dict__</code> and base class <code>__dict__</code></li>
+<li>call <code>__getattr__</code> if any</li>
+<li>raise <code>AttributeError</code></li>
+</ol>
+<p>But I found that this searching rule does not match the behavior of below codes:</p>
+<pre><code>class ADesc(object):
+    def __init__(self, name):
+        self._name = name
+
+    def __get__(self, obj, objclass):
+        print('get.....')
+        return self._name + '  ' + str(obj) + '  ' + str(objclass)
+
+    def __set__(self, obj, value):
+        print('set.....')
+        self._name = value
+
+
+class A(object):
+    dd_1 = ADesc('dd_1 in A')
+
+
+class B(A):
+    dd_1 = 'dd_1 in B'
+
+
+if __name__ == '__main__':
+    print(A.__dict__)
+    # {'dd_1': &lt;__main__.ADesc object at 0x10ed0d050&gt;, '__dict__': &lt;attribute '__dict__' of 'A' objects&gt;, '__module__': '__main__', '__weakref__': &lt;attribute '__weakref__' of 'A' objects&gt;, '__doc__': None}
+
+    print(B.__dict__)
+    # {'dd_1': 'dd_1 in B', '__module__': '__main__', '__doc__': None}
+
+    b = B()
+    print(b.dd_1)  # dd_1 in B
+</code></pre>
+<p>I think the last <code>print(b.dd_1)</code> will invoke the <code>__get__</code> in <code>ADesc</code>, because according to the 1st rule, <code>__dict__</code> of base class <code>A</code> contains the attribute <code>dd_1</code> that we're accessing, so that data descriptor should be called. So is the above access rule wrong or any other magic involved here ?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You misunderstood how descriptors are found in classes. Python will use the <strong>first</strong> such name in the class hierarchy. Once found, the search stops. <code>B.dd_1</code> exists, so <code>A.dd_1</code> is not considered.</p>
+<p>The documentation tells you about base classes for the case where <code>B</code> does not define <code>dd_1</code>; in that case <code>B</code> is searched, then <code>A</code>. But when <code>B</code> has an attribute <code>dd_1</code>, any further search is stopped.</p>
+<p>Note that the search order is set by the class MRO (method resolution order). Rather than distinguish between a search in the class <code>__dict__</code>, and separately, the <code>__dict__</code> attributes of the base classes, you should see the search as:</p>
+<pre><code>def find_class_attribute(cls, name):
+    for c in cls.__mro__:
+        if name in c.__dict__:
+            return c.__dict__[name]
+</code></pre>
+<p>The MRO (as embodied by the <a href="https://docs.python.org/3/reference/datamodel.html" rel="nofollow noreferrer"><code>cls.__mro__</code> attribute</a>) includes the current class object:</p>
+<pre><code>&gt;&gt;&gt; B.__mro__()
+(&lt;class '__main__.B'&gt;, &lt;class '__main__.A'&gt;, &lt;class 'object'&gt;)
+</code></pre>
+<p>The relevant documentation is found in the <a href="https://docs.python.org/3/reference/datamodel.html" rel="nofollow noreferrer">datamodel reference</a>; where <em>Custom Classes</em> states:</p>
+<blockquote>
+<p>Class attribute references are translated to lookups in this dictionary, e.g., <code>C.x</code> is translated to <code>C.__dict__["x"]</code> (although there are a number of hooks which allow for other means of locating attributes). <strong>When the attribute name is not found there, the attribute search continues in the base classes.</strong></p>
+</blockquote>
+<p>The actual implementation for instance attributes works like this:</p>
+<ul>
+<li>The class is located (<code>type(instance)</code>)</li>
+<li>The class <code>__getattribute__</code> method is called (<code>type(instance).__getattribute__(instance, name)</code>)</li>
+<li><code>__getattribute__</code> scans the MRO to see if the name exists on the class and its base classes (<code>find_class_attribute(self, name)</code>)
+
+<ul>
+<li>if there is such an object, and it is a data descriptor (has a <code>__set__</code> or <code>__delete__</code> method), this object is used, and the search stops.</li>
+<li>if there is such an object but it is not a data descriptor, a reference is kept for later.</li>
+</ul></li>
+<li><code>__getattribute__</code> looks for the name in <code>instance.__dict__</code>
+<ul>
+<li>if there is such an object, the search stops. The instance attribute is used.</li>
+</ul></li>
+<li>There was no data descriptor found, and no attribute in the instance dict. But the search through the MRO may have located a non-data-descriptor object
+
+<ul>
+<li>if there is a reference to an object found in the MRO, it is used and the search stops.</li>
+</ul></li>
+<li>If there is a <code>__getattr__</code> method defined on the class (or a base class), it is called, and the result is used. Search stops.</li>
+<li>an <code>AttributeError</code> is raised.</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>There aren't three separate searches through the class and the base class. (Also, it's not just the class and its base; it's the entire MRO.) There's one search through the MRO, and it stops as soon as it finds something, regardless of what parts of the descriptor protocol the found object may or may not support.</p>
+<p>When the search for <code>b.dd_1</code> finds <code>'dd_1 in B'</code>, it stops the MRO search. It doesn't keep looking just because <code>'dd_1 in B'</code> isn't a descriptor.</p>
+<p>Here's the correct version of the standard attribute resolution logic, implemented in <code>object.__getattribute__</code>. (This is only <code>object.__getattribute__</code>; it doesn't cover classes with their own <code>__getattribute__</code> or <code>__getattr__</code>.)</p>
+<ol>
+<li>Search the object's MRO for a dict entry matching the attribute name.</li>
+<li>If the MRO search finds a data descriptor with a <code>__get__</code> method, stop searching and use the descriptor.</li>
+<li>Otherwise, we check the instance dict. If there's an entry matching the attribute name, stop and use that. If there is no matching entry (or if there is no instance dict), continue.</li>
+<li>If the step 2 search found a non-data-descriptor or a non-descriptor, use that.</li>
+<li>Otherwise, lookup fails. Raise an AttributeError.</li>
+</ol>
+</div>
+<span class="comment-copy">Well it found the attribute on the first lookup</span>
+<span class="comment-copy">@user2357112: while it is true that technically <code>__getattribute__</code> and <code>__getattr__</code> are called by attribute resolution code, I don't think we need that level of detail <i>here</i>.</span>
+<span class="comment-copy"><code>It doesn't keep looking just because 'dd_1 in B' isn't a descriptor.</code> , if the attribute <code>dd_1</code> <b>is</b> a descriptor, the MRO search also needs to stop ( as long as <code>dd_1</code> is found ), is it?</span>
+<span class="comment-copy">@Bin: It stops if it finds something, descriptor or not.</span>

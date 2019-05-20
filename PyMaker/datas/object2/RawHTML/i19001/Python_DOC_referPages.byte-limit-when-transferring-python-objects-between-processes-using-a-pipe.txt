@@ -1,0 +1,116 @@
+<div class="post-text" itemprop="text">
+<p>I have a custom simulator (for biology) running on a 64-bit Linux (kernel
+version 2.6.28.4) machine using a 64-bit Python 3.3.0 CPython interpreter.</p>
+<p>Because the simulator depends on many independent experiments for valid results,
+I built in parallel processing for running experiments.  Communication between
+the threads primarily occurs under a producer-consumer pattern with managed
+<code>multiprocessing Queue</code>s
+(<a href="http://docs.python.org/3.3/library/multiprocessing.html#multiprocessing.Queue" rel="noreferrer">doc</a>).
+The rundown of the architecture is as follows:</p>
+<ul>
+<li>a master processes that handles spawning and managing <code>Process</code>es and the various <code>Queue</code>s</li>
+<li>N worker processes that do simulations</li>
+<li>1 result consumer process that consumes the results of a simulation and sorts and analyzes the results</li>
+</ul>
+<p>The master process and the worker processes communicate via an input <code>Queue</code>.
+Similarly, the worker processes place their results in an output <code>Queue</code> which
+the result consumer process consumes items from.  The final ResultConsumer
+object is passed via a <code>multiprocessing Pipe</code>
+(<a href="http://docs.python.org/3.3/library/multiprocessing.html#multiprocessing.Pipe" rel="noreferrer">doc</a>)
+back to the master process.</p>
+<p>Everything works fine until it tries to pass the ResultConsumer object back to
+the master process via the <code>Pipe</code>:</p>
+<pre><code>Traceback (most recent call last):
+  File "/home/cmccorma/.local/lib/python3.3/multiprocessing/process.py", line 258, in _bootstrap
+    self.run()
+  File "/home/cmccorma/.local/lib/python3.3/multiprocessing/process.py", line 95, in run
+    self._target(*self._args, **self._kwargs)
+  File "DomainArchitectureGenerator.py", line 93, in ResultsConsumerHandler
+    pipeConn.send(resCon)
+  File "/home/cmccorma/.local/lib/python3.3/multiprocessing/connection.py", line 207, in send
+    self._send_bytes(buf.getbuffer())
+  File "/home/cmccorma/.local/lib/python3.3/multiprocessing/connection.py", line 394, in _send_bytes
+    self._send(struct.pack("!i", n))
+struct.error: 'i' format requires -2147483648 &lt;= number &lt;= 2147483647
+</code></pre>
+<p>I understand the first two traces (unhandled exits in the <code>Process</code> library),
+and the third is my line of code for sending the ResultConsumer object down the
+<code>Pipe</code> to the master process.  The last two traces are where it gets
+interesting.  A <code>Pipe</code> pickles any object that is sent to it and passes the
+resulting bytes to the other end (matching connection) where it is unpickled
+upon running <code>recv()</code>.  <code>self._send_bytes(buf.getbuffer())</code> is attempting to
+send the bytes of the pickled object.  <code>self._send(struct.pack("!i", n))</code> is
+attempting to pack a struct with an integer (network/big-endian) of length n,
+where n is the length of the buffer passed in as a parameter (the <code>struct</code>
+library handles conversions between Python values and C structs represented as
+Python strings, see <a href="http://docs.python.org/3.3/library/struct.html" rel="noreferrer">the doc</a>).</p>
+<p>This error only occurs when attempting a lot of experiments, e.g. 10 experiments
+will not cause it, but 1000 will consitently (all other parameters being constant).  My best
+hypothesis so far as to why <code>struct.error</code> is thrown is that the number of bytes
+trying to be pushed down the pipe exceeds 2^32-1 (2147483647), or ~2 GB.</p>
+<p>So my question is two-fold:</p>
+<ol>
+<li><p>I'm getting stuck with my investigations as <code>struct.py</code> essentially just
+imports from <code>_struct</code> and I have no idea where that is.</p></li>
+<li><p>The byte limit seems arbitrary given that the underlying architecture is all
+64-bit.  So, why can't I pass anything larger than that?  Additionally, if I
+can't change this, are there any good (read: easy) workarounds to this issue?</p></li>
+</ol>
+<p>Note: I don't think that using a <code>Queue</code> in place of a <code>Pipe</code> will solve the issue,
+as I suspect that <code>Queue</code>'s use a similar pickling intermediate step.  <strong>EDIT:</strong> This note is entirely incorrect as pointed out in abarnert's answer.</p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>I'm getting stuck with my investigations as struct.py essentially just imports from _struct and I have no idea where that is.</p>
+</blockquote>
+<p>In CPython, <code>_struct</code> is a C extension module built from <code>_struct.c</code> in the <code>Modules</code> directory in the source tree. You can find the code online <a href="http://hg.python.org/cpython/file/3.3/Modules/_struct.c" rel="noreferrer">here</a>.</p>
+<p>Whenever <code>foo.py</code> does an <code>import _foo</code>, that's almost always a C extension module, usually built from <code>_foo.c</code>. And if you can't find a <code>foo.py</code> at all, it's probably a C extension module, built from <code>_foomodule.c</code>.</p>
+<p>It's also often worth looking at the <a href="https://bitbucket.org/pypy/pypy/src/release-2.0.0/rpython/rlib/rstruct" rel="noreferrer">equivalent PyPy source</a>, even if you're not using PyPy. They reimplement almost all extension modules in pure Python—and for the remainder (including this case), the underlying "extension language" is RPython, not C.</p>
+<p>However, in this case, you don't need to know anything about how <code>struct</code> is working beyond what's in the docs.</p>
+<hr/>
+<blockquote>
+<p>The byte limit seems arbitrary given that the underlying architecture is all 64-bit.</p>
+</blockquote>
+<p>Look at the code it's calling:</p>
+<pre><code>self._send(struct.pack("!i", n))
+</code></pre>
+<p>If you look at <a href="http://docs.python.org/3/library/struct.html#format-characters" rel="noreferrer">the documentation</a>, the <code>'i'</code> format character explicitly means "4-byte C integer", not "whatever <code>ssize_t</code> is". For that, you'd have to use <code>'n'</code>. Or you might want to explicitly use a long long, with <code>'q'</code>.</p>
+<p>You can monkeypatch <code>multiprocessing</code> to use <code>struct.pack('!q', n)</code>. Or <code>'!q'</code>. Or encode the length in some way other than <code>struct</code>. This will, of course, break compatibility with non-patched <code>multiprocessing</code>, which could be a problem if you're trying to do distributed processing across multiple computers or something. But it should be pretty simple:</p>
+<pre><code>def _send_bytes(self, buf):
+    # For wire compatibility with 3.2 and lower
+    n = len(buf)
+    self._send(struct.pack("!q", n)) # was !i
+    # The condition is necessary to avoid "broken pipe" errors
+    # when sending a 0-length buffer if the other end closed the pipe.
+    if n &gt; 0:
+        self._send(buf)
+
+def _recv_bytes(self, maxsize=None):
+    buf = self._recv(8) # was 4
+    size, = struct.unpack("!q", buf.getvalue()) # was !i
+    if maxsize is not None and size &gt; maxsize:
+        return None
+    return self._recv(size)
+</code></pre>
+<p>Of course there's no guarantee that this change is sufficient; you'll want to read through the rest of the surrounding code and test the hell out of it.</p>
+<hr/>
+<blockquote>
+<p>Note: I suspect that using a <code>Queue</code> in place of a <code>Pipe</code> will not solve the issue, as I suspect that <code>Queue</code>'s use a similar pickling intermediate step.</p>
+</blockquote>
+<p>Well, the problem has nothing to do with pickling. <code>Pipe</code> isn't using <code>pickle</code> to send the length, it's using <code>struct</code>. You can verify that <code>pickle</code> wouldn't have this problem: <code>pickle.loads(pickle.dumps(1&lt;&lt;100)) == 1&lt;&lt;100</code> will return <code>True</code>.</p>
+<p>(In earlier versions, <code>pickle</code> <em>also</em> had problems with huge objects—e.g., a <code>list</code> of 2G elements—which could have caused problems at a scale about 8x as high as the one you're currently hitting. But that's been fixed by 3.3.)</p>
+<p>Meanwhile… wouldn't it be faster to just try it and see, instead of digging through the source to try to figure out whether it would work?</p>
+<hr/>
+<p>Also, are you sure you really want to pass around a 2GB data structure by implicit pickling?</p>
+<p>If I were doing something that slow and memory-hungry, I'd prefer to make that explicit—e.g., pickle to a tempfile and send the path or fd. (If you're using <code>numpy</code> or <code>pandas</code> or something, use its binary file format instead of <code>pickle</code>, but same idea.)</p>
+<p>Or, even better, share the data. Yes, mutable shared state is bad… but sharing <em>immutable</em> objects is fine. Whatever you've got 2GB of, can you put it in a <code>multiprocessing.Array</code>, or put it in a <code>ctypes</code> array or struct (of arrays or structs of …) that you can share via <code>multiprocessing.sharedctypes</code>, or <code>ctypes</code> it out of a <code>file</code> that you <code>mmap</code> on both sides, or…? There's a bit of extra code to define and pick apart the structures, but when the benefits are likely to be this big, it's worth trying.</p>
+<hr/>
+<p>Finally, when you think you've found a bug/obvious missing feature/unreasonable limitation in Python, it's worth looking at the bug tracker. It looks like <a href="http://bugs.python.org/issue17560" rel="noreferrer">issue 17560: problem using multiprocessing with really big objects?</a> is exactly your problem, and has lots of information, including suggested workarounds.</p>
+</div>
+<span class="comment-copy">If you wanted a really dumb workaround, you could open up <code>process.py</code> and change that line to a long or something, but then you'd have to do it everywhere and there's no telling what else it'd break.</span>
+<span class="comment-copy">@SuperDisk: There's no line in <code>process.py</code> that's relevant, and there's no int to change to a long (there <i>is</i> no <code>long</code> type in Python 3.x, and even in 2.7 they're the same type). Also, it's much better to either monkeypatch <code>multiprocessing</code>, or fork it and keep a separate copy around, then to modify the stdlib in place.</span>
+<span class="comment-copy">@abarnert Looks like line 349 from the traceback. Change the 'i' to 'q' (which is a long long for the struct module). Perhaps I'm wrong?</span>
+<span class="comment-copy">@SuperDisk: Yes, changing an <code>i</code> to a <code>q</code> (as opposed to an <code>int</code> to a <code>long</code> on that line gets past the exception. But unless you also change the read side to a <code>q</code>, and read 8 bytes in the right place instead of 4, that won't do much good. Since this is all explained in the answer I wrote over an hour ago, you could just scroll down and read it.</span>
+<span class="comment-copy">@abarnert Yeah, I mentioned that as well in my original comment. Quality answer, by the way.</span>
+<span class="comment-copy">Wow, thank you for the incredibly comprehensive answer!  To address a few of your points: The issue of passing around a 2GB data structure was not an issue until just recently with a new simulation model that spits out <i>a lot</i> more data.  It looks like I'll need to re-architect the internals to either be more explicit about serialization and data passing, or move the required logic from the main process to the results process and do away with the issue entirely.  I didn't even think to look at the bug tracker, so thanks for that as well!</span>
+<span class="comment-copy">@CollinM: Then it sounds like it might make sense to add the workaround now, and start looking into changing the internals (whether that's to spit out less data, or to share it differently, or whatever) later. Hope it helps.</span>

@@ -1,0 +1,150 @@
+<div class="post-text" itemprop="text">
+<p>I am looking to:</p>
+<ul>
+<li>Make a custom timer wrapper, for logging/other timing purposes</li>
+<li>Include preemptive exiting if the wrapped operation(s) exceed a predefined length of time</li>
+</ul>
+<p>This is what I have so far:</p>
+<pre><code>from contextlib import ContextDecorator
+import datetime
+
+from tornado import gen, ioloop
+from tornado.concurrent import Future
+
+
+class timing_logger(ContextDecorator):
+    def __init__(self, allowed_ms):
+        self.allowed_ms = allowed_ms
+        self.f = Future()
+        # this exception is not bubbled up by Tornado but fires
+        gen.with_timeout(datetime.timedelta(seconds=1+allowed_ms/1000), self.f)
+
+    def __enter__(self):
+        self.start_time = datetime.datetime.now()
+        return self
+
+    def __exit__(self, exc_type, exc_val, traceback):
+        self.f.set_result(True)
+        elapsed_time_ms = (datetime.datetime.now() - self.start_time).total_seconds() * 1000
+
+        if exc_type == gen.TimeoutError:
+            raise TimeoutError('ruh oh, this is reeeally bad')
+
+        if elapsed_time_ms &gt; self.allowed_ms:
+            raise TimeoutError('took {actual} ms, but was only allowed {allowed}.'.format(
+                 actual=elapsed_time_ms, allowed=self.allowed_ms))
+
+        else:
+            print('worked. nothing to see here...')
+        return False
+
+
+@gen.coroutine
+def main():
+
+    with timing_logger(1000):
+        # real application may be a variety of coroutines
+        # and regular function calls, some of which may hang
+        # for a long time
+        for i in range(25):
+            yield gen.sleep(0.1)
+
+
+if __name__ == "__main__":
+    ioloop.IOLoop.current().run_sync(
+        lambda: main())
+</code></pre>
+<p>The problem I have here is that because I am not yielding the <code>gen.with_timeout</code> future, in the stack I see:</p>
+<pre><code>$python test.py 
+ERROR:tornado.application:Future &lt;tornado.concurrent.Future object at 0x10c7cb668&gt; exception was never retrieved: tornado.gen.TimeoutError: Timeout
+Traceback (most recent call last):
+  File "test.py", line 48, in &lt;module&gt;
+    lambda: main())
+&lt;snip&gt;
+    yielded = self.gen.send(value)
+  File "test.py", line 43, in main
+    yield gen.sleep(0.1)
+  File "test.py", line 28, in __exit__
+    actual=elapsed_time_ms, allowed=self.allowed_ms))
+TimeoutError: took 2606.2940000000003 ms, but was only allowed 1000.
+</code></pre>
+<p>The tornado timeout is <em>not</em> being "bubbled" (for lack of better word).</p>
+<p>I would like to have the <code>__exit__</code> capture the exception, so that I can handle it in and log appropriately, while re-raising as a different exception type.</p>
+<p>I am not sure if I need to:</p>
+<ul>
+<li>Not use a ContextDecorator at all</li>
+<li>Do something different with how/where I have the tornado call</li>
+<li>???? </li>
+</ul>
+<p>I know that in this example, I can wrap all the calling code into a coroutine and add a timeout to the <code>main</code> function around the timing logger wrap, like this:</p>
+<pre><code>@gen.coroutine
+def main():
+
+
+    @gen.coroutine
+    def f():
+        with timing_logger(1000):
+            # real application may be a variety of coroutines
+            # and regular function calls, some of which may hang
+            # for a long time
+            for i in range(25):
+                yield gen.sleep(0.1)
+
+    future = f()
+    yield gen.with_timeout(datetime.timedelta(seconds=1), future)
+</code></pre>
+<p>But I am looking to include the above into my ContextDecorator because having to copy that around everything I want to use <code>timing_logger</code> with becomes tedious as well as error prone.</p>
+<p>How can I achieve desired functionality to allow my ContextDecorator to include timeouts as part of how it functions?</p>
+<p>Using Python 3.6.1 and the latest Tornado (4.5.1).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Rather than using a tornado timeout, you can use a <a href="https://docs.python.org/3/library/signal.html" rel="nofollow noreferrer">signal</a> to interrupt and trigger this exception (though <a href="https://docs.python.org/3/library/signal.html#signal.alarm" rel="nofollow noreferrer">alarm only allows integer, second inputs</a>):</p>
+<pre><code>    def timeout_handler(signum, frame):
+        raise gen.TimeoutError()
+
+    self.signal = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(1 + self.allowed_ms // 1000)
+</code></pre>
+<p>This will raise the exception appropriately, resulting in a full ContextDecorator that looks like:</p>
+<pre><code>from contextlib import ContextDecorator
+import datetime
+
+from tornado import gen, ioloop
+from tornado.concurrent import Future
+
+
+class timing_logger(ContextDecorator):
+    def __init__(self, allowed_ms):
+        self.allowed_ms = allowed_ms
+        self.f = Future()
+        # this exception is not bubbled up by Tornado but fires
+        gen.with_timeout(datetime.timedelta(seconds=1+allowed_ms/1000), self.f)
+
+    def __enter__(self):
+        self.start_time = datetime.datetime.now()
+        def timeout_handler(signum, frame):
+            raise gen.TimeoutError()  # could be any type of exception
+
+        self.signal = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(1 + self.allowed_ms // 1000)
+
+        return self
+
+    def __exit__(self, exc_type, exc_val, traceback):
+        signal.alarm(0)
+        self.f.set_result(True)
+        elapsed_time_ms = (datetime.datetime.now() - self.start_time).total_seconds() * 1000
+
+        if exc_type == gen.TimeoutError:
+            raise TimeoutError('ruh oh, this is reeeally bad')
+
+        if elapsed_time_ms &gt; self.allowed_ms:
+            raise TimeoutError('took {actual} ms, but was only allowed {allowed}.'.format(
+                 actual=elapsed_time_ms, allowed=self.allowed_ms))
+
+        else:
+            print('worked. nothing to see here...')
+        return False
+</code></pre>
+<p>Note that you need to reset the alarm in the <code>__exit__</code> or it will fire later in your code.</p>
+</div>

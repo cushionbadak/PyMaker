@@ -1,0 +1,152 @@
+<div class="post-text" itemprop="text">
+<p>Does data written to temporary files contribute to memory usage in AWS lambda? In a lambda function, I'm streaming a file to a temporary file. In the lambda logs, I see that the max memory used is larger than the file that was downloaded. Strangely, if the lambda is invoked multiple times in quick succession the invocations that downloaded smaller files still report the max memory used from the invocation that downloaded the larger file. I have the concurrency limit set to 2.</p>
+<p>When I run the code locally, my memory usage is as expected at around 20MB. On lambda it is 180MB, which is about the size of the file that is streamed. The code is simply using python requests library to stream a file download, to shutil.copyfileobj() to write to tempfile.TemporaryFile(), which is then piped to postgres "copy from stdin".</p>
+<p>This makes it seem like the /tmp storage counts towards memory usage but haven't found any mention of this. The only mention of /tmp in the lambda documentation is that there is a 512mb limit.</p>
+<p>Example code:</p>
+<pre><code>import sys
+import json
+import os
+import io
+import re
+import traceback
+import shutil
+import tempfile
+
+import boto3
+import psycopg2
+import requests
+
+
+def handler(event, context):
+    try:
+        import_data(event["report_id"])
+    except Exception as e:
+        notify_failed(e, event)
+        raise
+
+def import_data(report_id):
+    token = get_token()
+    conn = psycopg2.connect(POSTGRES_DSN, connect_timeout=30)
+    cur = conn.cursor()
+
+    metadata = load_metadata(report_id, token)
+    table = ensure_table(metadata, cur, REPLACE_TABLE)
+    conn.commit()
+    print(f"report {report_id}: downloading")
+    with download_report(report_id, token) as f:
+        print(f"report {report_id}: importing data")
+        with conn, cur:
+            cur.copy_expert(f"COPY {table} FROM STDIN WITH CSV HEADER", f)
+        print(f"report {report_id}: data import complete")
+    conn.close()
+
+
+def download_report(report_id, token):
+    url = f"https://some_url"
+    params = {"includeHeader": True}
+    headers = {"authorization": f"Bearer {token['access_token']}"}
+
+    with requests.get(url, params=params, headers=headers, stream=True) as r:
+        r.raise_for_status()
+        tmp = tempfile.TemporaryFile()
+        print("streaming contents to temporary file")
+        shutil.copyfileobj(r.raw, tmp)
+        tmp.seek(0)
+        return tmp
+
+
+if __name__ == "__main__":
+    if len(sys.argv) &gt; 1:
+        handler({"report_id": sys.argv[1]}, None)
+</code></pre>
+<p>UPDATE:
+After changing the code to not use a temporary file but to just stream the download directly to postgres copy command the memory usage was fixed. Makes me think the /tmp directory is contributing to the logged memory usage.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><strong>Update</strong></p>
+<p>Note: 
+To answer this question, I used <a href="https://github.com/alestic/lambdash" rel="noreferrer">Lambdash</a>, although I had to modify the lambda version that is used to node8.10. Lambdash is a simple little library that you can use to run shell commands on a lambda from your local terminal.</p>
+<p>The /tmp directory on AWS Lambdas is mounted as a <a href="https://en.wikipedia.org/wiki/Loop_device" rel="noreferrer">loop device</a>. You can verify this by (after following the setup instructions for lambdash), running the following command: </p>
+<pre><code>./lambdash df -h
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/xvda1       30G  4.0G   26G  14% /
+/dev/loop0      526M  872K  514M   1% /tmp
+/dev/loop1      6.5M  6.5M     0 100% /var/task
+</code></pre>
+<p>According to <a href="https://unix.stackexchange.com/questions/278647/overhead-of-using-loop-mounted-images-under-linux">https://unix.stackexchange.com/questions/278647/overhead-of-using-loop-mounted-images-under-linux</a>, </p>
+<blockquote>
+<p>data accessed through the loop device has to go through two filesystem layers, each doing its own caching so data ends up cached twice, wasting much memory (the infamous "double cache" issue)</p>
+</blockquote>
+<p>However, my guess is that <code>/tmp</code> is actually kept in-memory. To test this, I ran the following commands:</p>
+<pre><code>./lambdash df -h
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/xvda1       30G  4.0G   26G  14% /
+/dev/loop0      526M  1.9M  513M   1% /tmp
+/dev/loop1      6.5M  6.5M     0 100% /var/task
+
+./lambdash dd if=/dev/zero of=/tmp/file.txt count=409600 bs=1024
+409600+0 records in
+409600+0 records out
+419430400 bytes (419 MB) copied, 1.39277 s, 301 MB/s
+
+./lambdash df -h
+ Filesystem      Size  Used Avail Use% Mounted on
+ /dev/xvda1       30G  4.8G   25G  17% /
+ /dev/loop2      526M  401M  114M  78% /tmp
+ /dev/loop3      6.5M  6.5M     0 100% /var/task
+
+./lambdash df -h
+ Filesystem      Size  Used Avail Use% Mounted on
+ /dev/xvda1       30G  4.8G   25G  17% /
+ /dev/loop2      526M  401M  114M  78% /tmp
+ /dev/loop3      6.5M  6.5M     0 100% /var/task
+</code></pre>
+<p>Keep in mind, each time I ran it, the lambda was executed. Below is the output from the Lambda's Cloudwatch logs:</p>
+<blockquote>
+<p>07:06:30 START RequestId: 4143f502-14a6-11e9-bce4-eff8b92bf218
+  Version: $LATEST 07:06:30 END RequestId:
+  4143f502-14a6-11e9-bce4-eff8b92bf218 07:06:30 REPORT RequestId:
+  4143f502-14a6-11e9-bce4-eff8b92bf218  Duration: 3.60 ms   Billed
+  Duration: 100 ms Memory Size: 1536 MB Max Memory Used: 30 MB</p>
+<p>07:06:32 START RequestId: 429eca30-14a6-11e9-9b0b-edfabd15c79f
+  Version: $LATEST 07:06:34 END RequestId:
+  429eca30-14a6-11e9-9b0b-edfabd15c79f 07:06:34 REPORT RequestId:
+  429eca30-14a6-11e9-9b0b-edfabd15c79f  Duration: 1396.29 ms    Billed
+  Duration: 1400 ms Memory Size: 1536 MB    Max Memory Used: 430 MB</p>
+<p>07:06:36 START RequestId: 44a03f03-14a6-11e9-83cf-f375e336ed87
+  Version: $LATEST 07:06:36 END RequestId:
+  44a03f03-14a6-11e9-83cf-f375e336ed87 07:06:36 REPORT RequestId:
+  44a03f03-14a6-11e9-83cf-f375e336ed87  Duration: 3.69 ms   Billed
+  Duration: 100 ms Memory Size: 1536 MB Max Memory Used: 431 MB</p>
+<p>07:06:38 START RequestId: 4606381a-14a6-11e9-a32d-2956620824ab
+  Version: $LATEST 07:06:38 END RequestId:
+  4606381a-14a6-11e9-a32d-2956620824ab 07:06:38 REPORT RequestId:
+  4606381a-14a6-11e9-a32d-2956620824ab  Duration: 3.63 ms   Billed
+  Duration: 100 ms Memory Size: 1536 MB Max Memory Used: 431 MB</p>
+</blockquote>
+<p><strong>What happened and what does this mean?</strong> </p>
+<p>The lambda was executed 4 times. On the first execution, I displayed mounted devices. On the second execution, I populated a file in the <code>/tmp</code> directory, utilizing 401Mb of the 500Mb allowed. On the subsequent executions, I listed mounted devices, displaying their available space. </p>
+<p>The memory utilization on the first execution was 30Mb. The memory utilization for the subsequent executions was in the 400Mb range.</p>
+<p>This confirms that <code>/tmp</code> utilization does in fact contribute to memory utilization. </p>
+<p><strong>Original Answer</strong></p>
+<p>My guess is that what you are observing is python, or the lambda container itself, buffering the file in memory during write operations. </p>
+<p>According to <a href="https://docs.python.org/3/library/functions.html#open" rel="noreferrer">https://docs.python.org/3/library/functions.html#open</a>,</p>
+<blockquote>
+<p>buffering is an optional integer used to set the buffering policy. Pass 0 to switch buffering off (only allowed in binary mode), 1 to select line buffering (only usable in text mode), and an integer &gt; 1 to indicate the size in bytes of a fixed-size chunk buffer. When no buffering argument is given, the default buffering policy works as follows:</p>
+<p>Binary files are buffered in fixed-size chunks; the size of the buffer is chosen using a heuristic trying to determine the underlying device’s “block size” and falling back on io.DEFAULT_BUFFER_SIZE. On many systems, the buffer will typically be 4096 or 8192 bytes long.
+  “Interactive” text files (files for which isatty() returns True) use line buffering. Other text files use the policy described above for binary files.</p>
+</blockquote>
+<p>The <code>tempfile.TemporaryFile()</code> function has a keyword parameter, <code>buffering</code>, which is basically passed directly into the <code>open</code> call described above. </p>
+<p>So my guess is that the <code>tempfile.TemporaryFile()</code> function uses the default <code>open()</code> function's buffering setting. You might try something like <code>tempfile.TemporaryFile(buffering=0)</code> to disable buffering, or <code>tempfile.TemporaryFile(buffering=512)</code> to explicitly set the maximum amount of memory that will be utilized while writing data to a file. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Usage of <code>/tmp</code> does not count towards memory usage. The only case when this could be correlated is when you read file content into the memory.</p>
+</div>
+<span class="comment-copy">Could be. It's still weird that the same code ran locally only uses 20mb so perhaps it's an os thing.</span>
+<span class="comment-copy">It's also weird that when multiple invocations run together the memory used increases for all of them. For example, if I download a small file (40mb), max memory uses is around there. However, if I download that small file within a few minutes of having downloaded the larger file, the max memory used for that same 40mb file is 180mb. Could it be an issue with the lambda logger? And it's not actually using what it's reporting?</span>
+<span class="comment-copy">Hmm. That is a bit odd. Could you post code?</span>
+<span class="comment-copy">I added the code.</span>
+<span class="comment-copy">I just ran the code with a docker container and while I do see increased memory usage compared to on my mac, it's still less than the filesize of the downloaded file unlike in lambda.</span>
+<span class="comment-copy">That's what weird. The file content is never loaded into memory. The same exact code run locally runs at about 20MB but the same code downloading the same file uses 185GB in lambda. That is around the size of the file.</span>
+<span class="comment-copy">@kylehyde215 What OS are you using locally?</span>
+<span class="comment-copy">@PeterKirby Good point. I only tested on mac locally.</span>

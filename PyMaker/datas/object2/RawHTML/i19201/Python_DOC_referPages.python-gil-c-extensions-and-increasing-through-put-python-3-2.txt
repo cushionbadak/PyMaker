@@ -1,0 +1,52 @@
+<div class="post-text" itemprop="text">
+<p>I have a server application that accepts requests, needs to run some Python, some of which calls into my C-based extension DLLs.  If I completely lock the GIL during the entire request, everything works fine.  But I'd like to release it while in the C-based extension DLL when long-ish operations are taking place so more requests can be processed.  This is my approach so far:</p>
+<pre><code>A. Request arrives on thread I don't control
+B.   Call PyGILState_Ensure
+C.      Call into Python runtime via PyRun_String  
+D.          Python calls my MethodA in my C-based code
+E.              Call PyGILState_Release 
+F.                  Do long-ish processing
+G.              Call PyGILState_Ensure to lock GIL again
+H.          Return control to Python for further script processing
+I.      Python runtime returns
+J.   Call PyGILState_Release
+</code></pre>
+<p>All of the steps above are a single thread (and there are many similar threads in the system).</p>
+<p>The call sequence above always throws an exception somewhere in step (H) deep in Python (which I can't seem to figure out from the stack trace).  However, if I make an extra call to PyGILState_Ensure at (B) so that the calls at (E) and (F) don't end up doing anything, everything runs perfectly.</p>
+<p>Can someone please help me understand what I'm doing wrong?  I'd really like to release the GIL during lengthy operations so other requests can make progress.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>First, you have to match the <code>PyGILState_Ensure</code>/<code>PyGILState_Release</code> pairs at B and E, and G and J, rather than the more naively-obvious matching matching of B and J and E and G. (If you try it that way, step E releases an uninitialized state, corrupting the interpreter's internal state information.)</p>
+<p>But you're using a single state, which doesn't have that problem. (I'm not actually sure this is legal, but I am pretty sure it's safe with every version of CPython, and there's definitely no way it could get things out of order.)</p>
+<hr/>
+<p>Unfortunately, this has a <em>different</em> problem. As the <a href="http://docs.python.org/3/c-api/init.html#PyGILState_Release" rel="nofollow"><code>PyGILState_Release</code></a> docs say, it:</p>
+<blockquote>
+<p>Release any resources previously acquired. After this call, Python’s state will be the same as it was prior to the corresponding <code>PyGILState_Ensure()</code> call…</p>
+</blockquote>
+<p>In other words, you can't carry any interpreter resources across a <code>Release</code> and subsequent <code>Ensure</code> (unless they're protected by an outer <code>Ensure</code>, of course, but in that case you're not actually releasing anything).</p>
+<p>So, as soon as you <code>Release</code> the state that was ensured for <code>PyRun_String</code>, the rest of that <code>PyRun_String</code> call becomes invalid. Switching to a newly-acquired state in the middle doesn't help.</p>
+<hr/>
+<p>But I think you're abusing <code>Ensure</code>/<code>Release</code> unnecessarily in the first place. You don't need to register the thread with the interpreter, unregister it, register it again, and unregister it again; all you need to do is release and reacquire the GIL from within the same thread. That's what <a href="http://docs.python.org/3.2/c-api/init.html#Py_BEGIN_ALLOW_THREADS" rel="nofollow"><code>Py_BEGIN_ALLOW_THREADS</code></a> and <code>Py_END_ALLOW_THREADS</code> are for.</p>
+<p>As the documentation for <a href="http://docs.python.org/3.2/c-api/init.html#PyGILState_Ensure" rel="nofollow"><code>PyGILState_Ensure</code></a> says:</p>
+<blockquote>
+<p>In general, other thread-related APIs may be used between <code>PyGILState_Ensure()</code> and <code>PyGILState_Release()</code> calls as long as the thread state is restored to its previous state before the Release(). For example, normal usage of the <code>Py_BEGIN_ALLOW_THREADS</code> and <code>Py_END_ALLOW_THREADS</code> macros is acceptable.</p>
+</blockquote>
+<p>So:</p>
+<pre><code>PyGILState_STATE state;
+
+B. state = PyGILState_Ensure();
+    ...
+E.              Py_BEGIN_ALLOW_THREADS
+F.                  Do long-ish processing
+G.              Py_END_ALLOW_THREADS
+    ...
+J.  PyGILState_Release(state);
+</code></pre>
+</div>
+<span class="comment-copy">Are you sure you're using the right <code>PyGILState_STATE</code> at each step? In other words, you have to pass the one from <code>B</code> to the one at <code>E</code>, then store the one from <code>G</code> in a different variable that you pass to <code>J</code>. (Alternatively, you could make <code>E</code> and <code>G</code> into a <code>Py_BEGIN_ALLOW_THREADS</code>/<code>Py_END_ALLOW_THREADS</code> pair.)</span>
+<span class="comment-copy">Also, can you provide a <a href="http://sscce.org" rel="nofollow noreferrer">SSCCE</a> instead of pseudocode?</span>
+<span class="comment-copy">I'm using a per-thread PyGILState_STATE value, so it's the same variable for B, E, G and J</span>
+<span class="comment-copy">OK, that's a slightly different problem, which is equivalent to the first part of the solution that I offered—and which still has a serious problem that I didn't explain. The quick answer is still <code>ALLOW_THREADS</code>, but I'll edit my answer to explain more.</span>
+<span class="comment-copy">Maybe the ALLOW_THREADS is the best way to go.  I'm so used to critical sections that it seemed best to just lock when I needed it, not unlock when I'm sure I don't need it.</span>
+<span class="comment-copy">@DougN: Even though it's not really equivalent, think of it this way: you wouldn't do <code>LeaveCriticalSection(&amp;cs); DeleteCriticalSection(&amp;cs); … InitializeCriticalSection(&amp;cs); EnterCriticalSection(&amp;cs);</code> when you just wanted the <code>Leave</code>/<code>Enter</code> parts, right?</span>
+<span class="comment-copy">Ahhhh, that's the light bulb I needed to go on!  Thank you!</span>

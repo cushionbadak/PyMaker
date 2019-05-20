@@ -1,0 +1,391 @@
+<div class="post-text" itemprop="text">
+<p>There is a <strong><a href="https://pypi.python.org/pypi/thinning" rel="nofollow">thinning</a></strong> pip package that is currently getting compiled only with <strong>Python2</strong>.</p>
+<p>When I install it with <code>sudo pip install thinning</code> and then attempt to <code>import thinning</code>, I get an error:</p>
+<pre><code>ImportError: /usr/lib/python3.5/site-packages/thinning.cpython-35m-x86_64-linux-gnu.so: undefined symbol: Py_InitModule3
+</code></pre>
+<p>I assume this is because of <code>Py_InitModule3</code> is not used by Python3 anymore.
+Here is complete c source file:</p>
+<pre><code>#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
+
+#include "Python.h"
+#include "arrayobject.h"
+#include &lt;stdlib.h&gt;
+#include &lt;assert.h&gt;
+#include &lt;stdbool.h&gt;
+#include &lt;limits.h&gt;
+
+static PyObject *guo_hall_thinning(PyObject *self, PyObject *args);
+int _guo_hall_thinning(unsigned char* binary_image, int width, int height);
+void initthinning(void);
+
+/* ==== Set up the methods table ====================== */
+static PyMethodDef thinningMethods[] = {
+    {"guo_hall_thinning",guo_hall_thinning, METH_VARARGS,
+    "Takes a 2D numpy UBYTE array in C-order and thins it in place using the algorithm by Guo and Hall."
+    "Images that come out of cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) have the right format."
+    "\n\n"
+    "We assume that the dimensions of the image fit into an int on your platform. If your computer for some"
+    "reason has a 2 byte int and lots of memory so that the image can become too large, bad things can happen."
+    "\n\n"
+    "interface:\n"
+    "\tguo_hall_thinning(segmented_image)"
+    "\tsegmented_image is a NumPy matrix,"
+    "\treturns the same NumPy matrix (thinned)"},
+    {NULL, NULL, 0, NULL}     /* Sentinel - marks the end of this structure */
+};
+
+/* ==== Initialize the C_test functions ====================== */
+void initthinning()  {
+    PyObject* module = Py_InitModule3("thinning",thinningMethods, "Thinning of segmented images. See https://bitbucket.org/adrian_n/thinning.");
+    PyModule_AddStringConstant(module, "__author__", "Adrian Neumann &lt;adrian_neumann@gmx.de&gt;");
+    PyModule_AddStringConstant(module, "__version__", "1.2.3");
+    import_array();  // Must be present for NumPy.  Called first after above line.
+}
+
+/* ==== Guo Hall Thinning =========
+    Takes a 2D numpy UBYTE array in C-order and thins it in place using the algorithm by Guo and Hall.
+    Images that come out of cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) have the right format.
+
+    We assume that the dimensions of the image fit into an int on your platform. If your computer for some
+    reason has a 2 byte int and lots of memory so that the image can become too large, bad things can happen.
+
+    interface:  guo_hall_thinning(segmented_image)
+                segmented_image is a NumPy matrix,
+                returns the same NumPy matrix (thinned)
+*/
+static PyObject *guo_hall_thinning(PyObject *self, PyObject *args)
+{
+    PyArrayObject *segmented_image;
+
+    /* Parse tuples separately since args will differ between C fcns */
+    if (!PyArg_ParseTuple(args, "O!", &amp;PyArray_Type, &amp;segmented_image)) {
+        return NULL;
+    }
+    if (NULL == segmented_image) {
+        PyErr_SetString(PyExc_TypeError, "Parameter is not a valid image");
+        return NULL;
+    }
+    if (PyArray_TYPE(segmented_image) != NPY_UBYTE || !PyArray_CHKFLAGS(segmented_image, NPY_ARRAY_CARRAY)) {
+        PyErr_SetString(PyExc_TypeError, "Parameter is not a grayscale image");
+        return NULL;
+    }
+
+    npy_intp* shape = PyArray_DIMS(segmented_image);
+
+    int height = (int)shape[0];
+    int width = (int)shape[1];
+
+    unsigned char *in_data = PyArray_DATA(segmented_image);
+
+    if (height&gt;=3 &amp;&amp; width&gt;=3) {
+        int ok = _guo_hall_thinning(in_data, width, height);
+        if (ok&lt;0) {
+            return PyErr_NoMemory();
+        }
+    }
+    Py_INCREF(segmented_image);
+    return (PyObject*)segmented_image;
+}
+
+int nonzero_clever(const unsigned char* arr, unsigned int start, unsigned int len) {
+    /* find the first nonzero element from arr[start] to arr[start+len-1] (inclusive)
+       look at a long long at a time to be faster on 64 bit cpus */
+    const unsigned int step=sizeof(unsigned long long)/sizeof(unsigned char);
+    unsigned int i=start;
+    //unsigned types should throw exceptions on under/overflow...
+    while(len&gt;step &amp;&amp; i&lt;len-step) {
+            if (*((unsigned long long*)(arr +i))==0) {
+                i+=step;
+            } else {
+                int j=0;
+                while(arr[i+j]==0) j++;
+                return i+j;
+            }
+    }
+    while(i&lt;len) {
+        if (arr[i]!=0) { return i;}
+        i++;
+    }
+    return len;
+}
+
+
+int guo_hall_iteration(const unsigned char* binary_image, unsigned char* mask, const unsigned int width, const unsigned int height, const int iteration) {
+        /* one iteration of the algorithm by guo and hall. see their paper for an explanation.
+           We only consider nonzero elemets of the image. We never reinitialize the mask, once a pixel is
+           black, it will never become white again anyway. */
+        unsigned int changed = 0;
+        for (unsigned int j = 1; j &lt; height-1; j++) {
+            const unsigned char* line = binary_image+j*width;
+            unsigned int start=0;
+            const int len = width-1;
+
+            while(start+1&lt;len) {
+                start = nonzero_clever(line, start+1, len);
+                if (start==len) break;
+
+                const unsigned int i = start;
+                assert(line[i]!=0);
+                assert(binary_image[i + j*width]!=0);
+
+                const bool p2 = binary_image[i-1 + width*j];
+                const bool p6 = binary_image[i+1 + width*j];
+
+                const bool p9 = binary_image[i-1 + width*(j-1)];
+                const bool p8 = binary_image[i   + width*(j-1)];
+                const bool p7 = binary_image[i+1 + width*(j-1)];
+
+                const bool p3 = binary_image[i-1 + width*(j+1)];
+                const bool p4 = binary_image[i   + width*(j+1)];
+                const bool p5 = binary_image[i+1 + width*(j+1)];
+                const unsigned int C = ((!p2 &amp;&amp; (p3 || p4)) +
+                    (!p4 &amp;&amp; (p5 || p6)) +
+                    (!p6 &amp;&amp; (p7 || p8)) +
+                    (!p8 &amp;&amp; (p9 || p2)));
+                // printf("%d %d %d %d %d %d %d %d\n",p2,p3,p4,p5,p6,p7,p8,p9);
+                if (C==1) {
+                    const unsigned int N1 = (p9 || p2) + (p3 || p4) + (p5 || p6) + (p7 || p8);
+                    const unsigned int N2 = (p2 || p3) + (p4 || p5) + (p6 || p7) + (p8 || p9);
+                    const unsigned int N = N1 &lt; N2 ? N1 : N2;
+                    unsigned int m;
+
+                    if (iteration == 0)
+                        {m = (p8 &amp;&amp; (p6 || p7 || !p9));}
+                    else
+                        {m = (p4 &amp;&amp; (p2 || p3 || !p5));}
+
+                    if (2 &lt;= N &amp;&amp; N &lt;= 3 &amp;&amp; m == 0)   {
+                        mask[i + width*j] = 0;
+                        changed += 1;
+                    }
+                }
+            }
+
+        }
+        return changed;
+}
+
+void andImage(unsigned char* image, const unsigned char* mask, const int size) {
+    /* calculate image &amp;=mask.
+       to be faster on 64 bit cpus, we do this one long long at a time */
+    const int step = sizeof(unsigned long long)/sizeof(unsigned char);
+    unsigned long long* image_l = (unsigned long long*)image;
+    const unsigned long long* mask_l = (unsigned long long*) mask;
+    unsigned int i=0;
+    for(; size/step&gt;2 &amp;&amp; i&lt;size/step-2; i+=2) {
+        image_l[i] = image_l[i] &amp; mask_l[i];
+        image_l[i+1] = image_l[i+1] &amp; mask_l[i+1];
+    }
+    for(i=i*step; i&lt;size; ++i) {
+        image[i] = image[i] &amp; mask[i];
+    }
+}
+
+int _guo_hall_thinning(unsigned char* binary_image, int width, int height) {
+    /* return -1 if we can't allocate the memory for the mask, else 0 */
+    int changed;
+    unsigned char* mask = (unsigned char*) malloc(width*height*sizeof(unsigned char));
+    if (mask==NULL) {
+        return -1;
+    }
+
+    memset(mask, UCHAR_MAX, width*height);
+    do {
+        changed = guo_hall_iteration(binary_image, mask, width, height, 0);
+        andImage(binary_image, mask, width*height);
+
+        changed += guo_hall_iteration(binary_image, mask, width, height, 1);
+        andImage(binary_image, mask, width*height);
+    } while (changed != 0);
+    free(mask);
+
+    return 0;
+}
+</code></pre>
+<p>I've started reading <a href="https://docs.python.org/3/howto/cporting.html" rel="nofollow">Porting Extension Modules to Python 3</a> but I must admit there is little I can understand.</p>
+<p>I tried to change <code>Py_InitModule</code> to Python 3 analogue <code>PyModule_Create</code> with some other code adjustments but it didn't work. Unfortunately this thinning module is a hard dependency for our application. So, I am pretty stuck right now without time and knowledge how to port this module to Python3. </p>
+</div>
+<div class="post-text" itemprop="text">
+<h3>What has changed:</h3>
+<p><strong>Note:</strong> I can't really get into the details of what the function <code>guo_hall_thinning</code> does per se. What I know is that it uses a small subset of the <code>numpy C-API</code> for getting and returning the data as an <code>ndarray</code>; I couldn't find any documentation on them being altered so it should be good to go. </p>
+<p><em>Now, what has <strong>definitely changed</strong> is the way modules are initialized</em>; with this I can help you and get it imported in a Python 3 distribution. I'm using <code>3.5</code> for this too, even though, I believe differences between older versions of the <code>3.x</code> family <em>shouldn't exist</em> or <em>are backwards compatible</em>.</p>
+<p>As you noted, general information is provided in the <em><a href="https://docs.python.org/3/howto/cporting.html" rel="nofollow noreferrer">Porting to Python 3</a></em> document with specifics about the initialization phase in <em><a href="https://docs.python.org/3/howto/cporting.html#module-initialization-and-state" rel="nofollow noreferrer">Module Initialization and state</a></em>. The new change is described in <strong><a href="https://www.python.org/dev/peps/pep-3121/" rel="nofollow noreferrer">PEP 3121</a></strong> which, by itself, is a nice but challenging read. </p>
+<p>Now, <em>the gist of it can be listed in two points</em>:</p>
+<p><strong><em>A) Modules are now defined in a dedicated <a href="https://docs.python.org/3/c-api/module.html#c.PyModuleDef" rel="nofollow noreferrer"><code>PyModuleDef</code></a> struct:</em></strong></p>
+<pre><code>struct PyModuleDef{
+  PyModuleDef_Base m_base;  /* To be filled out by the interpreter */
+  Py_ssize_t m_size; /* Size of per-module data */
+  PyMethodDef *m_methods;
+  inquiry m_reload;
+  traverseproc m_traverse;
+  inquiry m_clear;
+  freefunc m_free;
+};
+</code></pre>
+<p>This new struct contains some additional members holding the name and documentation for the module. The members <a href="https://docs.python.org/3/c-api/module.html#c.PyModuleDef" rel="nofollow noreferrer"><code>m_reload</code>, <code>m_traverse</code>, <code>m_clear</code> and <code>m_free</code> provide additional control during initialization/finalization but, we can opt to leave them as <code>NULL</code>.</a> These along with a module <code>m_size</code> set to <code>-1</code> are for simplicity, setting these values is generally done to support multiple interpreters/ mutliple initializations and should be more tricky.</p>
+<p>So, in short, the fancy new module struct for the <code>thinning</code> module could look like this:</p>
+<pre><code>static struct PyModuleDef moduledef = {
+       PyModuleDef_HEAD_INIT,
+       "thinning",
+       "Thinning of segmented images. See https://bitbucket.org/adrian_n/thinning",
+       -1,
+       thinningMethods,
+       NULL,
+       NULL,
+       NULL,
+       NULL
+};
+</code></pre>
+<p>aaand that's it for the first issue!</p>
+<p><strong><em>B) New initialization function i.e you'll need to give <code>initthinning</code> a major face-lift.</em></strong></p>
+<p>The new module initialization function returns a <code>PyObject *</code> and is now named <code>PyInit_&lt;module_name&gt;</code>. In it (heh, get it?) <a href="https://docs.python.org/3/c-api/module.html#c.PyModule_Create" rel="nofollow noreferrer">new modules are created with <code>PyModule_Create(&amp;moduledef)</code></a> which takes the struct we defined and returns the initialized module. It's prettier now and looks like this:</p>
+<pre><code>/* ==== Initialize the C_test functions ====================== */
+PyObject *
+PyInit_thinning(void){
+    // create module
+    PyObject *module = PyModule_Create(&amp;moduledef);
+
+    // handle probable error
+    if (module == NULL)
+        return NULL;
+
+    PyModule_AddStringConstant(module, "__author__", "Adrian Neumann &lt;adrian_neumann@gmx.de&gt;");
+    PyModule_AddStringConstant(module, "__version__", "1.2.3");
+    import_array();  // Must be present for NumPy.  Called first after above line.
+
+    // return newly created module
+    return module;
+}
+</code></pre>
+<hr/>
+<h3>Installing the module:</h3>
+<p>All this is for the initialization of the module. You can download the module (as you have done, I believe) find the <code>thinning_folder/src/c_thinning.c</code> file and replace <em>everything</em> <strong><em>prior</em></strong> to:</p>
+<pre><code>/* ==== Guo Hall Thinning =========
+</code></pre>
+<p>with the following:</p>
+<pre><code>#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
+
+#include "Python.h"
+#include "arrayobject.h"
+#include &lt;stdlib.h&gt;
+#include &lt;assert.h&gt;
+#include &lt;stdbool.h&gt;
+#include &lt;limits.h&gt;
+
+static PyObject *guo_hall_thinning(PyObject *self, PyObject *args);
+int _guo_hall_thinning(unsigned char* binary_image, int width, int height);
+
+
+/* ==== Set up the methods table ====================== */
+static PyMethodDef thinningMethods[] = {
+    {"guo_hall_thinning",guo_hall_thinning, METH_VARARGS,
+    "Takes a 2D numpy UBYTE array in C-order and thins it in place using the algorithm by Guo and Hall."
+    "Images that come out of cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) have the right format."
+    "\n\n"
+    "We assume that the dimensions of the image fit into an int on your platform. If your computer for some"
+    "reason has a 2 byte int and lots of memory so that the image can become too large, bad things can happen."
+    "\n\n"
+    "interface:\n"
+    "\tguo_hall_thinning(segmented_image)"
+    "\tsegmented_image is a NumPy matrix,"
+    "\treturns the same NumPy matrix (thinned)"},
+    {NULL, NULL, 0, NULL}     /* Sentinel - marks the end of this structure */
+};
+
+static struct PyModuleDef moduledef = {
+        PyModuleDef_HEAD_INIT,
+        "thinning",
+        "Thinning of segmented images. See https://bitbucket.org/adrian_n/thinning.",
+        -1,
+        thinningMethods,
+        NULL,
+        NULL,
+        NULL,
+        NULL
+};
+
+/* ==== Initialize the C_test functions ====================== */
+PyObject *
+PyInit_thinning(void){
+    PyObject *module = PyModule_Create(&amp;moduledef);
+
+    if (module == NULL)
+        return NULL;
+
+    PyModule_AddStringConstant(module, "__author__", "Adrian Neumann &lt;adrian_neumann@gmx.de&gt;");
+    PyModule_AddStringConstant(module, "__version__", "1.2.3");
+    import_array();  // Must be present for NumPy.  Called first after above line.
+    return module;
+}
+
+/* ==== Guo Hall Thinning =========
+// Leave the rest as it was
+</code></pre>
+<p>After that, navigate to the top level directory containing <code>setup.py</code> and run:</p>
+<pre><code>python setup.py install
+</code></pre>
+<p>as usual. Some compilation warnings will probably pop-up but <em>those are safe to ignore</em>. If all goes well you'll get a successful install and the following will not result in a nasty <em>seg-fault</em>:</p>
+<pre><code>&gt;&gt;&gt; from thinning import guo_hall_thinning
+&gt;&gt;&gt; print(guo_hall_thinning.__doc__)
+Takes a 2D numpy UBYTE array in C-order and thins it in place using the algorithm by Guo and Hall.Images that come out of cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) have the right format.
+
+We assume that the dimensions of the image fit into an int on your platform. If your computer for somereason has a 2 byte int and lots of memory so that the image can become too large, bad things can happen.
+
+interface:
+    guo_hall_thinning(segmented_image)  segmented_image is a NumPy matrix,  returns the same NumPy matrix (thinned)
+</code></pre>
+<hr/>
+<h3>It seems to run :) :</h3>
+<p>I further edited the source in <code>c_thinning.c</code> to print out the number of elements changed during every iteration. It seems to be changing things but I don't understand what underlying criteria it uses because I haven't read the corresponding paper.</p>
+<p>In short, <code>guo_hall_thinning(ndarr)</code> apparently does the 'thinning' <em>in place</em>. This means that after it is executed, the original array that was supplied as a parameter is going to be altered. So, a check of the form:</p>
+<pre><code>gray_img == guo_hall_thinning(gray_img)
+</code></pre>
+<p>is always going to be <code>True</code> (<a href="https://stackoverflow.com/questions/10580676/comparing-two-numpy-arrays-for-equality-element-wise">Hint: check for equality between numpy arrays with <code>(arr1 == arr2).all()</code></a>).</p>
+<p>Here's a test I ran in which you can visually see the altering taking place, I believe this test can be reproduced on your machine too:</p>
+<pre><code># dtype = 'B' is UBYTE
+&gt;&gt;&gt; n = numpy.ndarray(shape=(100, 200), dtype='B')
+&gt;&gt;&gt; n
+array([[ 40, 159,  95, ..., 114, 114,  97],
+       [121,  95, 108, ..., 114, 101,  32],
+       [ 48, 161,  90, ..., 127,   0,   0],
+       ..., 
+       [110,  32,  97, ..., 124,   1,   0],
+       [124,   5,   0, ...,   0,   0, 131],
+       [  1,   0,  25, ...,   0, 125,  17]], dtype=uint8)
+&gt;&gt;&gt; thinning.guo_hall_thinning(n)
+-- Array height 100 Array width: 200
+
+Value of `changed` during 0 iteration is: 1695 
+Value of `changed` during 1 iteration is: 1216 
+Value of `changed` during 2 iteration is: 808 
+Value of `changed` during 3 iteration is: 493 
+Value of `changed` during 4 iteration is: 323 
+Value of `changed` during 5 iteration is: 229 
+Value of `changed` during 6 iteration is: 151 
+Value of `changed` during 7 iteration is: 90 
+Value of `changed` during 8 iteration is: 46 
+Value of `changed` during 9 iteration is: 27 
+Value of `changed` during 10 iteration is: 11 
+Value of `changed` during 11 iteration is: 8 
+Value of `changed` during 12 iteration is: 7 
+Value of `changed` during 13 iteration is: 4 
+Value of `changed` during 14 iteration is: 0 
+Value of `ok` is: 0
+
+# array returned
+array([[ 40, 159,  95, ..., 114, 114,  97],
+       [121,   0,   0, ..., 114,   0,  32],
+       [ 48,   0,   0, ..., 127,   0,   0],
+       ..., 
+       [110,   0,  97, ..., 124,   1,   0],
+       [124,   5,   0, ...,   0,   0, 131],
+       [  1,   0,  25, ...,   0, 125,  17]], dtype=uint8)
+</code></pre>
+<p>So I'm guessing it does work :-).</p>
+</div>
+<span class="comment-copy">Read <a href="https://docs.python.org/3/extending/extending.html" rel="nofollow noreferrer">docs.python.org/3/extending/extending.html</a> and apply that to the source of thinning. It's a little module and good to start with.</span>
+<span class="comment-copy">I compiled and installed <code>thinning</code>, it does not throw errors anymore. I can award <code>+50</code> bonus only in <b>20h</b> as the system says unfortunately :( Thanks a lot, Jim, you really helped us out here.</span>
+<span class="comment-copy">Don't award the bounty yet, it wasn't my main motivator for providing the answer. It imports and that's great but what I'm interested in is if the function actually does its job. Try running something that utilizes its functionality, does it run smoothly or do errors pop up?</span>
+<span class="comment-copy">Just tested <code>thinning.guo_hall_thinning(cv2.imread('test.jpg'))</code> returns the same array as <code>cv2.imread('test.jpg')</code>, which means that <b>thinning</b> does not process the image sadly.</span>
+<span class="comment-copy">Just edited my answer even more. It seems it does indeed work :-)</span>
+<span class="comment-copy">Yes, you are good. I confused BGR2GRAY with RGB2GRAY, so we first do RGB2GRAY during segmentation and then BGR2GRAY and afterwards all should be ok</span>

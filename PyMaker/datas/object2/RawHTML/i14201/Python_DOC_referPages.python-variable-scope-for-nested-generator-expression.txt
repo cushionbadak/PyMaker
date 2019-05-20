@@ -1,0 +1,351 @@
+<div class="post-text" itemprop="text">
+<p>How do you access other class variables from a list comprehension within the class definition?  The following works in Python 2 but fails in Python 3:</p>
+<pre><code>class Foo:
+    x = 5
+    y = [x for i in range(1)]
+</code></pre>
+<p>Python 3.2 gives the error:</p>
+<pre><code>NameError: global name 'x' is not defined
+</code></pre>
+<p>Trying <code>Foo.x</code> doesn't work either.  Any ideas on how to do this in Python 3?</p>
+<p>A slightly more complicated motivating example:</p>
+<pre><code>from collections import namedtuple
+class StateDatabase:
+    State = namedtuple('State', ['name', 'capital'])
+    db = [State(*args) for args in [
+        ['Alabama', 'Montgomery'],
+        ['Alaska', 'Juneau'],
+        # ...
+    ]]
+</code></pre>
+<p>In this example, <code>apply()</code> would have been a decent workaround, but it is sadly removed from Python 3.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><em>Class scope and list, set or dictionary comprehensions, as well as generator expressions do not mix.</em></p>
+<h2>The why; or, the official word on this</h2>
+<p>In Python 3, list comprehensions were given a proper scope (local namespace) of their own, to prevent their local variables bleeding over into the surrounding scope (see <a href="https://stackoverflow.com/q/4198906">Python list comprehension rebind names even after scope of comprehension. Is this right?</a>). That's great when using such a list comprehension in a module or in a function, but in classes, scoping is a little, uhm, <em>strange</em>.</p>
+<p>This is documented in <a href="http://www.python.org/dev/peps/pep-0227/" rel="noreferrer">pep 227</a>:</p>
+<blockquote>
+<p>Names in class scope are not accessible.  Names are resolved in
+      the innermost enclosing function scope.  If a class definition
+      occurs in a chain of nested scopes, the resolution process skips
+      class definitions.</p>
+</blockquote>
+<p>and in the <a href="http://docs.python.org/3/reference/compound_stmts.html#class-definitions" rel="noreferrer"><code>class</code> compound statement documentation</a>:</p>
+<blockquote>
+<p>The class’s suite is then executed in a new execution frame (see section <a href="http://docs.python.org/3/reference/executionmodel.html#naming" rel="noreferrer"><em>Naming and binding</em></a>), using a newly created local namespace and the original global namespace. (Usually, the suite contains only function definitions.) When the class’s suite finishes execution, <strong>its execution frame is discarded but its local namespace is saved</strong>. <a href="http://docs.python.org/3/reference/compound_stmts.html#id8" rel="noreferrer">[4]</a> A class object is then created using the inheritance list for the base classes and the saved local namespace for the attribute dictionary.</p>
+</blockquote>
+<p>Emphasis mine; the execution frame is the temporary scope.</p>
+<p>Because the scope is repurposed as the attributes on a class object, allowing it to be used as a nonlocal scope as well leads to undefined behaviour; what would happen if a class method referred to <code>x</code> as a nested scope variable, then manipulates <code>Foo.x</code> as well, for example? More importantly, what would that mean for subclasses of <code>Foo</code>? Python <em>has</em> to treat a class scope differently as it is very different from a function scope.</p>
+<p>Last, but definitely not least, the linked <a href="http://docs.python.org/3/reference/executionmodel.html#naming" rel="noreferrer">Naming and binding</a> section in the Execution model documentation mentions class scopes explicitly:</p>
+<blockquote>
+<p>The scope of names defined in a class block is limited to the class block; it does not extend to the code blocks of methods – this includes comprehensions and generator expressions since they are implemented using a function scope. This means that the following will fail:</p>
+<pre><code>class A:
+     a = 42
+     b = list(a + i for i in range(10))
+</code></pre>
+</blockquote>
+<p>So, to summarize: you cannot access the class scope from functions, list comprehensions or generator expressions enclosed in that scope; they act as if that scope does not exist. In Python 2, list comprehensions were implemented using a shortcut, but in Python 3 they got their own function scope (as they should have had all along) and thus your example breaks. Other comprehension types have their own scope regardless of Python version, so a similar example with a set or dict comprehension would break in Python 2.</p>
+<pre><code># Same error, in Python 2 or 3
+y = {x: x for i in range(1)}
+</code></pre>
+<h2>The (small) exception; or, why one part <em>may</em> still work</h2>
+<p>There's one part of a comprehension or generator expression that executes in the surrounding scope, regardless of Python version. That would be the expression for the outermost iterable. In your example, it's the <code>range(1)</code>:</p>
+<pre><code>y = [x for i in range(1)]
+#               ^^^^^^^^
+</code></pre>
+<p>Thus, using <code>x</code> in that expression would not throw an error:</p>
+<pre><code># Runs fine
+y = [i for i in range(x)]
+</code></pre>
+<p>This only applies to the outermost iterable; if a comprehension has multiple <code>for</code> clauses, the iterables for inner <code>for</code> clauses are evaluated in the comprehension's scope:</p>
+<pre><code># NameError
+y = [i for i in range(1) for j in range(x)]
+</code></pre>
+<p>This design decision was made in order to throw an error at genexp creation time instead of iteration time when creating the outermost iterable of a generator expression throws an error, or when the outermost iterable turns out not to be iterable. Comprehensions share this behavior for consistency.</p>
+<h2>Looking under the hood; or, way more detail than you ever wanted</h2>
+<p>You can see this all in action using the <a href="http://docs.python.org/3/library/dis.html" rel="noreferrer"><code>dis</code> module</a>. I'm using Python 3.3 in the following examples, because it adds <a href="http://docs.python.org/3/whatsnew/3.3.html#pep-3155-qualified-name-for-classes-and-functions" rel="noreferrer">qualified names</a> that neatly identify the code objects we want to inspect. The bytecode produced is otherwise functionally identical to Python 3.2.</p>
+<p>To <em>create</em> a class, Python essentially takes the whole suite that makes up the class body (so everything indented one level deeper than the <code>class &lt;name&gt;:</code> line), and executes that as if it were a function:</p>
+<pre><code>&gt;&gt;&gt; import dis
+&gt;&gt;&gt; def foo():
+...     class Foo:
+...         x = 5
+...         y = [x for i in range(1)]
+...     return Foo
+... 
+&gt;&gt;&gt; dis.dis(foo)
+  2           0 LOAD_BUILD_CLASS     
+              1 LOAD_CONST               1 (&lt;code object Foo at 0x10a436030, file "&lt;stdin&gt;", line 2&gt;) 
+              4 LOAD_CONST               2 ('Foo') 
+              7 MAKE_FUNCTION            0 
+             10 LOAD_CONST               2 ('Foo') 
+             13 CALL_FUNCTION            2 (2 positional, 0 keyword pair) 
+             16 STORE_FAST               0 (Foo) 
+
+  5          19 LOAD_FAST                0 (Foo) 
+             22 RETURN_VALUE         
+</code></pre>
+<p>The first <code>LOAD_CONST</code> there loads a code object for the <code>Foo</code> class body, then makes that into a function, and calls it. The <em>result</em> of that call is then used to create the namespace of the class, its <code>__dict__</code>. So far so good.</p>
+<p>The thing to note here is that the bytecode contains a nested code object; in Python, class definitions, functions, comprehensions and generators all are represented as code objects that contain not only bytecode, but also structures that represent local variables, constants, variables taken from globals, and variables taken from the nested scope. The compiled bytecode refers to those structures and the python interpreter knows how to access those given the bytecodes presented.</p>
+<p>The important thing to remember here is that Python creates these structures at compile time; the <code>class</code> suite is a code object (<code>&lt;code object Foo at 0x10a436030, file "&lt;stdin&gt;", line 2&gt;</code>) that is already compiled.</p>
+<p>Let's inspect that code object that creates the class body itself; code objects have a <code>co_consts</code> structure:</p>
+<pre><code>&gt;&gt;&gt; foo.__code__.co_consts
+(None, &lt;code object Foo at 0x10a436030, file "&lt;stdin&gt;", line 2&gt;, 'Foo')
+&gt;&gt;&gt; dis.dis(foo.__code__.co_consts[1])
+  2           0 LOAD_FAST                0 (__locals__) 
+              3 STORE_LOCALS         
+              4 LOAD_NAME                0 (__name__) 
+              7 STORE_NAME               1 (__module__) 
+             10 LOAD_CONST               0 ('foo.&lt;locals&gt;.Foo') 
+             13 STORE_NAME               2 (__qualname__) 
+
+  3          16 LOAD_CONST               1 (5) 
+             19 STORE_NAME               3 (x) 
+
+  4          22 LOAD_CONST               2 (&lt;code object &lt;listcomp&gt; at 0x10a385420, file "&lt;stdin&gt;", line 4&gt;) 
+             25 LOAD_CONST               3 ('foo.&lt;locals&gt;.Foo.&lt;listcomp&gt;') 
+             28 MAKE_FUNCTION            0 
+             31 LOAD_NAME                4 (range) 
+             34 LOAD_CONST               4 (1) 
+             37 CALL_FUNCTION            1 (1 positional, 0 keyword pair) 
+             40 GET_ITER             
+             41 CALL_FUNCTION            1 (1 positional, 0 keyword pair) 
+             44 STORE_NAME               5 (y) 
+             47 LOAD_CONST               5 (None) 
+             50 RETURN_VALUE         
+</code></pre>
+<p>The above bytecode creates the class body. The function is executed and the resulting <code>locals()</code> namespace, containing <code>x</code> and <code>y</code> is used to create the class (except that it doesn't work because <code>x</code> isn't defined as a global). Note that after storing <code>5</code> in <code>x</code>, it loads another code object; that's the list comprehension; it is wrapped in a function object just like the class body was; the created function takes a positional argument, the <code>range(1)</code> iterable to use for its looping code, cast to an iterator. As shown in the bytecode, <code>range(1)</code> is evaluated in the class scope.</p>
+<p>From this you can see that the only difference between a code object for a function or a generator, and a code object for a comprehension is that the latter is executed <em>immediately</em> when the parent code object is executed; the bytecode simply creates a function on the fly and executes it in a few small steps.</p>
+<p>Python 2.x uses inline bytecode there instead, here is output from Python 2.7:</p>
+<pre><code>  2           0 LOAD_NAME                0 (__name__)
+              3 STORE_NAME               1 (__module__)
+
+  3           6 LOAD_CONST               0 (5)
+              9 STORE_NAME               2 (x)
+
+  4          12 BUILD_LIST               0
+             15 LOAD_NAME                3 (range)
+             18 LOAD_CONST               1 (1)
+             21 CALL_FUNCTION            1
+             24 GET_ITER            
+        &gt;&gt;   25 FOR_ITER                12 (to 40)
+             28 STORE_NAME               4 (i)
+             31 LOAD_NAME                2 (x)
+             34 LIST_APPEND              2
+             37 JUMP_ABSOLUTE           25
+        &gt;&gt;   40 STORE_NAME               5 (y)
+             43 LOAD_LOCALS         
+             44 RETURN_VALUE        
+</code></pre>
+<p>No code object is loaded, instead a <code>FOR_ITER</code> loop is run inline. So in Python 3.x, the list generator was given a proper code object of its own, which means it has its own scope.</p>
+<p>However, the comprehension was compiled together with the rest of the python source code when the module or script was first loaded by the interpreter, and the compiler does <em>not</em> consider a class suite a valid scope. Any referenced variables in a list comprehension must look in the scope <em>surrounding</em> the class definition, recursively. If the variable wasn't found by the compiler, it marks it as a global. Disassembly of the list comprehension code object shows that <code>x</code> is indeed loaded as a global:</p>
+<pre><code>&gt;&gt;&gt; foo.__code__.co_consts[1].co_consts
+('foo.&lt;locals&gt;.Foo', 5, &lt;code object &lt;listcomp&gt; at 0x10a385420, file "&lt;stdin&gt;", line 4&gt;, 'foo.&lt;locals&gt;.Foo.&lt;listcomp&gt;', 1, None)
+&gt;&gt;&gt; dis.dis(foo.__code__.co_consts[1].co_consts[2])
+  4           0 BUILD_LIST               0 
+              3 LOAD_FAST                0 (.0) 
+        &gt;&gt;    6 FOR_ITER                12 (to 21) 
+              9 STORE_FAST               1 (i) 
+             12 LOAD_GLOBAL              0 (x) 
+             15 LIST_APPEND              2 
+             18 JUMP_ABSOLUTE            6 
+        &gt;&gt;   21 RETURN_VALUE         
+</code></pre>
+<p>This chunk of bytecode loads the first argument passed in (the <code>range(1)</code> iterator), and just like the Python 2.x version uses <code>FOR_ITER</code> to loop over it and create its output.</p>
+<p>Had we defined <code>x</code> in the <code>foo</code> function instead, <code>x</code> would be a cell variable (cells refer to nested scopes):</p>
+<pre><code>&gt;&gt;&gt; def foo():
+...     x = 2
+...     class Foo:
+...         x = 5
+...         y = [x for i in range(1)]
+...     return Foo
+... 
+&gt;&gt;&gt; dis.dis(foo.__code__.co_consts[2].co_consts[2])
+  5           0 BUILD_LIST               0 
+              3 LOAD_FAST                0 (.0) 
+        &gt;&gt;    6 FOR_ITER                12 (to 21) 
+              9 STORE_FAST               1 (i) 
+             12 LOAD_DEREF               0 (x) 
+             15 LIST_APPEND              2 
+             18 JUMP_ABSOLUTE            6 
+        &gt;&gt;   21 RETURN_VALUE         
+</code></pre>
+<p>The <code>LOAD_DEREF</code> will indirectly load <code>x</code> from the code object cell objects:</p>
+<pre><code>&gt;&gt;&gt; foo.__code__.co_cellvars               # foo function `x`
+('x',)
+&gt;&gt;&gt; foo.__code__.co_consts[2].co_cellvars  # Foo class, no cell variables
+()
+&gt;&gt;&gt; foo.__code__.co_consts[2].co_consts[2].co_freevars  # Refers to `x` in foo
+('x',)
+&gt;&gt;&gt; foo().y
+[2]
+</code></pre>
+<p>The actual referencing looks the value up from the current frame data structures, which were initialized from a function object's <code>.__closure__</code> attribute. Since the function created for the comprehension code object is discarded again, we do not get to inspect that function's closure. To see a closure in action, we'd have to inspect a nested function instead:</p>
+<pre><code>&gt;&gt;&gt; def spam(x):
+...     def eggs():
+...         return x
+...     return eggs
+... 
+&gt;&gt;&gt; spam(1).__code__.co_freevars
+('x',)
+&gt;&gt;&gt; spam(1)()
+1
+&gt;&gt;&gt; spam(1).__closure__
+&gt;&gt;&gt; spam(1).__closure__[0].cell_contents
+1
+&gt;&gt;&gt; spam(5).__closure__[0].cell_contents
+5
+</code></pre>
+<p>So, to summarize:</p>
+<ul>
+<li>List comprehensions get their own code objects in Python 3, and there is no difference between code objects for functions, generators or comprehensions; comprehension code objects are wrapped in a temporary function object and called immediately.</li>
+<li>Code objects are created at compile time, and any non-local variables are marked as either global or as free variables, based on the nested scopes of the code. The class body is <em>not</em> considered a scope for looking up those variables.</li>
+<li>When executing the code, Python has only to look into the globals, or the closure of the currently executing object. Since the compiler didn't include the class body as a scope, the temporary function namespace is not considered.</li>
+</ul>
+<h2>A workaround; or, what to do about it</h2>
+<p>If you were to create an explicit scope for the <code>x</code> variable, like in a function, you <em>can</em> use class-scope variables for a list comprehension:</p>
+<pre><code>&gt;&gt;&gt; class Foo:
+...     x = 5
+...     def y(x):
+...         return [x for i in range(1)]
+...     y = y(x)
+... 
+&gt;&gt;&gt; Foo.y
+[5]
+</code></pre>
+<p>The 'temporary' <code>y</code> function can be called directly; we replace it when we do with its return value. Its scope <em>is</em> considered when resolving <code>x</code>:</p>
+<pre><code>&gt;&gt;&gt; foo.__code__.co_consts[1].co_consts[2]
+&lt;code object y at 0x10a5df5d0, file "&lt;stdin&gt;", line 4&gt;
+&gt;&gt;&gt; foo.__code__.co_consts[1].co_consts[2].co_cellvars
+('x',)
+</code></pre>
+<p>Of course, people reading your code will scratch their heads over this a little; you may want to put a big fat comment in there explaining why you are doing this.</p>
+<p>The best work-around is to just use <code>__init__</code> to create an instance variable instead:</p>
+<pre><code>def __init__(self):
+    self.y = [self.x for i in range(1)]
+</code></pre>
+<p>and avoid all the head-scratching, and questions to explain yourself. For your own concrete example, I would not even store the <code>namedtuple</code> on the class; either use the output directly (don't store the generated class at all), or use a global:</p>
+<pre><code>from collections import namedtuple
+State = namedtuple('State', ['name', 'capital'])
+
+class StateDatabase:
+    db = [State(*args) for args in [
+       ('Alabama', 'Montgomery'),
+       ('Alaska', 'Juneau'),
+       # ...
+    ]]
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>In my opinion it is a flaw in Python 3. I hope they change it.</p>
+<p>Old Way (works in 2.7, throws <code>NameError: name 'x' is not defined</code> in 3+):</p>
+<pre><code>class A:
+    x = 4
+    y = [x+i for i in range(1)]
+</code></pre>
+<p><em>NOTE: simply scoping it with <code>A.x</code> would not solve it</em></p>
+<p>New Way (works in 3+): </p>
+<pre><code>class A:
+    x = 4
+    y = (lambda x=x: [x+i for i in range(1)])()
+</code></pre>
+<p>Because the syntax is so ugly I just initialize all my class variables in the constructor typically </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The accepted answer provides excellent information, but there appear to be a few other wrinkles here -- differences between list comprehension and generator expressions. A demo that I played around with:</p>
+<pre><code>class Foo:
+
+    # A class-level variable.
+    X = 10
+
+    # I can use that variable to define another class-level variable.
+    Y = sum((X, X))
+
+    # Works in Python 2, but not 3.
+    # In Python 3, list comprehensions were given their own scope.
+    try:
+        Z1 = sum([X for _ in range(3)])
+    except NameError:
+        Z1 = None
+
+    # Fails in both.
+    # Apparently, generator expressions (that's what the entire argument
+    # to sum() is) did have their own scope even in Python 2.
+    try:
+        Z2 = sum(X for _ in range(3))
+    except NameError:
+        Z2 = None
+
+    # Workaround: put the computation in lambda or def.
+    compute_z3 = lambda val: sum(val for _ in range(3))
+
+    # Then use that function.
+    Z3 = compute_z3(X)
+
+    # Also worth noting: here I can refer to XS in the for-part of the
+    # generator expression (Z4 works), but I cannot refer to XS in the
+    # inner-part of the generator expression (Z5 fails).
+    XS = [15, 15, 15, 15]
+    Z4 = sum(val for val in XS)
+    try:
+        Z5 = sum(XS[i] for i in range(len(XS)))
+    except NameError:
+        Z5 = None
+
+print(Foo.Z1, Foo.Z2, Foo.Z3, Foo.Z4, Foo.Z5)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is a bug in Python. Comprehensions are advertised as being equivalent to for loops, but this is not true in classes. At least up to Python 3.6.6, in a comprehension used in a class, only one variable from outside the comprehension is accessible inside the comprehension, and it must be used as the outermost iterator. In a function, this scope limitation does not apply.</p>
+<p>To illustrate why this is a bug, let's return to the original example. This fails:</p>
+<pre><code>class Foo:
+    x = 5
+    y = [x for i in range(1)]
+</code></pre>
+<p>But this works:</p>
+<pre><code>def Foo():
+    x = 5
+    y = [x for i in range(1)]
+</code></pre>
+<p>The limitation is stated at the end of <a href="https://docs.python.org/3/reference/executionmodel.html#resolution-of-names" rel="nofollow noreferrer">this section</a> in the reference guide.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since the outermost iterator is evaluated in the surrounding scope we can use <a href="https://docs.python.org/3/library/functions.html#zip" rel="nofollow noreferrer"><code>zip</code></a> together with <a href="https://docs.python.org/3/library/itertools.html#itertools.repeat" rel="nofollow noreferrer"><code>itertools.repeat</code></a> to carry the dependencies over to the comprehension's scope:</p>
+<pre><code>import itertools as it
+
+class Foo:
+    x = 5
+    y = [j for i, j in zip(range(3), it.repeat(x))]
+</code></pre>
+<p>One can also use nested <code>for</code> loops in the comprehension and include the dependencies in the outermost iterable:</p>
+<pre><code>class Foo:
+    x = 5
+    y = [j for j in (x,) for i in range(3)]
+</code></pre>
+<p>For the specific example of the OP:</p>
+<pre><code>from collections import namedtuple
+import itertools as it
+
+class StateDatabase:
+    State = namedtuple('State', ['name', 'capital'])
+    db = [State(*args) for State, args in zip(it.repeat(State), [
+        ['Alabama', 'Montgomery'],
+        ['Alaska', 'Juneau'],
+        # ...
+    ])]
+</code></pre>
+</div>
+<span class="comment-copy">Why do you need to do that, just out of curiosity?</span>
+<span class="comment-copy">Your error message is incorrect. I get <code>NameError: global name 'x' is not defined</code> on Python 3.2 and 3.3 which is what I'd expect.</span>
+<span class="comment-copy">Interesting... One obvious workaround is to assign y after you exit the class definition.  Foo.y = [Foo.x for i in range(1)]</span>
+<span class="comment-copy">+martijn-pieters link to a duplicate is right, there's a comment from +matt-b in there with the explanation: Python 2.7 list comprehensions do not have their own namespace (unlike set or dict comprehensions or generator expressions... replace your [] with {} to see that in action). They <i>all</i> have their own namespace in 3.</span>
+<span class="comment-copy">@gps: Or use a nested scope, by inserting a (temporary) function in the class definition suite.</span>
+<span class="comment-copy">You can also use a lambda to fix the binding: <code>y = (lambda x=x: [x for i in range(1)])()</code></span>
+<span class="comment-copy">@ecatmur: Exactly, <code>lambda</code> are just anonymous functions, after all.</span>
+<span class="comment-copy">For the record, the work-around that uses a default argument (to a lambda or a function) to pass in the class variable has a gotcha.  Namely, it passes the <i>current value</i> of the variable.  So, if the variable changes later, and then the lambda or function is called, the lambda or function will be using the old value.  This behavior differs from the behavior of a closure (which would capture a reference to the variable, rather than its value), so may be unexpected.</span>
+<span class="comment-copy">If it requires a page of technical information to explain why something doesn't work intuitively, I call that a bug.</span>
+<span class="comment-copy">@JonathanLeaders: Don't call it a <i>bug</i>, call it a <i>tradeoff</i>. If you want A and B, but can get only one of them, then no matter how you decide, in some situations you will dislike the result. That's life.</span>
+<span class="comment-copy">The problem is present in Python 2 as well, when using generator expressions, as well as with set and dictionary comprehensions. It is not a bug, it is a consequence of how class namespaces work. It'll not change.</span>
+<span class="comment-copy">And I note that your workaround does exactly what my answer already states: create a new scope (a lambda is no different here from using <code>def</code> to create a function).</span>
+<span class="comment-copy">yep. While it is nice to have an answer with the work-around at a glance, this one incorrecly states the behavior as a bug, when it is a side-effect of the way the language works (and therefore, won't be changed)</span>
+<span class="comment-copy">This is a different problem, that actually isn't a problem in Python 3. It only occurs in IPython when you call it in embed mode using say <code>python -c "import IPython;IPython.embed()"</code>. Run IPython directly using say <code>ipython</code> and the problem will disappear.</span>

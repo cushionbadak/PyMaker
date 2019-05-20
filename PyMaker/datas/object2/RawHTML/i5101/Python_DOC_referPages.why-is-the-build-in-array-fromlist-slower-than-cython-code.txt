@@ -1,0 +1,110 @@
+<div class="post-text" itemprop="text">
+<p>Often, when gluing Python and C-code together, one needs to convert a Python-list to a continuous memory, e.g. an <code>array.array</code>. It's also not unusual, that this conversion step becomes the bottle-neck, so I find myself doing silly things with Cython because it is faster than the build-in Python solutions.</p>
+<p>For example to convert a Python-list <code>lst</code> to an <code>int32</code> continuous memory I'm aware of two possibilities: </p>
+<pre><code>a=array.array('i', lst)
+</code></pre>
+<p>and</p>
+<pre><code>a=array.array('i'); 
+a.fromlist(lst)
+</code></pre>
+<p>They are however both slower than the following cython-version:</p>
+<pre><code>%%cython
+import array
+from cpython cimport array
+def array_from_list_iter(lst):
+    cdef Py_ssize_t n=len(lst)
+    cdef array.array res=array.array('i')
+    cdef int cnt=0
+    array.resize(res, n)  #preallocate memory
+    for i in lst:
+       res.data.as_ints[cnt]=i
+       cnt+=1
+    return res
+</code></pre>
+<p>My timings show (Linux, Python3.6 but the results are very similar for Windows and/or Python2.7), that the cython-solution is about 6 times faster:</p>
+<pre><code>Size       new_array   from_list  cython_iter    factor
+1             284ns    347ns        176ns           1.6
+10            599ns    621ns        209ns           2.9
+10**2         3.7µs    3.5µs        578ns           6.1
+10**3        38.5µs    32µs         4.3µs           7.4
+10**4         343µs    316µs       40.4µs           7.8
+10**5         3.5ms    3.4ms        481µs           7.1
+10**6        34.1ms    31.5ms       5.0ms           6.3
+10**7         353ms    316ms       53.3ms           5.9
+</code></pre>
+<p>With my limited understanding of CPython, I would say that the <code>from_list</code>-solution uses this <a href="https://github.com/python/cpython/blob/aa0735f597b072c0eb00404c4d7df359ddc26755/Modules/arraymodule.c#L1531" rel="nofollow noreferrer">build-in function</a>:</p>
+<pre><code>static PyObject *
+array_array_fromlist(arrayobject *self, PyObject *list)
+{
+    Py_ssize_t n;
+
+    if (!PyList_Check(list)) {
+        PyErr_SetString(PyExc_TypeError, "arg must be list");
+        return NULL;
+    }
+    n = PyList_Size(list);
+    if (n &gt; 0) {
+        Py_ssize_t i, old_size;
+        old_size = Py_SIZE(self);
+        if (array_resize(self, old_size + n) == -1)
+            return NULL;
+        for (i = 0; i &lt; n; i++) {
+            PyObject *v = PyList_GetItem(list, i);
+            if ((*self-&gt;ob_descr-&gt;setitem)(self,
+                            Py_SIZE(self) - n + i, v) != 0) {
+                array_resize(self, old_size);
+                return NULL;
+            }
+        }
+    }
+    Py_RETURN_NONE;
+}
+</code></pre>
+<p><code>a=array.array('i', lst)</code> <a href="https://github.com/python/cpython/blob/aa0735f597b072c0eb00404c4d7df359ddc26755/Modules/arraymodule.c#L972" rel="nofollow noreferrer">grows dynamically</a> and needs to reallocate, so that could explain some slow-down (yet as the measurements show, not by much!), but <code>array_fromlist</code> preallocates the needed memory - it is basically exactly the same algorithm as the Cython-code. </p>
+<p>So the question: Why is this Python-code 6 times slower than the Cython-code? What am I missing?</p>
+<hr/>
+<p>Here is the code for measuring timings:</p>
+<pre><code>import array
+import numpy as np
+for n in [1, 10,10**2, 10**3, 10**4, 10**5, 10**6, 10**7]:
+    print ("N=",n)
+    lst=list(range(n))
+    print("python:")
+    %timeit array.array('i', lst)
+    print("python, from list:")
+    %timeit a=array.array('i'); a.fromlist(lst)
+    print("numpy:")
+    %timeit np.array(lst, dtype=np.int32)
+    print("cython_iter:")
+    %timeit array_from_list_iter(lst)
+</code></pre>
+<p>The numpy-solution is about factor 2 slower than the python-versions.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The biggest difference seems to be the actual int unboxing.  The CPython array implementation is using <a href="https://github.com/python/cpython/blob/aa0735f597b072c0eb00404c4d7df359ddc26755/Modules/arraymodule.c#L321" rel="nofollow noreferrer">PyArg_Parse</a> while cython is calling <a href="https://docs.python.org/3/c-api/long.html#c.PyLong_AsLong" rel="nofollow noreferrer">PyLong_AsLong</a> - at least I think, through several layers of macros.</p>
+<pre><code>%%cython -a
+from cpython cimport PyArg_Parse
+def arg_parse(obj):
+    cdef int i
+    for _ in range(100000):
+        PyArg_Parse(obj, "i;array item must be integer", &amp;i)
+    return i
+
+def cython_parse(obj):
+    cdef int i
+    for _ in range(100000):
+        i = obj
+    return i
+
+%timeit arg_parse(1)
+# 2.52 ms ± 67.1 µs per loop (mean ± std. dev. of 7 runs, 100 loops each)
+%timeit cython_parse(1)
+# 299 µs ± 1.86 µs per loop (mean ± std. dev. of 7 runs, 1000 loops each)
+</code></pre>
+</div>
+<span class="comment-copy">I suspect if you look at your Cython output, you'll find that the process of setting each item in the output array bypasses the <code>self-&gt;ob_descr-&gt;setitem</code> function call, setting the memory directly. It will operate incorrectly if the array isn't actually made of <code>int</code>s, but in exchange, it replaces a function call through multiple pointers including type checking each time (to determine the width of the target each and every time) with a direct memory assignment. Also, iterating the <code>list</code> might be slightly faster than repeated calls to <code>PyList_GetItem</code> (which performs repeated bounds checks).</span>
+<span class="comment-copy">Your <code>cython</code> code return only result, but <code>python array.array</code> is <code>['append', 'buffer_info', 'byteswap', 'count', 'extend', 'fromfile', 'fromlist', 'fromstring', 'fromunicode', 'index', 'insert', 'itemsize', 'pop', 'read', 'remove', 'reverse', 'tofile', 'tolist', 'tostring', 'tounicode', 'typecode', 'write']</code></span>
+<span class="comment-copy">@ShadowRanger cython writes direct to the memory, but also checks that the the range of passed python-integers is right. For example <code>array_from_list_iter([2**33])</code> would produce <code>Python int too large to convert to C long</code>-error.</span>
+<span class="comment-copy">@ead: The <code>setitem</code> function would have to do the same thing, and it would have to choose the "too large" bound dynamically.</span>
+<span class="comment-copy">Like @ShadowRanger said, the Cython generated C code does not use <code>setitem</code> but directly assigns memory at indices of the array after converting with <code>Pyx_PyInt_As_int</code> which is where the range checks come from. That is the only major difference from the <code>fromlist</code> C code. The Cython code could be made slightly faster still by using the known size of the list for iteration to avoid bounds checks - <code>for i in lst[:n]</code>. The assignment in Cython looks like <code>(__pyx_v_res-&gt;data.as_ints[__pyx_v_cnt]) = __pyx_t_3;</code></span>
+<span class="comment-copy">Thanks, you are right: when I replace <code>PyArg_Parse</code> with <code>PyLong_AsLong</code> in <code>arraymodule.c</code> the python's version becomes almost as fast as cython's. By looking at cython's <code>__Pyx_PyInt_As_int</code> I can understand why somebody would stick with the slow <code>PyArg_Parse</code>:)</span>

@@ -1,0 +1,132 @@
+<div class="post-text" itemprop="text">
+<p>I have trouble understanding why this simple program raises an <a href="https://docs.python.org/3/library/exceptions.html#EOFError" rel="nofollow noreferrer"><code>EOFError</code></a> at the end.</p>
+<p>I am using a <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Queue" rel="nofollow noreferrer"><code>Queue()</code></a> to communicate with a <a href="https://docs.python.org/3/library/threading.html#threading.Thread" rel="nofollow noreferrer"><code>Thread()</code></a> that I want to automatically and cleanly terminate <a href="https://docs.python.org/3/library/atexit.html#atexit.register" rel="nofollow noreferrer"><code>atexit</code></a> of my program.</p>
+<pre><code>import threading
+import multiprocessing
+import atexit
+
+class MyClass:
+
+    def __init__(self):
+        self.queue = None
+        self.thread = None
+
+    def start(self):
+        self.queue = multiprocessing.Queue()
+        self.thread = threading.Thread(target=self.queued_writer, daemon=True)
+        self.thread.start()
+
+        # Remove this: no error
+        self.queue.put("message")
+
+    def queued_writer(self):
+        while 1:
+            msg = self.queue.get()
+            print("Message:", msg)
+            if msg is None:
+                break
+
+    def stop(self):
+        self.queue.put(None)
+        self.thread.join()
+
+instance = MyClass()
+
+atexit.register(instance.stop)
+
+# Put this before register: no error
+instance.start()
+</code></pre>
+<p>This raises:</p>
+<pre><code>Traceback (most recent call last):
+  File "/usr/lib/python3.6/threading.py", line 916, in _bootstrap_inner
+    self.run()
+  File "/usr/lib/python3.6/threading.py", line 864, in run
+    self._target(*self._args, **self._kwargs)
+  File "test.py", line 21, in queued_writer
+    msg = self.queue.get()
+  File "/usr/lib/python3.6/multiprocessing/queues.py", line 94, in get
+    res = self._recv_bytes()
+  File "/usr/lib/python3.6/multiprocessing/connection.py", line 216, in recv_bytes
+    buf = self._recv_bytes(maxlength)
+  File "/usr/lib/python3.6/multiprocessing/connection.py", line 407, in _recv_bytes
+    buf = self._recv(4)
+  File "/usr/lib/python3.6/multiprocessing/connection.py", line 383, in _recv
+    raise EOFError
+EOFError
+</code></pre>
+<p>Moreover, this snippet behaves strangely: if I remove the <code>self.queue.put("message")</code> line, no error is raised and the thread exits successfully. Similarly, this seems to work if the <code>instance.start()</code> is call before <code>atexit.register()</code>.</p>
+<p>Does anyone know from where could come the error please?</p>
+<p><strong>Edit:</strong> I noticed that using a <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.SimpleQueue" rel="nofollow noreferrer"><code>SimpleQueue()</code></a> seems to make the error disappear. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The issue comes from a conflict between multiple <a href="https://docs.python.org/3.6/library/atexit.html#atexit.register" rel="nofollow noreferrer"><code>atexit.register()</code></a> calls.</p>
+<p>The documentation states that:</p>
+<blockquote>
+<p><code>atexit</code> runs these functions in the reverse order in which they were registered; if you register <code>A</code>, <code>B</code>, and <code>C</code>, at interpreter termination time they will be run in the order <code>C</code>, <code>B</code>, <code>A</code>.</p>
+<p>[...]</p>
+<p>The assumption is that lower level modules will normally be imported before higher level modules and thus must be cleaned up later.</p>
+</blockquote>
+<p>By first importing <code>multiprocessing</code> and then calling <code>atexit.register(my_stop)</code>, you would expect your stop function to be executed before any internal termination procedure... But this is not the case, because <code>atexit.register()</code> may be called dynamically.</p>
+<p>In the present case, the <code>multiprocessing</code> library makes use of a <a href="https://github.com/python/cpython/blob/e2732d3e66eba9ec13f9d55c499f2437ead552db/Lib/multiprocessing/util.py#L285" rel="nofollow noreferrer"><code>_exit_function</code></a> function which is meant to cleanly close internal threads and queues. This function is registered in <code>atexit</code> <a href="https://github.com/python/cpython/blob/e2732d3e66eba9ec13f9d55c499f2437ead552db/Lib/multiprocessing/util.py#L327" rel="nofollow noreferrer">at the module level</a>, however the module is only loaded <a href="https://github.com/python/cpython/blob/e2732d3e66eba9ec13f9d55c499f2437ead552db/Lib/multiprocessing/context.py#L101" rel="nofollow noreferrer">once the <code>Queue()</code> object is initialized</a>.</p>
+<p>Consequently, the <code>MyClass</code> stop function is registered <strong>before</strong> the <code>multiprocessing</code>'s one and thus <code>instance.stop</code> is called <strong>after</strong> <code>_exit_function</code>.</p>
+<p>During its termination, <code>_exit_function</code> closes internal pipes connections, so if the thread later try to call <code>.get()</code> with a closed read-connection, an <code>EOFError</code> is raised. This happens only if Python did not have time to automatically kill the <code>daemon</code> thread at the end, that is if a "slow" exit function (like <code>time.sleep(0.1)</code> or in this case <code>thread.join()</code>) is register and run after the usual closure procedure. For some reason, the write-connection shutdown is delayed hence <code>.put()</code> does not raise error immediately.</p>
+<p>As to why small modifications to the snippet makes it work: <code>SimpleQueue</code> does not have <code>Finalizer</code> so internal pipe is closed later. The internal thread of <code>Queue</code> is not started until the first <code>.put()</code> is called so removing it means there is no pipe to close. It is also posible to force registeration by importing <code>multiprocessing.queues</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>To achieve it you can define <code>__enter__</code> and <code>__exit__</code> inside your class and create your instance using <code>with</code> statement:</p>
+<pre><code>import threading
+import multiprocessing
+
+
+class MyClass:
+
+    def __init__(self):
+        self.queue = None
+        self.thread = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.stop()
+
+    def start(self):
+        self.queue = multiprocessing.Queue()
+        self.thread = threading.Thread(target=self.queued_writer, daemon=True)
+        self.thread.start()
+
+    def queued_writer(self):
+        while 1:
+            msg = self.queue.get()
+            print("Message:", str(msg))
+            if msg is None:
+                break
+
+    def put(self, msg):
+        self.queue.put(msg)
+
+    def stop(self):
+        self.queue.put(None)
+        self.thread.join()
+
+
+with MyClass() as instance:
+    instance.start()
+    print('Thread stopped: ' + str(instance.thread._is_stopped))
+    instance.put('abc')
+
+print('Thread stopped: ' + str(instance.thread._is_stopped))
+</code></pre>
+<p>Above code gives as an output:</p>
+<pre><code>Thread stopped: False
+Message: abc
+Message: None
+Thread stopped: True
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The surface answer to your question is fairly simple, The queued_writer process is still waiting for entries to be written to the queue when the main process ends, sending an EOF to the open blocking connection that <code>self.queue.get</code> opened.</p>
+<p>That raises the question of why the <code>atexit.register</code> didn't seem to do it's job, but of that I do not know the reason for.</p>
+</div>
+<span class="comment-copy">Thanks for your answer, however I am not specifically asking about workaround, I would rather like to know <b>why</b> my snippet is not working.</span>

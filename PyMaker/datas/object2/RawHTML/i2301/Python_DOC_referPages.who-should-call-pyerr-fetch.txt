@@ -1,0 +1,75 @@
+<div class="post-text" itemprop="text">
+<p>Many functions in the C API for Python are not safe to use if the error indicator might be set.  In particular, <code>PyFloat_AsDouble</code> and similar functions are <strong>ambiguous</strong> in that they have no return value reserved for indicating an error: if they succeed (but happen to return the value used for errors), the client that calls <code>PyErr_Occurred</code> will believe them to have failed if the error indicator was simply already set.  (Note that this is more or less guaranteed to happen with <code>PyIter_Next</code>.)  More generally, any function which can fail overwrites the error indicator if it does, which may or may not be desirable.</p>
+<p>Unfortunately, the possibility of calling such functions with the error indicator set is not at all unlikely: a common reaction to an error is to <code>Py_DECREF</code> local variables, and (unless the types of all objects that might be (indirectly) freed by it are known) that can execute arbitrary code.  (This is a good example of the danger of having cleanup code with the possibility of failure.)  The interpreter catches exceptions <em>raised</em> in such destructors, but it does not prevent exceptions from leaking <em>into</em> them.</p>
+<p>At <strong>either end</strong>, we can use <code>PyErr_Fetch</code> and <code>PyErr_Restore</code> to prevent these issues.  Put around a call to an ambiguous function, they allow reliably determining whether it succeeded; put around <code>Py_DECREF</code>, they prevent the error indicator from being set during the execution of whatever susceptible code in the first place.  (They can also be used even around directly-invoked cleanup code that might fail, so as to allow choosing which exception to propagate.  There’s no question about where to put it in this case: the cleanup code can’t choose between multiple exceptions anyway.)</p>
+<p>Either choice of placement significantly increases code complexity and execution time: there are a lot of calls to ambiguous functions, and there are a lot of <code>Py_DECREF</code>s on error-handling paths.  While the principle of defensive programming would suggest using it in <em>both</em> places, much nicer code would result from (careful programming with) a <strong>universal</strong> convention (to cover the arbitrary code being executed).</p>
+<p>C itself has such a convention: <code>errno</code> must be saved by the caller of arbitrary code even if (like the suppressed exceptions in Python destructors) that code is not expected to set <code>errno</code> to anything.  The main reason is that it can be reset (but never to 0) by many <em>successful</em> library calls (to let them handle errors internally), further narrowing the set of operations safe to perform while <code>errno</code> holds some significant value.  (This also prevents the issue that arises when <code>PyErr_Occurred</code> reports on a preexisting error: C programmers must set <code>errno</code> to 0 before calling an ambiguous function.)  Another reason is that “call some arbitrary code with no error reporting” is not a common operation in most C programs, so burdening other code for its sake would be nonsensical.</p>
+<p>Is there such a convention (even if there is buggy code that doesn’t follow it in CPython itself)?  Failing that, is there a technical reason to guide the choice of one to establish?  Or maybe is this an engineering problem based on too literal a reading of “arbitrary”: should CPython save and restore the error indicator itself while it’s handling destructor exceptions anyway?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If your cleanup is just a bunch of <code>Py_DECREF</code>, you shouldn't need to call <code>PyErr_Fetch</code>. <code>Py_DECREF</code> is intended to be safe to call with an exception set. If the code inside <code>Py_DECREF</code> needs to do something that isn't safe to do with an exception set, it will take responsibility for saving and restoring the exception state. (If your cleanup involves more than just <code>Py_DECREF</code>, you may need to handle things yourself.)</p>
+<p>For example, <code>tp_finalize</code>, one of the steps of object destruction most likely to invoke arbitrary Python code, <a href="https://docs.python.org/3/c-api/typeobj.html#c.PyTypeObject.tp_finalize" rel="nofollow noreferrer">is explicitly responsible for saving and restoring an active exception</a>:</p>
+<blockquote>
+<p><code>tp_finalize</code> should not mutate the current exception status;
+  therefore, a recommended way to write a non-trivial finalizer is:</p>
+<pre><code>static void
+local_finalize(PyObject *self)
+{
+    PyObject *error_type, *error_value, *error_traceback;
+
+    /* Save the current exception, if any. */
+    PyErr_Fetch(&amp;error_type, &amp;error_value, &amp;error_traceback);
+
+    /* ... */
+
+    /* Restore the saved exception. */
+    PyErr_Restore(error_type, error_value, error_traceback);
+}
+</code></pre>
+</blockquote>
+<p>For <code>__del__</code> methods written in Python, you can see the relevant handling in <a href="https://github.com/python/cpython/blob/v3.7.0/Objects/typeobject.c#L6631" rel="nofollow noreferrer"><code>slot_tp_finalize</code></a>:</p>
+<pre><code>/* Save the current exception, if any. */
+PyErr_Fetch(&amp;error_type, &amp;error_value, &amp;error_traceback);
+
+/* Execute __del__ method, if any. */
+del = lookup_maybe_method(self, &amp;PyId___del__, &amp;unbound);
+if (del != NULL) {
+    res = call_unbound_noarg(unbound, del, self);
+    if (res == NULL)
+        PyErr_WriteUnraisable(del);
+    else
+        Py_DECREF(res);
+    Py_DECREF(del);
+}
+
+/* Restore the saved exception. */
+PyErr_Restore(error_type, error_value, error_traceback);
+</code></pre>
+<p>The weak reference system also <a href="https://github.com/python/cpython/blob/v3.7.0/Objects/weakrefobject.c#L880" rel="nofollow noreferrer">takes responsibility</a> for saving exception state before invoking weak reference callbacks:</p>
+<pre><code>if (*list != NULL) {
+    PyWeakReference *current = *list;
+    Py_ssize_t count = _PyWeakref_GetWeakrefCount(current);
+    PyObject *err_type, *err_value, *err_tb;
+
+    PyErr_Fetch(&amp;err_type, &amp;err_value, &amp;err_tb);
+    if (count == 1) {
+        PyObject *callback = current-&gt;wr_callback;
+
+        current-&gt;wr_callback = NULL;
+        clear_weakref(current);
+        if (callback != NULL) {
+            if (((PyObject *)current)-&gt;ob_refcnt &gt; 0)
+                handle_callback(current, callback);
+            Py_DECREF(callback);
+        }
+    }
+    else {
+        ...
+</code></pre>
+<p>So calling <code>Py_DECREF</code> while an exception is set is scary, and it's good that you're thinking about it, but as long as the object destruction code is behaving properly, it should be okay.</p>
+<hr/>
+<p>So what if you have to do more cleanup than just clearing your references? In that case, if your cleanup isn't safe to do with an exception set, you should probably call <code>PyErr_Fetch</code>, and <code>PyErr_Restore</code> the exception state when you're done. If something raises another exception while you're cleaning up, you can either chain it (<a href="https://stackoverflow.com/questions/51030659/modifying-or-reraising-python-error-in-c-api">awkward but possible</a> at C level), or dump a short warning to stderr with <a href="https://docs.python.org/3/c-api/exceptions.html#c.PyErr_WriteUnraisable" rel="nofollow noreferrer"><code>PyErr_WriteUnraisable</code></a> and then suppress the new exception by <code>PyErr_Clear</code>-ing it or by <code>PyErr_Restore</code>-ing the original exception state over it.</p>
+</div>
+<span class="comment-copy">Hm—I know I’ve seen an exception remain set through a <code>Py_DECREF</code>, but that was 3 years ago and is apparently a bug in some C type (rather than <code>__del__</code> or <code>weakref.finalize</code>).  If I had known about the general degree of caution in this situation, I would have known to identify which C type was misbehaving when I had the chance!</span>
+<span class="comment-copy">Your answer implies but doesn’t quite say that it’s the responsibility of any routine that is handling an error <i>other</i> than by <code>Py_DECREF</code> to save/hide, <code>PyErr_WriteUnraisable</code> if necessary, and restore (or chain) exceptions.  Could you add it for completeness?</span>
+<span class="comment-copy">@DavisHerring: Answer expanded.</span>

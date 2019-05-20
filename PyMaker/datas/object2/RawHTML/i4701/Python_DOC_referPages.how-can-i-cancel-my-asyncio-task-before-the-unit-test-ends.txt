@@ -1,0 +1,91 @@
+<div class="post-text" itemprop="text">
+<p>I'm attempting to unit test an asynchronous socket server and using <code>pytest-asyncio</code> to make pytest compatible with the async code base. The server, once started, is always up to send a reply via a while loop, and probably spends most of its time awaiting an incoming message in <code>client_loop()</code>. The problem is there's no way to cancel this task before the unit test framework terminates the event loop and this warning gets issued:</p>
+<blockquote>
+<p>Task was destroyed but it is pending!</p>
+<p>task: &lt; Task pending coro=&lt; Server.new_client() done, defined at /[...path...]/server.py:16&gt; wait_for=&lt; Future pending cb=[&lt; TaskWakeupMethWrapper object at 0x106d7cbe8&gt;()]&gt;&gt;</p>
+</blockquote>
+<p>The only task it appears I have access to is the task created by <code>asyncio.create_task()</code>, which seems to not be the same task. That task looks like this:</p>
+<blockquote>
+<p>task: &lt; Task pending coro=&lt; start_server() running at
+  /usr/local/Cellar/python/[...different path...]/streams.py:86&gt;&gt;</p>
+</blockquote>
+<p>So calling <code>task.cancel(); await task.wait_cancelled()</code> on this task is having no effect.</p>
+<p>How can this unit test be written to cleanly start and start the server for each test and not cut off tasks which may still be running?</p>
+<p>Here's the example:</p>
+<p>test_server.py</p>
+<pre><code>import pytest
+import asyncio
+
+@pytest.fixture
+async def server(event_loop):
+    from server import Server
+    the_server = Server()
+    await the_server.start()
+    yield the_server
+    the_server.stop()
+
+@pytest.mark.asyncio
+async def test_connect(server):
+    loop = asyncio.get_event_loop()
+    reader, writer = await asyncio.open_connection('0.0.0.0', 8888, loop = loop)
+    writer.write(b'something')
+    await reader.read(100)
+    writer.write(b'something else')
+    await reader.read(100)
+    assert 1
+</code></pre>
+<p>server.py</p>
+<pre><code>import asyncio
+
+class Server():
+    async def start(self):
+        loop = asyncio.get_event_loop()
+        coro = asyncio.start_server(self.new_client, '0.0.0.0', 8888, loop = loop)
+        task = loop.create_task(coro)
+        print('\n')
+        print(task)
+        self.server = await task
+
+    def stop(self):
+        self.server.close()
+
+    async def new_client(self, reader, writer):
+        await self.client_loop(reader, writer)
+
+    async def client_loop(self, reader, writer):
+        while True:
+            await reader.read(100)
+            writer.write(b'reply')
+</code></pre>
+<p>If you want to run this example just run <code>pip3 install pytest-asyncio</code> and pytest can pick up this plugin.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You have to <code>await self.server.wait_closed()</code> after calling <code>self.server.close()</code>.</p>
+<p>Your fixture should thus look like this:</p>
+<pre><code>@pytest.fixture
+async def server(event_loop):
+    from server import Server
+    the_server = Server()
+    await the_server.start()
+    yield the_server
+    await the_server.stop()
+</code></pre>
+<p>And the <code>stop</code> method of your <code>Server</code> should look like this:</p>
+<pre><code>    async def stop(self):
+        self.server.close()
+        await self.server.wait_closed()
+</code></pre>
+<p>See <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.Server.wait_closed" rel="nofollow noreferrer">the documentation</a> for details.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <code>asyncio.Server.stop()</code> method does not completely stop the server. It merely stops accepting new connections. Any connections created before close will continue to execute until finished.</p>
+<p>According to <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.Server.close" rel="nofollow noreferrer">the documentation</a> <em>(emphasis mine)</em>:</p>
+<blockquote>
+<p>Stop serving: close listening sockets and set the sockets attribute to None.</p>
+<p><strong>The sockets that represent existing incoming client connections are left open.</strong></p>
+<p>The server is closed asynchronously, use the wait_closed() coroutine to wait until the server is closed.</p>
+</blockquote>
+<p>In this example, all connections are sent to the infinite <code>client_loop</code> method.</p>
+<p>A better solution is to create a collection of Tasks in <code>new_client()</code> responsible for executing <code>client_loop()</code> logic instead of awaiting the method directly. With this approach, all open Tasks can be terminated cleanly in the <code>stop()</code> method.</p>
+</div>
+<span class="comment-copy">Thank you for answering. wait_closed is an important step not present in my code, but this was still not solving the main issue of open connections terminating after the unit test finished.</span>

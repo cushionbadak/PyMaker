@@ -1,0 +1,271 @@
+<div class="post-text" itemprop="text">
+<p>I am in the process of improving a program that parses XML and categorises and indexes its subtrees. The actual program is too large to show here, so I have brought it down to a minimal test case showing the issue I encounter.</p>
+<p>The idea is:</p>
+<ol>
+<li>Process XML files in a directory, one by one</li>
+<li>Process all <code>alpino_ds</code> nodes in a file, in parallel</li>
+<li>During that process, the process needs read/write access to shared variables so that for instance we can check how many times an attribute has occurred in total, or keep track of file handles</li>
+</ol>
+<p>Note that in the actual code there are some more caveats:</p>
+<ul>
+<li>simply returning new values per process and then merging them in the main thread seems not advisable and presumably quite slow because the actual data structure are <code>dict</code>s of four levels deep consisting of <code>dicts</code>, <code>set</code>s, <code>int</code>s, and <code>string</code>s, as well as dict-to-filehandle, and <code>Counter()</code> objects;</li>
+<li>I tried using threads (with <code>ThreadPoolExecutor</code>) and even though there was <em>some</em> gain (I calculated around 5% improvement in speed), this is not good enough for me;</li>
+<li>the actual data I am working with can consist of XML files of more than 60GB, or up to 15 million <code>alpino_ds</code> tags per file. That is the main reason I want to run things in parallel - there is just <em>so</em> much data. That means that the nested objects get quite big as well, so merging/sharing these objects between processes may be a bottleneck in itself.</li>
+</ul>
+<p>Example code:</p>
+<pre><code>from pathlib import Path
+from collections import Counter
+from copy import copy
+from lxml import etree
+
+import concurrent.futures
+
+
+class XmlGrinder:
+    def __init__(self, m=1):
+        if m is False:
+            self.m = 1
+        elif m == 0:
+            self.m = None
+        else:
+            self.m = m
+
+        self.max_a = 7
+        self.max_b = 1000
+
+        self.pdin = self.pdout = None
+        self.pattern_counter = self.fhs = self.corpus = None
+
+    def grind(self, din, dout):
+        self.pdin = Path(din)
+        self.pdout = Path(dout)
+
+        for file in self.pdin.glob('*.xml'):
+            self._grind_xml(file)
+
+    def _grind_xml(self, pfin):
+        self.pattern_counter = Counter()
+        self.filenames = set()
+        self.fhs = {}
+        self.corpus = pfin.stem
+
+        with concurrent.futures.ProcessPoolExecutor(max_workers=self.m) as executor:
+            jobs = []
+            context = etree.iterparse(str(pfin), tag='alpino_ds')
+
+            for _, node in context:
+                attrs = node.attrib
+                # node has to have id
+                if 'id' not in attrs:
+                    continue
+
+                jobs.append(executor.submit(self._process_node, etree.tostring(node)))
+
+                # Makes sure our memory usage is kept in check by getting rid of unused elements
+                # Borrowed from https://stackoverflow.com/a/7171543/1150683
+                node.clear()
+                # Also eliminate now-empty references from the root node to elem
+                for ancestor in node.xpath('ancestor-or-self::*'):
+                    while ancestor.getprevious() is not None:
+                        del ancestor.getparent()[0]
+
+            # Get rid of xml iterator
+            del context
+
+            sentence_nr = 0
+            for job in concurrent.futures.as_completed(jobs):
+                sentence_nr += 1
+                print(f"Processed {self.corpus} sentence {sentence_nr:,d}", job.result(), flush=True)
+
+            # self.* variables are empty! :-(
+            print('pattern counter:', self.pattern_counter)
+            print('filenames:', self.filenames)
+            print('filehandles:', self.fhs)
+
+            # won't do anything because fh is empty:
+            for fh in self.fhs.values():
+                fh.close()
+
+    def _process_node(self, xml_str):
+        node = etree.fromstring(xml_str)
+
+        all_cats = ''
+        for subnode in node.iter('node'):
+            children_size = sum(1 for _ in subnode.iterchildren('node'))
+            descendants_size = sum(1 for _ in subnode.iter('node'))
+            # Size requirements of children and descendants
+            if children_size &lt; 1 \
+                    or self.max_a &lt; children_size \
+                    or descendants_size &gt; self.max_b:
+                continue
+
+            # get attribute of node
+            cat = subnode.attrib['cat']
+            all_cats += cat
+            self.pattern_counter[cat] += 1
+
+            # Create new XML tree
+            tree_xml = etree.Element('tree', {
+                'index': f"{cat}-{self.pattern_counter[cat]}"
+            })
+            tree_xml.append(copy(subnode))
+
+            # open filehandle and write new tree to file
+            if cat not in self.fhs:
+                (self.pdout / self.corpus).mkdir(exist_ok=True, parents=True)
+                tree_filename = self.pdout / self.corpus / f"{self.corpus}-{cat}-trees.xml"
+                # open file handle and keep it open, only close after loop
+                self.fhs[cat] = tree_filename.open(mode='a', encoding='utf-8')
+
+            self.fhs[cat].write('\n\t\t' + etree.tostring(tree_xml, encoding='unicode'))
+
+        return all_cats
+
+
+if __name__ == '__main__':
+    # use m=[int] to enable multiple cores or m=0 to utilise all cores
+    xml_grindr = XmlGrinder()
+    xml_grindr.grind(r'../data', r'../output')
+</code></pre>
+<p>Sample XML (save it to an XML file and put it inside a directory; use that directory as the first argument of <code>xml_grindr.grind()</code>):</p>
+<pre><code>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;treebank&gt;&lt;alpino_ds version="1.3" id="18.head.1.s.1"&gt;&lt;node begin="0" cat="top" end="4" id="0" rel="top"&gt;&lt;node begin="0" cat="conj" end="4" id="1" rel="--"&gt;&lt;node begin="0" end="1" frame="within_word_conjunct" id="2" lcat="np" lemma="_" pos="prefix" postag="SPEC(afgebr)" pt="spec" rel="cnj" root="taal" sense="taal" spectype="afgebr" word="taal-"/&gt;&lt;node begin="1" conjtype="neven" end="2" frame="conj(en)" id="3" lcat="vg" lemma="en" pos="vg" postag="VG(neven)" pt="vg" rel="crd" root="en" sense="en" word="en"/&gt;&lt;node begin="2" cat="mwu" end="4" id="4" mwu_root="spraaktechnologienieuws jul&amp;apos;03" mwu_sense="spraaktechnologienieuws jul&amp;apos;03" rel="cnj"&gt;&lt;node begin="2" end="3" frame="proper_name(both)" genus="onz" getal="ev" graad="basis" id="5" lcat="np" lemma="spraaktechnologienieuws" naamval="stan" ntype="soort" num="both" pos="name" postag="N(soort,ev,basis,onz,stan)" pt="n" rel="mwp" root="spraaktechnologienieuws" sense="spraaktechnologienieuws" word="spraaktechnologienieuws"/&gt;&lt;node begin="3" end="4" frame="proper_name(both)" id="6" lcat="np" lemma="_" num="both" pos="name" postag="SPEC(symb)" pt="spec" rel="mwp" root="jul&amp;apos;03" sense="jul&amp;apos;03" spectype="symb" word="jul&amp;apos;03"/&gt;&lt;/node&gt;&lt;/node&gt;&lt;/node&gt;&lt;/alpino_ds&gt;&lt;alpino_ds version="1.3" id="18.head.2.s.1"&gt;&lt;node begin="0" cat="top" end="2" id="0" rel="top"&gt;&lt;node begin="0" end="1" frame="noun(de,count,sg)" gen="de" id="1" lcat="np" lemma="1" num="sg" numtype="hoofd" pos="noun" positie="vrij" postag="TW(hoofd,vrij)" pt="tw" rel="--" root="1" sense="1" word="1"/&gt;&lt;node begin="1" end="2" frame="punct(punt)" id="2" lcat="punct" lemma="." pos="punct" postag="LET()" pt="let" rel="--" root="." sense="." special="punt" word="."/&gt;&lt;/node&gt;&lt;/alpino_ds&gt;&lt;alpino_ds version="1.3" id="18.head.2.s.2"&gt;&lt;node begin="0" cat="top" end="5" id="0" rel="top"&gt;&lt;node begin="0" cat="mwu" end="5" id="1" mwu_root="DISCUSSIE OVER TAALTECHNOLOGIE IN TAALSCHRIFT" mwu_sense="DISCUSSIE OVER TAALTECHNOLOGIE IN TAALSCHRIFT" rel="--"&gt;&lt;node begin="0" buiging="met-e" end="1" frame="proper_name(both)" graad="basis" id="2" lcat="np" lemma="Discussie" naamval="stan" num="both" pos="name" positie="prenom" postag="ADJ(prenom,basis,met-e,stan)" pt="adj" rel="mwp" root="DISCUSSIE" sense="DISCUSSIE" word="DISCUSSIE"/&gt;&lt;node begin="1" end="2" frame="proper_name(both)" id="3" lcat="np" lemma="over" num="both" pos="name" postag="VZ(init)" pt="vz" rel="mwp" root="OVER" sense="OVER" vztype="init" word="OVER"/&gt;&lt;node begin="2" end="3" frame="proper_name(both)" genus="zijd" getal="ev" graad="basis" id="4" lcat="np" lemma="taaltechnologie" naamval="stan" ntype="soort" num="both" pos="name" postag="N(soort,ev,basis,zijd,stan)" pt="n" rel="mwp" root="TAALTECHNOLOGIE" sense="TAALTECHNOLOGIE" word="TAALTECHNOLOGIE"/&gt;&lt;node begin="3" end="4" frame="proper_name(both)" id="5" lcat="np" lemma="iN" num="both" pos="name" postag="VZ(init)" pt="vz" rel="mwp" root="IN" sense="IN" vztype="init" word="IN"/&gt;&lt;node begin="4" end="5" frame="proper_name(both)" genus="zijd" getal="ev" graad="basis" id="6" lcat="np" lemma="taalschrift" naamval="stan" ntype="soort" num="both" pos="name" postag="N(soort,ev,basis,zijd,stan)" pt="n" rel="mwp" root="TAALSCHRIFT" sense="TAALSCHRIFT" word="TAALSCHRIFT"/&gt;&lt;/node&gt;&lt;/node&gt;&lt;/alpino_ds&gt;&lt;alpino_ds version="1.3" id="18.head.3.s.1"&gt;&lt;node begin="0" cat="top" end="2" id="0" rel="top"&gt;&lt;node begin="0" end="1" frame="number(hoofd(pl_num))" id="1" infl="pl_num" lcat="np" lemma="2" numtype="hoofd" pos="num" positie="vrij" postag="TW(hoofd,vrij)" pt="tw" rel="--" root="2" sense="2" special="hoofd" word="2"/&gt;&lt;node begin="1" end="2" frame="punct(punt)" id="2" lcat="punct" lemma="." pos="punct" postag="LET()" pt="let" rel="--" root="." sense="." special="punt" word="."/&gt;&lt;/node&gt;&lt;/alpino_ds&gt;&lt;alpino_ds version="1.3" id="18.head.3.s.2"&gt;&lt;node begin="0" cat="top" end="7" id="0" rel="top"&gt;&lt;node begin="0" cat="mwu" end="7" id="1" mwu_root="AMERIKAANSE OVERHEID KIEST VOOR LINKFACTORY VAN L&amp;amp;C" mwu_sense="AMERIKAANSE OVERHEID KIEST VOOR LINKFACTORY VAN L&amp;amp;C" rel="--"&gt;&lt;node begin="0" buiging="met-e" end="1" frame="proper_name(both)" graad="basis" id="2" lcat="np" lemma="Amerikaans" naamval="stan" num="both" pos="name" positie="prenom" postag="ADJ(prenom,basis,met-e,stan)" pt="adj" rel="mwp" root="AMERIKAANSE" sense="AMERIKAANSE" word="AMERIKAANSE"/&gt;&lt;node begin="1" end="2" frame="proper_name(both)" genus="zijd" getal="ev" graad="basis" id="3" lcat="np" lemma="overheid" naamval="stan" ntype="soort" num="both" pos="name" postag="N(soort,ev,basis,zijd,stan)" pt="n" rel="mwp" root="OVERHEID" sense="OVERHEID" word="OVERHEID"/&gt;&lt;node begin="2" end="3" frame="proper_name(both)" id="4" lcat="np" lemma="kiezen" num="both" pos="name" postag="WW(pv,tgw,met-t)" pt="ww" pvagr="met-t" pvtijd="tgw" rel="mwp" root="KIEST" sense="KIEST" word="KIEST" wvorm="pv"/&gt;&lt;node begin="3" end="4" frame="proper_name(both)" id="5" lcat="np" lemma="voor" num="both" pos="name" postag="VZ(init)" pt="vz" rel="mwp" root="VOOR" sense="VOOR" vztype="init" word="VOOR"/&gt;&lt;node begin="4" conjtype="neven" end="5" frame="proper_name(both)" id="6" lcat="np" lemma="linkfactory" num="both" pos="name" postag="VG(neven)" pt="vg" rel="mwp" root="LINKFACTORY" sense="LINKFACTORY" word="LINKFACTORY"/&gt;&lt;node begin="5" end="6" frame="proper_name(both)" id="7" lcat="np" lemma="van" num="both" pos="name" postag="VZ(init)" pt="vz" rel="mwp" root="VAN" sense="VAN" vztype="init" word="VAN"/&gt;&lt;node begin="6" end="7" frame="proper_name(both)" genus="zijd" getal="ev" graad="basis" id="8" lcat="np" lemma="l&amp;amp;amp;C" naamval="stan" ntype="soort" num="both" pos="name" postag="N(soort,ev,basis,zijd,stan)" pt="n" rel="mwp" root="L&amp;amp;C" sense="L&amp;amp;C" word="L&amp;amp;C"/&gt;&lt;/node&gt;&lt;/node&gt;&lt;/alpino_ds&gt;&lt;alpino_ds version="1.3" id="18.head.4.s.1"&gt;&lt;node begin="0" cat="top" end="2" id="0" rel="top"&gt;&lt;node begin="0" end="1" frame="number(hoofd(pl_num))" id="1" infl="pl_num" lcat="np" lemma="3" numtype="hoofd" pos="num" positie="vrij" postag="TW(hoofd,vrij)" pt="tw" rel="--" root="3" sense="3" special="hoofd" word="3"/&gt;&lt;node begin="1" end="2" frame="punct(punt)" id="2" lcat="punct" lemma="." pos="punct" postag="LET()" pt="let" rel="--" root="." sense="." special="punt" word="."/&gt;&lt;/node&gt;&lt;/alpino_ds&gt;&lt;alpino_ds version="1.3" id="18.head.4.s.2"&gt;&lt;node begin="0" cat="top" end="6" id="0" rel="top"&gt;&lt;node begin="0" cat="np" end="6" id="1" rel="--"&gt;&lt;node begin="0" buiging="met-e" end="1" frame="noun(both,both,both)" gen="both" graad="basis" id="2" lcat="np" lemma="Spraakgestuurde" naamval="stan" num="both" pos="noun" positie="prenom" postag="ADJ(prenom,basis,met-e,stan)" pt="adj" rel="hd" root="spraakgestuurde" sense="spraakgestuurde" word="SPRAAKGESTUURDE"/&gt;&lt;node begin="1" cat="mwu" end="6" id="3" mwu_root="LAST-MINUTE TAALCURSUS VIA DE TELEFOON" mwu_sense="LAST-MINUTE TAALCURSUS VIA DE TELEFOON" rel="app"&gt;&lt;node begin="1" buiging="met-e" end="2" frame="proper_name(both)" graad="basis" id="4" lcat="np" lemma="Last-minuat" naamval="stan" num="both" pos="name" positie="prenom" postag="ADJ(prenom,basis,met-e,stan)" pt="adj" rel="mwp" root="LAST-MINUTE" sense="LAST-MINUTE" word="LAST-MINUTE"/&gt;&lt;node begin="2" end="3" frame="proper_name(both)" getal="mv" graad="basis" id="5" lcat="np" lemma="taalcursus" ntype="soort" num="both" pos="name" postag="N(soort,mv,basis)" pt="n" rel="mwp" root="TAALCURSUS" sense="TAALCURSUS" word="TAALCURSUS"/&gt;&lt;node begin="3" end="4" frame="proper_name(both)" genus="zijd" getal="ev" graad="basis" id="6" lcat="np" lemma="Via" naamval="stan" ntype="eigen" num="both" pos="name" postag="N(eigen,ev,basis,zijd,stan)" pt="n" rel="mwp" root="VIA" sense="VIA" word="VIA"/&gt;&lt;node begin="4" end="5" frame="proper_name(both)" id="7" lcat="np" lemma="dE" lwtype="bep" naamval="stan" npagr="rest" num="both" pos="name" postag="LID(bep,stan,rest)" pt="lid" rel="mwp" root="DE" sense="DE" word="DE"/&gt;&lt;node begin="5" end="6" frame="proper_name(both)" getal="mv" graad="basis" id="8" lcat="np" lemma="telefoon" ntype="soort" num="both" pos="name" postag="N(soort,mv,basis)" pt="n" rel="mwp" root="TELEFOON" sense="TELEFOON" word="TELEFOON"/&gt;&lt;/node&gt;&lt;/node&gt;&lt;/node&gt;&lt;/alpino_ds&gt;&lt;alpino_ds version="1.3" id="18.head.5.s.1"&gt;&lt;node begin="0" cat="top" end="2" id="0" rel="top"&gt;&lt;node begin="0" end="1" frame="number(hoofd(pl_num))" id="1" infl="pl_num" lcat="np" lemma="4" numtype="hoofd" pos="num" positie="vrij" postag="TW(hoofd,vrij)" pt="tw" rel="--" root="4" sense="4" special="hoofd" word="4"/&gt;&lt;node begin="1" end="2" frame="punct(punt)" id="2" lcat="punct" lemma="." pos="punct" postag="LET()" pt="let" rel="--" root="." sense="." special="punt" word="."/&gt;&lt;/node&gt;&lt;/alpino_ds&gt;&lt;alpino_ds version="1.3" id="18.head.5.s.2"&gt;&lt;node begin="0" cat="top" end="5" id="0" rel="top"&gt;&lt;node begin="0" cat="np" end="5" id="1" rel="--"&gt;&lt;node begin="0" end="1" frame="noun(de,count,pl)" gen="de" id="2" lcat="np" lemma="_" num="pl" pos="noun" postag="SPEC(deeleigen)" pt="spec" rel="hd" root="aio_vacature" sense="aio_vacature" spectype="deeleigen" word="AIO-VACATURES"/&gt;&lt;node begin="1" cat="pp" end="5" id="3" rel="mod"&gt;&lt;node begin="1" end="2" frame="preposition(in,[])" id="4" lcat="pp" lemma="iN" pos="prep" postag="VZ(init)" pt="vz" rel="hd" root="in" sense="in" vztype="init" word="IN"/&gt;&lt;node begin="2" cat="conj" end="5" id="5" rel="obj1"&gt;&lt;node begin="2" end="3" frame="proper_name(both,'LOC')" genus="onz" getal="ev" graad="basis" id="6" lcat="np" lemma="Tilburg" naamval="stan" neclass="LOC" ntype="eigen" num="both" pos="name" postag="N(eigen,ev,basis,onz,stan)" pt="n" rel="cnj" root="TILBURG" sense="TILBURG" word="TILBURG"/&gt;&lt;node begin="3" conjtype="neven" end="4" frame="conj(en)" id="7" lcat="vg" lemma="eN" pos="vg" postag="VG(neven)" pt="vg" rel="crd" root="en" sense="en" word="EN"/&gt;&lt;node begin="4" end="5" frame="proper_name(both,'LOC')" genus="onz" getal="ev" graad="basis" id="8" lcat="np" lemma="Amsterdam" naamval="stan" neclass="LOC" ntype="eigen" num="both" pos="name" postag="N(eigen,ev,basis,onz,stan)" pt="n" rel="cnj" root="AMSTERDAM" sense="AMSTERDAM" word="AMSTERDAM"/&gt;&lt;/node&gt;&lt;/node&gt;&lt;/node&gt;&lt;/node&gt;&lt;/alpino_ds&gt;&lt;alpino_ds version="1.3" id="18.p.1.s.1"&gt;&lt;node begin="0" cat="top" end="7" id="0" rel="top"&gt;&lt;node begin="0" cat="smain" end="7" id="1" rel="--"&gt;&lt;node begin="0" end="1" frame="noun(de,count,pl)" gen="de" getal="mv" graad="basis" id="2" index="1" lcat="np" lemma="computer" ntype="soort" num="pl" pos="noun" postag="N(soort,mv,basis)" pt="n" rel="su" root="computer" sense="computer" word="Computers"/&gt;&lt;node begin="1" end="2" frame="verb(hebben,pl,aux(te_inf))" id="3" infl="pl" lcat="smain" lemma="hoeven" pos="verb" postag="WW(pv,tgw,mv)" pt="ww" pvagr="mv" pvtijd="tgw" rel="hd" root="hoef" sc="aux(te_inf)" sense="hoef" tense="present" word="hoeven" wvorm="pv"/&gt;&lt;node begin="0" cat="ti" end="7" id="4" rel="vc"&gt;&lt;node begin="4" end="5" frame="complementizer(te)" id="5" lcat="cp" lemma="te" pos="comp" postag="VZ(init)" pt="vz" rel="cmp" root="te" sc="te" sense="te" vztype="init" word="te"/&gt;&lt;node begin="0" cat="inf" end="7" id="6" rel="body"&gt;&lt;node begin="0" end="1" id="7" index="1" rel="su"/&gt;&lt;node begin="5" buiging="zonder" end="6" frame="verb('hebben/zijn',inf,aux(inf))" id="8" infl="inf" lcat="inf" lemma="kunnen" pos="verb" positie="vrij" postag="WW(inf,vrij,zonder)" pt="ww" rel="hd" root="kan" sc="aux(inf)" sense="kan" word="kunnen" wvorm="inf"/&gt;&lt;node begin="0" cat="inf" end="7" id="9" rel="vc"&gt;&lt;node begin="0" end="1" id="10" index="1" rel="su"/&gt;&lt;node begin="2" cat="np" end="4" id="11" rel="obj1"&gt;&lt;node begin="2" buiging="zonder" end="3" frame="determiner(geen,nwh,mod,pro,yparg,nwkpro,geen)" id="12" infl="geen" lcat="detp" lemma="geen" naamval="stan" npagr="agr" pdtype="det" pos="det" positie="prenom" postag="VNW(onbep,det,stan,prenom,zonder,agr)" pt="vnw" rel="det" root="geen" sense="geen" vwtype="onbep" wh="nwh" word="geen"/&gt;&lt;node begin="3" end="4" frame="noun(het,mass,sg)" gen="het" genus="onz" getal="ev" graad="basis" id="13" lcat="np" lemma="Nederlands" naamval="stan" ntype="eigen" num="sg" pos="noun" postag="N(eigen,ev,basis,onz,stan)" pt="n" rel="hd" root="Nederlands" sense="Nederlands" word="Nederlands"/&gt;&lt;/node&gt;&lt;node begin="6" buiging="zonder" end="7" frame="verb(hebben,inf(no_e),transitive)" id="14" infl="inf(no_e)" lcat="inf" lemma="verstaan" pos="verb" positie="vrij" postag="WW(inf,vrij,zonder)" pt="ww" rel="hd" root="versta" sc="transitive" sense="versta" word="verstaan" wvorm="inf"/&gt;&lt;/node&gt;&lt;/node&gt;&lt;/node&gt;&lt;/node&gt;&lt;/node&gt;&lt;/alpino_ds&gt;&lt;alpino_ds version="1.3" id="18.p.2.s.2"&gt;&lt;node begin="0" cat="top" end="14" id="0" rel="top"&gt;&lt;node begin="7" end="8" frame="punct(komma)" id="1" lcat="punct" lemma="," pos="punct" postag="LET()" pt="let" rel="--" root="," sense="," special="komma" word=","/&gt;&lt;node begin="10" end="11" frame="punct(komma)" id="2" lcat="punct" lemma="," pos="punct" postag="LET()" pt="let" rel="--" root="," sense="," special="komma" word=","/&gt;&lt;node begin="0" cat="smain" end="13" id="3" rel="--"&gt;&lt;node begin="0" end="1" frame="er_adverb(voor)" id="4" lcat="pp" lemma="daarvoor" pos="pp" postag="BW()" pt="bw" rel="mod" root="daarvoor" sense="daarvoor" special="er" word="Daarvoor"/&gt;&lt;node begin="1" end="2" frame="verb(unacc,sg3,intransitive)" id="5" infl="sg3" lcat="smain" lemma="verlopen" pos="verb" postag="WW(pv,tgw,met-t)" pt="ww" pvagr="met-t" pvtijd="tgw" rel="hd" root="verloop" sc="intransitive" sense="verloop" tense="present" word="verloopt" wvorm="pv"/&gt;&lt;node begin="2" cat="np" end="5" id="6" rel="su"&gt;&lt;node begin="2" end="3" frame="determiner(de)" id="7" infl="de" lcat="detp" lemma="de" lwtype="bep" naamval="stan" npagr="rest" pos="det" postag="LID(bep,stan,rest)" pt="lid" rel="det" root="de" sense="de" word="de"/&gt;&lt;node aform="base" begin="3" buiging="met-e" end="4" frame="adjective(e)" graad="basis" id="8" infl="e" lcat="ap" lemma="menselijk" naamval="stan" pos="adj" positie="prenom" postag="ADJ(prenom,basis,met-e,stan)" pt="adj" rel="mod" root="menselijk" sense="menselijk" vform="adj" word="menselijke"/&gt;&lt;node begin="4" end="5" frame="noun(de,count,sg)" gen="de" genus="zijd" getal="ev" graad="basis" id="9" lcat="np" lemma="communicatie" naamval="stan" ntype="soort" num="sg" pos="noun" postag="N(soort,ev,basis,zijd,stan)" pt="n" rel="hd" root="communicatie" sense="communicatie" word="communicatie"/&gt;&lt;/node&gt;&lt;node begin="5" cat="ap" end="7" id="10" rel="mod"&gt;&lt;node begin="5" end="6" frame="intensifier" id="11" lcat="advp" lemma="te" pos="adv" postag="BW()" pt="bw" rel="mod" root="te" sense="te" special="intensifier" word="te"/&gt;&lt;node aform="base" begin="6" buiging="zonder" end="7" frame="adjective(no_e(adv))" graad="basis" id="12" infl="no_e" lcat="ap" lemma="subtiel" pos="adj" positie="vrij" postag="ADJ(vrij,basis,zonder)" pt="adj" rel="hd" root="subtiel" sense="subtiel" vform="adj" word="subtiel"/&gt;&lt;/node&gt;&lt;node begin="8" cat="ppart" end="10" id="13" rel="mod"&gt;&lt;node begin="8" end="9" frame="intensifier" id="14" lcat="advp" lemma="te" pos="adv" postag="VZ(init)" pt="vz" rel="mod" root="te" sense="te" special="intensifier" vztype="init" word="te"/&gt;&lt;node aform="base" begin="9" buiging="zonder" end="10" frame="adjective(ge_no_e(adv))" id="15" infl="no_e" lcat="ppart" lemma="nuanceren" pos="adj" positie="vrij" postag="WW(vd,vrij,zonder)" pt="ww" rel="hd" root="genuanceerd" sense="genuanceerd" vform="psp" word="genuanceerd" wvorm="vd"/&gt;&lt;/node&gt;&lt;node begin="11" cat="ap" end="13" id="16" rel="mod"&gt;&lt;node begin="11" end="12" frame="intensifier" id="17" lcat="advp" lemma="te" pos="adv" postag="BW()" pt="bw" rel="mod" root="te" sense="te" special="intensifier" word="te"/&gt;&lt;node aform="base" begin="12" buiging="zonder" end="13" frame="adjective(no_e(adv))" graad="basis" id="18" infl="no_e" lcat="ap" lemma="rijk" pos="adj" positie="vrij" postag="ADJ(vrij,basis,zonder)" pt="adj" rel="hd" root="rijk" sense="rijk" vform="adj" word="rijk"/&gt;&lt;/node&gt;&lt;/node&gt;&lt;node begin="13" end="14" frame="punct(punt)" id="19" lcat="punct" lemma="." pos="punct" postag="LET()" pt="let" rel="--" root="." sense="." special="punt" word="."/&gt;&lt;/node&gt;&lt;/alpino_ds&gt;&lt;/treebank&gt;
+</code></pre>
+<p><code>Pipfile</code>, in case you wish to set up a local environment for testing (the above script probably works with 3.4 and up, though):</p>
+<pre><code>[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+lxml = "&gt;=4.2.1"
+
+[dev-packages]
+
+[requires]
+python_version = "3.6"
+</code></pre>
+<p>Depending on how you named the XML, the output of the script will be something as follows:</p>
+<pre><code>Processing WRPEE-dummy sentence 1 topconjmwu
+Processing WRPEE-dummy sentence 2 top
+Processing WRPEE-dummy sentence 3 topmwu
+Processing WRPEE-dummy sentence 4 top
+Processing WRPEE-dummy sentence 5 topmwu
+Processing WRPEE-dummy sentence 6 top
+Processing WRPEE-dummy sentence 7 topnpmwu
+Processing WRPEE-dummy sentence 8 top
+Processing WRPEE-dummy sentence 9 topnpppconj
+Processing WRPEE-dummy sentence 10 topsmaintiinfinfnp
+Processing WRPEE-dummy sentence 11 topsmainnpapppartap
+pattern counter: Counter()
+filenames: set()
+filehandles: {}
+</code></pre>
+<p>This shows that the variables that I want to be shared between processes is indeed not shared or modified. (I am aware that this happens because the process and its variables are forked.) In this dummy example it may not seem very important (even though it is clear that now I can't close the opened file handles), but in the large program these and other variables are modified and used inside the forked processes. The question is, then, how to make that work.</p>
+<p>I read about Pipe() and Queue() and it seems to me that I would need <a href="https://docs.python.org/3.6/library/queue.html" rel="noreferrer"><code>Queue()</code></a>. In addition, because I will be reading and writing very often from the different processes to the same object I think I need a <a href="https://docs.python.org/3.6/library/multiprocessing.html?highlight=process#multiprocessing-managers" rel="noreferrer"><code>Manager()</code></a> as well. This is the part that I am uncertain about, however. I tried reading <a href="https://stackoverflow.com/a/9436866/1150683">this topic</a> but it only confused me more. Furthermore, the comments <a href="https://stackoverflow.com/questions/9436757/how-does-multiprocessing-manager-work-in-python#comment83837396_9436866">suggest</a> that even on 3.6.4 there may be issues when using complex objects. Remember that the actual data that I am sharing is nested and consists of different types.</p>
+<p>The question, in summary, thus is: how can I re-write the above example code to ensure that all <code>Process</code>es have (non-blocking) read/write access to instance variables inside <code>_process_node</code> and methods that are called from within that process? I am willing to update my current Python version (3.6.4) to 3.7, and to use additional libraries.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <code>multiprocessing</code> library lets you make use of <em>parallelism</em> in concurrent Python code. Without <code>multiprocessing</code> the Python GIL tends to get in the way of true parallel execution, but you should see <code>multiprocessing</code> code as no different from other concurrency techniques. Basically, the biggest difference between <code>multiprocessing</code> and threads, is that state is shared via slow-ish IPC calls.</p>
+<p>This means you need to carefully handle <em>shared resources</em>. Your current implementation doesn't do a great job of this; you have multiple concurrent tasks access shared resources without regard for what others may be doing. There are multiple opportunities for race conditions in your code, where multiple tasks can write to the same file, or where a nested data structure is updated without regard for other updates.</p>
+<p>When you have to update shared data structures or files, you usually can pick between two options:</p>
+<ul>
+<li>Use synchronisation; anyone that needs to mutate a resource needs to obtain a shared lock first, or use some <a href="https://docs.python.org/3/library/multiprocessing.html#synchronization-primitives" rel="nofollow noreferrer">other form of synchronisation primitive</a> to coordinate access.</li>
+<li>Make a single task responsible for mutating the resource. This usually involves one or more <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Queue" rel="nofollow noreferrer">queues</a>.</li>
+</ul>
+<p>Note that you'll have to pass either of these objects (synchronisation primitives or queues) to child processes explicitly, see the <a href="https://docs.python.org/3/library/multiprocessing.html#all-start-methods" rel="nofollow noreferrer">programming guidelines</a>; don't use references on an instance to share state.</p>
+<p>For your case, I'd go with queues and dedicated tasks; your bottleneck is the data processing, writing data to disk and updating a few data structures with the results of the analysis tasks is relatively fast in comparison.</p>
+<p>So use a single task to write to files; just put the serialised XML string together with the <code>cat</code> value into a dedicated queue, and have a separate task that pulls these from the queue and writes them to files. This separate task is then responsible for all file access, including opening and closing. This serialises file access and removes the possibility for race conditions and clobbered writes. If the data for these files comes in so thick and fast as to make this task a bottleneck, create tasks per target file.</p>
+<p>Do the same for the shared data structures; send mutations to a queue, leave it to a dedicated task to merge the data. Updating proxy objects is not really suitable because their changes propagate to other processes via RPC calls, increasing the chances for race conditions, and locking won't guarantee that the data is consistent across all task processes!</p>
+<p>For your simple example, updates to the <code>Counter()</code> object are not actually shared; each child process inherits a copy when it forks and updates that local copy, and the parent process will never see the changes made. So you'd use a <em>local, new <code>Counter()</code> instance</em>, and push that into a queue. A dedicated task can then receive these from the queue and update a local <code>Counter()</code> instance with the values by using <code>total_counter.update(queued_counter)</code>, again ensuring that updates are serialised.</p>
+<p>To illustrate, here is a contrived example counting Lorem Ipsum data; a series of <code>count_words</code> tasks do the counting, but pass the <code>Counter()</code> object they produce to a queue for a separate collating task to combine into a final word count. A separate logging task writes data from a logging queue to disk:</p>
+<pre><code>import datetime
+import random
+import re
+import time
+
+from collections import Counter
+from functools import partial
+from multiprocessing import Manager, Pool
+from io import TextIOWrapper
+from urllib.request import urlopen
+
+COMPLETE = "COMPLETE"
+
+def collating_task(countsqueue, logqueue):
+    wordcounts = Counter()
+
+    # Loop until COMPLETE is found in the queue
+    for counts in iter(countsqueue.get, COMPLETE):
+        wordcounts.update(counts)
+        logqueue.put(
+            f"collating: updating with {len(counts)} words "
+            f"(total {len(wordcounts)})"
+        )
+
+    return wordcounts
+
+def logging_task(logqueue):
+    # Loop until COMPLETE is found in the queue
+    with open('logfile.txt', 'w') as logf:
+        for message in iter(logqueue.get, COMPLETE):
+            print(datetime.datetime.now(), message, flush=True, file=logf)
+
+def count_words(line, countsqueue, logqueue):
+    findwords = re.compile(r"\w+").findall
+    counts = Counter(findwords(line))
+    logqueue.put(f"counting: counted {len(counts)} words")
+    # a random short delay to make this task 'heavy'
+    time.sleep(random.uniform(0.0, 0.05))
+    countsqueue.put(counts)
+
+def main():
+    # Random latin text, 1000 paragraphs
+    loripsum_response = urlopen("https://loripsum.net/api/1000/long/plaintext")
+    text = list(TextIOWrapper(loripsum_response, encoding="utf8"))
+    print(f"Will process {len(text)} lines of data")
+
+    # create managed queues that can be passed in as arguments. The alternative
+    # is to create globals or Process() objects with queues passed in.
+    manager = Manager()
+    countsqueue, logqueue = manager.Queue(), manager.Queue()
+    with Pool() as pool:
+        # start processing tasks, these loop forever until signalled
+        collator = pool.apply_async(collating_task, (countsqueue, logqueue))
+        logger = pool.apply_async(logging_task, (logqueue,))
+
+        # process lines, blocks until complete
+        pool.map(partial(count_words, countsqueue=countsqueue, logqueue=logqueue), text)
+
+        countsqueue.put(COMPLETE)
+        wordcounts = collator.get()
+        logqueue.put(COMPLETE)
+        logger.wait()
+
+    print(f"Counted {len(wordcounts)} different words; top 5 is:")
+    for word, count in wordcounts.most_common(5):
+        print(f'{word:&lt;10} {count:4d}')
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<p>which produces something like:</p>
+<pre><code>Will process 2000 lines of data
+Counted 5651 different words; top 5 is:
+et         2078
+in         2074
+est        2036
+non        1911
+ut         1477
+</code></pre>
+<p>and a largish <code>logfile.txt</code> with information pushed to the logging queue.</p>
+</div>
+<span class="comment-copy">The comments indicate that people have not fully understood what is meant by <i>nested objects</i>. <code>manager.list([1, [2, 3]])</code> uses a nested <i>regular</i> list, while <code>manager.list([1, manager.list([2, 3])])</code> nests a <i>proxied, managed list</i>. The latter works (on 3.6 and up), the former requires that you explicitly update the outer list each time for the manager to be notified that something changed. I updated the answer there.</span>
+<span class="comment-copy">@MartijnPieters So the solution would be to create nested <code>manager.dict()</code>s and <code>manager.list()</code>s and then pass those with <code>Process(target=f,args=(d,e,f))</code>? (d, e, f being deep <code>manager.dict()</code>s). I might be wrong, but aren't these things very slow? And is it safe or a <code>manager.dict()</code> to be modified in parallel/concurrently? I am looking forward to any answer that can tell me that it's all fast and safe and that I needn't worry.</span>
+<span class="comment-copy">You still need to treat them as shared resources in a concurrent programming model; you can still trivially cause race conditions if two tasks update the same key in the dictionary. And yes, they are slower, as each mutation has to be sent to the other processes.</span>
+<span class="comment-copy">You'd want to use queues and a single process that receives the updates from the tasks and merges the data.</span>
+<span class="comment-copy">As for your specific application, do you think it is the <i>data processing work</i> that is taking time, or is it the XML reading, parsing and serialisation?</span>
+<span class="comment-copy">Thanks for taking the time to reply! Could you give an example based on my code of 'sending mutations to a queue'? Is it different from returning values from the asynchronous process (e.g. <code>for job in futures.as_completed</code>) in terms of performance or ease of use? And finally, just to be sure, this would mean that parallel execution continues regardless of the state of the queue, right? Even if the queue is not empty, parallel execution continues?</span>
+<span class="comment-copy">@BramVanroy: returning values from a job means you don't get to process those mutations until the job has fully completed. By using a queue you get to process these in parallel, but by making one task responsible for those mutations you avoid race conditions and having to worry about locking and propagation times, and you can use multiple tasks for different tasks; writing to files, collating counts, etc.</span>
+<span class="comment-copy">@BramVanroy: Putting items into the queue does not block, unless you put a cap on the queue. So yes, parallel execution continues.</span>
+<span class="comment-copy">If you could example code of running the queue separately from the parallel execution, that would be great. I've been trying to do it myself by initialising a queue as an instance property and the passing that queue in apply_async, but to no avail <code>p.apply_async(self._process_node, args=(etree.tostring(node), self.q_fhs)</code>. Then <code>put</code>ting a merged dict of old and new values of <code>q_fhs</code> in that queue. But this leads to a deadlock. I would really appreciate example code applied to my example but of course you can just restrict yourself to one variable, e.g. <code>self.fhs</code>.</span>
+<span class="comment-copy">@BramVanroy: you do need to create an additional task that then takes items <i>from</i> the queue. Your existing tasks are hanging because they are waiting to flush items to the queue to prevent queue elements being lost. See the <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Queue.cancel_join_thread" rel="nofollow noreferrer"><code>cancel_join_thread()</code> call</a> and the second warning in the <a href="https://docs.python.org/3/library/multiprocessing.html#pipes-and-queues" rel="nofollow noreferrer">queues and pipes section</a>.</span>

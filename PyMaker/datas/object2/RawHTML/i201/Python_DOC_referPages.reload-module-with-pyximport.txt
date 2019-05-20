@@ -1,0 +1,149 @@
+<div class="post-text" itemprop="text">
+<p>I have a python program that loads quite a bit of data before running. As such, I'd like to be able to reload code without reloading data. With regular python, <code>importlib.reload</code> has been working fine. Here's an example:</p>
+<p>setup.py:</p>
+<pre><code>from distutils.core import setup
+from distutils.extension import Extension
+from Cython.Build import cythonize
+
+extensions = [
+    Extension("foo.bar", ["foo/bar.pyx"],
+              language="c++",
+              extra_compile_args=["-std=c++11"],
+              extra_link_args=["-std=c++11"])
+]
+setup(
+    name="system2",
+    ext_modules=cythonize(extensions, compiler_directives={'language_level' : "3"}),
+)
+</code></pre>
+<p>foo/bar.py</p>
+<pre><code>cpdef say_hello():
+    print('Hello!')
+</code></pre>
+<p>runner.py:</p>
+<pre><code>import pyximport
+pyximport.install(reload_support=True)
+
+import foo.bar
+import subprocess
+from importlib import reload
+
+if __name__ == '__main__':
+
+    def reload_bar():
+        p = subprocess.Popen('python setup.py build_ext --inplace',
+                             shell=True,
+                             cwd='&lt;your directory&gt;')
+        p.wait()
+
+        reload(foo.bar)
+        foo.bar.say_hello()
+</code></pre>
+<p>But this doesn't seem to work. If I edit bar.pyx and run <code>reload_bar</code> I don't see my changes. I also tried <code>pyximport.build_module()</code> with no luck -- the module rebuilt but didn't reload. I'm running in a "normal" python shell, not IPython if it makes a difference.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I was able to get a solution working for Python 2.x a lot easier than Python 3.x. For whatever reason, Cython seems to be caching the shareable object (<code>.so</code>) file it imports your module from, and even after rebuilding and deleting the old file while running, it still imports from the old shareable object file. However, this isn't necessary anyways (when you <code>import foo.bar</code>, it doesn't create one), so we can just skip this anyways.</p>
+<p>The largest problem was that python kept a reference to the old module, even after <code>reload</code>ing. Normal python modules seem to work find, but not anything cython related. To fix this, I run execute two statements in place of <code>reload(foo.bar)</code></p>
+<pre><code>del sys.modules['foo.bar']
+import foo.bar
+</code></pre>
+<p>This successfully (though probably less efficiently) reloads the cython module. The only issue that remains in in Python 3.x running that subprocess creates a problematic shareable objects. Instead, skip that all together and let the <code>import foo.bar</code> work its magic with the <code>pyximporter</code> module, and recompile for you. I also added an option to the <code>pyxinstall</code> command to specify the language level to match what you've specified in the <code>setup.py</code></p>
+<pre><code>pyximport.install(reload_support=True, language_level=3)
+</code></pre>
+<p>So all together:</p>
+<p><strong>runner.py</strong></p>
+<pre><code>import sys
+import pyximport
+pyximport.install(reload_support=True, language_level=3)
+
+import foo.bar
+
+if __name__ == '__main__':
+    def reload_bar():
+        del sys.modules['foo.bar']
+        import foo.bar
+
+    foo.bar.say_hello()
+    input("  press enter to proceed  ")
+    reload_bar()
+    foo.bar.say_hello()
+</code></pre>
+<p><em>Other two files remained unchanged</em></p>
+<p>Running:</p>
+<pre><code>Hello!
+  press enter to proceed
+</code></pre>
+<p>-replace <code>"Hello!"</code> in <strong>foo/bar.pyx</strong> with <code>"Hello world!"</code>, and press <kbd>Enter</kbd>.</p>
+<pre><code>Hello world!
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Cython-extensions are not the usual python-modules and thus the behavior of the underlying OS shimmers through. This answer is about Linux, but also other OSes have similar behavior/problems (ok, Windows wouldn't even allow you to rebuild the extension).</p>
+<p>A cython-extension is a shared object. CPython opens this shared object via <code>ldopen</code> and calls the init-function, i.e. <code>PyInit_&lt;module_name&gt;</code> in Python3, which among other things registers the functions/functionality provided by the extension.</p>
+<p>The most important thing: When <code>ldopen</code> loads a shared object with the same path as one already loaded shared object, it will not read it from the disc, but just reuse the already loaded version - even if it is a different version on the disc.</p>
+<p>And this is the problem with our approach: As long as the resulting shared object has the same name as the old one, you will never get to see the new functionality in the interpreter without restarting it.</p>
+<p>What are your options?</p>
+<p><strong>A: Use <code>pyximport</code> with <code>reload_support=True</code></strong></p>
+<p>Let's assume your Cython (<code>foo.pyx</code>) module looks as follows:</p>
+<pre><code>def doit(): 
+    print(42)
+# called when loaded:
+doit()
+</code></pre>
+<p>Now import it with pyximport:</p>
+<pre><code>&gt;&gt;&gt; import pyximport
+&gt;&gt;&gt; pyximport.install(reload_support=True)
+&gt;&gt;&gt; import foo
+42
+&gt;&gt;&gt; foo.doit()
+42
+</code></pre>
+<p><code>foo.pyx</code> was built and loaded (we can see, it prints 42 while loading, as expected). Let's take a look at the file of <code>foo</code>:</p>
+<pre><code>&gt;&gt;&gt; foo.__file__
+'/home/XXX/.pyxbld/lib.linux-x86_64-3.6/foo.cpython-36m-x86_64-linux-gnu.so.reload1'
+</code></pre>
+<p>You can see the additional <code>reload1</code>-prefix compared to the case built with <code>reload_support=False</code>. Seeing the file-name, we also verify that there is no other <code>foo.so</code> lying in the path somewhere and being wrongly loaded.</p>
+<p>Now let's change <code>42</code> to <code>21</code> in the <code>foo.pyx</code> and reload the file: </p>
+<pre><code>&gt;&gt;&gt; import importlib
+&gt;&gt;&gt; importlib.reload(foo)
+21
+&gt;&gt;&gt; foo.doit()
+42
+&gt;&gt;&gt; foo.__file__
+'/home/XXX/.pyxbld/lib.linux-x86_64-3.6/foo.cpython-36m-x86_64-linux-gnu.so.reload2'
+</code></pre>
+<p>What happened? <code>pyximport</code> built an extension with a different prefix (<code>reload2</code>) and loaded it. It was successful, because the name/path of the new extension is different due to the new prefix and we can see <code>21</code> printed while loaded.</p>
+<p>However, <code>foo.doit()</code> is still the old version! If we look up the <a href="https://docs.python.org/3/library/importlib.html#importlib.reload" rel="nofollow noreferrer"><code>reload</code>-documentation</a>, we see:</p>
+<blockquote>
+<p>When reload() is executed:</p>
+<p>Python module’s code is recompiled and the module-level code re-executed,
+    defining a new set of objects which are bound to names in
+    the module’s dictionary by reusing the loader which originally loaded
+    the module. The <code>init</code> function of extension modules is <strong>not called a
+    second time</strong>.</p>
+</blockquote>
+<p><code>init</code> (i.e. <code>PyInit_&lt;module_name&gt;</code>)  isn't executed for extension (that means also for Cython-extensions), thus <a href="https://docs.python.org/3/c-api/module.html#c.PyModuleDef_Init" rel="nofollow noreferrer"><code>PyModuleDef_Init</code></a> with <code>foo</code>-module-definition isn't called and one is stuck with the old definition bound to <code>foo.doit</code>. This behavior is sane, because for some extension, <code>init</code>-function isn't supposed to be called twice. </p>
+<p>To fix it we have to import the module <code>foo</code> once again:</p>
+<pre><code>&gt;&gt;&gt; import foo
+&gt;&gt;&gt; foo.doit()
+21
+</code></pre>
+<p>Now <code>foo</code> is reloaded as good as it gets - which means there might be still old objects being in use. But I trust you to know what you do.</p>
+<p><strong>B: Change the name of your extensions with every version</strong></p>
+<p>Another strategy could be to build the module <code>foo.pyx</code> as <code>foo_prefix1.so</code> and then <code>foo_prefix2.so</code> and so on and load it as </p>
+<pre><code>&gt;&gt;&gt; import foo_perfixX as foo
+</code></pre>
+<p>This is strategy used by <code>%%cython</code>-magic in IPython, <a href="https://github.com/cython/cython/blob/3a5a2e3b5ccdd5b932d6ff387d8f830e1dd87ab9/Cython/Build/IpythonMagic.py#L307" rel="nofollow noreferrer">which uses sha1-hash</a> of the Cython-code as prefix.</p>
+<hr/>
+<p>Even if reloading and reloading of extension in particular is kind of hacky, for prototyping purposes I would probably go with <code>pyximport</code>-solution... or use IPython and <code>%%cython</code>-magic.</p>
+</div>
+<span class="comment-copy">How are you trying to use the reloaded module? In general (Cython or not) <code>reload(x)</code> can't update existing objects based on things in the <code>x</code> module, and doesn't replace any references to <code>x</code> elsewhere (e.g. if module <code>y</code> also done <code>import x</code> then that isn't automatically updated). You need to be pretty thorough about updating <i>everything</i> that refers to <code>x</code>.</span>
+<span class="comment-copy">yep, i'm aware of this. I generally recreate an object from the reloaded package and rerun. I've updated the original post with a better example.</span>
+<span class="comment-copy">Have you seen the second comment on <a href="https://stackoverflow.com/a/18134343/4657412">this answer</a>?</span>
+<span class="comment-copy">good eye, but it didn't help. i'll update the code in the question to reflect the code change.</span>
+<span class="comment-copy">Is it okay if I open a chat room with you slushi? I can't try running the code myself atm, so there's a few things I'd like to ask you to try, but I'd rather not bloat the comment section with conversation.</span>
+<span class="comment-copy">Does not work with <code>Python 3.6.7, [GCC 8.2.0] on linux</code></span>
+<span class="comment-copy">@jojo Tested on <code>Python 3.5.2 and 2.7.12, [GCC 5.4.0] on linux</code>, so I guess your mileage may vary with newer versions. I'd recommend throwing in an <code>from importlib import reload, invalidate_caches; invalidate_caches(); reload(foo.bar);</code> for good measure.</span>
+<span class="comment-copy">didn't work on 3.6 on a mac either, even with those method calls and an explicit <code>pyximport.build_module()</code> call. also not sure if i'd be able to set the "use c++" options with this approach.</span>
+<span class="comment-copy">@slushi I forgot to mention, you should delete the <code>.so</code> object file before running, otherwise it'll use that and whatever caching it seems to cause.</span>
+<span class="comment-copy">that worked! along with <a href="https://stackoverflow.com/questions/21938065/how-to-configure-pyximport-to-always-make-a-cpp-file" title="how to configure pyximport to always make a cpp file">stackoverflow.com/questions/21938065/…</a> now i can reload my c++ code!</span>

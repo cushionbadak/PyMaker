@@ -1,0 +1,266 @@
+<div class="post-text" itemprop="text">
+<p>In python it is possible to share ctypes objects between multiple processes. However I notice that allocating these objects seems to be extremely expensive.</p>
+<p>Consider following code:</p>
+<pre><code>from multiprocessing import sharedctypes as sct
+import ctypes as ct
+import numpy as np
+
+n = 100000
+l = np.random.randint(0, 10, size=n)
+
+def foo1():
+    sh = sct.RawArray(ct.c_int, l)
+    return sh
+
+def foo2():
+    sh = sct.RawArray(ct.c_int, len(l))
+    sh[:] = l
+    return sh
+
+%timeit foo1()
+%timeit foo2()
+
+sh1 = foo1()
+sh2 = foo2()
+
+for i in range(n):
+    assert sh1[i] == sh2[i]
+</code></pre>
+<p>The output is:</p>
+<pre><code>10 loops, best of 3: 30.4 ms per loop
+100 loops, best of 3: 9.65 ms per loop
+</code></pre>
+<p>There are two things that puzzle me: </p>
+<ul>
+<li>Why is explicit allocation and initialization compared to passing a numpy array so much faster?</li>
+<li>Why is allocating shared memory in python so extremely expensive? <code>%timeit np.arange(n)</code> only takes <code>46.4 µs</code>. There are several orders of magnitude between those timings.</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<h1>Sample Code</h1>
+<p>I rewrote your sample code a little bit to look into this issue. Here's where I landed, I'll use it in my answer below:</p>
+<p><code>so.py</code>:</p>
+<pre><code>from multiprocessing import sharedctypes as sct
+import ctypes as ct
+import numpy as np
+
+n = 100000
+l = np.random.randint(0, 10, size=n)
+
+
+def sct_init():
+    sh = sct.RawArray(ct.c_int, l)
+    return sh
+
+def sct_subscript():
+    sh = sct.RawArray(ct.c_int, n)
+    sh[:] = l
+    return sh
+
+def ct_init():
+    sh = (ct.c_int * n)(*l)
+    return sh
+
+def ct_subscript():
+    sh = (ct.c_int * n)(n)
+    sh[:] = l
+    return sh
+</code></pre>
+<p>Note that I added two test cases that do not use shared memory (and use regular a <code>ctypes</code> array instead).</p>
+<p><code>timer.py</code>:</p>
+<pre><code>import traceback
+from timeit import timeit
+
+for t in ["sct_init", "sct_subscript", "ct_init", "ct_subscript"]:
+    print(t)
+    try:
+        print(timeit("{0}()".format(t), setup="from so import {0}".format(t), number=100))
+    except Exception as e:
+        print("Failed:", e)
+        traceback.print_exc()
+    print
+
+print()
+
+print ("Test",)
+from so import *
+sh1 = sct_init()
+sh2 = sct_subscript()
+
+for i in range(n):
+    assert sh1[i] == sh2[i]
+print("OK")
+</code></pre>
+<h1>Test results</h1>
+<p>The results from running the above code using Python 3.6a0 (specifically <a href="https://github.com/python/cpython/commit/3c2fbdb" rel="nofollow"><code>3c2fbdb</code></a>) are:</p>
+<pre><code>sct_init
+2.844902500975877
+sct_subscript
+0.9383537038229406
+ct_init
+2.7903486443683505
+ct_subscript
+0.978101353161037
+
+Test
+OK
+</code></pre>
+<p>What's interesting is that <em>if you change <code>n</code></em>, the results scale linearly. For example, using <code>n = 100000</code> (10 times bigger), you get something that's pretty much 10 times slower:</p>
+<pre><code>sct_init
+30.57974253082648
+sct_subscript
+9.48625904135406
+ct_init
+30.509132395964116
+ct_subscript
+9.465419146697968
+
+Test
+OK
+</code></pre>
+<h1>Speed difference</h1>
+<p>In the end, the speed difference lies in the hot loop that is called to initialize the array by copying every single value over from the Numpy array (<code>l</code>) to the new array (<code>sh</code>). This makes sense, because as we noted speed scales linearly with array size.</p>
+<p>When you pass the Numpy array as a constructor argument, the function that does this is <a href="https://github.com/python/cpython/blob/6fd916862e1a93b1578d8eabdefc3979a4d4af62/Modules/_ctypes/_ctypes.c#L4213-L4232" rel="nofollow"><code>Array_init</code></a>. However, if you assign using <code>sh[:] = l</code>, then it's <a href="https://github.com/python/cpython/blob/6fd916862e1a93b1578d8eabdefc3979a4d4af62/Modules/_ctypes/_ctypes.c#L4398-L4453" rel="nofollow"><code>Array_ass_subscript</code> that does the job</a>.</p>
+<p>Again, what matters here are the hot loops. Let's look at them.</p>
+<p><code>Array_init</code> hot loop (slower):</p>
+<pre><code>for (i = 0; i &lt; n; ++i) {
+    PyObject *v;
+    v = PyTuple_GET_ITEM(args, i);
+    if (-1 == PySequence_SetItem((PyObject *)self, i, v))
+        return -1;
+}
+</code></pre>
+<p><code>Array_ass_subscript</code> hot loop (faster): </p>
+<pre><code>for (cur = start, i = 0; i &lt; otherlen; cur += step, i++) {
+    PyObject *item = PySequence_GetItem(value, i);
+    int result;
+    if (item == NULL)
+        return -1;
+    result = Array_ass_item(myself, cur, item);
+    Py_DECREF(item);
+    if (result == -1)
+        return -1;
+}
+</code></pre>
+<p>As it turns out, the majority of the speed difference lies in using <code>PySequence_SetItem</code> vs. <code>Array_ass_item</code>. </p>
+<p>Indeed, if you change the code for <code>Array_init</code> to use <code>Array_ass_item</code> instead of <code>PySequence_SetItem</code> (<code>if (-1 == Array_ass_item((PyObject *)self, i, v))</code>), and recompile Python, the new results become:</p>
+<pre><code>sct_init
+11.504781467840075
+sct_subscript
+9.381130554247648
+ct_init
+11.625461496878415
+ct_subscript
+9.265848568174988
+
+Test
+OK
+</code></pre>
+<p>Still a bit slower, but not by much.</p>
+<p>In other words, most of the overhead is caused by a slower hot loop, and mostly caused by <a href="https://github.com/python/cpython/blob/1364858e6ec7abfe04d92b7796ae8431eda87a7a/Objects/abstract.c#L1584-L1609" rel="nofollow">the code that <code>PySequence_SetItem</code> wraps around <code>Array_ass_item</code></a>.</p>
+<p>This code might appear like little overhead at first read, but it really isn't. </p>
+<p><code>PySequence_SetItem</code> actually calls into the entire Python machinery to resolve the <code>__setitem__</code> method and call it. </p>
+<p>This <em>eventually</em> resolves in a call to <code>Array_ass_item</code>, but only after a large number of levels of indirection (which a direct call to <code>Array_ass_item</code> would bypass entirely!)</p>
+<p>Going through the rabbit hole, the call sequence looks a bit like this:</p>
+<ul>
+<li><code>s-&gt;ob_type-&gt;tp_as_sequence-&gt;sq_ass_item</code> points to <a href="https://github.com/python/cpython/blob/cca9b8e3ff022d48eeb76d8567f297bc399fec3a/Objects/typeobject.c#L5790-L5803" rel="nofollow"><code>slot_sq_ass_item</code></a>.</li>
+<li><code>slot_sq_ass_item</code> calls into <a href="https://github.com/python/cpython/blob/cca9b8e3ff022d48eeb76d8567f297bc399fec3a/Objects/typeobject.c#L1439-L1471" rel="nofollow"><code>call_method</code></a>.</li>
+<li><code>call_method</code> calls into <a href="https://github.com/python/cpython/blob/1364858e6ec7abfe04d92b7796ae8431eda87a7a/Objects/abstract.c#L2149-L2175" rel="nofollow"><code>PyObject_Call</code></a></li>
+<li>And on and on until we eventually get to <code>Array_ass_item</code>..!</li>
+</ul>
+<p>In other words, we have C code in <code>Array_init</code> that's calling Python code (<code>__setitem__</code>) in a hot loop. That's slow.</p>
+<h2>Why ?</h2>
+<p>Now, why does Python use <code>PySequence_SetItem</code> in <code>Array_init</code> and not <code>Array_ass_item</code> in <code>Array_init</code>? </p>
+<p>That's because if it did, it would be bypassing the hooks that are exposed to the developer in Python-land.</p>
+<p>Indeed, you <em>can</em> intercept calls to <code>sh[:] = ...</code> by subclassing the array and overriding <code>__setitem__</code> (<code>__setslice__</code> in Python 2). It will be called once, with a <code>slice</code> argument for the index.</p>
+<p>Likewise, defining your own <code>__setitem__</code> also overrides the logic in the constructor. It will be called N times, with an integer argument for the index.</p>
+<p>This means that if <code>Array_init</code> directly called into <code>Array_ass_item</code>, then you would lose something: <code>__setitem__</code> would no longer be called in the constructor, and you wouldn't be able to override the behavior anymore.</p>
+<p>Now can we try to retain the faster speed all the while still exposing the same Python hooks? </p>
+<p>Well, perhaps, using this code in <code>Array_init</code> instead of the existing hot loop:</p>
+<pre><code> return PySequence_SetSlice((PyObject*)self, 0, PyTuple_GET_SIZE(args), args);
+</code></pre>
+<p>Using this will call into <code>__setitem__</code> <strong>once</strong> with a slice argument (on Python 2, it would call into <code>__setslice__</code>). We still go through the Python hooks, but we only do it once instead of N times.</p>
+<p>Using this code, the performance becomes:</p>
+<pre><code>sct_init
+12.24651838419959
+sct_subscript
+10.984305887017399
+ct_init
+12.138383641839027
+ct_subscript
+11.79078131634742
+
+Test
+OK
+</code></pre>
+<h2>Other overhead</h2>
+<p>I think the rest of the overhead may be due to the tuple instantiation that takes place <a href="https://github.com/python/cpython/blob/6fd916862e1a93b1578d8eabdefc3979a4d4af62/Lib/multiprocessing/sharedctypes.py#L66" rel="nofollow">when calling <code>__init__</code> on the array object</a> (note the <code>*</code>, and the fact that <code>Array_init</code> expects a tuple for <code>args</code>) — this presumably scales with <code>n</code> as well.</p>
+<p>Indeed, if you replace <code>sh[:] = l</code> with <code>sh[:] = tuple(l)</code> in the test case, then the performance results become <em>almost</em> identical. With <code>n = 100000</code>:</p>
+<pre><code>sct_init
+11.538272527977824
+sct_subscript
+10.985187001060694
+ct_init
+11.485244687646627
+ct_subscript
+10.843198659364134
+
+Test
+OK
+</code></pre>
+<p>There's probably still something smaller going on, but ultimately we're comparing two substantially different hot loops. There's simply little reason to expect them to have identical performance.</p>
+<p>I think it might be interesting to try calling <code>Array_ass_subscript</code> from <code>Array_init</code> for the hot loop and see the results, though!</p>
+<h1>Baseline speed</h1>
+<p>Now, to your second question, regarding allocating shared memory.</p>
+<p>Note that there isn't really a cost to allocating <em>shared</em> memory. As noted in the results above, there isn't a substantial difference between using shared memory or not.</p>
+<p>Looking at the Numpy code (<code>np.arange</code> is <a href="https://github.com/numpy/numpy/blob/eeba2cbfa4c56447e36aad6d97e323ecfbdade56/numpy/core/src/multiarray/multiarraymodule.c#L2912-L2930" rel="nofollow">implemented here</a>), we can finally understand why it's so much faster than <code>sct.RawArray</code>: <strong><code>np.arange</code> doesn't appear to make calls to Python "user-land"</strong> (i.e. no call to <code>PySequence_GetItem</code> or <code>PySequence_SetItem</code>).</p>
+<p>That doesn't necessarily explain <em>all</em> the difference, but you'd probably want to start investigating there.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Not an answer (<a href="https://stackoverflow.com/a/33915113/364696">the accepted answer</a> explains this quite well), but for those looking for how to fix this, here's how: <strong>Don't use <code>RawArray</code>s slice assignment operator</strong>.</p>
+<p>As noted in <a href="https://stackoverflow.com/a/33915113/364696">the accepted answer</a>, <code>RawArray</code>s slice assignment operator doesn't take advantage of the fact that you're copying between two wrappers around C-style arrays of identical type and size. But <code>RawArray</code> implements the buffer protocol, so you can wrap it in <a href="https://docs.python.org/3/library/stdtypes.html#memoryview" rel="nofollow noreferrer">a <code>memoryview</code></a> to access it in an "even more raw" way (and it will make <code>Foo2</code> win, because you can only do this after constructing the object, not as part of construction):</p>
+<pre><code>def foo2():
+    sh = sct.RawArray(ct.c_int, len(l))
+    # l must be another buffer protocol object w/the same C format, which is the case here
+    memoryview(sh)[:] = l
+    return sh
+</code></pre>
+<p>In tests <a href="https://stackoverflow.com/a/37708824/364696">solving this problem on another question</a>, the time to copy using a <code>memoryview</code> wrapper is less than 1% of the time required to copy with <code>RawArray</code>s normal slice assignment.
+One trick here is that the sizes of the elements of the output of <code>np.random.randint</code> are <code>np.int</code>, and on a 64 bit system, <code>np.int</code> is 64 bits, so on 64 bit Python, you need another round of copying to coerce it to the right size (or you need to declare the <code>RawArray</code> to be of a type that matches the size of <code>np.int</code>). Even if you do need to make that temporary copy though, it's still much cheaper with a <code>memoryview</code>:</p>
+<pre><code>&gt;&gt;&gt; l = np.random.randint(0, 10, size=100000)
+&gt;&gt;&gt; %time sh = sct.RawArray(ct.c_int, len(l))
+Wall time: 472 µs  # Creation is cheap
+
+&gt;&gt;&gt; %time sh[:] = l
+Wall time: 14.4 ms  # TOO LONG!
+
+# Must convert to numpy array with matching element size when c_int and np.int don't match
+&gt;&gt;&gt; %time memoryview(sh)[:] = np.array(l, dtype=np.int32)
+Wall time: 424 µs
+</code></pre>
+<p>As you can see, even when you need to copy the <code>np.array</code> to resize the elements first, the total time is less than 3% of the time required using <code>RawArray</code>'s own slice assignment operator.</p>
+<p>If you avoid the temporary copy by making the size of the <code>RawArray</code> match the source, the cost drops further:</p>
+<pre><code># Make it 64 bit to match size of np.int on my machine
+&gt;&gt;&gt; %time sh = sct.RawArray(ct.c_int64, len(l))
+Wall time: 522 µs  # Creation still cheap, even at double the size
+
+# No need to convert source array now:
+&gt;&gt;&gt; %time memoryview(sh)[:] = l
+Wall time: 123 µs
+</code></pre>
+<p>which gets us down to 0.85% of the <code>RawArray</code> slice assignment time; at this point, you're basically running at <code>memcpy</code> speeds; the rest of your actual Python code will swamp the miniscule amount of time spent on data copying.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This should be a comment, but I do not have enough reputation :-(</p>
+<p>Starting with Python 3.5, shared arrays in Linux are created as temp files mapped to memory (see <a href="https://bugs.python.org/issue30919" rel="nofollow noreferrer">https://bugs.python.org/issue30919</a>). I think this explains why creating a Numpy array, which is created in memory, is faster than creating and initializing a large shared array.
+To force Python to use shared memory, a workaround is to execute these two lines of code (ref. <a href="https://stackoverflow.com/questions/43573500/no-space-left-while-using-multiprocessing-array-in-shared-memory">No space left while using Multiprocessing.Array in shared memory</a>):</p>
+<p><code>from multiprocessing.process import current_process
+ current_process()._config[‘tempdir’] = ‘/dev/shm’</code></p>
+</div>
+<span class="comment-copy">The difference is quite substantial, the only line that differs in the source is <a href="https://github.com/python/cpython/blob/master/Lib/multiprocessing/sharedctypes.py#L66" rel="nofollow noreferrer">github.com/python/cpython/blob/master/Lib/multiprocessing/…</a> which is hit when you pass an array</span>
+<span class="comment-copy">Thanks for the very detailed analysis! You say <code>In other words... it looks like the correct behavior here is the slower one!</code> - This I did not get. Does it mean that the slicing initiation can have unexpected effects?</span>
+<span class="comment-copy">@cel My answer wasn't ideal here. The slower behavior is correct, but so is the faster one. I added some detail, and proposed an implementation to have faster <i>and</i> correct behavior (though it would still be a breaking change for users that subclassed a <code>ctypes</code> array <i>and</i> don't handle slices in their <code>__setitem__</code> method; I doubt this would be changed in Python — especially considering the presence of a workaround).</span>
+<span class="comment-copy">@cel also added another note regarding why the baseline is so slow compared to e.g. <code>np.arange</code>. If that's too slow for you, I'd recommend looking into implementing the hot loop in C to cut the corners you can cut.</span>
+<span class="comment-copy">@ThomasOrozco this might be one of the best answers I have ever seen. I must have learned a thousand things reading it. A hearty +1!</span>
+<span class="comment-copy">Small correction: <code>PyArray_Arange</code> is never multithreaded. What you're seeing in that code that you linked to is that while running it drops the GIL. So: <code>PyArray_Arange</code> itself only ever uses one thread, but if your Python program has other threads, they can run at the same time that <code>PyArray_Arange</code> is running.</span>
+<span class="comment-copy">Don't worry. An enhancement to an existing answer might count as answer too. You wouldn't be able to provide a nicely formatted code sample as comment. So, posting this as answer seems appropriate to me.</span>

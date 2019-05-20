@@ -1,0 +1,76 @@
+<div class="post-text" itemprop="text">
+<p>I have an application with a <code>ProcessPoolExecutor</code>, to which I deliver an object instance that has a destructor implemented using the <code>__del__</code> method.</p>
+<p>The problem is, that the <code>__del__</code> method deletes files from the disk, that are common to all the threads (processes). When a process in the pool finishes its job, it calls the <code>__del__</code> method of the object it got and thus ruins the resources of the other threads (processes).</p>
+<p>I tried to prepare a "safe" object, without a destructor, which I would use when submitting jobs to the pool:</p>
+<pre><code>my_safe_object = copy.deepcopy(my_object)
+delattr(my_safe_object, '__del__')
+</code></pre>
+<p>But the <code>delattr</code> call fails with the following error:</p>
+<pre><code>AttributeError: __del__
+</code></pre>
+<p>Any idea how to get rid of the <code>__del__</code> method of an existing object at runtime?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The best thing yo do there, if you have access to the object's class code, is not to rely on <code>__del__</code> at all. The fact of <code>__del__</code> having a permanent side-effect could be a problem by itself, but in an environment using multiprocessing it is definitively a no-go!</p>
+<p>Here is why: first <code>__del__</code> is a method that lies on the instance's class, as most "magic" methods (and that is why you can't delete it from an instance). Second: <code>__del__</code> is called when references to an object reach zero. However, if you don't have any reference to an object on the "master" process, that does not mean all the child processes are over with it. This is likely the source of your problem: reference counting for objects are independent in each process. And third: you don't have that much control on when <code>__del__</code> is called, even in a single process application. It is not hard to have a dangling reference to an object in a dictionary, or cache somewhere - so tying important application behavior to <code>__del__</code> is normally discouraged. And all of this is only for recent Python versions (~ &gt; 3.5), as prior to that, <code>__del__</code> would be even more unreliable, and Python would not ensure it was called at all.</p>
+<p>So, as the other answers put it, you could <em>try</em> snooze <code>__del__</code> directly on the class, but that would have to be done on the object's class in all the sub-processes as well.  </p>
+<p>Therefore the way I recommend you to do this is to have a method to be explicitly  called that will perform the file-erasing and other side-effects when disposing of an object. You simply rename your <code>__del__</code> method and call it just on the main process.</p>
+<p>If you want to ensure this "destructor" to be called,Python does offer some automatic control with the <a href="https://docs.python.org/3/reference/datamodel.html#with-statement-context-managers" rel="nofollow noreferrer">context protocol</a>: you will then use your objects within a <code>with</code> statement block - and destroy it with inside an <code>__exit__</code> method. This method is called automatically at the end of the <code>with</code> block. Of course, you will have to devise a way for the <code>with</code> block just to be left when work in the subprocess on the instance have finished. That is why in this case, I think an ordinary, explicit, clean-up method that would be called on your main process when consuming the "result" of whatever you executed off-process would be easier.</p>
+<h1>TL;DR</h1>
+<ul>
+<li>Change your source object's class clean-up code from <code>__del__</code> to an ordinary method, like <code>cleanup</code></li>
+<li>On submitting your instances to off-process executing, call the clean-up in your main-process, by using the <code>concurrent.futures.as_completed</code> call.</li>
+</ul>
+<p>In case you can't change the source code for the object's class, inherit it, 
+override <code>__del__</code> with a no-op method, and force the object's <code>__class__</code> atribute to the inherited class before submitting it to other processes:</p>
+<pre><code>class SafeObject(BombObject):
+    def __del__(self):
+       pass
+
+def execute(obj):
+    # this function is executed in other process
+    ...
+
+def execute_all(obj_list):
+    executor = concurrent.futures.ProcessPoolExecutor(max_workers=XX)
+    with executor:
+        futures = {}
+        for obj in obj_list:
+            obj.__class__ = SafeObject
+            futures[executor.submit(execute, obj)] = obj
+        for future in concurrent.futures.as_completed(futures):
+            value = future.result()  # add try/except aroudn this as needed.
+            BombClass.__del__(obj)  # Or just restore the "__class__" if the isntances will be needed elsewhere
+
+    del futures  # Needed to clean-up the extra references to the objects created in the futures dict. 
+</code></pre>
+<p>(please note that the "with" statement above is from the recommended usage for ProcessPoolExecutor, from the docs, not for the custom <code>__exit__</code> method I suggested you using earlier in the answer. Having a <code>with</code> block equivalent that will allow you to take full advantage of the ProcessPoolExecutor will require some ingenuity into it)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>In general, <em>methods belong to the class</em>. While generally you can <em>shadow</em> a method on an instance, special "dunder" methods are optimized to check the class first regardless. So consider:</p>
+<pre><code>In [1]: class Foo:
+   ...:     def __int__(self):
+   ...:         return 42
+   ...:
+
+In [2]: foo = Foo()
+
+In [3]: int(foo)
+Out[3]: 42
+
+In [4]: foo.__int__ = lambda self: 43
+
+In [5]: int(foo)
+Out[5]: 42
+</code></pre>
+<p>You can read more about this behavior in <a href="https://docs.python.org/3/reference/datamodel.html#special-method-lookup" rel="nofollow noreferrer">the docs</a></p>
+<blockquote>
+<p>For custom classes, implicit invocations of special methods are only guaranteed to work correctly if defined on an object’s type, not in the object’s instance dictionary.</p>
+</blockquote>
+<p>I think the cleanest solution if you are using <code>multiprocessing</code> is to simply derive from the class and override <code>__del__</code>. I fear that monkey-patching the class will not play nice with multiprocessing, unless you monkey patch the class in all the processes. Not sure how the <code>pickle</code>ing will work out here.</p>
+</div>
+<span class="comment-copy">Check to ensure that <code>__del__</code> is in the deep copy.</span>
+<span class="comment-copy">In this example, why are you copying the object?</span>
+<span class="comment-copy">Wouldn't overriding the <code>__del__</code> method contents to just <code>pass</code> be better in this case?</span>
+<span class="comment-copy">Methods are stored in classes, not the objects themselves.</span>
+<span class="comment-copy">@NPE um, no, that is <i>completely true</i>. Methods are stored in the class. You can <i>shadow</i> a method on an instance by assigning to an attribute of the same name, but the method still exists on the class. Special "dunder" methods, like <code>__del__</code> or <code>__int__</code> etc are special cased for speed and are always looked up on the class first. But <i>typically</i> anyways, methods always belong to the class</span>

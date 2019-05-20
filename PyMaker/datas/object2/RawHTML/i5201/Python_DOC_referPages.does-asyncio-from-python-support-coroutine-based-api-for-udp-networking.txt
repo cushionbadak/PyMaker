@@ -1,0 +1,79 @@
+<div class="post-text" itemprop="text">
+<p>I was browsing the python <code>asyncio</code> module documentation this night looking for some ideas for one of my course projects, but I soon find that there might be a lack of feature in python's standard <code>aysncio</code> module.</p>
+<p>If you look through the documentation, you'll find that there's a callback based API and a coroutine based API. And the callback API could be used for building both UDP and TCP applications, while it looks that the coroutine API could only be used for building TCP application, as it utilizes the use of a stream-style API.</p>
+<p>This quite causes a problem for me because I was looking for a coroutine-based API for UDP networking, although I did find that <code>asyncio</code> supports low-level coroutine based socket methods like <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.AbstractEventLoop.sock_recv" rel="noreferrer"><code>sock_recv</code></a> and <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.AbstractEventLoop.sock_sendall" rel="noreferrer"><code>sock_sendall</code></a>, but the crucial APIs for UDP networking, <code>recvfrom</code> and <code>sendto</code> are not there.</p>
+<p>What I wish to do is to write some codes like:</p>
+<pre><code>async def handle_income_packet(sock):
+    await data, addr = sock.recvfrom(4096)
+    # data handling here...
+    await sock.sendto(addr, response)
+</code></pre>
+<p>I know that this could be equivalently implemented using a callback API, but the problem here is that callbacks are not coroutines but regular functions, so that in it you cannot yield control back to the event loop and preserve the function execution state. </p>
+<p>Just look at the above code, if we need to do some blocking-IO operations in the data handling part, we won't have a problem in the coroutine version as long as our IO operations are done in coroutines as well: </p>
+<pre><code>async def handle_income_packet(sock):
+    await data, addr = sock.recvfrom(4096)
+    async with aiohttp.ClientSession() as session:
+        info = await session.get(...)
+    response = generate_response_from_info(info)
+    await sock.sendto(addr, response)
+</code></pre>
+<p>As long as we use <code>await</code> the event loop would take the control flow from that point to handle other things until that IO is done. But sadly these codes are <strong>not</strong> usable at this moment because we do not have a coroutined version of <code>socket.sendto</code> and <code>socket.recvfrom</code> in <code>asyncio</code>.</p>
+<p>What we could implement this in is to use the transport-protocol callback API:</p>
+<pre><code>class EchoServerClientProtocol(asyncio.Protocol):
+    def connection_made(self, transport):
+        peername = transport.get_extra_info('peername')
+        self.transport = transport
+
+    def data_received(self, data):
+        info = requests.get(...)
+        response = generate_response_from_info(info)
+        self.transport.write(response)
+        self.transport.close()
+</code></pre>
+<p>we cannot <code>await</code> a coroutine there because callbacks are not coroutines,  and using a blocking IO call like above would stall the control flow in the callback and prevent the loop to handle any other events until the IO is done</p>
+<p>Another recommended implementation idea is to create a <code>Future</code> object in the <code>data_received</code> function, add it to the event loop, and store any needed state variable in the Protocol class, then explicitly return control to the loop. While this could work, it does create a lot of complex codes where in the coroutine version they're not needed in any way.</p>
+<p>Also <a href="https://www.pythonsheets.com/notes/python-asyncio.html#simple-asyncio-udp-echo-server" rel="noreferrer">here</a> we have an example of using non-blocking socket and <code>add_reader</code> for handle UDP sockets. But the code still looks complex comparing to coroutine-version's a few lines.</p>
+<p>The point I want to make is that coroutine is a really good design that could utilize the power of concurrency in one single thread while also has a really straightforward design pattern that could save both brainpower and unnecessary lines of codes, but the crucial part to get it work for UDP networking is really lacking in our <code>asyncio</code> standard library.</p>
+<p>What do you guys think about this?</p>
+<p>Also, if there's any other suggestions for 3rd party libraries supporting this kind of API for UDP networking, I would be extremely grateful for the sake of my course project. I found <a href="https://github.com/sampsyo/bluelet" rel="noreferrer">Bluelet</a> is quite like such a thing but it does not seem to be actively maintained.</p>
+<p>edit:</p>
+<p>It seems that this <a href="https://github.com/python/asyncio/pull/321" rel="noreferrer">PR</a> did implement this feature but was rejected by the <code>asyncio</code> developers. The developers claim that all functions could be implemented using <code>create_datagram_endpoint()</code>, the protocol-transfer API. But just as I have discussed above, coroutine API has the power of simpleness compared to using the callback API in many use cases, it is really unfortunate that we do not have these with UDP.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The reason a stream-based API is not provided is because streams offer <em>ordering</em> on top of the callbacks, and UDP communication is inherently unordered, so the two are fundamentally incompatible.</p>
+<p>But none of that means you can't invoke coroutines from your callbacks - it's in fact quite easy! Starting from the <a href="https://docs.python.org/3/library/asyncio-protocol.html#udp-echo-server-protocol" rel="nofollow noreferrer"><code>EchoServerProtocol</code> example</a>, you can do this:</p>
+<pre><code>def datagram_received(self, data, addr):
+    loop = asyncio.get_event_loop()
+    loop.create_task(self.handle_income_packet(data, addr))
+
+async def handle_income_packet(self, data, addr):
+    # echo back the message, but 2 seconds later
+    await asyncio.sleep(2)
+    self.transport.sendto(data, addr)
+</code></pre>
+<p>Here <code>datagram_received</code> starts your <code>handle_income_packet</code> coroutine which is free to await any number of coroutines. Since the coroutine runs in the "background", the event loop is not blocked at any point and <code>datagram_received</code> returns immediately, just as intended.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You might be interested in <a href="https://gist.github.com/vxgmichel/e47bff34b68adb3cf6bd4845c4bed448" rel="nofollow noreferrer">this module providing high-level UDP endpoints for asyncio</a>:</p>
+<pre><code>async def main():
+    # Create a local UDP enpoint
+    local = await open_local_endpoint('localhost', 8888)
+
+    # Create a remote UDP enpoint, pointing to the first one
+    remote = await open_remote_endpoint(*local.address)
+
+    # The remote endpoint sends a datagram
+    remote.send(b'Hey Hey, My My')
+
+    # The local endpoint receives the datagram, along with the address
+    data, address = await local.receive()
+
+    # Print: Got 'Hey Hey, My My' from 127.0.0.1 port 50603
+    print(f"Got {data!r} from {address[0]} port {address[1]}")
+</code></pre>
+</div>
+<span class="comment-copy">It's asyncore module that handles what you're describing, not asyncio <a href="https://stackoverflow.com/questions/34040658/python-asyncore-with-udp" title="python asyncore with udp">stackoverflow.com/questions/34040658/python-asyncore-with-udp</a></span>
+<span class="comment-copy">@dmitryro The asyncore module is deprecated, and asyncio handles UDP at least as well - see <a href="https://docs.python.org/3/library/asyncio-protocol.html#udp-echo-client-protocol" rel="nofollow noreferrer">the documentation</a> for examples. Either way, the OP would not be helped by asyncore, whose event loop doesn't support coroutines.</span>
+<span class="comment-copy">@user4815162342 Good to know. Thanks.</span>
+<span class="comment-copy">Well, though I personally prefer to avoid the use of callbacks in design pattern, this solution certainly is a smart enough one to me to limit the use of callback to the largest extent. I'll accept this one. Thanks!  Just a follow-up question, if I tend to use low-level socket interface with <code>asyncio</code>, say I want to send ICMP packets, is using <code>add_reader</code> the only solution?</span>
+<span class="comment-copy">@Chaserhkj In this case you can view the callbacks not as a design choice, but as no more than an API entry point, a mere trampoline to the world of coroutines. I have never used ICMP packets, so I wouldn't venture to guess, but that might be material for another question.</span>

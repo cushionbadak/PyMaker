@@ -1,0 +1,63 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to use <code>itertools.tee</code> to know if an iterator is empty without consuming it entirely:</p>
+<pre><code>from itertools import tee
+def get_iterator(i):
+    i1, i2 = tee(i, 2)
+    if next(i1, None) is None:
+       # iterator is empty - raises some error
+       pass
+    return i2 # return not empty iterator to caller
+</code></pre>
+<p>As the <a href="https://docs.python.org/3.6/library/itertools.html#itertools.tee" rel="nofollow noreferrer">docs</a> of tee states:</p>
+<blockquote>
+<p>This itertool may require significant auxiliary storage (depending on how much temporary data needs to be stored). In general, if one iterator uses most or all of the data before another iterator starts, it is faster to use list() instead of tee().</p>
+</blockquote>
+<p>so it's clearly when i is not empty, i2 uses most of the data before i1 does.
+Can a simple del overcome this?:</p>
+<pre><code>from itertools import tee
+def get_iterator(i):
+    i1, i2 = tee(i, 2)
+    if next(i1, None) is None:
+       # iterator is empty - raises some error
+       pass
+    del i1  # Does this overcome storage issue?
+    return i2  # return not empty iterator to caller
+</code></pre>
+<p>Is there a better way of achieving this goal?</p>
+<p>Thanks in advance!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is somewhat subtle - it depends on an undocumented property of the <code>tee</code> function along with an intentionally vague property of the <a href="https://docs.python.org/3/library/gc.html" rel="nofollow noreferrer">garbage collector</a>. The sample Python code would store all the items from the point where the iterators were created until they're consumed by each iterator, but one might easily imagine that the iterators would have a cleanup effect that would drop their claim on data in the queue. But even so, <code>del</code> removes your name; it doesn't guarantee the object's destruction. Such a cleanup would thus work but not necessarily at the time you expect it. Knowing whether this happens would require reading <a href="https://hg.python.org/cpython/file/tip/Modules/itertoolsmodule.c#l378" rel="nofollow noreferrer">the source code for <code>tee</code></a>. It does have <a href="https://docs.python.org/3/library/weakref.html" rel="nofollow noreferrer">weak reference</a> support for the individual iterators, suggesting one way this optimization could have been done. </p>
+<p>The CPython code for <a href="https://hg.python.org/cpython/file/tip/Modules/itertoolsmodule.c#l621" rel="nofollow noreferrer"><code>tee_next</code></a> is reasonably simple; it holds a reference to a <code>teedataobject</code>, which is a batch of up to 57 items, also forming a singly linked list. Thus the normal reference counting semantics apply at that batch level. So basically, for CPython, up to 56 items are kept in memory even <em>after</em> they've been consumed by <em>all</em> the iterators, but no more than that because the reference count handling is immediate. As long as the <code>tee</code> iterators exist, any number of items between them can be held, but they do not read ahead from the source iterator; at least one tee iterator must have fetched the items via <a href="https://hg.python.org/cpython/file/tip/Modules/itertoolsmodule.c#l433" rel="nofollow noreferrer"><code>teedataobject_getitem</code></a>. </p>
+<p>So the basic verdict is: yes, <code>del</code> will work in CPython, but using <code>tee</code> means you're temporarily storing batches of 57 items, not 1. Repeating this method could cause an arbitrary number of such windows - except <code>tee</code> iterators are copyable, and will share their underlying list. </p>
+<p>This is the interpretation specifically of one version (4243df51fe43) of CPython. Implementations will differ in e.g. PyPy, IronPython, Jython, or other versions of CPython. </p>
+<p>For instance, <a href="https://bitbucket.org/pypy/pypy/src/cadf868794410a9b3e8178b4b08b252acdbc2cce/pypy/module/itertools/interp_itertools.py?at=default#interp_itertools.py-875" rel="nofollow noreferrer">PyPy's tee</a> (version cadf868) uses a similar linked list with one item per link, so doesn't batch up the way this CPython version did. </p>
+<p>There is one notable shortcut that prevents this cost from growing: both <code>tee</code> implementations I examined produce copyable iterators, and also copy copyable iterators. So repeatedly applying <code>tee</code> doesn't create new layers of iterators, a potential problem with the <code>chain</code> approach. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I mean, in your specific case, what wrong with this</p>
+<pre><code>from itertools import chain
+def get_iterator(i):
+    try:
+        first = next(i):
+    except StopIteration:
+       # iterator is empty - raises some error
+       pass
+    return chain([first], i)
+</code></pre>
+<p>It does exactly the same thing, but doesn't store anything other than the first value.</p>
+</div>
+<span class="comment-copy">See <a href="https://github.com/ActiveState/code/tree/master/recipes/Python/413614_Testing_for_an_empty_iterator" rel="nofollow noreferrer">Testing for an empty iterator ActiveState's recipe</a></span>
+<span class="comment-copy">@Chris_Rands <i>tee basically does exhaust the entire iterator to create the new iterators</i> – this is totally not true.</span>
+<span class="comment-copy">@Chris_Rands The docs say "The following Python code helps explain what tee does (although the actual implementation is more complex and uses only a single underlying FIFO queue)." If you look at <code>teedataobject_getitem</code> in the CPython code, you see that it only grabs new data <code>PyIter_Next</code> if the lead iterator has reached that point. It then stores that until all <code>tee</code>s have used the value.</span>
+<span class="comment-copy">See Alex Martelli's remark on sentinel value <a href="https://stackoverflow.com/a/3114573/95735">here</a>.</span>
+<span class="comment-copy">@Chris_Rands Only when you run through one of the new iterators. For example, if you use <code>a, b, c = tee(itr, 3)</code> then if you do <code>i = next(a); del i</code> you will have  <code>i</code> stored in memory until <b>both</b> <code>next(b)</code> and <code>next(c)</code> are executed. Worst case scenario, if you do <code>la = list(a)</code> then you will have <code>len(la)</code> elements in memory until both <code>b</code> and <code>c</code> are iterated forward.</span>
+<span class="comment-copy"><i>Implementations will differ in (…) or different version of CPython.</i> :)</span>
+<span class="comment-copy">Many thanks on this comprehensive useful answer!</span>
+<span class="comment-copy">What do you mean by <i>copyable iterator</i>?</span>
+<span class="comment-copy">A copyable iterator has a <a href="https://docs.python.org/3/library/copy.html" rel="nofollow noreferrer"><code>__copy__</code></a> method to produce a copy of itself. A copy of an iterator produces the same output as the first iterator. <code>tee</code> produces copies of iterators even if they don't have the <code>__copy__</code> method, by storing the values as needed.</span>
+<span class="comment-copy">It actually did solved my specific need, but I was also curious about the impact of del on tee objects. Many thanks!</span>
+<span class="comment-copy">This answer deserves its upvotes. It applies to the second question "is there a better way", while mine applied to the first, "can a del overcome [the storage costs of tee]".</span>
+<span class="comment-copy">It's a bad taste to give answer already pointed in comments to the question…</span>
+<span class="comment-copy">@PiotrDobrogost Honestly, I didn't even follow your link. I came up with this independently. Apologies for not checking first.</span>
+<span class="comment-copy">I actually found an argument against this form (and for the <code>tee</code> form). Both PyPy and CPython <code>tee</code> implementations copy iterators if they can, which doesn't copy the underlying storage - and <code>tee</code> iterators are copyable.</span>

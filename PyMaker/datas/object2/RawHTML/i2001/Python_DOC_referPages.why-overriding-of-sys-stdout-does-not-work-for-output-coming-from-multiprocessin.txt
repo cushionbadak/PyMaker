@@ -1,0 +1,118 @@
+<div class="post-text" itemprop="text">
+<p>I am redirecting stdout to a logger, and now I spawned a process using multiprocessing.Process. However even though the processes stdout is redirected to the parent stdout, it ignores the sys.stdout override. Here is an example:</p>
+<pre><code>import multiprocessing
+import sys
+import logging
+
+def worker():
+    print('Hello from the multiprocessing')
+    sys.stdout.flush()
+
+class LoggerWriter:
+    def __init__(self, logger, level):
+        self.logger = logger
+        self.level = level
+
+    def write(self, message):
+        if message != '\n':
+            self.logger.log(self.level, "LOGGER: "+message)
+
+    def flush(self):
+        pass
+
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
+    sys.stdout = LoggerWriter(logging.getLogger(), logging.INFO)
+    p = multiprocessing.Process(target=worker)
+    print("Hello from main")
+    p.start()
+    p.join()
+</code></pre>
+<p>I expected it to print </p>
+<pre><code>LOGGER: Hello from main
+LOGGER: Hello from the multiprocessing
+</code></pre>
+<p>but Instead I get </p>
+<pre><code>LOGGER: Hello from main
+Hello from the multiprocessing
+</code></pre>
+<p>It completely ignores the sys.stdout ... Why is that? Can the first case be achieved?</p>
+<p>Note: This is on Windows 7 - seems like it might play a role.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You're on Windows, so you're using the <a href="https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods" rel="nofollow noreferrer"><em>spawn</em></a> method for starting multiprocessing workers. This method starts a fresh Python interpreter from scratch and imports your script as a module before starting work.</p>
+<p>Because your workers are started from scratch instead of forked, they don't automatically inherit setup performed by the main process, including setup like your stdout wrapper, and they don't redo that setup because it's inside the <code>if __name__ == '__main__'</code> guard. They just have the regular <code>sys.stdout</code>.</p>
+<p>You'll have to arrange for the workers to set up their own stdout wrappers, perhaps by placing the wrapper setup outside the <code>if __name__ == '__main__'</code> guard.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Based the comments and @user2357112's answer, I've eventually ended up using threading.Thread for handling logs from child process (exchanged through Queue), while still using Process for actual work. Here it is in case someone will need something similar.</p>
+<p>Basically after adding:</p>
+<pre><code>class LoggedProcess(multiprocessing.Process):
+
+    class LoggerWriter:
+        def __init__(self, queue):
+            self.queue = queue
+
+        def write(self, message):
+            for line in message.rstrip().splitlines():
+                self.queue.put(line.rstrip())
+
+        def flush(self):
+            pass
+
+    @staticmethod
+    def logged_worker(logger_queue, worker, *args, **kwargs):
+        import sys
+        sys.stdout = sys.stderr = LoggedProcess.LoggerWriter(logger_queue)
+        logging.basicConfig(format="%(message)s", level=logging.INFO)
+        try:
+            worker(*args, **kwargs)
+        except:
+            pass
+        logger_queue.put(None)
+
+    @staticmethod
+    def process_logger(process, logger_queue, name):
+        while True:
+            try:
+                if not process.is_alive():
+                    raise EOFError()
+                msg = logger_queue.get(timeout=1)
+                if msg is None:
+                    raise EOFError()
+                logging.getLogger().log(logging.INFO, f"[PROCESS {process.pid} {name}] {msg}")
+            except queue.Empty:
+                pass # timeout
+            except Exception:
+                break # queue closed
+
+    def __init__(self, target, log_name='', args=(), kwargs={}):
+        self.logger_queue = multiprocessing.Queue()
+        self.log_name = log_name
+        super().__init__(target=self.logged_worker, args=(self.logger_queue, target, *args), kwargs=kwargs)
+
+
+    def start(self):
+        super().start()
+        logger_t = threading.Thread(target=self.process_logger, args=(self, self.logger_queue, self.log_name))
+        logger_t.setDaemon(True)
+        logger_t.start()
+
+    def terminate(self):
+        super().terminate()
+        super().join()
+        self.logger_queue.put(None)
+</code></pre>
+<p>we can just replace <code>p = multiprocessing.Process(target=worker)</code> with <code>p = LoggedProcess(target=worker)</code>. Now child process logs are mixed into the parent process logger, in this case resulting into</p>
+<pre><code>LOGGER: Hello from main
+[PROCESS 5000 ] Hello from the multiprocessing
+</code></pre>
+<p>I've added some additional process info around, but original intent could be still satisfied, plus now it can be for example all put into same single log file by the parent process, or whatever is needed.</p>
+</div>
+<span class="comment-copy">You need to override <code>sys.stdout</code> in each of your processes. Check <a href="https://stackoverflow.com/a/44489010">this answer</a> as an example on capturing STDOUT/STDERR in a multiprocessing setting.</span>
+<span class="comment-copy">Because you construct a <i>new</i> process, so that means it has its own stdin, stdout, etc.</span>
+<span class="comment-copy">Actually, the above works on my python3.7 (although with an extra trailing empty logging line). Is this a windows vs linux thing?</span>
+<span class="comment-copy">@AndrasDeak - It's a fork vs actual new process thing. It may happen on fork-enabled systems (not all multiprocessing can be achieved through forking) but it will always be the case on Windows as it doesn't even support fork.</span>
+<span class="comment-copy">@zwer Thank you, will check it.</span>
+<span class="comment-copy">Thank you, I think I've achieved what I needed, basically each of the workers do set up their logging, plus I needed to have the logging to same resource, so just created also one threading.Thread that gets log messages from child as they come in through Queue (which is a bit ironic since originally I wanted avoid Threads due to GIL limitations etc, but this way their functionality is at least limited to handle  this logging issue, so I guess it's alright).</span>

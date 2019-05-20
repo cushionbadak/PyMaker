@@ -1,0 +1,170 @@
+<div class="post-text" itemprop="text">
+<p>I have the following code (python 3):</p>
+<pre><code>import inspect
+
+def get_class_for_method(method):
+    if inspect.ismethod(method):
+        for cls in inspect.getmro(method.__self__.__class__):
+            if cls.__dict__.get(method.__name__) is method:
+                return cls
+
+        method = method.__func__  # fallback to __qualname__ parsing
+
+    if inspect.isfunction(method):
+        cls = getattr(inspect.getmodule(method),
+                      method.__qualname__.split('.&lt;locals&gt;', 1)[0].rsplit('.', 1)[0])
+
+        if isinstance(cls, type):
+            return cls
+
+    return None
+
+class A:
+    def __init__(self):
+        self.name = 'Class A'
+
+    def foo(self):
+        print('foo: ' + self.name)
+
+def bar(self):
+    print('bar: ' + self.name)
+
+
+setattr(A, bar.__name__, bar)
+
+instance_of_a = A()
+
+instance_of_a.foo()
+instance_of_a.bar()
+
+print(get_class_for_method(A.foo))
+print(get_class_for_method(A.bar))
+</code></pre>
+<p>And get the following output:</p>
+<pre><code>foo: Class A
+bar: Class A
+&lt;class '__main__.A'&gt;
+None
+</code></pre>
+<p>So the methods are working like expected. The only thing what I'm not able to do is to bind the method to the object. So that <code>print(get_class_for_method(A.bar))</code> will return <code>&lt;class '__main__.A'&gt;</code> instead of <code>None</code>.</p>
+<p><code>types.MethodType</code> of the types module looks like exactly what I need but it works only on an explicit instances of the class. What I figured out so far is that I have to set the <code>__self__</code> attribute of the method, but if I'm trying that seems not to change anything.</p>
+<p>Edit: Additional information.</p>
+<p>The idea behind my question is to write a decorator method to overwrite (monkey patch) class methods. The following code is the one I have for now. It works for overwriting methods like expected, but if a method was added dynamically, it fails because <code>get_class_for_method</code> (grabbed from <a href="https://stackoverflow.com/questions/3589311/get-defining-class-of-unbound-method-object-in-python-3">Get defining class of unbound method object in Python 3</a>) return <code>None</code>.</p>
+<pre><code>def patch_method(original_fnc):
+    def get_class_for_method(method):
+        if inspect.ismethod(method):
+            for cls in inspect.getmro(method.__self__.__class__):
+                if cls.__dict__.get(method.__name__) is method:
+                    return cls
+
+            method = method.__func__  # fallback to __qualname__ parsing
+
+        if inspect.isfunction(method):
+            cls = getattr(inspect.getmodule(method),
+                          method.__qualname__.split('.&lt;locals&gt;', 1)[0].rsplit('.', 1)[0])
+
+            if isinstance(cls, type):
+                return cls
+
+        return None
+
+    def wrap(fnc):
+        fnc_object = get_class_for_method(original_fnc)
+
+        if fnc_object is not None:
+            if fnc.__doc__ is None:
+                fnc.__doc__ = original_fnc.__doc__
+
+            method = partial(fnc, original_fnc)
+            method.__doc__ = fnc.__doc__
+            setattr(fnc_object, original_fnc.__name__, method)
+        return None
+    return wrap
+</code></pre>
+<p>Usage of the decorator:</p>
+<pre><code>@patch_method(module.Object.method)
+def patched_method(original, self, arg):
+    print('foo')
+    original(self, arg)
+    print('bar')
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>There's no simple way to do exactly what you want.</p>
+<p>The main reason for this is aliasing. In Python, it's perfectly legal for the same function to be a method of multiple classes:</p>
+<pre><code>class A(object):
+    def method(self):
+        return "foo"
+
+class B(object):
+    method = A.method
+</code></pre>
+<p>Here <code>A.method</code> and <code>B.method</code> are both references to the same function object, but your code will only find class <code>A</code> (regardless of whether you pass it <code>A.method</code> or <code>B.method</code>). It can find that class because of the method's <code>__qualname__</code>, but even that is no guarantee. After the code above ran, you could do <code>del A.method</code> and class A would no longer have the method at all. Your class would now be incorrect (rather than merely incomplete) when it identifies <code>A</code> as the class containing <code>B.method</code>.</p>
+<p>The failure you're currently seeing in your code probably has to do with functions that are initially defined outside of any class:</p>
+<pre><code>def method(self):
+    pass
+
+class A(object):
+    method = method
+</code></pre>
+<p><code>A.method</code> won't identify any class in its <code>__qualname__</code>, since it wasn't in a class when it was defined.</p>
+<p>Now that I've said it's impossible, I want to take that back a bit. There is a very hacky way to do what you want, but I'd strongly discourage you from using it in production code.</p>
+<p>The <code>gc.get_referrers</code> method <em>does</em> let you see all the places an object is being referenced from. In the case of methods, those will mostly be class member dictionaries (though you'll also see global dictionaries if the method was originally defined as a top-level function), and possibly other kinds of containers as well in odd cases. We can write our decorator to replace the original function with the new one in each of those dicts (ignoring any other non-dictionary containers).</p>
+<pre><code>import gc
+
+def patch_method(original_fnc):
+    def wrap(fnc):
+        method = partial(fnc, original_fnc)
+        for container in gc.get_referrers(original_fnc):
+            if isinstance(container, dict): #
+                for key, value in container.items():
+                    if value is original_fnc:
+                        container[key] = method
+        return fnc
+return wrap
+</code></pre>
+<p>To re-emphasize my point about not using this in production: The <a href="https://docs.python.org/3/library/gc.html#gc.get_referrers" rel="nofollow"><code>gc.get_referrers</code> documentation</a> says: "Avoid using <code>get_referrers()</code> for any purpose other than debugging." There's also a good chance that it will not work on other Python interpreters. So while it's neat to see that it can be done, albeit as a gross hack, I'd not recommend this as a solution. </p>
+<p>The better approach is to specifically name the object you want to patch in the decorator call. That is, rather than <code>@patch_method(Foo.bar)</code>, you'd use <code>@patch_method(Foo, "bar")</code>. This is unambiguous, since we're told exactly what class to patch. We don't need to care about aliasing, since we don't need make any attempt to patch the other aliases of the named method. Here's a quick (untested) implementation:</p>
+<pre><code>def patch_method(obj, name):
+    def wrapper(fnc):
+        method = partial(fnc, getattr(obj, name))
+        setattr(obj, name, method)
+        return fnc
+    return wrapper
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You don't have enough information to reliably figure out what class the function has been assigned to. The information you available is: the function, its name and the module it was defined it. However, you don't know anything about the class or even if the class and the function were defined in the same module. It might even be that the function was defined in another function rather than at the module level. </p>
+<p>If you want to be able to do what you're attempting then it'd be easier to set the class on the function when assigning it. But that gets problematic if you assign the function to more than one class, so you'll need to create new function for each class.</p>
+<p>eg.</p>
+<pre><code>from types import FunctionType
+
+class A: pass
+class B: pass
+def bar(self): pass
+
+def set_function(class_, function):
+    new_func = FunctionType(
+        function.__code__,
+        function.__globals__,
+        function.__name__,
+        function.__defaults__,
+        function.__closure__
+    )
+    new_func.owner = class_
+    setattr(class_, new_func.__name__, new_func)
+
+set_function(A, bar)
+set_function(B, bar)
+
+print(A.bar.owner)
+assert not hasattr(bar, "owner")
+assert A.bar.owner is not B.bar.owner
+</code></pre>
+<p>Now you just need to add a third case your <code>get_class_for_method</code> function.</p>
+<p>Additionally, your method test <code>get_class_for_method</code> should test against <code>method.__func__</code> not <code>method</code>. A method is a function with first argument bound to an object. A method never <em>is</em> or <em>equal to</em> its function. eg. <code>A.bar is not A().bar</code> and <code>A.bar != A().bar</code>.</p>
+</div>
+<span class="comment-copy">If you patch <code>A</code> using an instance, it works fine: <code>setattr(A, 'bar', MethodType(bar, A()))</code></span>
+<span class="comment-copy">I'm not sure that what you're wanting to do makes a whole lot of sense. A single function can be added into several classes at once. If that happens, what do you expect your <code>get_class_for_method</code> function to return? Also, the first branch of your code (working with methods) will never succeed since it only checks for an already-bound method object in the class dict. You probably want <code>cls.__dict__.get(method.__name__) is method.__func__</code>.</span>
+<span class="comment-copy">Your suggested function solved my issue and is much cleaner and robust. Thanks for that!</span>
+<span class="comment-copy">I add some additional information above, to make it a bit more clear what I want to achieve. In my opinion it would be preferable to destroy the original function after it was assigned to the object. So the problem with reassign the function to a different object shouldn't be one.</span>

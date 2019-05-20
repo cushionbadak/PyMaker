@@ -1,0 +1,246 @@
+<div class="post-text" itemprop="text">
+<p>I am finding that I am using plenty of context managers in Python. However, I have been testing a number of things using them, and I am often needing the following:</p>
+<pre><code>class MyTestCase(unittest.TestCase):
+  def testFirstThing(self):
+    with GetResource() as resource:
+      u = UnderTest(resource)
+      u.doStuff()
+      self.assertEqual(u.getSomething(), 'a value')
+
+  def testSecondThing(self):
+    with GetResource() as resource:
+      u = UnderTest(resource)
+      u.doOtherStuff()
+      self.assertEqual(u.getSomething(), 'a value')
+</code></pre>
+<p>When this gets to many tests, this is clearly going to get boring, so in the spirit of SPOT/DRY (single point of truth/dont repeat yourself), I'd want to refactor those bits into the test <code>setUp()</code> and <code>tearDown()</code> methods.</p>
+<p>However, trying to do that has lead to this ugliness:</p>
+<pre><code>  def setUp(self):
+    self._resource = GetSlot()
+    self._resource.__enter__()
+
+  def tearDown(self):
+    self._resource.__exit__(None, None, None)
+</code></pre>
+<p>There must be a better way to do this. Ideally, in the <code>setUp()</code>/<code>tearDown()</code> without repetitive bits for each test method (I can see how repeating a decorator on each method could do it).</p>
+<p><strong>Edit:</strong> Consider the undertest object to be internal, and the <code>GetResource</code> object to be a third party thing (which we aren't changing).</p>
+<p>I've renamed <code>GetSlot</code> to <code>GetResource</code> here—this is more general than specific case—where context managers are the way which the object is intended to go into a locked state and out.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>How about overriding <code>unittest.TestCase.run()</code> as illustrated below?  This approach doesn't require calling any private methods or doing something to every method, which is what the questioner wanted.</p>
+<pre><code>from contextlib import contextmanager
+import unittest
+
+@contextmanager
+def resource_manager():
+    yield 'foo'
+
+class MyTest(unittest.TestCase):
+
+    def run(self, result=None):
+        with resource_manager() as resource:
+            self.resource = resource
+            super(MyTest, self).run(result)
+
+    def test(self):
+        self.assertEqual('foo', self.resource)
+
+unittest.main()
+</code></pre>
+<p>This approach also allows passing the <code>TestCase</code> instance to the context manager, if you want to modify the <code>TestCase</code> instance there.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Manipulating context managers in situations where you don't want a <code>with</code> statement to clean things up if all your resource acquisitions succeed is one of the use cases that <a href="https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack" rel="noreferrer"><code>contextlib.ExitStack()</code></a> is designed to handle.</p>
+<p>For example (using <code>addCleanup()</code> rather than a custom <code>tearDown()</code> implementation):</p>
+<pre><code>def setUp(self):
+    with contextlib.ExitStack() as stack:
+        self._resource = stack.enter_context(GetResource())
+        self.addCleanup(stack.pop_all().close)
+</code></pre>
+<p>That's the most robust approach, since it correctly handles acquisition of multiple resources:</p>
+<pre><code>def setUp(self):
+    with contextlib.ExitStack() as stack:
+        self._resource1 = stack.enter_context(GetResource())
+        self._resource2 = stack.enter_context(GetOtherResource())
+        self.addCleanup(stack.pop_all().close)
+</code></pre>
+<p>Here, if <code>GetOtherResource()</code> fails, the first resource will be cleaned up immediately by the with statement, while if it succeeds, the <code>pop_all()</code> call will postpone the cleanup until the registered cleanup function runs.</p>
+<p>If you know you're only ever going to have one resource to manage, you can skip the with statement:</p>
+<pre><code>def setUp(self):
+    stack = contextlib.ExitStack()
+    self._resource = stack.enter_context(GetResource())
+    self.addCleanup(stack.close)
+</code></pre>
+<p>However, that's a bit more error prone, since if you add more resources to the stack without first switching to the with statement based version, successfully allocated resources may not get cleaned up promptly if later resource acquisitions fail.</p>
+<p>You can also write something comparable using a custom <code>tearDown()</code> implementation by saving a reference to the resource stack on the test case:</p>
+<pre><code>def setUp(self):
+    with contextlib.ExitStack() as stack:
+        self._resource1 = stack.enter_context(GetResource())
+        self._resource2 = stack.enter_context(GetOtherResource())
+        self._resource_stack = stack.pop_all()
+
+def tearDown(self):
+    self._resource_stack.close()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem with calling <code>__enter__</code> and <code>__exit__</code> as you did, is not that you have done so: they can be called outside of a <code>with</code> statement. The problem is that your code has no provision to call the object's <code>__exit__</code> method properly if an exception occurs. </p>
+<p>So, the way to do it is to have a decorator that will wrap the call to your original method in a <code>with</code>statement. A short metaclass can apply the decorator transparently to all methods named test* in the class -</p>
+<pre><code># -*- coding: utf-8 -*-
+
+from functools import wraps
+
+import unittest
+
+def setup_context(method):
+    # the 'wraps' decorator preserves the original function name
+    # otherwise unittest would not call it, as its name
+    # would not start with 'test'
+    @wraps(method)
+    def test_wrapper(self, *args, **kw):
+        with GetSlot() as slot:
+            self._slot = slot
+            result = method(self, *args, **kw)
+            delattr(self, "_slot")
+        return result
+    return test_wrapper
+
+class MetaContext(type):
+    def __new__(mcs, name, bases, dct):
+        for key, value in dct.items():
+            if key.startswith("test"):
+                dct[key] = setup_context(value)
+        return type.__new__(mcs, name, bases, dct)
+
+
+class GetSlot(object):
+    def __enter__(self): 
+        return self
+    def __exit__(self, *args, **kw):
+        print "exiting object"
+    def doStuff(self):
+        print "doing stuff"
+    def doOtherStuff(self):
+        raise ValueError
+
+    def getSomething(self):
+        return "a value"
+
+def UnderTest(*args):
+    return args[0]
+
+class MyTestCase(unittest.TestCase):
+  __metaclass__ = MetaContext
+
+  def testFirstThing(self):
+      u = UnderTest(self._slot)
+      u.doStuff()
+      self.assertEqual(u.getSomething(), 'a value')
+
+  def testSecondThing(self):
+      u = UnderTest(self._slot)
+      u.doOtherStuff()
+      self.assertEqual(u.getSomething(), 'a value')
+
+unittest.main()
+</code></pre>
+<p>(I also included mock implementations of "GetSlot" and the methods and functions in your example so that I myself could test the decorator and metaclass I am suggesting on this answer)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>pytest</code> fixtures are very close to your idea/style, and allow for exactly what you want:</p>
+<pre><code>import pytest
+from code.to.test import foo
+
+@pytest.fixture(...)
+def resource():
+    with your_context_manager as r:
+        yield r
+
+def test_foo(resource):
+    assert foo(resource).bar() == 42
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'd argue you should separate your test of the context manager from your test of the Slot class. You could even use a mock object simulating the initialize/finalize interface of slot to test the context manager object, and then test your slot object separately.</p>
+<pre><code>from unittest import TestCase, main
+
+class MockSlot(object):
+    initialized = False
+    ok_called = False
+    error_called = False
+
+    def initialize(self):
+        self.initialized = True
+
+    def finalize_ok(self):
+        self.ok_called = True
+
+    def finalize_error(self):
+        self.error_called = True
+
+class GetSlot(object):
+    def __init__(self, slot_factory=MockSlot):
+        self.slot_factory = slot_factory
+
+    def __enter__(self):
+        s = self.s = self.slot_factory()
+        s.initialize()
+        return s
+
+    def __exit__(self, type, value, traceback):
+        if type is None:
+            self.s.finalize_ok()
+        else:
+            self.s.finalize_error()
+
+
+class TestContextManager(TestCase):
+    def test_getslot_calls_initialize(self):
+        g = GetSlot()
+        with g as slot:
+            pass
+        self.assertTrue(g.s.initialized)
+
+    def test_getslot_calls_finalize_ok_if_operation_successful(self):
+        g = GetSlot()
+        with g as slot:
+            pass
+        self.assertTrue(g.s.ok_called)
+
+    def test_getslot_calls_finalize_error_if_operation_unsuccessful(self):
+        g = GetSlot()
+        try:
+            with g as slot:
+                raise ValueError
+        except:
+            pass
+
+        self.assertTrue(g.s.error_called)
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<p>This makes code simpler, prevents concern mixing and allows you to reuse the context manager without having to code it in many places.</p>
+</div>
+<span class="comment-copy">I don't understand the issue with your <code>setUp</code>/<code>tearDown</code> methods, looks perfectly fine to me. I suppose an alternative would be to create a decorator that uses the <code>with</code> statement and apply it automatically to all methods, but that would be more work for no real benefit.</span>
+<span class="comment-copy">I suppose it is that I view the '__' methods as private and "magic" methods that shouldn't be explicitly called. However, given that this is in a test context, perhaps this will suffice.</span>
+<span class="comment-copy">The setup and teardown is the cleaner of the two.  I would think that GetSlot should have the proper API to be used without the context manager.  The fact that you're struggling with finding the cleanest way to do this proves that GetSlot needs work.  Unless GetSlot is not your code, in which case I take it all back.</span>
+<span class="comment-copy">Go for your existing solution, it is totally valid to call "magic" methods within test cases.</span>
+<span class="comment-copy">If the code is not my code, I could wrap it such that I have a clean outside API, although perhaps I am prepared to take @FerdinandBeyer's as a suitable answer. Add these as answers (and I can credit them).</span>
+<span class="comment-copy">I like this - it is a simple solution.</span>
+<span class="comment-copy">I think the answer it's unclear. Explain better that the test() method is executed inside the context, and that doStuff() or doOtherStuff() can be executed before asserting something.</span>
+<span class="comment-copy">will, with this way, <code>unittest</code> evaluate the occurrence of an exception inside the context manager's <code>__enter__</code> or <code>__exit__</code>, in the same way as it would evaluate the occurrence of an exception in the <code>setUp</code> or <code>tearDown</code> methods, respectively?</span>
+<span class="comment-copy">I came across this while trying to understand <a href="http://flask.pocoo.org/snippets/26/" rel="nofollow noreferrer">flask.pocoo.org/snippets/26</a> where there it seems <code>__call__</code> is used similar to <code>run</code>. I wonder what the difference is between overriding <code>__call__</code> vs <code>run</code>?</span>
+<span class="comment-copy">@BenjaminGolder <code>TestCase.__call__</code> is defined as <code>return self.run(*args, **kwds)</code> so the difference would seem to be stylistic.</span>
+<span class="comment-copy">+1 This is definitely nicer than overriding <code>run</code>.  The only downside is that the context manager can't process exceptions when it's closed like this.</span>
+<span class="comment-copy">The last <code>tearDown</code> example is a bit dangerous, because if <code>setUp</code> fails (after the example <code>with</code> statement), <code>tearDown</code> is not called. Prefer <a href="https://docs.python.org/3/library/unittest.html#unittest.TestCase.addCleanup" rel="nofollow noreferrer"><code>addCleanup</code></a>.</span>
+<span class="comment-copy">Referring to python docs: <a href="http://docs.python.org/library/unittest.html#unittest.TestCase.tearDown" rel="nofollow noreferrer">docs.python.org/library/…</a>, tearDown is called after every test, even when failure cases and exceptions have been raised (and setUp before every test). The MetaClass/MetaContext is surely only going to enter/exit when MyTestCase as a whole test case is run, not the individual units. This could mean there are interactions between tests.</span>
+<span class="comment-copy">@DannyStaple: as for my code: I wrap each individual test method in a decorator which calls teh text within a <code>with</code>statement - both enter and exit are run at each test execution. Insert some print statements on the test_wrapper function and see for yourself. As fro your original code, it is nice to know <code>.__exit__</code> will be called. Technicalle <code>.__exit__</code> should be passed information about the exceptiontaht ocurred, but I agree this should not be an issue in most cases.</span>
+<span class="comment-copy">Ah I see - your hitting the objects dict and applying the context to each item which starts with "test", which would be the test methods. The @wraps decorator is handy to know -I've had the issue of loosing the methods name when wrapping before.</span>
+<span class="comment-copy">This is the solution I ended up going with.</span>
+<span class="comment-copy">The simple solution: use pytest</span>
+<span class="comment-copy">I think mocking is probably the solution here, so I'll give you a +1 for this. The original code (in a number of cases - I've now generalized the question a little) allowed you to construct something, but it wasn't locked until going into context. Note that in the original question - neither the Context, nor the Slot are the SUT (Subject under test)- they are resources.</span>
+<span class="comment-copy">Coming back to this now, I think mocking the resource is exactly what I would now do, as looking at the above code, as you have pointed out, the resource is not under test at all. You may want to not have any side effect the resource could have by being used. I'd mock only the resource interface that the SUT required and may even create helpers to construct the mock resource if I needed it a lot.</span>
+<span class="comment-copy">This answer still leaves open the question of how to apply a context manager in a DRY way to the tests in a TestCase class.</span>
+<span class="comment-copy">cjerdonek: setUp/tearDown itself <i>is</i> a context manager behaviour, even though it's different in style from Python with syntax. If you <i>must</i> use a context manager then it's probably a matter of API, and you should decouple the context manager from the actual code. And, BTW, the setUp/tearDown solution proposed by Danny, although ugly, should work 100%.</span>
+<span class="comment-copy">Alan, I understand that Danny's code works, but his "solution" was part of his question. He was asking for a less ugly way to apply a context manager in a DRY way to the tests in a TestCase class (e.g. one that doesn't require accessing the private methods of a context manager). Perhaps my comment should have read more simply that this answer still leaves unanswered his original question. I offered a way to do this which allows one to use the context manager as-is.</span>

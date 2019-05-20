@@ -1,0 +1,240 @@
+<div class="post-text" itemprop="text">
+<p>I need to create a software that receives concurrently from web socket and pipe and it sends the messages on the other channel (it receives from the socket, creates a new thread and sends to the pipe. In the same way it receives from the pipe, creates a new thread and sends to the socket).</p>
+<p>I have a problem with multithreading, at the boot of the program I have to start the methods <code>socket_receiver</code> and <code>pipe_receiver</code> but I can only start the <code>pipe_receiver</code>. I tried removing all the code and keep only <code>socket_receiver</code> and <code>pipe_receiver</code> but it only enters in the <code>while True</code> of the <code>pipe_receiver</code>.</p>
+<pre><code>import asyncio
+import sys
+import json
+from concurrent.futures.thread import ThreadPoolExecutor
+import websockets
+
+# make the Pool of workers
+executor = ThreadPoolExecutor(max_workers=10)
+# Make connection to socket and pipe
+header = {"Authorization": r"Basic XXXX="}
+connection = websockets.connect('wss://XXXXXXXX', extra_headers=header)
+
+
+async def socket_receiver():
+    """Listening from web socket"""
+    async with connection as web_socket:
+        while True:
+            message = await web_socket.recv()
+            # send the message to the pipe in a new thread
+            executor.submit(send_to_pipe(message))
+
+
+async def pipe_receiver():
+    """Listening from pipe"""
+    while True:
+        message = sys.stdin.readline()
+        if not message:
+            break
+        executor.submit(send_to_socket(message))
+        # jsonValue = json.dump(str(line), file);
+        sys.stdout.flush()
+
+
+def send_to_pipe(message):
+    # Check if message is CAM or DENM
+    json_message = json.loads(message)
+    type = int(json_message["header"]["messageID"])
+    # 1 is DENM message, 2 is CAM message
+    if type == 1  or type == 2:
+        # send the message to the pipe
+        sys.stdout.print(json_message);
+
+
+async def send_to_socket(message):
+     async with connection as web_socket:
+        json_message = json.dumps(message)
+        await web_socket.send(json_message)
+
+
+asyncio.get_event_loop().run_until_complete(
+    asyncio.gather(socket_receiver(),pipe_receiver()))
+</code></pre>
+<p>This program is called by a subprocess, the parent process communicates with it through pipes connected to stdout and stdin.</p>
+<p>UPDATE: I receive this exception with @Martijn Pieters code</p>
+<pre><code>Traceback (most recent call last):
+  File "X", line 121, in &lt;module&gt;
+    main()
+  File "X", line 119, in main
+    loop.run_until_complete(asyncio.gather(socket_coro, pipe_coro))
+  File "X\AppData\Local\Programs\Python\Python37-32\lib\asyncio\base_events.py", line 568, in run_until_complete
+    return future.result()
+  File "X", line 92, in connect_pipe
+    reader, writer = await stdio()
+  File "X", line 53, in stdio
+    lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
+  File "X/AppData\Local\Programs\Python\Python37-32\lib\asyncio\base_events.py", line 1421, in connect_read_pipe
+    transport = self._make_read_pipe_transport(pipe, protocol, waiter)
+  File "X/AppData\Local\Programs\Python\Python37-32\lib\asyncio\base_events.py", line 433, in _make_read_pipe_transport
+    raise NotImplementedError
+NotImplementedError
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You are not using the <code>ThreadPoolExecutor</code> correctly, and you really don't want to use that here. Instead, you need to set up consumers and producers to handle your socket and pipe with queues to send messages between them.</p>
+<ul>
+<li><p>for each connection type, create a coroutine that creates the connection, then passes that single connection to both a consumer and producer <em>tasks</em> (created with <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.ensure_future" rel="nofollow noreferrer"><code>asyncio.ensure_future()</code></a>) for that connection. Use <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.wait" rel="nofollow noreferrer"><code>asyncio.wait()</code></a> to run both tasks with <code>return_when=asyncio.FIRST_COMPLETED</code>, so you can cancel any that are still running when one of the two completes 'early' (e.g. has failed).</p></li>
+<li><p>Use a <a href="https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue" rel="nofollow noreferrer">queue</a> to pass messages from the consumer of one, to the producer of the other connection.</p></li>
+<li><p><code>sys.stdin</code> and <code>sys.stdout</code> are <em>blocking</em> streams, don't just read and write to them!  See <a href="https://gist.github.com/nathan-hoad/8966377" rel="nofollow noreferrer">https://gist.github.com/nathan-hoad/8966377</a> for a gist attempting to set up non-blocking STDIO streams, and <a href="https://github.com/python/asyncio/issues/213" rel="nofollow noreferrer">this asyncio issue</a> that asks for a non-blocking streams feature.</p></li>
+<li><p>Don't use a global socket connection, certainly not with two separate <code>async with</code> statements. Your <code>send_to_socket()</code> method would actually <strong>close</strong> the socket because the <code>async with connection as web_socket:</code> context manager exits when the first message is sent, and this then causes issues for the <code>socket_receiver</code> code which assumes the socket remains open indefinitely. </p></li>
+<li><p>Don't use threading here! Your connections are entirely managed by asyncio, threading would stomp majorly on this. </p></li>
+<li><p><a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Executor" rel="nofollow noreferrer"><code>asyncio.Executor()</code> instances</a> should only be used with regular callables, <em>not</em> with coroutines. <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Executor.submit" rel="nofollow noreferrer"><code>Executor.submit()</code></a> states it takes a callable, passing in a coroutine with <code>executor.submit(send_to_pipe(message))</code> or <code>executor.submit(send_to_socket(message))</code> will cause an exception to be raised as coroutines are not callables. You are probably not seeing an exception message as that exception is raised in the other thread.</p>
+<p>This is the reason your <code>socket_receiver()</code> coroutine fails; it certainly <em>starts</em> but attempts to send messages fail. When I run your code against a local mocked-up websocket server a warning is printed:</p>
+<pre><code>RuntimeWarning: coroutine 'send_to_socket' was never awaited
+  executor.submit(send_to_socket(message))
+</code></pre>
+<p>When a coroutine is not awaited, the code in that coroutine is never executed. Wrapping the coroutine in one that prints out the exception to stderr (<code>try: callable(), except Exception: traceback.print_exc(file=sys.stderr))</code>) you get:</p>
+<pre><code>Traceback (most recent call last):
+  File "soq52219672.py", line 15, in log_exception
+    callable()
+TypeError: 'coroutine' object is not callable
+</code></pre></li>
+</ul>
+<p>Executors should only be used to integrate code that can't be converted to using coroutines; the executor manages that code to run parallel to the <code>asyncio</code> tasks without interference. Care should be taken if that code wanted to interact with <code>asyncio</code> tasks, always use <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.run_coroutine_threadsafe" rel="nofollow noreferrer"><code>asyncio.run_coroutine_threadsafe()</code></a> or <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.AbstractEventLoop.call_soon_threadsafe" rel="nofollow noreferrer"><code>asyncio.call_soon_threadsafe()</code></a> to call across the boundary. See the <a href="https://docs.python.org/3/library/asyncio-dev.html#asyncio-multithreading" rel="nofollow noreferrer"><em>Concurrency and multithreading</em> section</a>.</p>
+<p>Here is an example of how I'd rewrite your code to use the consumer/producer pattern, with <code>stdio()</code> based on the <a href="https://gist.github.com/nathan-hoad/8966377" rel="nofollow noreferrer">Nathan Hoad gist on the subject</a>, plus a fallback for Windows where <a href="https://stackoverflow.com/questions/31510190/aysncio-cannot-read-stdin-on-windows">support for treating stdio as pipes is limited</a>:</p>
+<pre><code>import asyncio
+import json
+import os
+import sys
+
+import websockets
+
+async def socket_consumer(socket, outgoing):
+    # take messages from the web socket and push them into the queue
+    async for message in socket:
+        await outgoing.put(message)
+
+async def socket_producer(socket, incoming):
+    # take messages from the queue and send them to the socket
+    while True:
+        message = await incoming.get()
+        jsonmessage = json.dumps(message)
+        await socket.send(jsonmessage)
+
+async def connect_socket(incoming, outgoing, loop=None):
+    header = {"Authorization": r"Basic XXXX="}
+    uri = 'wss://XXXXXXXX'
+    async with websockets.connect(uri, extra_headers=header) as websocket:
+        # create tasks for the consumer and producer. The asyncio loop will
+        # manage these independently
+        consumer_task = asyncio.ensure_future(
+            socket_consumer(websocket, outgoing), loop=loop)
+        producer_task = asyncio.ensure_future(
+            socket_producer(websocket, incoming), loop=loop)
+
+        # start both tasks, but have the loop return to us when one of them
+        # has ended. We can then cancel the remainder
+        done, pending = await asyncio.wait(
+            [consumer_task, producer_task], return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        # force a result check; if there was an exception it'll be re-raised
+        for task in done:
+            task.result()
+
+
+# pipe support
+async def stdio(loop=None):
+    if loop is None:
+        loop = asyncio.get_event_loop()
+
+    if sys.platform == 'win32':
+        # no support for asyncio stdio yet on Windows, see https://bugs.python.org/issue26832
+        # use an executor to read from stdio and write to stdout
+        class Win32StdinReader:
+            def __init__(self):
+                self.stdin = sys.stdin.buffer 
+            async def readline():
+                # a single call to sys.stdin.readline() is thread-safe
+                return await loop.run_in_executor(None, self.stdin.readline)
+
+        class Win32StdoutWriter:
+            def __init__(self):
+                self.buffer = []
+                self.stdout = sys.stdout.buffer
+            def write(self, data):
+                self.buffer.append(data)
+            async def drain(self):
+                data, self.buffer = self.buffer, []
+                # a single call to sys.stdout.writelines() is thread-safe
+                return await loop.run_in_executor(None, sys.stdout.writelines, data)
+
+        return Win32StdinReader(), Win32StdoutWriter()
+
+    reader = asyncio.StreamReader()
+    await loop.connect_read_pipe(
+        lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
+
+    writer_transport, writer_protocol = await loop.connect_write_pipe(
+        asyncio.streams.FlowControlMixin, os.fdopen(sys.stdout.fileno(), 'wb'))
+    writer = asyncio.streams.StreamWriter(
+        writer_transport, writer_protocol, None, loop)
+
+    return reader, writer
+
+async def pipe_consumer(pipereader, outgoing):
+    # take messages from the pipe and push them into the queue
+    while True:
+        message = await pipereader.readline()
+        if not message:
+            break
+        await outgoing.put(message.decode('utf8'))
+
+async def pipe_producer(pipewriter, incoming):
+    # take messages from the queue and send them to the pipe
+    while True:
+        jsonmessage = await incoming.get()
+        message = json.loads(jsonmessage)
+        type = int(message.get('header', {}).get('messageID', -1))
+        # 1 is DENM message, 2 is CAM message
+        if type in {1, 2}:
+            pipewriter.write(jsonmessage.encode('utf8') + b'\n')
+            await pipewriter.drain()
+
+async def connect_pipe(incoming, outgoing, loop=None):
+    reader, writer = await stdio()
+    # create tasks for the consumer and producer. The asyncio loop will
+    # manage these independently
+    consumer_task = asyncio.ensure_future(
+        pipe_consumer(reader, outgoing), loop=loop)
+    producer_task = asyncio.ensure_future(
+        pipe_producer(writer, incoming), loop=loop)
+
+    # start both tasks, but have the loop return to us when one of them
+    # has ended. We can then cancel the remainder
+    done, pending = await asyncio.wait(
+        [consumer_task, producer_task], return_when=asyncio.FIRST_COMPLETED)
+    for task in pending:
+        task.cancel()
+    # force a result check; if there was an exception it'll be re-raised
+    for task in done:
+        task.result()
+
+def main():
+    loop = asyncio.get_event_loop()
+    pipe_to_socket = asyncio.Queue(loop=loop)
+    socket_to_pipe = asyncio.Queue(loop=loop)
+
+    socket_coro = connect_socket(pipe_to_socket, socket_to_pipe, loop=loop)
+    pipe_coro = connect_pipe(socket_to_pipe, pipe_to_socket, loop=loop)
+
+    loop.run_until_complete(asyncio.gather(socket_coro, pipe_coro))
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>This then starts with two tasks, one to manage the socket, the other to manage the STDIO pipe. Both each start 2 more tasks, for their consumer and producer. There are two queues to send the messages from the consumer of one and to the producer of the other.</p>
+</div>
+<span class="comment-copy">Shouldn't the <code>websocket.connect()</code> call be <i>inside the <code>socket_receiver()</code> coroutine`</i>?</span>
+<span class="comment-copy">The <a href="https://github.com/aaugustin/websockets" rel="nofollow noreferrer">project documentation</a> certainly seems to suggest so.</span>
+<span class="comment-copy">See the <a href="https://websockets.readthedocs.io/en/stable/intro.html#both" rel="nofollow noreferrer"><i>Both</i> pattern in the intro section of the <code>websockets</code> documentation</a> on how to create a websocket connection that you both send and receive on.</span>
+<span class="comment-copy">I used inside <code>socket_receiver</code> but the problem is the same, furthermore I even have to send the message so I should open the socket outside</span>
+<span class="comment-copy"><code>sys.stdout.print</code> is not a function, and you are currently 'printing' raw Python objects (wouldn't than need to be re-encoded to JSON?). You can't just use <code>sys.stdout</code> and <code>sys.stdin</code> in non-blocking fashion either.</span>
+<span class="comment-copy">I fixed with new ubuntu virtual machine, the only method that doesn't work is pipe_producer, the socket_consumer receives the json but pipe_producer kepp on  await incoming.get()</span>
+<span class="comment-copy">@luca is the patent process using buffering when writing to the pipe? Make sure to flush!</span>
+<span class="comment-copy">the object is in the queue by <code>socket_consumer</code> (received from the socket) but the <code>pipe_producer</code> doesn't go ahead from <code>incoming.get()</code>, I don't think is the parent process the problem</span>
+<span class="comment-copy">@luca I can’t reproduce this. The queues are well tested. Are you certain you are not missing a get for a message with an invalid header? I didn’t include JSON parsing error handling either, it may be prudent to add a try...except there and log issues.</span>
+<span class="comment-copy">I open a new question only about this problem <a href="https://stackoverflow.com/questions/52291218/python-asyncio-queue-get-doesnt-receive-the-message">here</a></span>

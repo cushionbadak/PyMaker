@@ -1,0 +1,124 @@
+<div class="post-text" itemprop="text">
+<p>I'm working on an application that uses <code>LevelDB</code> and that uses multiple long-lived processes for different tasks.</p>
+<p>Since LevelDB does only allow a single process maintaining a database connection, all our database access is funneled through a special <em>database process</em>.</p>
+<p>To access the database from another process we use a <code>BaseProxy</code>. But since we are using <code>asyncio</code> our proxy shouldn't block on these APIs that call into the db process which then eventually read from the db. Therefore we implement the APIs on the proxy using an executor.</p>
+<pre><code>    loop = asyncio.get_event_loop()
+
+    return await loop.run_in_executor(
+        thread_pool_executor,
+        self._callmethod,
+        method_name,
+        args,
+    )
+</code></pre>
+<p>And while that works just fine, I wonder if there's a better alternative to wrapping the <code>_callmethod</code> call of the <code>BaseProxy</code> in a <code>ThreadPoolExecutor</code>.</p>
+<p>The way I understand it, the <code>BaseProxy</code> calling into the DB process is the textbook example of waiting on IO, so using a thread for this seems unnecessary wasteful.</p>
+<p>In a perfect world, I'd assume an <code>async _acallmethod</code> to exist on the <code>BaseProxy</code> but unfortunately that API does not exist.</p>
+<p>So, my question basically boils down to: When working with <code>BaseProxy</code> is there a more efficient alternative to running these cross process calls in a <code>ThreadPoolExecutor</code>?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Unfortunately, the multiprocessing library is not suited to conversion to asyncio, what you have is the best you can do if you must use <code>BaseProxy</code> to handle your IPC (Inter-Process communication).</p>
+<p>While it is true that the library uses blocking I/O here you can't easily reach in and re-work the blocking parts to use non-blocking primitives instead. If you were to insist on going this route you'd have to patch or rewrite the internal implementation details of that library, but being internal implementation details these can differ from Python point release to point release making any patching fragile and prone to break with minor Python upgrades. The <code>_callmethod</code> method is part of a deep hierarchy of abstractions involving threads, socket or pipe connections, and serializers. See <a href="https://github.com/python/cpython/blob/3.7/Lib/multiprocessing/connection.py" rel="noreferrer"><code>multiprocessing/connection.py</code></a> and <a href="https://github.com/python/cpython/blob/3.7/Lib/multiprocessing/managers.py" rel="noreferrer"><code>multiprocessing/managers.py</code></a>.</p>
+<p>So your options here are to stick with your current approach (using a threadpool executor to shove <code>BaseProxy._callmethod()</code> to another thread) <em>o</em>r to implement your own IPC solution using asyncio primitives. Your central database-access process would act as a server for your other processes to connect to as a client, either using sockets or named pipes, using an agreed-upon serialisation scheme for client requests and server responses. This is what <code>multiprocessing</code> implements for you, but you'd implement your own (simpler) version, using <a href="https://docs.python.org/3/library/asyncio-stream.html#asyncio-streams" rel="noreferrer"><code>asyncio</code> <em>streams</em></a> and whatever serialisation scheme best suits your application patterns (e.g. pickle, JSON, protobuffers, or something else entirely).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>A thread pool is what you want.  aioprocessing provides some async functionality of multiprocessing, but it does it using threads as you have proposed. I suggest making an issue against python if there isn't one for exposing true async multiprocessing.</p>
+<p><a href="https://github.com/dano/aioprocessing" rel="nofollow noreferrer">https://github.com/dano/aioprocessing</a></p>
+<blockquote>
+<p>In most cases, this library makes blocking calls to multiprocessing methods asynchronous by executing the call in a ThreadPoolExecutor</p>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<p>Assuming you have the python and the database running in the same system (i.e. you are not looking to <code>async</code> any network calls), you have two options. </p>
+<ol>
+<li><p>what you are already doing (run in executor). It blocks the db thread but main thread remains free to do other stuff. This is not pure non-blocking, but it is quite an acceptable solution for I/O blocking cases, with a small overhead of maintaining a thread.</p></li>
+<li><p>For true non-blocking solution (that can be run in a single thread without blocking) you have to have #1. native support for <code>async</code> (callback) from the DB for each fetch call and #2 wrap that in your custom event loop implementation. Here you subclass the Base loop, and overwrite methods to integrate your db callbacks. For example you can create a base loop that implements a pipe server. the db writes to the pipe and python polls the pipe. See the implementation of Proactor event loop in the <code>asyncio</code> code base. Note: I have never implemented any custom event loop.</p></li>
+</ol>
+<p>I am not familiar with leveldb, but for a key-value store, it is not clear if there will be any significant benefit for such a callback for fetch and pure non-blocking implementation. In case you are getting multiple fetches inside an iterator and that is your main problem you can make the loop <code>async</code> (with each fetch still blocking) and can improve your performance. Below is a dummy code that explains this.</p>
+<pre><code>import asyncio
+import random
+import time
+
+async def talk_to_db(d):
+    """ 
+        blocking db iteration. sleep is the fetch function.
+    """
+    for k, v in d.items():
+        time.sleep(1)
+        yield (f"{k}:{v}")
+
+async def talk_to_db_async(d):
+    """ 
+        real non-blocking db iteration. fetch (sleep) is native async here 
+    """
+    for k, v in d.items():
+        await asyncio.sleep(1)
+        yield (f"{k}:{v}")
+
+async def talk_to_db_async_loop(d):
+    """ 
+        semi-non-blocking db iteration. fetch is blocking, but the
+        loop is not.
+    """
+    for k, v in d.items():
+        time.sleep(1)
+        yield (f"{k}:{v}")
+        await asyncio.sleep(0)
+
+async def db_call_wrapper(db):
+    async for row in talk_to_db(db):
+        print(row)
+
+async def db_call_wrapper_async(db):
+    async for row in talk_to_db_async(db):
+        print(row)
+
+async def db_call_wrapper_async_loop(db):
+    async for row in talk_to_db_async_loop(db):
+        print(row)
+
+async def func(i):
+    await asyncio.sleep(5)
+    print(f"done with {i}")
+
+database = {i:random.randint(1,20) for i in range(20)}
+
+async def main():
+    db_coro = db_call_wrapper(database)
+    coros = [func(i) for i in range(20)]
+    coros.append(db_coro)
+    await asyncio.gather(*coros)
+
+async def main_async():
+    db_coro = db_call_wrapper_async(database)
+    coros = [func(i) for i in range(20)]
+    coros.append(db_coro)
+    await asyncio.gather(*coros)
+
+async def main_async_loop():
+    db_coro = db_call_wrapper_async_loop(database)
+    coros = [func(i) for i in range(20)]
+    coros.append(db_coro)
+    await asyncio.gather(*coros)
+
+# run the blocking db iteration
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main())
+
+# run the non-blocking db iteration
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main_async())
+
+# run the non-blocking (loop only) db iteration
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main_async_loop())
+</code></pre>
+<p>This is something you can try. Otherwise, I would say your current method is quite efficient. I do not think BaseProxy can give you an async acall API, it does not know how to handle the callback from your db.</p>
+</div>
+<span class="comment-copy">As for the actual question: it is certainly reasonable to want a native-async version of <code>callmethod</code>, but it's very unlikely you'll find one. Looking at the <a href="https://github.com/python/cpython/blob/3dc67d0316740e78e7cd014343f34d85908219b7/Lib/multiprocessing/managers.py#L783" rel="nofollow noreferrer">code</a>, it is synchronous from the ground up, and it's based on a lot of support machinery inside multiprocessing. While it's certainly <b>possible</b> to create async versions of all that, it is somewhat of an undertaking for a volunteer.</span>
+<span class="comment-copy">@user4815162342 Thanks, I'm happy to read it's not totally off :)  I can see it being a fair amount of work. I might end up being that poor volunteer that bites the bullet and works through it. If that happens I'll link it here (all FOSS). But meanwhile I may try throwing a bounty on this question to see if someone is up for it while I'm still busy with other tasks :)</span>
+<span class="comment-copy">You have to queue all db queries and then await on a future for result. This library can help. <a href="https://github.com/aio-libs/janus" rel="nofollow noreferrer">github.com/aio-libs/janus</a></span>
+<span class="comment-copy">It's a complicated status. What is your priority ranking? You need to make a selection of the data center of gravity (read/write/update). You can make a hundred thousand connections at the same time, but you can't apply any "ready-for-use" script ! It is not healthy to suggest a solution without knowing the data structure. Why use an paper if your words is very short(for high query count: better way is "save to ram") !</span>
+<span class="comment-copy">Yes, but it is my understanding that this is a crutch to ensure we don't block the event loop. But the whole idea of <code>asyncio</code> is to avoid threads and instead just put a task aside while it is waiting on IO and use the OS capabilities (select/poll) to become aware when it is ready to continue.  I'll consider opening an issue against the Python repo as you suggest but before I do that, I'll throw a bounty at this question and see if someone comes up with a solution that provides something like an <code>def async _acallmethod</code>  or explains why that wouldn't work / be a bad idea :)</span>
+<span class="comment-copy">Thank you for the detailed answer! Let's forget the LevelDB for a moment and just assume our BaseProxy calls into another process that receives it and returns <code>True</code> (or any other data). Isn't there still a big incentive to have a native async <code>_acallmethod</code> just because there's networking involved and blocking on networking is inefficient and a thread is still less efficient compared to native asyncio?</span>
+<span class="comment-copy">I see your point. If network call is your main blocker then it is theoretically possible to update the <code>connection</code> object with <code>asyncio</code> tcp server (both <code>asyncio</code> and <code>multiprocessing</code> use <code>socket</code> as the underlying construct). This will mostly cater to network delays. Your current version (thread in executor) caters both to disk I/O delays and network delays.</span>

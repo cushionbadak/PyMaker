@@ -1,0 +1,70 @@
+<div class="post-text" itemprop="text">
+<p>A Python class's <code>__call__</code> method lets us specify how a class member should be behave as a function. Can we do the "opposite", i.e. specify how a class member should behave as an argument to an arbitrary other function?</p>
+<p>As a simple example, suppose I have a <code>ListWrapper</code> class that wraps lists, and when I call a function <code>f</code> on a member of this class, I want <code>f</code> to be mapped over the wrapped list. For instance:</p>
+<pre><code>x = WrappedList([1, 2, 3])
+print(x + 1) # should be WrappedList([2, 3, 4])
+
+d = {1: "a", 2: "b", 3:"c"}
+print(d[x]) # should be WrappedList(["a", "b", "c"])
+</code></pre>
+<p>Calling the hypothetical <code>__call__</code> analogue I'm looking for <code>__arg__</code>, we could imagine something like this: </p>
+<pre><code>class WrappedList(object):
+    def __init__(self, to_wrap):
+        self.wrapped = to_wrap
+
+   def __arg__(self, func):
+       return WrappedList(map(func, self.wrapped))
+</code></pre>
+<p>Now, I know that (1) <code>__arg__</code> doesn't exist in this form, and (2) it's easy to get the behavior in this simple example without any tricks. But is there a way to approximate the behavior I'm looking for in the general case?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can't do this in general.<sup>*</sup></p>
+<hr/>
+<p>You <em>can</em> do something equivalent for most of the builtin operators (like your <code>+</code> example), and a handful of builtin functions (like <code>abs</code>). They're implemented by calling special methods on the operands, as described in <a href="https://docs.python.org/3/reference/datamodel.html#special-method-names" rel="nofollow noreferrer">the reference docs</a>.</p>
+<p>Of course that means writing a whole bunch of special methods for each of your types—but it wouldn't be too hard to write a base class (or decorator or metaclass, if that doesn't fit your design) that implements all those special methods in one place, by calling the subclass's <code>__arg__</code> and then doing the default thing:</p>
+<pre><code>class ArgyBase:
+    def __add__(self, other):
+        return self.__arg__() + other
+    def __radd__(self, other):
+        return other + self.__arg__()
+    # ... and so on
+</code></pre>
+<hr/>
+<p>And if you want to extend that to a whole suite of functions that you create yourself, you can give <em>them</em> all similar special-method protocols similar to the builtin ones, and expand your base class to cover them. Or you can just short-circuit that and use the <code>__arg__</code> protocol directly in those functions. To avoid lots of repetition, I'd use a decorator for that.</p>
+<pre><code>def argify(func):
+    def _arg(arg):
+        try:
+            return arg.__arg__()
+        except AttributeError:
+            return arg
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        args = map(_arg, args)
+        kwargs = {kw: _arg(arg) for arg in args}
+        return func(*args, **kwargs)
+    return wrapper
+
+@argify
+def spam(a, b):
+    return a + 2 * b
+</code></pre>
+<hr/>
+<p>And if you really want to, you can go around wrapping other people's functions:</p>
+<pre><code>sin = argify(math.sin)
+</code></pre>
+<p>… or even monkeypatching their modules:</p>
+<pre><code>requests.get = argify(requests.get)
+</code></pre>
+<p>… or monkeypatching a whole module dynamically a la early versions of <code>gevent</code>, but I'm not going to even show that, because at this point we're getting into don't-do-this-for-multiple-reasons territory.</p>
+<p>You mentioned in a comment that you'd like to do this to a bunch of someone else's functions without having to specify them in advance, if possible. Does that mean every function that ever gets constructed in any module you import? Well, you can even do <em>that</em> if you're willing to create an import hook, but that seems like an even worse idea. Explaining how to write an import hook and either AST-patch each function creation node or insert wrappers around the bytecode or the like is way too much to get into here, but if your research abilities exceed your common sense, you can figure it out. :)</p>
+<hr/>
+<p>As a side note, if I were doing this, I wouldn't call the method <code>__arg__</code>, I'd call it either <code>arg</code> or <code>_arg</code>. Besides being reserved for future use by the language, the dunder-method style implies things that aren't true here (special-method lookup instead of a normal call, you can search for it in the docs, etc.).</p>
+<p><sub>* There are languages where you can, such as C++, where a combination of implicit casting and typed variables instead of typed values means you can get a method called on your objects just by giving them an odd type with an implicit conversion operator to the expected type.</sub></p>
+</div>
+<span class="comment-copy">Sounds too evil to be true.</span>
+<span class="comment-copy">Do you want it to work this way in <i>every</i> function, or just in a set of functions you define? For the former, you can do something kind of similar in some languages with variable types and implicit casts (C++), but not in Python. For the latter, yes, it's basically the same way operator overloading works in Python, and I can explain more if that's not enough.</span>
+<span class="comment-copy">The short answer is no. The much longer answer is yes, although you get to your syntax by defining special methods like <code>__add__</code> ( for <code>+ 1</code>) and quite a few intermediary classes...</span>
+<span class="comment-copy">For most of the operators, they <i>already</i> support this by looking up special methods with double underscores. That's how numpy does exactly your example out of the box. For a set of new functions you create, you can create the same kind of protocol—calling <code>f</code> on a function first calls its <code>__arg__</code> method. (Although you're probably better off calling it <code>arg</code> or <code>_arg</code>.)</span>
+<span class="comment-copy">@user1604015 OK, let me write an answer.</span>
+<span class="comment-copy">Yah... I get the decorator approach, but was hoping for something cleaner, especially for cases like using my class instances as indices to dicts etc. But I guess this is the best I'm likely to do in Python - thanks! (I guess this should be possible in any language with procedural reflection, but as you point out, building on Python's structural reflection (AST etc.) is not nice in this case.)</span>
+<span class="comment-copy">@user1604015 Once you get the hang of writing import hook hacks, it isn’t really all that hard to do something like replacing every function call and operator mode, or every <code>CALL_FUNCTION</code> bytecode, but you still have the problem that anything that gets called internally by a C function (not the outermost special method lookup for operators/abs/etc., but anything an extension module does—like, say, most of what happens inside any Cython function) will be a problem. So ultimately, I think you might have to fork CPython and hook the bytecode itself in ceval, and also all the relevant C API.</span>

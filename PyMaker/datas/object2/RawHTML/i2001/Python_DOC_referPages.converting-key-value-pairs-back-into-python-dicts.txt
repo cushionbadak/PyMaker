@@ -1,0 +1,204 @@
+<div class="post-text" itemprop="text">
+<p>There's a logfile with text in the form of space-separated <code>key=value</code> pairs, and each line was originally serialized from data in a Python dict, something like:</p>
+<pre><code>' '.join([f'{k}={v!r}' for k,v in d.items()])
+</code></pre>
+<p>The keys are always just strings. The values could be anything that <a href="https://docs.python.org/3/library/ast.html#ast.literal_eval" rel="nofollow noreferrer"><code>ast.literal_eval</code></a> can successfully parse, no more no less.  </p>
+<p><strong>How to process this logfile and turn the lines back into Python dicts?</strong> Example:</p>
+<pre><code>&gt;&gt;&gt; to_dict("key='hello world'")
+{'key': 'hello world'}
+
+&gt;&gt;&gt; to_dict("k1='v1' k2='v2'")
+{'k1': 'v1', 'k2': 'v2'}
+
+&gt;&gt;&gt; to_dict("s='1234' n=1234")
+{'s': '1234', 'n': 1234}
+
+&gt;&gt;&gt; to_dict("""k4='k5="hello"' k5={'k6': ['potato']}""")
+{'k4': 'k5="hello"', 'k5': {'k6': ['potato']}}
+</code></pre>
+<p>Here is some extra context about the data:</p>
+<ul>
+<li>Keys are <a href="https://docs.python.org/3/reference/lexical_analysis.html#identifiers" rel="nofollow noreferrer">valid names</a></li>
+<li>Input lines are well-formed (e.g. no dangling brackets)</li>
+<li>The data is trusted (unsafe functions such as  <a href="https://docs.python.org/3/library/functions.html#eval" rel="nofollow noreferrer"><code>eval</code></a>, <a href="https://docs.python.org/3/library/functions.html#exec" rel="nofollow noreferrer"><code>exec</code></a>, <code>yaml.load</code> are OK to use)</li>
+<li>Order is not important. Performance is not important. Correctness is important.</li>
+</ul>
+<p><strong><em>Edit:</em></strong>  As requested in the comments, here is an MCVE and an example code that didn't work correctly</p>
+<pre><code>&gt;&gt;&gt; def to_dict(s):
+...     s = s.replace(' ', ', ')
+...     return eval(f"dict({s})")
+... 
+... 
+&gt;&gt;&gt; to_dict("k1='v1' k2='v2'")
+{'k1': 'v1', 'k2': 'v2'}  # OK
+&gt;&gt;&gt; to_dict("s='1234' n=1234")
+{'s': '1234', 'n': 1234}  # OK
+&gt;&gt;&gt; to_dict("key='hello world'")
+{'key': 'hello, world'}  # Incorrect, the value was corrupted
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your input can't be conveniently parsed by something like <code>ast.literal_eval</code>, but it <em>can</em> be <a href="https://docs.python.org/3/library/tokenize.html" rel="nofollow noreferrer">tokenized</a> as a series of Python tokens. This makes things a bit easier than they might otherwise be.</p>
+<p>The only place <code>=</code> tokens can appear in your input is as key-value separators; at least for now, <code>ast.literal_eval</code> doesn't accept anything with <code>=</code> tokens in it. We can use the <code>=</code> tokens to determine where the key-value pairs start and end, and most of the rest of the work can be handled by <code>ast.literal_eval</code>. Using the <code>tokenize</code> module also avoids problems with <code>=</code> or backslash escapes in string literals.</p>
+<pre><code>import ast
+import io
+import tokenize
+
+def todict(logstring):
+    # tokenize.tokenize wants an argument that acts like the readline method of a binary
+    # file-like object, so we have to do some work to give it that.
+    input_as_file = io.BytesIO(logstring.encode('utf8'))
+    tokens = list(tokenize.tokenize(input_as_file.readline))
+
+    eqsign_locations = [i for i, token in enumerate(tokens) if token[1] == '=']
+
+    names = [tokens[i-1][1] for i in eqsign_locations]
+
+    # Values are harder than keys.
+    val_starts = [i+1 for i in eqsign_locations]
+    val_ends = [i-1 for i in eqsign_locations[1:]] + [len(tokens)]
+
+    # tokenize.untokenize likes to add extra whitespace that ast.literal_eval
+    # doesn't like. Removing the row/column information from the token records
+    # seems to prevent extra leading whitespace, but the documentation doesn't
+    # make enough promises for me to be comfortable with that, so we call
+    # strip() as well.
+    val_strings = [tokenize.untokenize(tok[:2] for tok in tokens[start:end]).strip()
+                   for start, end in zip(val_starts, val_ends)]
+    vals = [ast.literal_eval(val_string) for val_string in val_strings]
+
+    return dict(zip(names, vals))
+</code></pre>
+<p>This behaves correctly on your example inputs, as well as on an example with backslashes:</p>
+<pre><code>&gt;&gt;&gt; todict("key='hello world'")
+{'key': 'hello world'}
+&gt;&gt;&gt; todict("k1='v1' k2='v2'")
+{'k1': 'v1', 'k2': 'v2'}
+&gt;&gt;&gt; todict("s='1234' n=1234")
+{'s': '1234', 'n': 1234}
+&gt;&gt;&gt; todict("""k4='k5="hello"' k5={'k6': ['potato']}""")
+{'k4': 'k5="hello"', 'k5': {'k6': ['potato']}}
+&gt;&gt;&gt; s=input()
+a='=' b='"\'' c=3
+&gt;&gt;&gt; todict(s)
+{'a': '=', 'b': '"\'', 'c': 3}
+</code></pre>
+<p>Incidentally, we probably could look for token type NAME instead of <code>=</code> tokens, but that'll break if they ever add <code>set()</code> support to <code>literal_eval</code>. Looking for <code>=</code> could also break in the future, but it doesn't seem as likely to break as looking for <code>NAME</code> tokens.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><em>Regex replacement functions</em> to the rescue</p>
+<p>I'm <em>not</em> rewriting a ast-like parser for you, but one trick that works pretty well is to use regular expressions to replace the quoted strings and replace them by "variables" (I've chosen <code>__token(number)__</code>), a bit like you're offuscating some code.</p>
+<p>Make a note of the strings you're replacing (that should take care of the spaces), replace space by comma (protecting against symbols before like <code>:</code> allows to pass last test) and replace by strings again.</p>
+<pre><code>import re,itertools
+
+def to_dict(s):
+    rep_dict = {}
+    cnt = itertools.count()
+    def rep_func(m):
+        rval = "__token{}__".format(next(cnt))
+        rep_dict[rval] = m.group(0)
+        return rval
+
+    # replaces single/double quoted strings by token variable-like idents
+    # going on a limb to support escaped quotes in the string and double escapes at the end of the string
+    s = re.sub(r"(['\"]).*?([^\\]|\\\\)\1",rep_func,s)
+    # replaces spaces that follow a letter/digit/underscore by comma
+    s = re.sub("(\w)\s+",r"\1,",s)
+    #print("debug",s)   # uncomment to see temp string
+    # put back the original strings
+    s = re.sub("__token\d+__",lambda m : rep_dict[m.group(0)],s)
+
+    return eval("dict({s})".format(s=s))
+
+print(to_dict("k1='v1' k2='v2'"))
+print(to_dict("s='1234' n=1234"))
+print(to_dict(r"key='hello world'"))
+print(to_dict('key="hello world"'))
+print(to_dict("""k4='k5="hello"' k5={'k6': ['potato']}"""))
+# extreme string test
+print(to_dict(r"key='hello \'world\\'"))
+</code></pre>
+<p>prints:</p>
+<pre><code>{'k2': 'v2', 'k1': 'v1'}
+{'n': 1234, 's': '1234'}
+{'key': 'hello world'}
+{'key': 'hello world'}
+{'k5': {'k6': ['potato']}, 'k4': 'k5="hello"'}
+{'key': "hello 'world\\"}
+</code></pre>
+<p>The key is to extract the strings (quoted/double quoted) using non-greedy regex and replace them by non-strings (like if those were string <em>variables</em> not literals) in the expression. The regex has been tuned so it can accept escaped quotes and double escape at the end of string (custom solution)</p>
+<p>The replacement function is an inner function so it can make use of the nonlocal dictionary &amp; counter and track the replaced text, so it can be restored once the spaces have been taken care of.</p>
+<p>When replacing the spaces by commas, you have to be careful not to do it after a colon (last test) or all things considered after a alphanum/underscore (hence the <code>\w</code> protection in the replacement regex for comma)</p>
+<p>If we uncomment the debug print code just before the original strings are put back that prints:</p>
+<pre><code>debug k1=__token0__,k2=__token1__
+debug s=__token0__,n=1234
+debug key=__token0__
+debug k4=__token0__,k5={__token1__: [__token2__]}
+debug key=__token0__
+</code></pre>
+<p>The strings have been pwned, and the replacement of spaces has worked properly. With some more effort, it should probably be possible to quote the keys and replace <code>k1=</code> by <code>"k1":</code> so <code>ast.literal_eval</code> can be used instead of <code>eval</code> (more risky, and not required here)</p>
+<p>I'm sure some super-complex expressions can break my code (I've even heard that there are very few json parsers able to parse 100% of the valid json files), but for the tests you submitted, it'll work (of course if some funny guy tries to put <code>__tokenxx__</code> idents in the original strings, that'll fail, maybe it could be replaced by some otherwise invalid-as-variable placeholders). I have built an Ada lexer using this technique some time ago to be able to avoid spaces in strings and that worked pretty well.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can find all the occurrences of <code>=</code> characters, and then find the maximum runs of characters which give a valid <code>ast.literal_eval</code> result. Those characters can then be parsed for the value, associated with a key found by a string slice between the last successful parse and the index of the current <code>=</code>:</p>
+<pre><code>import ast, typing
+def is_valid(_str:str) -&gt; bool:  
+  try:
+     _ = ast.literal_eval(_str)
+  except:
+    return False
+  else:
+    return True
+
+def parse_line(_d:str) -&gt; typing.Generator[typing.Tuple, None, None]:
+  _eq, last = [i for i, a in enumerate(_d) if a == '='], 0
+  for _loc in _eq:
+     if _loc &gt;= last:
+       _key = _d[last:_loc]
+       _inner, seen, _running, _worked = _loc+1, '', _loc+2, []
+       while True:
+         try:
+            val = ast.literal_eval(_d[_inner:_running])
+         except:
+            _running += 1
+         else:
+            _max = max([i for i in range(len(_d[_inner:])) if is_valid(_d[_inner:_running+i])])
+            yield (_key, ast.literal_eval(_d[_inner:_running+_max]))
+            last = _running+_max
+            break
+
+
+def to_dict(_d:str) -&gt; dict:
+  return dict(parse_line(_d))
+</code></pre>
+<hr/>
+<pre><code>print([to_dict("key='hello world'"), 
+       to_dict("k1='v1' k2='v2'"), 
+       to_dict("s='1234' n=1234"), 
+       to_dict("""k4='k5="hello"' k5={'k6': ['potato']}"""),
+       to_dict("val=['100', 100, 300]"),
+       to_dict("val=[{'t':{32:45}, 'stuff':100, 'extra':[]}, 100, 300]")
+   ]
+
+)
+</code></pre>
+<p>Output:</p>
+<pre><code>{'key': 'hello world'}
+{'k1': 'v1', 'k2': 'v2'}
+{'s': '1234', 'n': 1234}
+{'k4': 'k5="hello"', 'k5': {'k6': ['potato']}}
+{'val': ['100', 100, 300]}
+{'val': [{'t': {32: 45}, 'stuff': 100, 'extra': []}, 100, 300]}
+</code></pre>
+<p>Disclaimer:</p>
+<p>This solution is not as elegant as @Jean-FrançoisFabre's, and I am not sure if it can parse 100% of what is passed to <code>to_dict</code>, but it may give you inspiration for your own version.</p>
+</div>
+<span class="comment-copy">It looks like you want us to write some code for you. While many users are willing to produce code for a coder in distress, they usually only help when the poster has already tried to solve the problem individually. A good way to show this effort is to include a <a href="http://stackoverflow.com/help/mcve">Minimal, complete, verifiable example</a>. Check the <a href="https://stackoverflow.com/tour">intro tour</a> you finished before posting, especially <a href="http://stackoverflow.com/help/how-to-ask">How to Ask</a>.</span>
+<span class="comment-copy">With 150k rep you'd think there'll be some code shown...</span>
+<span class="comment-copy">ouch. I think wim knows <a href="https://stackoverflow.com/questions/how-to-ask">How to Ask</a>. This is different than a gimmethecode homework question...</span>
+<span class="comment-copy">You have 11,720 reputation from python answers. Surprised you couldn’t knock some code up, or that you didn’t know you should.</span>
+<span class="comment-copy">@Prune tss tss canned comments for low reps, upvotes for high reps?</span>
+<span class="comment-copy">Re-using the tokenizer was a really creative and thinking-outside-the-box idea. Well done.</span>
+<span class="comment-copy">This doesn't handle backslashes in string literals.</span>
+<span class="comment-copy">@user2357112 it <i>does</i> now. Just beefed up the string regex</span>
+<span class="comment-copy">this solution chokes on escaped quotes (like mine BTW): try <code>"key='hello \'world'"</code>. It's near to impossible to write such a parser without really parsing the data</span>

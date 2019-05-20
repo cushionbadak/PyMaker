@@ -1,0 +1,157 @@
+<div class="post-text" itemprop="text">
+<p><a href="https://docs.python.org/3/library/asyncio-subprocess.html#asyncio.asyncio.subprocess.Process" rel="nofollow noreferrer">The Python docs about asyncio - Subprocess say:</a></p>
+<blockquote>
+<p>The <code>communicate()</code> and <code>wait()</code> methods don’t take a timeout parameter: use the <code>wait_for()</code> function</p>
+</blockquote>
+<p>It's pretty easy to impose a timeout on <code>communicate()</code> using <code>wait_for()</code>, however I can't find a way to retrieve the partial results from the interrupted <code>communicate()</code> call, and subsequent calls to <code>communicate()</code> doesn't return the lost part either.</p>
+<p>Example script:</p>
+<pre><code>#! /usr/bin/env python3
+
+import asyncio
+
+async def communicate_short(loop):
+    p = await asyncio.create_subprocess_exec('ping', '127.0.0.1', '-n', '4', stdout=asyncio.subprocess.PIPE)
+    # For Linux: use '-c' instead of '-n'
+
+    try:
+        # 2 seconds timeout
+        res = await asyncio.wait_for(p.communicate(), 2)
+    except asyncio.TimeoutError as e:
+        # After timeout happens:
+        # How do I get the subprocess's STDOUT up to this point?
+        try:
+            print(res[0].decode('utf-8'))
+            # Will raise NameError since the communicate() call did not complete
+        except NameError as e:
+            print('NameError: %s' % e)
+
+
+    res = await p.communicate()
+    print(res[0].decode('utf-8'))
+    # Only prints the later half of ping's STDOUT
+
+if __name__ == '__main__':
+    loop = asyncio.ProactorEventLoop()
+    asyncio.set_event_loop(loop)
+    # For Linux: just do loop = asyncio.get_event_loop()
+
+    loop.run_until_complete(communicate_short(loop))
+</code></pre>
+<p>Output from the example script:</p>
+<pre><code>NameError: local variable 'res' referenced before assignment
+Reply from 127.0.0.1: bytes=32 time&lt;1ms TTL=128
+Reply from 127.0.0.1: bytes=32 time&lt;1ms TTL=128
+
+Ping statistics for 127.0.0.1:
+    Packets: Sent = 4, Received = 4, Lost = 0 (0% loss),
+Approximate round trip times in milli-seconds:
+    Minimum = 0ms, Maximum = 0ms, Average = 0ms
+</code></pre>
+<p>Notice that only the last 2 packets are printed. Output about the first 2 packets are lost.</p>
+<p>So, how should I get the output from the subprocess before the timeout happened?</p>
+<p><strong>Edit</strong>: To be more precise, ideally what I'm looking for something that:</p>
+<ol>
+<li><p>Does what <code>communicate()</code> does, i.e. asynchronously write to a subprocess's STDIN and read its STDOUT and STDERR, without possibility of deadlocking (<a href="https://docs.python.org/3/library/asyncio-subprocess.html#asyncio.asyncio.subprocess.Process.stderr" rel="nofollow noreferrer">that the docs ominously warn about</a>);</p></li>
+<li><p>has a configurable total timeout, so that when either the subprocess terminates or the timeout is reached, the received STDOUT and STDERR so far are returned.</p></li>
+</ol>
+<p>Looks like such a thing does not exist yet, and one would have to implement it.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You have to use <a href="https://docs.python.org/3/library/asyncio-subprocess.html?highlight=subprocess#asyncio.asyncio.subprocess.Process.stdout" rel="nofollow noreferrer">process.stdout</a>:</p>
+<pre><code>data = await process.stdout.readline()
+</code></pre>
+<p>See the example in the <a href="http://asyncio.readthedocs.io/en/latest/subprocess.html#communicate-with-a-subprocess-using-standard-streams" rel="nofollow noreferrer">user documentation</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>For the second part of your question, <em>"how should I get the output from the subprocess before the timeout happened?"</em> I would suggest using <code>asyncio.wait()</code> which does not cancel the task (<code>p.communicate()</code>) instead of <code>asyncio.wait_for()</code> (which cancels the task):</p>
+<pre><code>task = asyncio.Task(p.communicate())
+done, pending = await asyncio.wait([task], timeout=2)
+if pending:
+    print("timeout!", task._state)
+res = await task  # Note: It is OK to await a task more than once
+print(res[0].decode())
+</code></pre>
+<p>Regarding <em>"retrieve the partial results"</em> , I would suggest not to use <code>communicate()</code> which calls <code>stdout.read()</code> and use a different approach:</p>
+<pre><code>import asyncio
+
+
+async def ping(loop, host):
+    p = await asyncio.create_subprocess_exec(
+        'ping', host, '-c', '4',
+        stdout=asyncio.subprocess.PIPE, loop=loop)
+
+    async for line in p.stdout:
+        print(host, "==&gt;", line.decode(), end="")
+
+    print(host, "done")
+
+
+if __name__ == '__main__':
+    loop = loop = asyncio.get_event_loop()
+    asyncio.set_event_loop(loop)
+    tasks = [
+        ping(loop, '8.8.8.8'),
+        ping(loop, '127.0.0.1'),
+        ping(loop, 'example.com'),
+    ]
+    loop.run_until_complete(asyncio.wait(tasks))
+    loop.close()
+</code></pre>
+<p>Combining the two solutions (and using <code>readline()</code> instead of the much cooler async for) gives:</p>
+<pre><code>import asyncio
+
+
+async def ping(loop, host):
+    p = await asyncio.create_subprocess_exec(
+        'ping', host, '-c', '10',
+        stdout=asyncio.subprocess.PIPE, loop=loop)
+
+    n = 0
+    while True:
+        n += 1
+        task = asyncio.Task(p.stdout.readline())
+        done, pending = await asyncio.wait([task], timeout=1)
+        if not done:
+            print(host, n, "==&gt;", "Timeout!")
+        line = await task
+        if not line:
+            break
+        print(host, n, "==&gt;", line.decode(), end="")
+
+    print(host, "==&gt;", "done")
+
+
+if __name__ == '__main__':
+    loop = loop = asyncio.get_event_loop()
+    asyncio.set_event_loop(loop)
+    tasks = [
+        # ping(loop, '8.8.8.8'),
+        # ping(loop, '127.0.0.1'),
+        ping(loop, 'example.com'),
+    ]
+    loop.run_until_complete(asyncio.wait(tasks))
+    loop.close()
+</code></pre>
+<p>Notice the timeout (1 second) is per line. </p>
+<p>See also: <a href="https://github.com/aio-libs/async-timeout" rel="nofollow noreferrer">https://github.com/aio-libs/async-timeout</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If killing subprocess after timeout was expected, you could get the partial output like this:</p>
+<pre><code>future = asyncio.ensure_future(p.communicate())
+done, pending = await asyncio.wait([future], timeout=2)
+if pending:
+    # timeout
+    if p.returncode is None:
+        # kill the subprocess, then `await future` will return soon
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+output, err = await future
+print(output.decode('utf-8'))
+</code></pre>
+</div>
+<span class="comment-copy">What solution did you use?</span>
+<span class="comment-copy">@Udi I changed my program logic to simply use readline() to process lines as they arrived.</span>
+<span class="comment-copy">Just added a bit to the question. I was hoping such functionality already exists, but it looks like something that has to be separately implemented.</span>
+<span class="comment-copy">You are right. <code>communiate()</code> works <i>"...until end-of-file is reached..."</i> and not for partial results.  You can probably use <code>asyncio.wait(tasks)</code> to communicate with stdout+stdin safely.  Refer to <code>communicate()</code> source code for an example.</span>

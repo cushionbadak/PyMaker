@@ -1,0 +1,201 @@
+<div class="post-text" itemprop="text">
+<p>Suppose I have a few coroutines running in a loop. How to make so that if some of them failed with exception the whole program would fail with this exception? Because right now asyncio doesn't even prints the error messages from coroutines unless I use logging level "DEBUG".</p>
+<pre><code>from asyncio import get_event_loop, sleep
+
+
+async def c(sleep_time=2, fail=False):
+    print('c', sleep_time, fail)
+    if fail:
+        raise Exception('fail')
+    while True:
+        print('doing stuff')
+        await sleep(sleep_time)
+
+
+
+loop = get_event_loop()
+loop.create_task(c(sleep_time=10, fail=False))
+loop.create_task(c(fail=True))
+loop.run_forever()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>A graceful way is using error handling api.</p>
+<p><a href="https://docs.python.org/3/library/asyncio-eventloop.html#error-handling-api" rel="noreferrer">https://docs.python.org/3/library/asyncio-eventloop.html#error-handling-api</a></p>
+<p>Example:</p>
+<pre><code>import asyncio
+
+
+async def run_division(a, b):
+    await asyncio.sleep(2)
+    return a / b
+
+
+def custom_exception_handler(loop, context):
+    # first, handle with default handler
+    loop.default_exception_handler(context)
+
+    exception = context.get('exception')
+    if isinstance(exception, ZeroDivisionError):
+        print(context)
+        loop.stop()
+
+loop = asyncio.get_event_loop()
+
+# Set custom handler
+loop.set_exception_handler(custom_exception_handler)
+loop.create_task(run_division(1, 0))
+loop.run_forever()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here are some notes that you might want use to craft your solution:</p>
+<p>The easiest way to retrieve a couroutine's exception (or result!) is to <code>await</code> for it.  <code>asyncio.gather()</code> will create tasks from coroutines and wrap all of them in one encompassing task that will fail if one of the subtasks fails:</p>
+<pre><code>import asyncio
+
+import random
+
+
+async def coro(n):
+    print("Start", n)
+    await asyncio.sleep(random.uniform(0.2, 0.5))
+    if n % 4 == 0:
+        raise Exception('fail ({})'.format(n))
+    return "OK: {}".format(n)
+
+
+async def main():
+    tasks = [coro(i) for i in range(10)]
+    await asyncio.gather(*tasks)
+    print("done")
+
+loop = asyncio.get_event_loop()
+try:
+    asyncio.ensure_future(main())
+    loop.run_forever()
+finally:
+    loop.close()
+</code></pre>
+<p>This however does not shutdown the loop. To stop a running loop, use <code>loop.stop()</code>.  Use this instead:</p>
+<pre><code>async def main():
+    tasks = [coro(i) for i in range(10)]
+    try:
+        await asyncio.gather(*tasks)
+    except Exception as e:
+        loop.stop()
+        raise
+    print("done")
+</code></pre>
+<p>Stopping the loop while some long-running coroutines are running is probably not what you want. You might want to first signal some your coroutines to shut down using an event:</p>
+<pre><code>import asyncio
+
+import random
+
+
+async def repeat(n):
+    print("start", n)
+    while not shutting_down.is_set():
+        print("repeat", n)
+        await asyncio.sleep(random.uniform(1, 3))
+    print("done", n)
+
+
+async def main():
+    print("waiting 6 seconds..")
+    await asyncio.sleep(6)
+    print("shutting down")
+    shutting_down.set()  # not a coroutine!
+    print("waiting")
+    await asyncio.wait(long_running)
+    print("done")
+    loop.stop()
+
+loop = asyncio.get_event_loop()
+shutting_down = asyncio.Event(loop=loop)
+long_running = [loop.create_task(repeat(i + 1))  for i in range(5)]
+try:
+    asyncio.ensure_future(main())
+    loop.run_forever()
+finally:
+    loop.close()
+</code></pre>
+<p>If you don't want to <code>await</code> for your tasks, you might want to use an <code>asyncio.Event</code> (or <code>asyncio.Queue</code>) to signal a global error handler to stop the loop:</p>
+<pre><code>import asyncio
+
+
+async def fail():
+    try:
+        print("doing stuff...")
+        await asyncio.sleep(0.2)
+        print("doing stuff...")
+        await asyncio.sleep(0.2)
+        print("doing stuff...")
+        raise Exception('fail')
+    except Exception as e:
+        error_event.payload = e
+        error_event.set()
+        raise  # optional
+
+
+async def error_handler():
+    await error_event.wait()
+    e = error_event.payload
+    print("Got:", e)
+    raise e
+
+
+loop = asyncio.get_event_loop()
+error_event = asyncio.Event()
+try:
+    loop.create_task(fail())
+    loop.run_until_complete(error_handler())
+finally:
+    loop.close()
+</code></pre>
+<p>(Used here with <code>run_until_complete()</code> for simplicity, but can be used with <code>loop.stop()</code> as well)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Okay, I've found the solution that doesn't require rewriting any existing code. It may seem hacky, but I think I like it.</p>
+<p>Since I already catch <code>KeyboardInterrupt</code> like so.</p>
+<pre><code>def main(task=None):
+    task = task or start()
+    loop = get_event_loop()
+    try:
+        task = loop.create_task(task)
+        future = ensure_future(task)
+        loop.run_until_complete(task)
+    except KeyboardInterrupt:
+        print('\nperforming cleanup...')
+        task.cancel()
+        loop.run_until_complete(future)
+        loop.close()
+        sys.exit()
+</code></pre>
+<p>How about sending <code>KeyboardInterrupt</code> to itself from a coroutine? I thought that this would hang the application, because <code>os.kill</code> would wait for application to close and because the application it would wait is the same application it would make kind of a deadlock, but thankfully I was wrong. And this code actually works and prints <code>clean up</code> before exiting.</p>
+<pre><code>async def c(sleep_time=2, fail=False):
+    print('c', sleep_time, fail)
+    if fail:
+        await sleep(sleep_time)
+        os.kill(os.getpid(), signal.SIGINT)
+    while True:
+        print('doing stuff')
+        await sleep(sleep_time)
+
+
+
+loop = get_event_loop()
+loop.create_task(c(sleep_time=10, fail=False))
+loop.create_task(c(fail=True))
+try:
+    loop.run_forever()
+except KeyboardInterrupt:
+    print('clean up')
+    loop.close()
+    sys.exit()
+</code></pre>
+</div>
+<span class="comment-copy">Do you mind creating an <a href="https://stackoverflow.com/help/mcve">MCVE</a>?</span>
+<span class="comment-copy">@Udi Seriously? See my example, what am I doing wrong?</span>
+<span class="comment-copy">Well, it all comes down to using events everywhere. I guess I could make a decorator, but what I really wanted is something like <code>for coro in coros cancel(coro)</code></span>
+<span class="comment-copy">Canceling the outer task in gather cancels all inner tasks.</span>
+<span class="comment-copy">I'm creating them dynamically in callbacks.</span>

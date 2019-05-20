@@ -1,0 +1,68 @@
+<div class="post-text" itemprop="text">
+<p>I have a python module that calls a DLL written C to encode XML strings. Once the function returns the encoded string, it fails to de-allocate the memory which was allocated during this step. Concretely:</p>
+<p>encodeMyString = ctypes.create_string_buffer(4096)</p>
+<p>CallEncodingFuncInDLL(encodeMyString, InputXML)</p>
+<p>I have looked at <a href="https://stackoverflow.com/questions/6999522/python-line-by-line-memory-profiler">this</a>, <a href="http://smira.ru/wp-content/uploads/2011/08/heapy.html" rel="nofollow noreferrer">this</a>, and <a href="http://mg.pov.lt/objgraph/" rel="nofollow noreferrer">this</a> and have also tried calling the <code>gc.collect</code> but perhaps since the object has been allocated in an external DLL, python gc doesn't have any record of it and fails to remove it. But since the code keeps calling the encoding function, it keeps on allocating memory and eventually the python process crashes. Is there a way to profile this memory usage?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since you haven't given any information about the DLL, this will necessarily be pretty vague, but…</p>
+<p>Python can't track memory allocated by something external that it doesn't know about. How could it? That memory could be part of the DLL's constant segment, or allocated with <code>mmap</code> or <code>VirtualAlloc</code>, or part of a larger object, or the DLL could just be expecting it to be alive for its own use.</p>
+<p>Any DLL that has a function that allocates and returns a new object has to have a function that deallocates that object. For example, if <code>CallEncodingFuncInDLL</code> returns a new object that you're responsible for, there will be a function like <code>DestroyEncodedThingInDLL</code> that takes such an object and deallocates it.</p>
+<p>So, when do you call this function?</p>
+<hr/>
+<p>Let's step back and make this more concrete. Let's say the function is plain old <code>strdup</code>, so the function you call to free up the memory is <code>free</code>. You have two choices for when to call <code>free</code>. No, I have no idea why you'd ever want to call <code>strdup</code> from Python, but it's about the simplest possible example, so let's pretend it's not useless.</p>
+<hr/>
+<p>The first option is to call <code>strdup</code>, immediately convert the returned value to a native Python object and free it, and not have to worry about it after that:</p>
+<pre><code>newbuf = libc.strdup(mybuf)
+s = newbuf.value
+libc.free(newbuf)
+# now use s, which is just a Python bytes object, so it's GC-able
+</code></pre>
+<p>Or, better, wrap this up so it's automatic by using a custom <a href="https://docs.python.org/3/library/ctypes.html#return-types" rel="nofollow"><code>restype</code></a> callable:</p>
+<pre><code>def convert_and_free_char_p(char_p):
+    try:
+        return char_p.value
+    finally:
+        libc.free(char_p)
+libc.strdup.restype = convert_and_free_char_p
+
+s = libc.strdup(mybuf)
+# now use s
+</code></pre>
+<hr/>
+<p>But some objects can't be converted to a native Python object so easily—or they can be, but it's not very useful to do so, because you need to keep passing them back into the DLL. In that case, you can't clean it up until you're done with it.</p>
+<p>The best way to do this is to wrap that opaque value up in a class that releases it on <code>close</code> or <code>__exit__</code> or <code>__del__</code> or whatever seems appropriate. One nice way to do this is with <a href="https://docs.python.org/3/library/contextlib.html#contextlib.contextmanager" rel="nofollow"><code>@contextmanager</code></a>:</p>
+<pre><code>@contextlib.contextmanager
+def freeing(value):
+    try:
+        yield value
+    finally:
+        libc.free(value)
+</code></pre>
+<p>So:</p>
+<pre><code>newbuf = libc.strdup(mybuf)
+with freeing(newbuf):
+    do_stuff(newbuf)
+    do_more_stuff(newbuf)
+# automatically freed before you get here
+# (or even if you don't, because of an exception/return/etc.)
+</code></pre>
+<p>Or:</p>
+<pre><code>@contextlib.contextmanager
+def strduping(buf):
+    value = libc.strdup(buf)
+    try:
+        yield value
+    finally:
+        libc.free(value)
+</code></pre>
+<p>And now:</p>
+<pre><code>with strduping(mybuf) as newbuf:
+    do_stuff(newbuf)
+    do_more_stuff(newbuf)
+# again, automatically freed here
+</code></pre>
+</div>
+<span class="comment-copy">Python can't track memory allocated by something external that it doesn't know about; you have to do it manually. Presumably the DLL has a <code>ReleaseThingEncodedByDLL</code> function. And you have to call that. Either copy the value out of it to an appropriate native Python object and immediately release it, or wrap it up in an object that releases it on <code>close</code> or <code>__exit__</code> or <code>__del__</code> or whatever's appropriate.</span>
+<span class="comment-copy">@abarnert, but python's process itself is keeping track of this memory, it just can't delete it. How is that possible?</span>
+<span class="comment-copy">What do you mean "python's process itself is keeping track of this memory"? If you mean it's in the python process's heap… well yeah, of course it is, DLLs are part of the process, and loaded into its heap. That doesn't mean Python can track any memory a DLL allocates, much less know when that DLL is done with it.</span>

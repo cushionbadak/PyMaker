@@ -1,0 +1,54 @@
+<div class="post-text" itemprop="text">
+<p>I'm working with an arcane data collection filesystem.  It's got a block describing the files and their exact offsets on disk, so I know each files' start byte, end byte and length in bytes.  The goal is to grab one file from the physical disk.  They're big files so performance is paramount.</p>
+<p>Here's what "works," but very inefficiently:</p>
+<pre><code>import shutil, io
+def start_copy(startpos, endpos, filename="C:\\out.bin"):
+    with open(r"\\.\PhysicalDrive1", 'rb') as src_f:
+        src_f.seek(startpos)
+        flength = endpos - startpos
+        print("Starting copy of "+filename+" ("+str(flength)+"B)")
+        with open(filename, 'wb') as dst_f:
+            shutil.copyfileobj( io.BytesIO(src_f.read(flength)), dst_f )
+        print("Finished copy of "+filename)
+</code></pre>
+<p>This is slow: <code>io.BytesIO(src_f.read(flength))</code> technically works, but it reads the entire file into memory before writing to the destination file.  So it takes much longer than it should.</p>
+<p>Copying directly using <code>dst_f</code> won't work.  (I assume) the end position can't be specified, so the copy doesn't stop.</p>
+<p>Here are some questions, each of which could be a solution to this:</p>
+<ul>
+<li>Is there a copy library (or external utility for Windows 7 that would work with <code>subprocess</code>) that takes start/end byte arguments?</li>
+<li>Is it possible to create a file-like object that <code>copyfileobj</code> can use, which references just a portion of another file-like object?</li>
+<li>Can an exception be raised when an <code>io</code> object seeks past a certain end point?</li>
+<li>Can <code>copyfileobj</code> be forced to naturally stop at a given byte offset of the drive (a sort of "fake EOF")?</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>The obvious way to do this is to just <code>write</code> to the file.</p>
+<p>The whole point of <code>copyfileobj</code> is that it buffers the data for you. If you have to read the whole file into a <code>BytesIO</code>, you're just buffering the <code>BytesIO</code>, which is pointless.</p>
+<p>So, just loop around <code>read</code>ing a decent-sized buffer from <code>src_f</code> and <code>write</code> it to <code>dst_f</code> until you reach <code>flength</code> bytes.</p>
+<p>If you look at <a href="https://github.com/python/cpython/blob/3.6/Lib/shutil.py#L76" rel="nofollow noreferrer">the <code>shutil</code> source</a> (which is linked from <a href="https://docs.python.org/3/library/shutil.html#shutil.copyfileobj" rel="nofollow noreferrer">the <code>shutil</code> docs</a>), there's no magic inside <code>copyfileobj</code>; it's a trivial function. As of 3.6 (and I think it's been completely unchanged since <code>shutil</code> was added somewhere around 2.1…), it looks like this:</p>
+<pre><code>def copyfileobj(fsrc, fdst, length=16*1024):
+    """copy data from file-like object fsrc to file-like object fdst"""
+    while 1:
+        buf = fsrc.read(length)
+        if not buf:
+            break
+        fdst.write(buf)
+</code></pre>
+<p>You can do the same thing, just keeping track of bytes read and stopping at <code>flength</code>:</p>
+<pre><code>def copypartialfileobj(fsrc, fdst, size, length=16*1024):
+    """copy size bytes from file-like object fsrc to file-like object fdst"""
+    written = 0
+    while written &lt; size:
+        buf = fsrc.read(min(length, size - written))
+        if not buf:
+            break
+        fdst.write(buf)
+        written += len(buf)
+</code></pre>
+</div>
+<span class="comment-copy">Why do you need to use <code>copyfileobj</code> instead of just <code>write</code>?</span>
+<span class="comment-copy">@charjabug It doesn't work asynchronously, but the buffering done by the OS (and driver and drive circuitry) means it gets pipelined pretty well anyway as long as you're reading sequentially in nice-sized chunks.</span>
+<span class="comment-copy">@charjabug If you need to speed it up any further, async probably isn't the key, at least not directly. If one of the disks is an SSD or wide RAID stripe (so the seek times aren't horribly slower than the throughput, as they are with a normal hard drive), just doing 4 threads each copying 1/4th of the file may speed things up. Alternatively, you can use <code>pywin32</code> to call some appropriate Win32 API function, although I think you'll have to deal with Overlapped I/O to get any speedup that way.</span>
+<span class="comment-copy">@charjabug Also, a good chunk of Python's stdlib modules are designed to be useful as sample code, not just as out-of-the-box tools. If you go to the docs for any module, and there's a link to the source, click it and you can see exactly how it works.</span>
+<span class="comment-copy">@charjabug I think read-once-write-twice should be faster… but not by that much. After all, that's optimizing the fastest part of the process (reading off an SSD, and probably even out of its cache) while not at all affecting the slowest part (writing to the mechanical drives). However, doing the two copies in parallel (A-&gt;a &amp; B-&gt;b at the same time on two threads, and then A-&gt;b and B-&gt;a on two threads) could cut your time nearly in half. (Depends on whether bus contention is anywhere near as much of a bottleneck as mechanical HD speed, but I'd try it.)</span>
+<span class="comment-copy">Given you know the target file size already, you could use <code>fdst.truncate(size)</code>; memory-map the destination via  <code>mdst = mmap.mmap(fdst.fileno(), 0)</code>; and then copy the data via <code>fsrc.readinto(mdst)</code>.</span>

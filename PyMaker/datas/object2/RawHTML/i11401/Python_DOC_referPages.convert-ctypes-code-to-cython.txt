@@ -1,0 +1,146 @@
+<div class="post-text" itemprop="text">
+<p>I'd like to convert some ctypes code to use cython instead, but I'm struggling.
+Essentially, the ctypes code:</p>
+<ul>
+<li>copies the contents (floats)  of two lists into C-compatible structs</li>
+<li>sends the structs to my binary via FFI</li>
+<li>receives the structs back (the length is never modified)</li>
+<li><em>copies</em> the contents to two new lists</li>
+<li>sends the structs back across the FFI boundary so their memory can be freed</li>
+</ul>
+<p>My ctypes code looks like this so far:</p>
+<p><code>rlib.h</code></p>
+<pre><code>#ifndef RLIB_H
+#define RLIB_H
+
+typedef struct _FFIArray {
+  void* data;
+  size_t len;
+} _FFIArray;
+
+typedef struct _Result_Tuple {
+    _FFIArray e;
+    _FFIArray n;
+} _Result_Tuple;
+
+_Result_Tuple convert_to_bng_threaded(_FFIArray x, _FFIArray y);
+void drop_float_array(_FFIArray x, _FFIArray y)
+
+#endif
+</code></pre>
+<p><code>mylib.pxd</code></p>
+<pre><code>cdef extern from "rlib.h":
+    struct _FFIArray:
+        void* data
+        size_t len
+
+    struct _Result_Tuple:
+        _FFIArray e
+        _FFIArray n
+
+    cdef _Result_Tuple convert_to_bng_threaded(_FFIArray x, _FFIArray y)
+    cdef void drop_float_array(_FFIArray x, _FFIArray y)
+</code></pre>
+<p><code>util_cython.pyx</code></p>
+<pre><code>import cython
+from mylib cimport _FFIArray, convert_to_bng_threaded, drop_float_array
+
+def call_convert_bng(_FFIArray x, _FFIArray y):
+    return convert_to_bng_threaded(x, y)
+
+def call_drop_float_array(_FFIArray x, _FFIArray y):
+    return drop_float_array(x, y)
+</code></pre>
+<p><code>setup.py</code></p>
+<pre><code>from setuptools import setup, Extension, find_packages
+
+from Cython.Build import cythonize
+from Cython.Distutils import build_ext
+
+ext = Extension('util_cython', 
+          sources=['util_cython.pyx'],
+          libraries=['latlon_bng',],
+          library_dirs=['.',],
+          include_dirs=['.']
+)
+
+extensions = [ext,]
+
+setup(
+    name = "util_cython",
+    ext_modules = cythonize(extensions),
+    cmdclass={'build_ext': build_ext},
+)
+</code></pre>
+<p>I have a few questions about how to proceed:</p>
+<p>Firstly, the compilation step is currently failing:</p>
+<pre><code>python setup.py build_ext --inplace
+Compiling util_cython.pyx because it changed.
+[1/1] Cythonizing util_cython.pyx
+
+Error compiling Cython file:
+------------------------------------------------------------
+...
+import cython
+from mylib cimport _FFIArray, convert_to_bng_threaded, drop_float_array
+
+def call_convert_bng(_FFIArray x, _FFIArray y):
+    return convert_to_bng_threaded(x, y)
+                                 ^
+------------------------------------------------------------
+
+util_cython.pyx:5:34: Cannot convert '_Result_Tuple' to Python object
+Traceback (most recent call last):
+  File "setup.py", line 17, in &lt;module&gt;
+    ext_modules = cythonize(extensions),
+  File "/Users/sth/dev/cythonize_test/venv/lib/python2.7/site-packages/Cython/Build/Dependencies.py", line 912, in cythonize
+    cythonize_one(*args)
+  File "/Users/sth/dev/cythonize_test/venv/lib/python2.7/site-packages/Cython/Build/Dependencies.py", line 1034, in cythonize_one
+    raise CompileError(None, pyx_file)
+Cython.Compiler.Errors.CompileError: util_cython.pyx
+</code></pre>
+<p>Why is Cython failing to convert <code>_Result_tuple</code>?  </p>
+<p>Secondly, how do I define a cython function to accept lists (or arrays; anything that supports <code>__iter__</code>), and copy their contents into <code>_FFIArray</code> structs, so I can call <code>call_convert_bng</code>?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The following is untested, because I don't have the library code and have had to take some guesses as to how it works. But it should give you an idea as to how you go about it.</p>
+<p>I'd start by using a Python array type to store your input/output. Either the <a href="https://docs.python.org/3/library/array.html" rel="nofollow">standard library array type</a>, or numpy arrays. These store the arrays continuously in memory (like C would) and so provided the <code>_FFIArray</code> <code>data</code> attribute can just be pointed at this memory for input.</p>
+<pre><code>def convert_bng(double[::1] x, double[::1] y):
+  # I'm assuming that the data is double, not float, but it's easy changed
+  # here the [::1] promises it's continuous in memory
+  cdef _FFIArray x_ffi, y_ffi
+  # get a pointer to the data, and cast it to void*
+  x_ffi.data = &lt;void*&gt;&amp;x[0]
+  x_ffi.len = x.shape[0] # possibly *sizeof(double) - depends on the C api
+
+  # repeat for y
+  y_ffi.data = &lt;void*&gt;&amp;y[0]
+  y_ffi.len = y.shape[0]
+
+  cdef _Result_Tuple result = convert_to_bng_threaded(x_ffi, y_ffi)
+
+  # get data pointers for the two result arrays
+  cdef double* e_ptr = &lt;double*&gt;(result.e.data)
+  cdef double* n_ptr = &lt;double*&gt;(result.n.data)
+  # now view your output arrays using memoryviews
+  # you need to tell it the length (this is how many doubles the contain)
+  cdef double[::1] e = &lt;double[:result.e.len:1]&gt;e_ptr
+  cdef double[::1] n = &lt;double[:result.n.len:1]&gt;n_ptr
+
+  # create a numpy copy of the two arrays
+  import numpy as np
+  e_numpy = np.copy(e)
+  n_numpy = np.copy(n)
+
+  # you can now free your two returned arrays
+  # I assume this is done with drop_float_array
+  drop_float_array(result.e,result.n)
+
+  # return as tuple containing two arrays to python
+  return e_numpy, n_numpy
+</code></pre>
+</div>
+<span class="comment-copy">What do you expect here? I would be surprised if cython would make a python tuple out of your custom struct implicitly.</span>
+<span class="comment-copy">@cel I expect someone to tell me how to be explicit about what I need to do to get cython to convert my result?</span>
+<span class="comment-copy">this may help, though: <a href="https://docs.python.org/2/c-api/tuple.html" rel="nofollow noreferrer">docs.python.org/2/c-api/tuple.html</a></span>
+<span class="comment-copy">This worked flawlessly. Thanks!</span>

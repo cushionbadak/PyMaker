@@ -1,0 +1,178 @@
+<div class="post-text" itemprop="text">
+<p>I'm having a strange phenomena in Python with callback functions and handlers. 
+I use ZMQ to handle my communication and use a stream for the socket. I have the base class:</p>
+<pre><code>import multiprocessing    
+import zmq
+from concurrent.futures import ThreadPoolExecutor
+from zmq.eventloop import ioloop, zmqstream
+from zmq.utils import jsonapi as json
+
+# Types of messages
+TYPE_A = 'type_a'
+TYPE_B = 'type_b'
+
+
+class ZmqProcess(multiprocessing.Process):
+    def __init__(self):
+        super(ZmqProcess, self).__init__()
+        self.context = None
+        self.loop = None
+        self.handle_stream = None
+
+    def setup(self):
+        self.context = zmq.Context()
+        self.loop = ioloop.IOLoop.instance()
+
+    def send(self, msg_type, msg, host, port):
+        sock = zmq.Context().socket(zmq.PAIR)
+        sock.connect('tcp://%s:%s' % (host, port))
+        sock.send_json([msg_type, msg])
+
+    def stream(self, sock_type, addr):
+        sock = self.context.socket(sock_type)
+            if isinstance(addr, str):
+            addr = addr.split(':')
+        host, port = addr if len(addr) == 2 else (addr[0], None)
+            if port:
+            sock.bind('tcp://%s:%s' % (host, port))
+        else:
+            port = sock.bind_to_random_port('tcp://%s' % host)
+        stream = zmqstream.ZMQStream(sock, self.loop)    
+        return stream, int(port)
+
+class MessageHandler(object):
+    def __init__(self, json_load=-1):
+        self._json_load = json_load
+        self.pool = ThreadPoolExecutor(max_workers=10)
+
+    def __call__(self, msg):
+        i = self._json_load
+        msg_type, data = json.loads(msg[i])
+        msg[i] = data
+        if msg_type.startswith('_'):
+            raise AttributeError('%s starts with an "_"' % msg_type)
+        getattr(self, msg_type)(*msg)
+</code></pre>
+<p>And I have a class that inherits from it:</p>
+<pre><code>import zmq    
+import zmq_base    
+
+class ZmqServerMeta(zmq_base.ZmqProcess):
+    def __init__(self, bind_addr, handlers):
+        super(ZmqServerMeta, self).__init__()
+        self.bind_addr = bind_addr
+        self.handlers = handlers
+
+    def setup(self):
+        super(ZmqServerMeta, self).setup()
+        self.handle_stream, _ = self.stream(zmq.PAIR, self.bind_addr)
+        self.handle_stream.on_recv(StreamHandler(self.handle_stream, self.stop,
+                                                 self.handlers))
+
+    def run(self):
+        self.setup()
+        self.loop.start()
+
+    def stop(self):
+        self.loop.stop()
+
+class StreamHandler(zmq_base.MessageHandler):
+    def __init__(self, handle_stream, stop, handlers):
+        super(StreamHandler, self).__init__()
+        self._handle_stream = handle_stream
+        self._stop = stop
+        self._handlers = handlers
+
+    def type_a(self, data):
+        if zmq_base.TYPE_A in self._handlers:
+            if self._handlers[zmq_base.TYPE_A]:
+                for handle in self._handlers[zmq_base.TYPE_A]:
+                    self.pool.submit(handle, data)
+            else:
+                pass
+        else:
+            pass
+
+    def type_b(self, data):
+        if zmq_base.TYPE_B in self._handlers:
+            if self._handlers[zmq_base.TYPE_B]:
+                for handle in self._handlers[zmq_base.TYPE_B]:
+                    self.pool.submit(handle, data)
+            else:
+                pass
+        else:
+            pass
+
+    def endit(self):
+        self._stop()
+</code></pre>
+<p>Additionally, I have a class that I want to use as storage. And here is where the trouble starts:</p>
+<pre><code>import threading
+import zmq_server_meta as server
+import zmq_base as base
+
+
+class Storage:
+    def __init__(self):
+        self.list = []
+
+        self.list_lock = threading.RLock()
+
+        self.zmq_server = None
+        self.host = '127.0.0.1'
+        self.port = 5432
+        self.bind_addr = (self.host, self.port)
+
+    def setup(self):
+        handlers = {base.TYPE_A: [self. remove]}
+        self.zmq_server = server.ZmqServerMeta(handlers=handlers, bind_addr=self.bind_addr)
+        self.zmq_server.start()
+
+    def add(self, data):
+        with self.list_lock:
+            try:
+                self.list.append(data)
+            except:
+                print "Didn't work"
+
+    def remove(self, msg):
+        with self.list_lock:
+            try:
+                self.list.remove(msg)
+            except:
+                print "Didn't work"
+</code></pre>
+<p>The idea is that that class stores some global information that it receives. 
+It is all started in a file to test:</p>
+<pre><code>import sys
+import time
+import storage
+import zmq_base as base
+import zmq_server_meta as server
+
+
+
+def printMsg(msg):
+    print msg
+
+store = storage.Storage()
+
+store.setup()
+handlers = {base.TYPE_B: [printMsg]}
+client = server.ZmqServerMeta(handlers=handlers, bind_addr=('127.0.0.1', 5431))
+client.start()
+
+message = "Test"
+
+store.add(message)
+client.send(base.TYPE_A, message, '127.0.0.1', 5432)
+</code></pre>
+<p>I simplified it to reduce clutter. Instead of just adding it, it is usually send and then a response comes back. The response, the client sending, should be processed by the correct callback, remove(), and it should remove something out of the list. The problem that occurs is, that the remove() function sees an empty list, although there should be an element in the list. If I check from the testing file, I can see the element after it was added, and if I call remove() from there, I see a non-empty list and can remove it. My question is, why does the callback sees an empty list and how can I make sure it does see the correct elements in the list?</p>
+<p>Kind regards
+Patrick</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I believe the problem lays in the fact that the ZmqProcess class inherits from multiprocessing.Process. Multiprocessing does not allow to share objects among different processes, except by using a shared memory map using Value or Array ( as can be seen in the documentation: <a href="https://docs.python.org/3/library/multiprocessing.html#sharing-state-between-processes" rel="nofollow noreferrer">https://docs.python.org/3/library/multiprocessing.html#sharing-state-between-processes</a> )</p>
+<p>If you want to use your custom object, you can use a Server process / proxy object, which can be found in on the same page of the documentation. </p>
+<p>So you can, for instance, define a manager in the init function of the Storage class like:  <code>self.manager = Manager()</code> Afterwards you put <code>self.list = self.manager.list()</code>. This should do the trick.</p>
+</div>

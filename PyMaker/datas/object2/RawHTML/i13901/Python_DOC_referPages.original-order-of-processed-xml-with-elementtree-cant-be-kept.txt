@@ -1,0 +1,260 @@
+<div class="post-text" itemprop="text">
+<p>I've written a fairly simple filter in python using ElementTree to munge the contexts of some xml files. And it works, more or less. </p>
+<p>But it reorders the attributes of various tags, and I'd like it to not do that.</p>
+<p>Does anyone know a switch I can throw to make it keep them in specified order?</p>
+<h2>Context for this</h2>
+<p>I'm working with and on a particle physics tool that has a complex, but oddly limited configuration system based on xml files. Among the many things setup that way are the paths to various static data files. These paths are hardcoded into the existing xml and there are no facilities for setting or varying them based on environment variables, and in our local installation they are necessarily in a different place.</p>
+<p>This isn't a disaster because the combined source- and build-control tool we're using allows us to shadow certain files with local copies. But even thought the data fields are static the xml isn't, so I've written a script for fixing the paths, but with the attribute rearrangement diffs between the local and master versions are harder to read than necessary.</p>
+<hr/>
+<p>This is my first time taking ElementTree for a spin (and only my fifth or sixth python project) so maybe I'm just doing it wrong.</p>
+<p>Abstracted for simplicity the code looks like this:</p>
+<pre><code>tree = elementtree.ElementTree.parse(inputfile)
+i = tree.getiterator()
+for e in i:
+    e.text = filter(e.text)
+tree.write(outputfile)
+</code></pre>
+<p>Reasonable or dumb?</p>
+<hr/>
+<p>Related links:</p>
+<ul>
+<li><a href="https://stackoverflow.com/questions/998514/how-can-i-get-the-order-of-an-element-attribute-list-using-python-xml-sax">How can I get the order of an element attribute list using Python xml.sax?</a></li>
+<li><a href="https://stackoverflow.com/questions/662624/preserve-order-of-attributes-when-modifying-with-minidom">Preserve order of attributes when modifying with minidom</a></li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>With help from @bobince's answer and these two (<a href="https://stackoverflow.com/questions/14257978/elementtree-setting-attribute-order">setting attribute order</a>, <a href="https://stackoverflow.com/questions/10829200/override-module-method-where-from-import-is-used">overriding module methods</a>)</p>
+<p>I managed to get this monkey patched it's dirty and I'd suggest using another module that better handles this scenario but when that isn't a possibility:</p>
+<pre><code># =======================================================================
+# Monkey patch ElementTree
+import xml.etree.ElementTree as ET
+
+def _serialize_xml(write, elem, encoding, qnames, namespaces):
+    tag = elem.tag
+    text = elem.text
+    if tag is ET.Comment:
+        write("&lt;!--%s--&gt;" % ET._encode(text, encoding))
+    elif tag is ET.ProcessingInstruction:
+        write("&lt;?%s?&gt;" % ET._encode(text, encoding))
+    else:
+        tag = qnames[tag]
+        if tag is None:
+            if text:
+                write(ET._escape_cdata(text, encoding))
+            for e in elem:
+                _serialize_xml(write, e, encoding, qnames, None)
+        else:
+            write("&lt;" + tag)
+            items = elem.items()
+            if items or namespaces:
+                if namespaces:
+                    for v, k in sorted(namespaces.items(),
+                                       key=lambda x: x[1]):  # sort on prefix
+                        if k:
+                            k = ":" + k
+                        write(" xmlns%s=\"%s\"" % (
+                            k.encode(encoding),
+                            ET._escape_attrib(v, encoding)
+                            ))
+                #for k, v in sorted(items):  # lexical order
+                for k, v in items: # Monkey patch
+                    if isinstance(k, ET.QName):
+                        k = k.text
+                    if isinstance(v, ET.QName):
+                        v = qnames[v.text]
+                    else:
+                        v = ET._escape_attrib(v, encoding)
+                    write(" %s=\"%s\"" % (qnames[k], v))
+            if text or len(elem):
+                write("&gt;")
+                if text:
+                    write(ET._escape_cdata(text, encoding))
+                for e in elem:
+                    _serialize_xml(write, e, encoding, qnames, None)
+                write("&lt;/" + tag + "&gt;")
+            else:
+                write(" /&gt;")
+    if elem.tail:
+        write(ET._escape_cdata(elem.tail, encoding))
+
+ET._serialize_xml = _serialize_xml
+
+from collections import OrderedDict
+
+class OrderedXMLTreeBuilder(ET.XMLTreeBuilder):
+    def _start_list(self, tag, attrib_in):
+        fixname = self._fixname
+        tag = fixname(tag)
+        attrib = OrderedDict()
+        if attrib_in:
+            for i in range(0, len(attrib_in), 2):
+                attrib[fixname(attrib_in[i])] = self._fixtext(attrib_in[i+1])
+        return self._target.start(tag, attrib)
+
+# =======================================================================
+</code></pre>
+<p>Then in your code:</p>
+<pre><code>tree = ET.parse(pathToFile, OrderedXMLTreeBuilder())
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Nope. ElementTree uses a dictionary to store attribute values, so it's inherently unordered.</p>
+<p>Even DOM doesn't guarantee you attribute ordering, and DOM exposes a lot more detail of the XML infoset than ElementTree does. (There are some DOMs that do offer it as a feature, but it's not standard.)</p>
+<p>Can it be fixed? Maybe. Here's a stab at it that replaces the dictionary when parsing with an ordered one (<a href="https://docs.python.org/2/library/collections.html#ordereddict-objects" rel="noreferrer"><code>collections.OrderedDict()</code></a>).</p>
+<pre><code>from xml.etree import ElementTree
+from collections import OrderedDict
+import StringIO
+
+class OrderedXMLTreeBuilder(ElementTree.XMLTreeBuilder):
+    def _start_list(self, tag, attrib_in):
+        fixname = self._fixname
+        tag = fixname(tag)
+        attrib = OrderedDict()
+        if attrib_in:
+            for i in range(0, len(attrib_in), 2):
+                attrib[fixname(attrib_in[i])] = self._fixtext(attrib_in[i+1])
+        return self._target.start(tag, attrib)
+
+&gt;&gt;&gt; xmlf = StringIO.StringIO('&lt;a b="c" d="e" f="g" j="k" h="i"/&gt;')
+
+&gt;&gt;&gt; tree = ElementTree.ElementTree()
+&gt;&gt;&gt; root = tree.parse(xmlf, OrderedXMLTreeBuilder())
+&gt;&gt;&gt; root.attrib
+OrderedDict([('b', 'c'), ('d', 'e'), ('f', 'g'), ('j', 'k'), ('h', 'i')])
+</code></pre>
+<p>Looks potentially promising.</p>
+<pre><code>&gt;&gt;&gt; s = StringIO.StringIO()
+&gt;&gt;&gt; tree.write(s)
+&gt;&gt;&gt; s.getvalue()
+'&lt;a b="c" d="e" f="g" h="i" j="k" /&gt;'
+</code></pre>
+<p>Bah, the serialiser outputs them in canonical order.</p>
+<p>This looks like the line to blame, in <code>ElementTree._write</code>:</p>
+<pre><code>            items.sort() # lexical order
+</code></pre>
+<p>Subclassing or monkey-patching that is going to be annoying as it's right in the middle of a big method.</p>
+<p>Unless you did something nasty like subclass <code>OrderedDict</code> and hack <code>items</code> to return a special subclass of <code>list</code> that ignores calls to <code>sort()</code>. Nah, probably that's even worse and I should go to bed before I come up with anything more horrible than that.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Wrong question. Should be: "Where do I find a <code>diff</code> gadget that works sensibly with XML files?</p>
+<p>Answer: Google is your friend. First result for search on "xml diff" =&gt; <a href="http://diffxml.sourceforge.net/" rel="nofollow noreferrer">this</a>. There are a few more possibles.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Yes, with <a href="http://lxml.de/" rel="nofollow">lxml</a></p>
+<pre><code>&gt;&gt;&gt; from lxml import etree
+&gt;&gt;&gt; root = etree.Element("root", interesting="totally")
+&gt;&gt;&gt; etree.tostring(root)
+b'&lt;root interesting="totally"/&gt;'
+&gt;&gt;&gt; print(root.get("hello"))
+None
+&gt;&gt;&gt; root.set("hello", "Huhu")
+&gt;&gt;&gt; print(root.get("hello"))
+Huhu
+&gt;&gt;&gt; etree.tostring(root)
+b'&lt;root interesting="totally" hello="Huhu"/&gt;'
+</code></pre>
+<p>Here is direct <a href="http://lxml.de/tutorial.html#elements-carry-attributes-as-a-dict" rel="nofollow">link</a> to documentation, from which the above example is slightly adapted.</p>
+<p>Also note that lxml has, by design, some good API compatiblity with standard <a href="https://docs.python.org/3/library/xml.etree.elementtree.html" rel="nofollow">xml.etree.ElementTree</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>From section 3.1 of <a href="http://www.w3.org/TR/REC-xml/" rel="nofollow noreferrer">the XML recommendation</a>:</p>
+<blockquote>
+<p>Note that the order of attribute specifications in a start-tag or empty-element tag is not significant.</p>
+</blockquote>
+<p>Any system that relies on the order of attributes in an XML element is going to break.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Have had your problem. Firstly looked for some Python script to canonize, didnt found anyone. Then started thinking about making one. Finally <a href="http://linux.die.net/man/1/xmllint" rel="nofollow"><code>xmllint</code></a>solved.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is a partial solution, for the case where xml is being emitted and a predictable order is desired. It does not solve round trip parsing and writing.   Both 2.7 and 3.x use <code>sorted()</code> to force an attribute ordering.  So, this code, in conjunction with use of an OrderedDictionary to hold the attributes will preserve the order for xml output to match the order used to create the Elements.</p>
+<pre><code>from collections import OrderedDict
+from xml.etree import ElementTree as ET
+
+# Make sorted() a no-op for the ElementTree module
+ET.sorted = lambda x: x
+
+try:
+    # python3 use a cPython implementation by default, prevent that
+    ET.Element = ET._Element_Py
+    # similarly, override SubElement method if desired
+    def SubElement(parent, tag, attrib=OrderedDict(), **extra):
+        attrib = attrib.copy()
+        attrib.update(extra)
+        element = parent.makeelement(tag, attrib)
+        parent.append(element)
+        return element
+    ET.SubElement = SubElement
+except AttributeError:
+    pass  # nothing else for python2, ElementTree is pure python
+
+# Make an element with a particular "meaningful" ordering
+t = ET.ElementTree(ET.Element('component',
+                       OrderedDict([('grp','foo'),('name','bar'),
+                                    ('class','exec'),('arch','x86')])))
+# Add a child element
+ET.SubElement(t.getroot(),'depend',
+              OrderedDict([('grp','foo'),('name','util1'),('class','lib')]))  
+x = ET.tostring(n)
+print (x)
+# Order maintained...
+# &lt;component grp="foo" name="bar" class="exec" arch="x86"&gt;&lt;depend grp="foo" name="util1" class="lib" /&gt;&lt;/component&gt;
+
+# Parse again, won't be ordered because Elements are created
+#   without ordered dict
+print ET.tostring(ET.fromstring(x))
+# &lt;component arch="x86" name="bar" grp="foo" class="exec"&gt;&lt;depend name="util1" grp="foo" class="lib" /&gt;&lt;/component&gt;
+</code></pre>
+<p>The problem with parsing XML into an element tree is that the code internally creates plain <code>dict</code>s which are passed in to Element(), at which point the order is lost.  No equivalent simple patch is possible.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Best Option is to use the <strong>lxml</strong> library <a href="http://lxml.de/" rel="nofollow noreferrer">http://lxml.de/</a>
+Installing the lxml and just switching the library did the magic to me.</p>
+<pre><code>#import xml.etree.ElementTree as ET
+from lxml import etree as ET
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I used the accepted answer above, with both statements:</p>
+<pre><code>ET._serialize_xml = _serialize_xml
+ET._serialize['xml'] = _serialize_xml
+</code></pre>
+<p>While this fixed the ordering in every node, attribute ordering on new nodes inserted from copies of existing nodes failed to preserve without a deepcopy.  Watch out for reusing nodes to create others...
+In my case I had an element with several attributes, so I wanted to reuse them:</p>
+<pre><code>to_add = ET.fromstring(ET.tostring(contract))
+to_add.attrib['symbol'] = add
+to_add.attrib['uniqueId'] = add
+contracts.insert(j + 1, to_add)
+</code></pre>
+<p>The <code>fromstring(tostring)</code> will reorder the attributes in memory.  It may not result in the alpha sorted dict of attributes, but it also may not have the expected ordering.</p>
+<pre><code>to_add = copy.deepcopy(contract)
+to_add.attrib['symbol'] = add
+to_add.attrib['uniqueId'] = add
+contracts.insert(j + 1, to_add)
+</code></pre>
+<p>Now the ordering persists.</p>
+</div>
+<span class="comment-copy">is there no real solution to this? etree in python 3.4 does not preserve attributes? or does it with some settings?? Thanks for the help!</span>
+<span class="comment-copy">@Gabriel Look at the accepted answer...</span>
+<span class="comment-copy">i thought of an non-monkey-patch solution =)? sadly as it looks there is nothing better for now... this question is especially relevant if the XML should stay hand-editable, and user-friendy to read, I almost think I am going for regex substitutions to modify the xml, sucks but, the layout is then preserved (also formattings like indentations and linebreaks)</span>
+<span class="comment-copy">If your goal is a reasonable diff, consider keeping the canonical copy of your file in <a href="https://www.w3.org/TR/xml-c14n" rel="nofollow noreferrer">c14n</a> format. That way you can re-canonicalize any modified version and get a diff that only includes semantically-relevant changes.</span>
+<span class="comment-copy">Wow. In the years since I asked this question the offending tool has been re-structured to allow persistent local overrides so that my original need has disappeared and I've moved on to different, if not greener, pastures and don't even use the fixed version any more. None the less, I am sure that <i>someone</i> still has this need.</span>
+<span class="comment-copy">@dmckee : you are totally right. <a href="http://stackoverflow.com/questions/31587264/original-order-of-processed-xml-with-elementtree-cant-be-kept?noredirect=1#comment51129714_31587264">This question is still relevant</a> and the patch can't be the correct way to solve this .</span>
+<span class="comment-copy">is there a solution now for python 3.4? Did the etree implementation change to allow this?</span>
+<span class="comment-copy">"Another module that better handles this scenario" Do you have any specific ones in mind?</span>
+<span class="comment-copy"><b>Note</b>: patching <code>ET._serialize_xml</code> is NOT enough if you want root node atributes to preserve the order as well! Also put the patched <code>_serialize_xml</code> into <code>ET._serialize['xml']</code> and Voilà you got that too!! :]</span>
+<span class="comment-copy">Very nice OrderedXmlTreeBuilder in code above! It can be used with ltree and serialization will be fixed too. Thank you very much for this.</span>
+<span class="comment-copy">Always happy to see an alternate solution. Thanks.</span>
+<span class="comment-copy">In a perfect world, yes.  However, sometimes we don't get to choose all the components of our toolset--for example, if your version control system can't be taught to diff XML files semantically, and you can't change to a different one.</span>
+<span class="comment-copy">How do I integrate the tool with Github, Stash or any other web interface to a version control system?</span>
+<span class="comment-copy">Are you sure that lxml preserves the attribute order? The documentation seems to say the opposite.</span>
+<span class="comment-copy">From the documentation, I simplified the example, and tried it with my python 3.4, and the example provided here is pasted from my terminal. At least it worked for me. Also the documentation, at least the url I provided, clearly states that it preserves order, not the lexical order, but the order asked in this stackoverfow question.</span>
+<span class="comment-copy">No offence, but the question is about preserving the order of the attributes of an element. The documentation of lxml (on your link) says: "Attributes are just unordered name-value pairs...". I did not find anything about preserving the order of element attributes from the XML source. The tricky part of the question is that the author has more strict needs than those that are guaranteed by XML format -- which is understandable, but probably not implemented by lxml.</span>
+<span class="comment-copy">My understanding of "Attributes are just unordered name-value pairs..." is, contrary to xml.etree.ElementTree who is ordering by lexical order, lxml is able to keep the non-lexical order, that is something like the FIFO order here. When you say "I did not find anything about preserving the order of element attributes from the XML source.", I would read the xml file with lxml (note the 'l'), and when writing, I would explicitely chose the order I want, using above example.</span>
+<span class="comment-copy">Is the preserving the order of element attributes documented for lxml? I did not find it, and I cannot rely on any guess based on any observation.</span>
+<span class="comment-copy">This is not necessarily about correctness, but about maintaining minimal diff.</span>
+<span class="comment-copy">But then tried and now am not that sure.</span>
+<span class="comment-copy">In those days since then have had kinda similar problem with rdf (an xml subset) which i solve with inner views and sorting alphabetically that views.</span>
+<span class="comment-copy">thdox already <a href="https://stackoverflow.com/a/34560411/2509">posted that suggestion</a>.</span>
+<span class="comment-copy">@dmckee : you are right. I totally missed that answer.</span>
+<span class="comment-copy">reusing a node? I wasn't able to comment so I added it as a complement to the accepted answer.  It is to caution anyone that also wants to copy an existing and insert it with some values changed back into the tree.  If one wants to do this, the accepted answer fails without a deepcopy.</span>

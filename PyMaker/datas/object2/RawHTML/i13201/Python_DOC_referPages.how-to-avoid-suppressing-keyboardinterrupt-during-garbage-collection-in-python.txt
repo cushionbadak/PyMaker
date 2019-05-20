@@ -1,0 +1,38 @@
+<div class="post-text" itemprop="text">
+<p>Default handler for SIGINT raises KeyboardInterrupt. However, if a program is inside a __del__ method (because of an ongoing garbage collection), the exception is ignored with the following message printed to stderr:</p>
+<pre><code>Exception KeyboardInterrupt in &lt;...&gt; ignored
+</code></pre>
+<p>As a result, the program continues to work despite receiving SIGINT. Of course, I can define my own handler for SIGINT that sets a global variable sigint_received to True, and then often check the value of the variable in my program. But this looks ugly.</p>
+<p>Is there an elegant and reliable way to make sure that the python program gets interrupted after receiving SIGINT? </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Before I dive into my solution, I want to highlight the scary red "Warning:" sidebar in the <a href="https://docs.python.org/3/reference/datamodel.html#object.__del__" rel="nofollow">docs for <code>object.__del__</code></a> (emphasis mine):</p>
+<blockquote>
+<p>Due to the precarious circumstances under which <code>__del__()</code> methods are invoked, exceptions that occur during their execution are ignored, and a warning is printed to <code>sys.stderr</code> instead. [...]  <strong><code>__del__()</code> methods should do the absolute minimum needed to maintain external invariants.</strong></p>
+</blockquote>
+<p>This suggests to me that any <code>__del__</code> method that's at serious risk of being interrupted by an interactive user's <code>Ctrl-C</code> might be doing too much.  So my first suggestion would be to look for ways to minimize your <code>__del__</code> method, whatever it is.</p>
+<p>Or to put it another way:  If your <code>__del__</code> method really <em>does</em> do "the absolute minimum needed", then how can it be safe to kill the process half-way through?</p>
+<h1>Custom Signal Handler</h1>
+<p>The only solution I could find was indeed a <a href="https://docs.python.org/3/library/signal.html#signal.signal" rel="nofollow">custom signal handler</a> for <code>signal.SIGINT</code>... but a lot of the obvious tricks didn't work:</p>
+<h2>Failed:  <code>sys.exit</code></h2>
+<p>Calling <code>sys.exit</code> from the signal handler just raised a <code>SystemExit</code> exception, which was ignored.  Python's C API docs suggest that it is impossible for the Python interpreter to raise <em>any</em> exception during a <code>__del__</code> method:</p>
+<blockquote>
+<p><code>void</code><a href="https://docs.python.org/3/c-api/exceptions.html#c.PyErr_WriteUnraisable" rel="nofollow"><code>PyErr_WriteUnraisable</code></a><code>(PyObject *obj)</code></p>
+<p>[Called when...] it is impossible for the interpreter to actually raise the exception [...] for example, when an exception occurs in an <a href="https://docs.python.org/3/reference/datamodel.html#object.__del__" rel="nofollow"><code>__del__()</code></a> method.</p>
+</blockquote>
+<h2>Partial Success:  Flag Variable</h2>
+<p>Your idea of setting a global "drop dead" variable inside the signal handler worked only partially --- although it updated the variable, nothing got a chance to <em>read</em> that variable until after the <code>__del__</code> method returned.  So for several seconds, the <code>Ctrl-C</code> appeared to have done nothing.</p>
+<p>This might be good enough if you just want to terminate the process "eventually", since it <em>will</em> exit whenever the <code>__del__</code> method returns.  But since you probably want to shut down the process <em>without</em> waiting (both <code>SIGINT</code> and <code>KeyboardInterrupt</code> typically come from an impatient user), this won't do.</p>
+<h2>Success:  <code>os.kill</code></h2>
+<p>Since I couldn't find a way to convince the Python interpreter to kill itself, my solution was to have the (much more persuasive) operating system do it for me.  This signal handler uses <a href="https://docs.python.org/3/library/os.html#os.kill" rel="nofollow"><code>os.kill</code></a> to send a stronger <code>SIGTERM</code> to its own process ID, causing the Python interpreter itself to exit.</p>
+<pre class="lang-python3 prettyprint-override"><code>def _sigterm_this_process(signum, frame):
+    pid = os.getpid()
+    os.kill(pid, signal.SIGTERM)
+    return
+
+# Elsewhere...
+signal.signal(signal.SIGINT, _sigterm_this_process)
+</code></pre>
+<p>Once the custom signal handler was set,  <code>Ctrl-C</code> caused the <code>__del__</code> method (and the entire program) to exit immediately.</p>
+</div>
+<span class="comment-copy">Thanks for your answer Kevin.  <code>__del__</code> methods in my code come from generators, so there is no way to get rid of them.  Your solution works, but I would also like to do some cleanup before exiting the program. I couldn't do the cleanup in signal handler, because I have no idea which line of the code has been just executed. Besides, I think that what <code>except KeyboardInterrupt</code> clause is for. Unfortunately, as I mentioned in my original post it's not reliable.</span>

@@ -1,0 +1,82 @@
+<div class="post-text" itemprop="text">
+<p>I'm writing an application which reads text data and acts on it. The text data could come from a TCP port, or from a text file (which contains data earlier read from the TCP port and archived). I'm writing it in Python 3, and using <a href="https://docs.python.org/3/library/asyncio.html" rel="nofollow noreferrer"><strong>asyncio</strong></a> seems like the obvious tool to use. </p>
+<p>It's straightforward to use the <a href="https://docs.python.org/3/library/asyncio-stream.html#stream-functions" rel="nofollow noreferrer">Streams API <code>open_connection()</code></a> to open the TCP port and read from it. The <strong>asyncio</strong> architecture has the concept a <a href="https://docs.python.org/3/library/asyncio-protocol.html#transports" rel="nofollow noreferrer">Transport</a> and a <a href="https://docs.python.org/3/library/asyncio-protocol.html#protocols" rel="nofollow noreferrer">Protocol</a> for the lower and upper layers of input-output. So, it seems I should implement a Transport for reading text from a file, and pass it to the Protocol. That will let me keep the rest of my application decoupled from whether the text data came from the TCP port or the file.</p>
+<p>But I'm having a hard time figuring out how to tell <strong>asyncio</strong> to use my preferred Transport. </p>
+<ul>
+<li>the <a href="https://docs.python.org/3/library/asyncio-stream.html#stream-functions" rel="nofollow noreferrer">Streams API <code>open_connection()</code></a> has a parameter list which is all about the TCP port Transport, with no way to specify a different Transport, much less parameters like file path.  </li>
+<li><code>open_connection()</code> turns around and calls <a href="https://docs.python.org/3/library/asyncio-eventloop.html#creating-connections" rel="nofollow noreferrer"><code>loop.create_connection()</code></a>. This is just as specialised for the TCP Port Transport. Still now way to provide a different Transport.</li>
+<li>The implementation of <code>loop.create_connection()</code> gets its Transport object from either <code>self._make_ssl_transport()</code> or <code>self._make_socket_transport()</code>. These have alternative implementations in <code>asyncio.selector_events.BaseSelectorEventLoop</code> and <code>asyncio.proactor_events.BaseProactorEventLoop</code>, so we are clearly past the point where a File Transport ought to have been selected.</li>
+</ul>
+<p>Am I missing some place where <strong>asyncio</strong> lets me tell it what Transport to use?  Or is <strong>asyncio</strong> really coded down to its roots to use its own TCP port and UDP datagram Transports, and nothing else? </p>
+<p>If I want to allow the possibility of using my own Transport with <strong>asyncio</strong>, it looks like I have to extend the event loop, or write more a flexible alternative <code>create_connection()</code> that is coded to a particular event loop implementation.  That seems like a lot of work, and vulnerable to changes in the implementation.</p>
+<p>Or, is it a foolish errand to handle file input with a Transport?  Should I instead structure my code to say:</p>
+<p><code>if (using_tcp_port): 
+    await asyncio.open_connection(....)
+else:
+    completely_different_file_implementation(....)
+</code></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>According to the <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.AbstractEventLoop.create_connection" rel="nofollow noreferrer">documentation</a> of <strong>API</strong> <code>create_connection()</code>, it <em>takes</em> a protocol and <em>creates</em> a <strong>streaming</strong> transport, which <em>is</em> a TCP connection. So it is not supposed to be an API for custom transports.</p>
+<p>However, the idea to reuse the same protocol for either TCP transports or custom file transports is valid. It won't be a "completely different implementation", but at least not using <code>create_connection()</code>. Let's assume it is <code>read_file()</code>:</p>
+<pre><code>def my_protocol_factory():
+    return your_protocol
+
+if using_tcp_port:
+    transport, protocol = await loop.create_connection(my_protocol_factory, host, port)
+else:
+    transport, protocol = await read_file(loop, my_protocol_factory, path_to_file)
+</code></pre>
+<p>Then you would have something like this:</p>
+<pre><code>from asyncio import transports
+
+import aiofiles  # https://github.com/Tinche/aiofiles
+
+
+def read_file(loop, protocol_factory, path):
+    protocol = protocol_factory()
+    transport = FileTransport(path, loop)
+    transport.set_protocol(protocol)
+    return transport, protocol
+
+
+class FileTransport(transports.ReadTransport):
+    def __init__(self, path, loop):
+        super().__init__()
+        self._path = path
+        self._loop = loop
+        self._closing = False
+
+    def is_closing(self):
+        return self._closing
+
+    def close(self):
+        self._closing = True
+
+    def set_protocol(self, protocol):
+        self._protocol = protocol
+        self._loop.create_task(self._do_read())
+
+    def get_protocol(self):
+        return self._protocol
+
+    async def _do_read(self):
+        try:
+            async with aiofiles.open(self._path) as f:
+                self._loop.call_soon(self._protocol.connection_made, self)
+                async for line in f:
+                    self._loop.call_soon(self._protocol.data_received, line)
+                    if self._closing:
+                        break
+                self._loop.call_soon(self._protocol.eof_received)
+        except Exception as ex:
+            self._loop.call_soon(self._protocol.connection_lost, ex)
+        else:
+            self._loop.call_soon(self._protocol.connection_lost, None)
+</code></pre>
+</div>
+<span class="comment-copy">Thank you, I hadn't known about <a href="https://github.com/Tinche/aiofiles" rel="nofollow noreferrer">github.com/Tinche/aiofiles</a> .</span>
+<span class="comment-copy">No problem, it's a library that calls blocking file I/O in thread pool (executor).</span>
+<span class="comment-copy">At the risk of turning this into a discussion: the statement, "a streaming transport, which is a TCP connection", is not self-evident. I interpret "stream" to mean an abstraction of input/output as a sequence of bytes, which could be attached to TCP connections, files, the Unix stdin/stdout/stderror, or pipes to Unix filters, or a wide range of things. I think &lt;<a href="https://en.wikipedia.org/wiki/Standard_streams" rel="nofollow noreferrer">en.wikipedia.org/wiki/Standard_streams</a>&gt; has the same broad meaning. If the <code>asyncio</code> package wants to define "streams" as limited to TCP connections, they should say so.</span>
+<span class="comment-copy">@JimDeLaHunt Oh I should have said "<code>create_connection()</code> ... creates a streaming transport, which is a TCP connection <b>in this case</b>". I agree with you that stream is more generic than just TCP. And actually <code>create_connection()</code> may also be used to create UNIX domain sockets, by passing in a <code>sock</code> instance initialized with <code>AF_UNIX</code>, it is just not a traditional usage though with <code>create_unix_connection()</code> present. The implication in this documentation is: it is creating a streaming transport with <b>socket</b>.</span>
+<span class="comment-copy">Actually neither <a href="https://linux.die.net/man/7/socket" rel="nofollow noreferrer">socket(7)</a> nor <a href="https://linux.die.net/man/2/connect" rel="nofollow noreferrer">connect(2)</a> mentioned TCP, and <code>create_connection()</code> has claimed to use <code>AF_INET</code>/<code>AF_INET6</code> and <code>SOCK_STREAM</code> to connect to Internet host and port.</span>

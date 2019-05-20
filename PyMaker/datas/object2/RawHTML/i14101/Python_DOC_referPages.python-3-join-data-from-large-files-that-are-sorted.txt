@@ -1,0 +1,163 @@
+<div class="post-text" itemprop="text">
+<p>I have multiple large files (&gt; 5M rows of data) that are sorted on a unique timestamp. All the files contain virtually all the same timestamps except for a handful of randomly missing rows (&lt; 1000). I'd like to efficiently join the data from all the files into a single dataset with one row per timestamp, preferably using a generator. </p>
+<p>Except for the missing rows, I could just use zip:</p>
+<pre><code>def get_data(list_of_iterables):
+    for data in zip(*list_of_iterables):
+        yield data
+</code></pre>
+<p>However, since there are some missing rows, I need to join the data on timestamp instead of simply zipping. I can simply ignore any rows that don't have matching timestamps in every file. </p>
+<p>Is there a pythonic way to implement this functionality in a few lines? </p>
+<p>My approach would be to advance each iterable in turn until it's timestamp is no longer less than the maximum timestamp for the group of iterables. Whenever all the timestamps match, yield a row and advance all the iterables. But, the logic seems messy when I try to implement this approach.</p>
+<p>Edit: Performance.</p>
+<p>The implementation needs to start returning rows without reading all the data into memory first. It takes a while to read all the data and many times only the first handful of rows needs to be examined. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I ended up writing the following code to solve my problem, which turned out to be lighter than I expected:</p>
+<pre><code>def advance_values(iters):
+    for it in iters:
+        yield next(it)
+
+def align_values(iters, values, key):
+    for it, value in zip(iters, values):
+        while (value[0],value[1]) &lt; key:
+            value = next(it)
+        yield value
+
+def merge_join(*iters):
+    values = list(advance_values(iters))
+    while True:
+        if len(values) != len(iters):
+            return
+        tms = [(v[0],v[1]) for v in values]
+        max_tm = max(tms)
+        if all((v[0],v[1]) == max_tm for v in values):
+            yield values
+            values = list(advance_values(iters))
+        else:
+            values = list(align_values(iters, values, max_tm))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If each iterable in <code>list_of_iterables</code> is sorted by <code>timestamp</code> then you could use <a href="https://docs.python.org/3/library/heapq.html#heapq.merge" rel="nofollow"><code>heapq.merge()</code></a> to merge them taking into account possible gaps in the data and <a href="https://docs.python.org/3/library/itertools.html#itertools.groupby" rel="nofollow"><code>itertools.groupby()</code></a> to group records with the same timestamp:</p>
+<pre><code>from heapq import merge
+from itertools import groupby
+from operator import attrgetter
+
+for timestamp, group in groupby(merge(*list_of_iterables), 
+                                key=attrgetter('timestamp')):
+    print(timestamp, list(group)) # same timestamp
+</code></pre>
+<p>The implementation yields groups without reading all the data into memory first.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>My first guess would be to use a dictionary with timestamps as keys and the rest of the data in the rows as values, then for each row in each file, add it to the dictionary only if an item with the same timestamp (key) isn't already present.</p>
+<p>However, if you truly are dealing with giant data sets (which it seems like you are in this case), then the approach you mention in your original question would be your best option.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>ok, i got interested in the problem (had a similar problem recently) and worked a bit on it. you could try something like this:</p>
+<pre><code>import io
+import datetime
+from csv import DictReader
+
+file0 = io.StringIO('''timestamp,data
+2015-06-01 10:00, data00
+2015-06-01 11:00, data01
+2015-06-01 12:00, data02
+2015-06-01 12:30, data03
+2015-06-01 13:00, data04
+''')
+
+file1 = io.StringIO('''timestamp,data
+2015-06-01 09:00, data10
+2015-06-01 10:30, data11
+2015-06-01 11:00, data12
+2015-06-01 12:30, data13
+''')
+
+class Data(object):
+
+    def __init__(self):
+        self.timestamp = None
+        self.data = None
+
+    @staticmethod
+    def new_from_dict(dct=None):
+        if dct is None:
+            return None
+        ret = Data()
+        ret.data = dct['data'].strip()
+        ret.timestamp = datetime.datetime.strptime(dct['timestamp'],
+                                                   '%Y-%m-%d %H:%M')
+        return ret
+
+    def __lt__(self, other):
+        if other is None:
+            return False
+        return self.timestamp &lt; other.timestamp
+
+    def __gt__(self, other):
+        if other is None:
+            return False
+        return self.timestamp &gt; other.timestamp
+
+    def __str__(self):
+        ret = '{0.__class__.__name__}'.format(self) +\
+              '(timestamp={0.timestamp}, data={0.data})'.format(self)
+        return ret
+
+
+def next_or_none(reader):
+    try:
+        return Data.new_from_dict(next(reader))
+    except StopIteration:
+        return None
+
+
+def yield_in_order(reader0, reader1):
+
+    data0 = next_or_none(reader0)
+    data1 = next_or_none(reader1)
+
+    while not data0 == data1 == None:
+
+        if data0 is None:
+            yield None, data1
+            data1 = next_or_none(reader1)
+            continue
+        if data1 is None:
+            yield data0, None
+            data0 = next_or_none(reader0)
+            continue
+
+        while data0 &lt; data1:
+            yield data0, None
+            data0 = next_or_none(reader0)
+
+        while data0 &gt; data1:
+            yield None, data1
+            data1 = next_or_none(reader1)
+
+        if data0 is not None and data1 is not None:
+            if data0.timestamp == data1.timestamp:
+                yield data0, data1
+                data0 = next_or_none(reader0)
+                data1 = next_or_none(reader1)
+
+csv0 = DictReader(file0)
+csv1 = DictReader(file1)
+
+FMT = '{!s:50s} | {!s:50s}'
+print(FMT.format('file0', 'file1'))
+print(101*'-')
+for dta0, dta1 in yield_in_order(csv0, csv1):
+    print(FMT.format(dta0, dta1))
+</code></pre>
+<p>this is for 2 files only.</p>
+</div>
+<span class="comment-copy">please add some example data</span>
+<span class="comment-copy">I would suggest for you to take a look at pandas (<a href="http://pandas.pydata.org/" rel="nofollow noreferrer">pandas.pydata.org</a>). It has tools to do this exact type of merging that you´re mentioning.</span>
+<span class="comment-copy">@Ivan I noticed the Pandas library when I was Googling this issue. The library looks very useful for many of the operations that I am doing. I currently rely heavily on Numpy, but I am going to investigate Pandas when I get some time.</span>
+<span class="comment-copy">@RandomBits: pandas is built on top of <code>numpy</code> arrays. It is built to make it easier the operations you describe in particular <a href="http://pandas.pydata.org/pandas-docs/stable/merging.html" rel="nofollow noreferrer">to merge, join data</a>.</span>
+<span class="comment-copy">sorry. updated my answer and saw now only that you posted a solution  yourself...</span>
+<span class="comment-copy">I can see how that would work, but seem my comment on performance as this method seems like it needs to read all the data into memory first.</span>
+<span class="comment-copy">@RandomBits OK, thanks for the extra information. I can't think of a better way to solve the problem than the one you gave in your original question, in that case.</span>

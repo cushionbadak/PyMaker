@@ -1,0 +1,79 @@
+<div class="post-text" itemprop="text">
+<p>Splitting on white-space can be done in two ways with <strong><a href="https://docs.python.org/3/library/stdtypes.html#str.strip" rel="nofollow noreferrer"><code>str.strip</code></a></strong>. You can either issue a call with no arguments, <code>str.strip()</code>, which defaults to using a white-space delimiter or explicitly supply the argument yourself with <code>str.strip(' ')</code>.</p>
+<p>But, why is it that when timed these functions perform so differently? </p>
+<p>Using a sample string with an intentional amount of white spaces:</p>
+<pre><code>s = " " * 100 + 'a' + " " * 100
+</code></pre>
+<p>The timings for <code>s.strip()</code> and <code>s.strip(' ')</code> are respectively:</p>
+<pre><code>%timeit s.strip()
+The slowest run took 32.74 times longer than the fastest. This could mean that an intermediate result is being cached.
+1000000 loops, best of 3: 396 ns per loop
+
+%timeit s.strip(' ')
+100000 loops, best of 3: 4.5 µs per loop
+</code></pre>
+<p><code>strip</code> takes <code>396ns</code> while <code>strip(' ')</code> takes <code>4.5 μs</code>, a similar scenario is present with <code>rsplit</code> and <code>lsplit</code> under the same conditions. Also, <a href="https://stackoverflow.com/a/38286494/4952130"><code>bytes objects</code> seem do be affected too</a>.</p>
+<p>The timings were performed for <code>Python 3.5.2</code>, on <code>Python 2.7.1</code> the difference is less drastic. The <a href="https://docs.python.org/3/library/stdtypes.html#str.strip" rel="nofollow noreferrer">docs on <code>str.split</code></a> don't indicate anything useful, so, <em>why does this happen</em>?  </p>
+</div>
+<div class="post-text" itemprop="text">
+<h3>In a tl;dr fashion:</h3>
+<p>This is because two functions exist for the two different cases, as can be seen in <a href="https://github.com/python/cpython/blob/master/Objects/unicodeobject.c#L12260" rel="nofollow"><code>unicode_strip</code></a>; <code>do_strip</code> and <code>_PyUnicodeXStrip</code> the first executing much faster than the second. </p>
+<p>Function <strong><a href="https://github.com/python/cpython/blob/master/Objects/unicodeobject.c#L12164" rel="nofollow"><code>do_strip</code></a></strong> is for the common case <code>str.strip()</code> where no arguments exist and <a href="https://github.com/python/cpython/blob/master/Objects/unicodeobject.c#L12230" rel="nofollow"><strong><code>do_argstrip</code></strong></a> (which wraps  <code>_PyUnicode_XStrip</code>) for the case where <code>str.strip(arg)</code> is called, i.e arguments are provided.</p>
+<hr/>
+<p><code>do_argstrip</code> just checks the separator and if it is valid and not equal to <code>None</code> (in which case it calls <code>do_strip</code>) it calls <a href="https://github.com/python/cpython/blob/master/Objects/unicodeobject.c#L12077" rel="nofollow"><code>_PyUnicode_XStrip</code></a>. </p>
+<p>Both <code>do_strip</code> and <code>_PyUnicode_XStrip</code> follow the same logic, two counters are used, one equal to zero and the other equal to the length of the string. </p>
+<p>Using two <code>while</code> loops, the first counter is incremented until a value not equal to the separator is reached and the second counter is decremented until the same condition is met.</p>
+<p>The difference lies in the way checking if the current character is not equal to the separator is performed.</p>
+<h3>For <code>do_strip</code>:</h3>
+<p>In the most common case where the characters in the string to be split can be represented in <code>ascii</code> an additional small performance boost is present. </p>
+<pre><code>while (i &lt; len) {
+    Py_UCS1 ch = data[i];
+    if (!_Py_ascii_whitespace[ch])
+        break;
+    i++;
+}
+</code></pre>
+<ul>
+<li>Accessing the current character in the data is made quickly with by accessing the underlying array: <code>Py_UCS1 ch = data[i];</code></li>
+<li>The check if a character is a white-space is made by a simple array index into an array called <a href="https://github.com/python/cpython/blob/master/Objects/unicodeobject.c#L217" rel="nofollow"><code>_Py_ascii_whitespace[ch]</code></a>. </li>
+</ul>
+<p>So, in short, it is quite efficient.</p>
+<p>If the characters are not in the <code>ascii</code> range, the differences aren't that drastic but they do slow the overall execution down:</p>
+<pre><code>while (i &lt; len) {
+    Py_UCS4 ch = PyUnicode_READ(kind, data, i);
+    if (!Py_UNICODE_ISSPACE(ch))
+        break;
+    i++;
+}
+</code></pre>
+<ul>
+<li>Accessing is done with <code>Py_UCS4 ch = PyUnicode_READ(kind, data, i);</code></li>
+<li>Checking if the character is whitespace is done by the <a href="https://docs.python.org/3/c-api/unicode.html#c.Py_UNICODE_ISSPACE" rel="nofollow"><code>Py_UNICODE_ISSPACE(ch)</code></a> macro (which simply calls another macro: <a href="https://github.com/python/cpython/blob/master/Include/pyctype.h#L24" rel="nofollow"><code>Py_ISSPACE</code></a>)</li>
+</ul>
+<h3>For <code>_PyUnicodeXStrip</code>:</h3>
+<p>For this case, accessing the underlying data is, as it was in the previous case, done with <code>PyUnicode_Read</code>; the check, on the other hand, to see if the character is a white-space (or really, any character we've provided) is reasonably a bit more complex.</p>
+<pre><code>while (i &lt; len) {
+     Py_UCS4 ch = PyUnicode_READ(kind, data, i);
+     if (!BLOOM(sepmask, ch))
+         break;
+     if (PyUnicode_FindChar(sepobj, ch, 0, seplen, 1) &lt; 0)
+         break;
+     i++;
+}
+</code></pre>
+<p><a href="https://docs.python.org/3/c-api/unicode.html#c.PyUnicode_FindChar" rel="nofollow"><code>PyUnicode_FindChar</code></a> is used, which, although efficient, is much more complex and slow compared to an array access. For each character in the string it is called to see if that character is contained in the separator(s) we've provided. As the length of the string increases, so does the overhead introduced by calling this function continuously. </p>
+<p>For those interested, <code>PyUnicode_FindChar</code> after quite some checks, will eventually call <a href="https://github.com/python/cpython/blob/master/Objects/stringlib/fastsearch.h#L36" rel="nofollow"><code>find_char</code></a> inside <code>stringlib</code> which in the case where the length of the separators is <code>&lt; 10</code> will loop until it finds the character.</p>
+<p>Apart from this, consider the additional functions that need to already be called in order to get here. </p>
+<hr/>
+<p>As for <code>lstrip</code> and <code>rstrip</code>, the situation is similar. Flags for which mode of striping to perform exist, namely: <code>RIGHTSTRIP</code> for <code>rstrip</code>, <code>LEFTSTRIP</code> for <code>lstrip</code> and <code>BOTHSTRIP</code> for <code>strip</code>. The logic inside <code>do_strip</code> and <code>_PyUnicode_XStrip</code> is performed conditionally based on the flag.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>For the reasons explained in @Jims answer the same behavior is found in <code>bytes</code> objects:</p>
+<pre><code>b = bytes(" " * 100 + "a" + " " * 100, encoding='ascii')
+
+b.strip()      # takes 427ns
+b.strip(b' ')  # takes 1.2μs
+</code></pre>
+<p>For <code>bytearray</code> objects this doesn't happen, the functions performing the <code>split</code> in this case are similar for both cases.</p>
+<p>Additionally, in <code>Python 2</code> the same applies to a smaller extent according to my timings.</p>
+</div>

@@ -1,0 +1,72 @@
+<div class="post-text" itemprop="text">
+<p>I'm baffled to find out neither of <code>typing.Awaitable</code> nor <code>collections.abc.Awaitable</code> cover a generator-based coroutine which is one of <em>awaitable</em>s defined in</p>
+<ul>
+<li><a href="https://www.python.org/dev/peps/pep-0492/#await-expression" rel="nofollow noreferrer">https://www.python.org/dev/peps/pep-0492/#await-expression</a></li>
+</ul>
+<p>As of Python 3.6, several <code>asyncio</code> APIs such as <code>sleep()</code> and <code>open_connection()</code> actually return generator-based coroutines. I usually have no problems with applying <code>await</code> keywords to the return values of them, but I'm going to handle a mixture of normal values and <em>awaitable</em>s and I'd need to figure out which ones require <code>await</code> to yield an actual value.</p>
+<p>So here's my question, what satisfies <code>isinstance(c, ???) == True</code> for an arbitrary generator-based coroutine <code>c</code>?  I'm not insisting on using <code>isinstance</code> for this purpose, maybe <code>getattr()</code> can be a solution...</p>
+<h2>Background</h2>
+<p>I'm working on a tiny mock utility for unit testing of async function based on <a href="https://blog.miguelgrinberg.com/post/unit-testing-asyncio-code" rel="nofollow noreferrer">https://blog.miguelgrinberg.com/post/unit-testing-asyncio-code</a> which internally has a <code>asyncio.Queue()</code> of mocked return values, and I want to enhance my utility so that the queue can have <em>awaitable</em> elements, each of which triggering <code>await</code> operation. My code will look like</p>
+<pre><code>async def case01(loop):
+  f = AsyncMock()
+  f.side_effect = loop, []
+  await f()  # blocks forever on an empty queue
+
+async def case02(loop):
+  f = AsyncMock()
+  f.side_effect = loop, ['foo']
+  await f() # =&gt; 'foo'
+  await f() # blocks forever
+
+async def case03(loop):
+  f = AsyncMock()
+  f.side_effect = loop, [asyncio.sleep(1.0, 'bar', loop=loop)]
+  await f() # yields 'bar' after 1.0 sec of delay
+</code></pre>
+<p>For usability reason, I don't want to manually wrap the return values with <code>create_task()</code>.</p>
+<p>I'm not sure my queue will ever legitimely contain normal, non-coroutine generators; still, the ideal solution should be able to distinguish normal generators from generator-based coroutines and skip applying <code>await</code> operation to the former.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The documented way to detect objects that can be passed to <code>await</code> is with <a href="https://docs.python.org/3/library/inspect.html#inspect.isawaitable" rel="nofollow noreferrer"><code>inspect.isawaitable</code></a>.</p>
+<p>According to <a href="https://www.python.org/dev/peps/pep-0492/#await-expression" rel="nofollow noreferrer">PEP 492</a>, <code>await</code> requires an awaitable object, which can be:</p>
+<ul>
+<li>A <em>native coroutine</em> - a Python function defined with <code>async def</code>;</li>
+<li>A generator-based coroutine - a Python generator decorated with <code>@types.coroutine</code>;</li>
+<li>Python object that defines <code>__await__</code>;</li>
+<li>Python/C object whose type implements <code>tp_as_async.am_await</code>.</li>
+</ul>
+<p><code>isinstance(o, collections.abc.Awaitable)</code> covers all except the 2nd one. This could be reported as a bug in <code>Awaitable</code> if it wasn't <a href="https://docs.python.org/3/library/collections.abc.html#collections.abc.Awaitable" rel="nofollow noreferrer">explicitly documented</a>, pointing to <code>inspect.isawaitable</code> to check for <em>all</em> awaitable objects.</p>
+<p>Note that you cannot distinguish generator-based coroutine objects from regular generator-iterators by checking the type. The two have the exact same type because the <code>coroutine</code> decorator doesn't wrap the given generator, it just sets a flag on its code object. The only way to check if the object is a generator-iterator produced by a generator-based coroutine is to check its code flags, which how <code>inspect.isawaitable</code> is <a href="https://github.com/python/cpython/blob/master/Lib/inspect.py#L221" rel="nofollow noreferrer">implemented</a>.</p>
+<p>A related question is why <code>Awaitable</code> only checks for the existence of <code>__await__</code> and not for other mechanisms that <code>await</code> itself uses. This is unfortunate for code that tries to use <code>Awaitable</code> to check the actual awaitability of an object, but it is not without precedent. A similar discrepancy exists between iterability and the the <code>Iterable</code> ABC:</p>
+<pre><code>class Foo:
+  def __getitem__(self, item):
+      raise IndexError
+
+&gt;&gt;&gt; iter(Foo())
+&lt;iterator object at 0x7f2af4ad38d0&gt;
+&gt;&gt;&gt; list(Foo())
+[]
+</code></pre>
+<p>Despite instances of <code>Foo</code> being iterable, <code>isinstance(Foo(), collections.abc.Iterable)</code> returns false.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'm not sure what you're trying to test here, but <a href="https://docs.python.org/3/library/inspect.html#types-and-members" rel="nofollow noreferrer">the <code>inspect</code> module</a> has functions for checking most things like this:</p>
+<pre><code>&gt;&gt;&gt; async def f(c):
+...     await c
+&gt;&gt;&gt; co = f()
+&gt;&gt;&gt; inspect.iscoroutinefunction(f)
+True
+&gt;&gt;&gt; inspect.iscoroutine(co)
+True
+&gt;&gt;&gt; inspect.isawaitable(co)
+True
+</code></pre>
+<p>The difference between the last two is that <code>isawaitable</code> is true for anything you can <code>await</code>, not just coroutines.</p>
+<p>If you really want to test with <code>isinstance</code>:</p>
+<p><code>isinstance(f)</code> is just <code>types.FunctionType</code>, which isn't very useful. To check whether it's a function that returns a <code>coroutine</code>, you need to also check its flags: <code>f.__code__.co_flags &amp; inspect.CO_COROUTINE</code> (or you could hardcode 0x80 if you don't want to use <code>inspect</code> for some reason).</p>
+<p><code>isinstance(co)</code> is <code>types.CoroutineType</code>, which you <em>could</em> test for, but it's still probably not a great idea.</p>
+</div>
+<span class="comment-copy">What is the <code>c</code> you're testing for here? Is it a function object, like <code>case01</code>, or the coroutine returned by calling it, or something else?</span>
+<span class="comment-copy">Also, you talk about distinguishing  normal generators from generator-based coroutines. Do you mean you want to distinguish 3.4-style-<code>asyncio</code> generators using <code>yield from</code> from normal generators using <code>yield from</code>?</span>
+<span class="comment-copy">You did a good job of pointing out the official doc already had an answer to my question!</span>
+<span class="comment-copy">I'm only interested in checking <code>co</code> rather than <code>f</code> in your example, so <code>inspect.isawaitable</code> is the answer. Thanks</span>

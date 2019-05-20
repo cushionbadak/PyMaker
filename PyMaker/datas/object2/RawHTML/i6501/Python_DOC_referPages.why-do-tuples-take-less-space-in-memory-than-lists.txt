@@ -1,0 +1,149 @@
+<div class="post-text" itemprop="text">
+<p>A <code>tuple</code> takes less memory space in Python:</p>
+<pre><code>&gt;&gt;&gt; a = (1,2,3)
+&gt;&gt;&gt; a.__sizeof__()
+48
+</code></pre>
+<p>whereas <code>list</code>s takes more memory space:</p>
+<pre><code>&gt;&gt;&gt; b = [1,2,3]
+&gt;&gt;&gt; b.__sizeof__()
+64
+</code></pre>
+<p>What happens internally on the Python memory management? </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I assume you're using CPython and with 64bits (I got the same results on my CPython 2.7 64-bit). There could be differences in other Python implementations or if you have a 32bit Python.</p>
+<p>Regardless of the implementation, <code>list</code>s are variable-sized while <code>tuple</code>s are fixed-size. </p>
+<p>So <code>tuple</code>s can store the elements directly inside the struct, lists on the other hand need a layer of indirection (it stores a pointer to the elements). This layer of indirection is a pointer, on 64bit systems that's 64bit, hence 8bytes.</p>
+<p>But there's another thing that <code>list</code>s do: They over-allocate. Otherwise <code>list.append</code> would be an <code>O(n)</code> operation <strong>always</strong> - to make it amortized <code>O(1)</code> (much faster!!!) it over-allocates. But now it has to keep track of the <strong>allocated</strong> size and the <strong>filled</strong> size (<code>tuple</code>s only need to store one size, because allocated and filled size are always identical). That means each list has to store another "size" which on 64bit systems is a 64bit integer, again 8 bytes.</p>
+<p>So <code>list</code>s need at least 16 bytes more memory than <code>tuple</code>s. Why did I say "at least"? Because of the over-allocation. Over-allocation means it allocates more space than needed. However, the amount of over-allocation depends on "how" you create the list and the append/deletion history:</p>
+<pre><code>&gt;&gt;&gt; l = [1,2,3]
+&gt;&gt;&gt; l.__sizeof__()
+64
+&gt;&gt;&gt; l.append(4)  # triggers re-allocation (with over-allocation), because the original list is full
+&gt;&gt;&gt; l.__sizeof__()
+96
+
+&gt;&gt;&gt; l = []
+&gt;&gt;&gt; l.__sizeof__()
+40
+&gt;&gt;&gt; l.append(1)  # re-allocation with over-allocation
+&gt;&gt;&gt; l.__sizeof__()
+72
+&gt;&gt;&gt; l.append(2)  # no re-alloc
+&gt;&gt;&gt; l.append(3)  # no re-alloc
+&gt;&gt;&gt; l.__sizeof__()
+72
+&gt;&gt;&gt; l.append(4)  # still has room, so no over-allocation needed (yet)
+&gt;&gt;&gt; l.__sizeof__()
+72
+</code></pre>
+<h2>Images</h2>
+<p>I decided to create some images to accompany the explanation above. Maybe these are helpful</p>
+<p>This is how it (schematically) is stored in memory in your example. I highlighted the differences with red (free-hand) cycles:</p>
+<p><a href="https://i.stack.imgur.com/ZRop8.png" rel="noreferrer"><img alt="enter image description here" src="https://i.stack.imgur.com/ZRop8.png"/></a></p>
+<p>That's actually just an approximation because <code>int</code> objects are also Python objects and CPython even reuses small integers, so a probably more accurate representation (although not as readable) of the objects in memory would be:</p>
+<p><a href="https://i.stack.imgur.com/lmR8d.png" rel="noreferrer"><img alt="enter image description here" src="https://i.stack.imgur.com/lmR8d.png"/></a></p>
+<p>Useful links:</p>
+<ul>
+<li><a href="https://github.com/python/cpython/blob/2.7/Include/tupleobject.h#L24-L32" rel="noreferrer"><code>tuple</code> struct in CPython repository for Python 2.7</a></li>
+<li><a href="https://github.com/python/cpython/blob/2.7/Include/listobject.h#L22_L39" rel="noreferrer"><code>list</code> struct in CPython repository for Python 2.7</a></li>
+<li><a href="https://github.com/python/cpython/blob/2.7/Include/intobject.h#L23-L26" rel="noreferrer"><code>int</code> struct in CPython repository for Python 2.7</a></li>
+</ul>
+<p>Note that <code>__sizeof__</code> doesn't really return the "correct" size! It only returns the size of the stored values. However when you use <a href="https://docs.python.org/2/library/sys.html#sys.getsizeof" rel="noreferrer"><code>sys.getsizeof</code></a> the result is different:</p>
+<pre><code>&gt;&gt;&gt; import sys
+&gt;&gt;&gt; l = [1,2,3]
+&gt;&gt;&gt; t = (1, 2, 3)
+&gt;&gt;&gt; sys.getsizeof(l)
+88
+&gt;&gt;&gt; sys.getsizeof(t)
+72
+</code></pre>
+<p>There are 24 "extra" bytes. These are <strong>real</strong>, that's the garbage collector overhead that isn't accounted for in the <code>__sizeof__</code> method. That's because you're generally not supposed to use magic methods directly - use the functions that know how to handle them, in this case: <a href="https://github.com/python/cpython/blob/2.7/Python/sysmodule.c#L687-L761" rel="noreferrer"><code>sys.getsizeof</code></a> (which actually <a href="https://github.com/python/cpython/blob/2.7/Python/sysmodule.c#L731-L732" rel="noreferrer">adds the GC overhead</a> to the value returned from <code>__sizeof__</code>).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'll take a deeper dive into the CPython codebase so we can see how the sizes are actually calculated. <em>In your specific example</em>, <em>no over-allocations have been performed, so I won't touch on that</em>. </p>
+<p>I'm going to use 64-bit values here, as you are.</p>
+<hr/>
+<p>The size for <code>list</code>s is calculated from the following function, <a href="https://github.com/python/cpython/blob/2.7/Objects/listobject.c#L2471" rel="noreferrer"><code>list_sizeof</code></a>: </p>
+<pre class="lang-c prettyprint-override"><code>static PyObject *
+list_sizeof(PyListObject *self)
+{
+    Py_ssize_t res;
+
+    res = _PyObject_SIZE(Py_TYPE(self)) + self-&gt;allocated * sizeof(void*);
+    return PyInt_FromSsize_t(res);
+}
+</code></pre>
+<p>Here <a href="https://github.com/python/cpython/blob/6f0eb93183519024cb360162bdd81b9faec97ba6/Include/object.h#L118" rel="noreferrer"><code>Py_TYPE(self)</code></a> is a macro that grabs the <code>ob_type</code> of <code>self</code> (returning <code>PyList_Type</code>) while  <code>_PyObject_SIZE</code> is another macro that grabs <a href="https://docs.python.org/3/c-api/typeobj.html#c.PyTypeObject.tp_basicsize" rel="noreferrer"><code>tp_basicsize</code></a> from that type. <code>tp_basicsize</code> is calculated as <code>sizeof(PyListObject)</code> where <code>PyListObject</code> is the instance struct.</p>
+<p>The <a href="https://github.com/python/cpython/blob/2.7/Include/listobject.h#L22" rel="noreferrer"><code>PyListObject</code> structure</a> has three fields:</p>
+<pre class="lang-c prettyprint-override"><code>PyObject_VAR_HEAD     # 24 bytes 
+PyObject **ob_item;   #  8 bytes
+Py_ssize_t allocated; #  8 bytes
+</code></pre>
+<p>these have comments (which I trimmed) explaining what they are, follow the link above to read them. <a href="https://docs.python.org/2/c-api/structures.html#c.PyObject_VAR_HEAD" rel="noreferrer"><code>PyObject_VAR_HEAD</code></a> expands into three 8 byte fields (<code>ob_refcount</code>, <code>ob_type</code> and <code>ob_size</code>) so a <code>24</code> byte contribution.</p>
+<p>So for now <code>res</code> is:</p>
+<pre><code>sizeof(PyListObject) + self-&gt;allocated * sizeof(void*)
+</code></pre>
+<p>or:</p>
+<pre><code>40 + self-&gt;allocated * sizeof(void*)
+</code></pre>
+<p>If the list instance has elements that are allocated. the second part calculates their contribution. <code>self-&gt;allocated</code>, as it's name implies, holds the number of allocated elements.</p>
+<p>Without any elements, the size of lists is calculated to be:</p>
+<pre><code>&gt;&gt;&gt; [].__sizeof__()
+40
+</code></pre>
+<p>i.e the size of the instance struct.</p>
+<hr/>
+<p><code>tuple</code> objects don't define a <code>tuple_sizeof</code> function. Instead, they use <a href="https://github.com/python/cpython/blob/2.7/Objects/typeobject.c#L3644" rel="noreferrer"><code>object_sizeof</code></a> to calculate their size:</p>
+<pre class="lang-c prettyprint-override"><code>static PyObject *
+object_sizeof(PyObject *self, PyObject *args)
+{
+    Py_ssize_t res, isize;
+
+    res = 0;
+    isize = self-&gt;ob_type-&gt;tp_itemsize;
+    if (isize &gt; 0)
+        res = Py_SIZE(self) * isize;
+    res += self-&gt;ob_type-&gt;tp_basicsize;
+
+    return PyInt_FromSsize_t(res);
+}
+</code></pre>
+<p>This, as for <code>list</code>s, grabs the <code>tp_basicsize</code> and, if the object has a non-zero <code>tp_itemsize</code> (meaning it has variable-length instances), it multiplies the number of items in the tuple (which it gets via <a href="https://github.com/python/cpython/blob/6f0eb93183519024cb360162bdd81b9faec97ba6/Include/object.h#L119" rel="noreferrer"><code>Py_SIZE</code></a>) with <code>tp_itemsize</code>. </p>
+<p><code>tp_basicsize</code> again uses <code>sizeof(PyTupleObject)</code> where the  <a href="https://github.com/python/cpython/blob/2.7/Include/tupleobject.h#L24" rel="noreferrer"><code>PyTupleObject</code> struct contains</a>:</p>
+<pre class="lang-c prettyprint-override"><code>PyObject_VAR_HEAD       # 24 bytes 
+PyObject *ob_item[1];   # 8  bytes
+</code></pre>
+<p>So, without any elements (that is, <code>Py_SIZE</code> returns <code>0</code>) the size of empty tuples is equal to <code>sizeof(PyTupleObject)</code>:</p>
+<pre><code>&gt;&gt;&gt; ().__sizeof__()
+24
+</code></pre>
+<p>huh? Well, here's an oddity which I haven't found an explanation for, the <code>tp_basicsize</code> of <code>tuple</code>s is actually calculated as follows:</p>
+<pre class="lang-c prettyprint-override"><code>sizeof(PyTupleObject) - sizeof(PyObject *)
+</code></pre>
+<p>why an additional <code>8</code> bytes is removed from <code>tp_basicsize</code> is something I haven't been able to find out. (See MSeifert's comment for a possible explanation)</p>
+<hr/>
+<p>But, this is basically the difference <em>in your specific example</em>. <code>list</code>s also keep around a number of allocated elements which helps determine when to over-allocate again. </p>
+<p>Now, when additional elements are added, lists do indeed perform this over-allocation in order to achieve O(1) appends. This results in greater sizes as MSeifert's covers nicely in his answer.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>MSeifert answer covers it broadly; to keep it simple you can think of:</p>
+<p><strong><code>tuple</code></strong> is immutable. Once it set, you can't change it. So you know in advance how much memory you need to allocate for that object.</p>
+<p><strong><code>list</code></strong> is mutable. You can add or remove items to or from it. It has to know the size of it (for internal impl.). It resizes as needed.</p>
+<p><em>There are no free meals</em> - these capabilities comes with a cost. Hence the overhead in memory for lists.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The size of the tuple is prefixed, meaning at tuple initialization the interpreter allocate enough space for the contained data, and that's the end of it, giving it's immutable (can't be modified), whereas a list is a mutable object hence implying dynamic allocation of memory, so to avoid allocating space each time you append or modify the list ( allocate enough space to contain the changed data and copy the data to it), it allocates additional space for future append, modifications, ... that pretty much sums it up.</p>
+</div>
+<span class="comment-copy">I am not sure on how this works internally, but the list object at least has more functions like for instance append which the tuple does not have. It therefore makes sense for the tuple as a simpler type of object to be smaller</span>
+<span class="comment-copy">I think it also depend on machine to machine ....for me when i check  a = (1,2,3) takes 72 and b = [1,2,3]  takes 88.</span>
+<span class="comment-copy">Python tuples are immutable. Mutable objects have extra overhead to deal with runtime changes.</span>
+<span class="comment-copy">@Metareven the number of methods a type has does not impact the memory space the instances take. The method list and their code are handled by the object prototype, but instances store only data and internal variables.</span>
+<span class="comment-copy">Re "<i>So lists need at least 16 bytes more memory than tuples.</i>", Wouldn't that be 8? One size for tuples and two sizes for lists means one extra size for lists.</span>
+<span class="comment-copy">Yes, list has one extra "size" (8 byte) but also stores a pointer (8byte) to the "array of PyObject"s instead of storing them in the struct directly (what the tuple does). 8+8=16.</span>
+<span class="comment-copy">Another <b>useful</b> link about <code>list</code> memory allocation <a href="https://stackoverflow.com/questions/40018398/list-uses-more-memory-than-list-comprehension" title="list uses more memory than list comprehension">stackoverflow.com/questions/40018398/…</a></span>
+<span class="comment-copy">@vishes_shell That's not really related to the question because the code in the question <b>doesn't over-allocate at all</b>. But yes it's useful in case you want to know more about the amount of over-allocation when using <code>list()</code> or a list comprehension.</span>
+<span class="comment-copy">@user3349993 Tuples are immutable, so you can't append to a tuple or remove an item from a tuple.</span>
+<span class="comment-copy">I believe the <code>ob_item[1]</code> is mostly a placeholder (so it makes sense it's subtracted from the basicsize). The <code>tuple</code> is allocated using <a href="https://docs.python.org/3.6/c-api/allocation.html#c.PyObject_NewVar" rel="nofollow noreferrer"><code>PyObject_NewVar</code></a>. I haven't figured out the details so that's just an educated guess...</span>
+<span class="comment-copy">@MSeifert Sorry for that, fixed :-). I really don't know, I remember finding it in the past at some point but I never giving it too much attention, maybe I'll just ask a question at some point in the future :-)</span>

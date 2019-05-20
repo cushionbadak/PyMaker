@@ -1,0 +1,63 @@
+<div class="post-text" itemprop="text">
+<p>I have two files in which I store:</p>
+<ol>
+<li>an IP range - country lookup </li>
+<li>a list of requests coming from different IPs</li>
+</ol>
+<p>The IPs are stored as integers (using inet_aton()). </p>
+<p>I tried using Spark SQL to join these pieces of data by loading both files into dataframes and registering them as temp tables.</p>
+<pre><code>GeoLocTable - ipstart, ipend, ...additional Geo location data
+Recordstable - INET_ATON, ...3 more fields
+</code></pre>
+<p>I tried using Spark SQL to join these pieces of data using a SQL statement like so -</p>
+<pre><code>"select a.*, b.* from Recordstable a left join GeoLocTable b on a.INET_ATON between b.ipstart and b.ipend"
+</code></pre>
+<p>There are about 850K records in RecordsTable and about 2.5M records in GeoLocTable. The join as it exists runs for about 2 hours with about 20 executors. </p>
+<p>I have tried caching and broadcasting the GeoLocTable but it does not really seem to help. I have bumped up spark.sql.autoBroadcastJoinThreshold=300000000 and  spark.sql.shuffle.partitions=600.</p>
+<p>Spark UI shows a BroadcastNestedLoopJoin being performed. Is this the best I should be expecting? I tried searching for conditions where this type of join would be performed but the documentation seems sparse. </p>
+<p>PS - I am using PySpark to work with Spark.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The source of the problem is pretty simple. When you execute join and join condition is not equality based the only thing that Spark can do right now is expand it to Cartesian product followed by filter what is pretty much what happens inside <code>BroadcastNestedLoopJoin</code>. So logically you have this huge nested loop which tests all 850K * 2.5M records. </p>
+<p>This approach is obviously extremely inefficient. Since it looks like lookup table fits into memory the simplest improvement is to use local, sorted data structure instead of Spark <code>DataFrame</code>. Assuming your data looks like this:</p>
+<pre><code>geo_loc_table = sc.parallelize([
+    (1, 10, "foo"), (11, 36, "bar"), (37, 59, "baz"),
+]).toDF(["ipstart", "ipend", "loc"])
+
+records_table = sc.parallelize([
+    (1,  11), (2, 38), (3, 50)
+]).toDF(["id", "inet"])
+</code></pre>
+<p>We can project and sort reference data by <code>ipstart</code> and create broadcast variable:</p>
+<pre><code>geo_start_bd = sc.broadcast(geo_loc_table
+  .select("ipstart")
+  .orderBy("ipstart") 
+  .flatMap(lambda x: x)
+  .collect())
+</code></pre>
+<p>Next we'll use an UDF and bisect module to augment <code>records_table</code></p>
+<pre><code>from bisect import bisect_right
+from pyspark.sql.functions import udf
+from pyspark.sql.types import LongType
+
+# https://docs.python.org/3/library/bisect.html#searching-sorted-lists
+def find_le(x):
+    'Find rightmost value less than or equal to x'
+    i = bisect_right(geo_start_bd.value, x)
+    if i:
+        return geo_start_bd.value[i-1]
+    return None
+
+records_table_with_ipstart = records_table.withColumn(
+    "ipstart", udf(find_le, LongType())("inet")
+)
+</code></pre>
+<p>and finally join both datasets:</p>
+<pre><code> records_table_with_ipstart.join(geo_loc_table, ["ipstart"], "left")
+</code></pre>
+</div>
+<span class="comment-copy">I ran into a situation where it seems that the IP ranges are not continuous. For example - <code>geo_loc_table = sc.parallelize([     (1, 10, "foo"), (11, 36, "bar"), (45, 59, "baz"), ]).toDF(["ipstart", "ipend", "loc"])</code>. I am thinking of broadcasting 2 collections - a list of sorted "ipstarts" and a dictionary of ipstart:ipend pairs and using them in a modified <code>find_le</code>. I will try and code this up and report back.</span>
+<span class="comment-copy">You can correct for something like that by adding secondary filter: <code>.where(col("inet").between(col("ipstart"), col("ipend"))</code>.</span>
+<span class="comment-copy">That helped a lot. Thanks. I can only accept the answer but not upvote. Sorry about that.</span>
+<span class="comment-copy">I am glad to hear that and thanks for accepting. There are other methods you can use, for example bucketing by range but general idea is always the same - instead of performing brute force search over Cartesian identify possible candidates first.</span>
+<span class="comment-copy">I learned so much from this one post. Great job! Updated SPARK-8682 with suggestion to have something like this in Spark natively <a href="https://issues.apache.org/jira/browse/SPARK-8682?focusedCommentId=16329150&amp;page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-16329150" rel="nofollow noreferrer">issues.apache.org/jira/browse/…</a></span>

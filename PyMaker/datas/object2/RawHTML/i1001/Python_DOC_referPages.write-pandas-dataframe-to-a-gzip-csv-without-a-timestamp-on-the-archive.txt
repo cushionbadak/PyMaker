@@ -1,0 +1,90 @@
+<div class="post-text" itemprop="text">
+<p>Writing a pandas DataFrame to a gzip-compressed CSV adds the timestamp to the archive:</p>
+<pre><code>import pandas as pd
+df = pd.DataFrame({'a': [1]})
+df.to_csv('df.csv.gz', compression='gzip')
+# Timestamp is the large number per https://unix.stackexchange.com/a/79546/88807.
+!&lt;df.csv.gz dd bs=4 skip=1 count=1 | od -t d4
+# 1+0 records in
+# 1+0 records out
+# 4 bytes copied, 5.6233e-05 s, 71.1 kB/s
+# 0000000  1546978755
+# 0000004df.csv
+</code></pre>
+<p>I'd like to write it without the timestamp, such that two subsequent exports of the same DataFrame are identical:</p>
+<pre><code>df.to_csv('df2.csv.gz', compression='gzip')
+import filecmp
+filecmp.cmp('df.csv.gz', 'df2.csv.gz')
+# False
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>After looking through the Pandas code for <a href="https://github.com/pandas-dev/pandas/blob/v0.23.4/pandas/io/formats/csvs.py#L123" rel="nofollow noreferrer">CSV writing</a>, the best I can suggest is to use the <code>gzip</code> module directly.  that way you can set the <a href="https://docs.python.org/3/library/gzip.html#gzip.GzipFile" rel="nofollow noreferrer"><code>mtime</code> attribute</a> directly which seems to be what you want:</p>
+<pre><code>import pandas as pd
+from gzip import GzipFile
+from io import TextIOWrapper
+
+def to_gzip_csv_no_timestamp(df, f, *kwargs):
+    # Write pandas DataFrame to a .csv.gz file, without a timestamp in the archive
+    # header, using GzipFile and TextIOWrapper.
+    #
+    # Args:
+    #     df: pandas DataFrame.
+    #     f: Filename string ending in .csv (not .csv.gz).
+    #     *kwargs: Other arguments passed to to_csv().
+    #
+    # Returns:
+    #     Nothing.
+    with TextIOWrapper(GzipFile(f, 'w', mtime=0), encoding='utf-8') as fd:
+        df.to_csv(fd, *kwargs)
+
+to_gzip_csv_no_timestamp(df, 'df.csv.gz')
+to_gzip_csv_no_timestamp(df, 'df2.csv.gz')
+
+filecmp.cmp('df.csv.gz', 'df2.csv.gz')
+# True
+</code></pre>
+<p>This outperforms the two-step <code>subprocess</code> approach below for this tiny dataset:</p>
+<pre><code>%timeit to_gzip_csv_no_timestamp(df, 'df.csv')                                                                                                                                                                                                                                    
+693 us +- 14.6 us per loop (mean +- std. dev. of 7 runs, 1000 loops each)
+
+%timeit to_gzip_csv_no_timestamp_subprocess(df, 'df.csv')
+10.2 ms +- 167 us per loop (mean +- std. dev. of 7 runs, 100 loops each)
+</code></pre>
+<p>I'm using a <code>TextIOWrapper()</code> to handle converting strings to bytes as <a href="https://github.com/pandas-dev/pandas/blob/v0.23.4/pandas/io/common.py#L298" rel="nofollow noreferrer">Pandas does</a>, but you could also do this if you know you're not going to be saving much data:</p>
+<pre><code>with GzipFile('df.csv.gz', 'w', mtime=0) as fd:
+    fd.write(df.to_csv().encode('utf-8'))
+</code></pre>
+<p>Note that <code>gzip -lv df.csv.gz</code> still shows the "current time" but it's just pulling this from the inode's mtime.  dumping with <code>hexdump -C</code> shows the value is saved in the file, and changing the files mtime (with <code>touch -mt 0711171533 df.csv.gz</code>) causes <code>gzip</code> to display a different value</p>
+<p>Also note that the original "filename" is also part of the gzipped file, so you'll need to write to the same name (or also override this) to make it deterministic.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can export as an uncompressed CSV and then call <code>gzip</code> with the <code>-n</code> flag to avoid timestamping (this is also an instruction to not save the file name in the archive):</p>
+<pre><code>import subprocess
+
+def to_gzip_csv_no_timestamp_subprocess(df, f, *kwargs):
+    # Write pandas DataFrame to a .csv.gz file, without a timestamp in the archive
+    # header.
+    # Args:
+    #     df: pandas DataFrame.
+    #     f: Filename string ending in .csv (not .csv.gz).
+    #     *kwargs: Other arguments passed to to_csv().
+    # Returns:
+    #     Nothing.
+    import subprocess
+    df.to_csv(f, *kwargs)
+    # -n for the timestamp, -f to overwrite.
+    subprocess.check_call(['gzip', '-nf', f])
+
+to_gzip_csv_no_timestamp(df, 'df.csv')
+to_gzip_csv_no_timestamp(df, 'df2.csv')
+filecmp.cmp('df.csv.gz', 'df2.csv.gz')
+# True
+</code></pre>
+</div>
+<span class="comment-copy">I changed the question to check the timestamp via this approach <a href="https://unix.stackexchange.com/a/79546/88807">unix.stackexchange.com/a/79546/88807</a>.</span>
+<span class="comment-copy">@MaxGhenis I was using <code>hexdump -C df.csv.gz</code> to make sure the <code>mtime</code> field was making it to the file correctly… it displays a hex and ascii dump of the contents of the file</span>
+<span class="comment-copy">Were you looking for something in particular with <code>hexdump</code> or just to see if the result differed after changing <code>mtime</code>?</span>
+<span class="comment-copy">BTW I edited this to make it a function, which was more easily benchmarked. As expected, it's a lot faster than my answer.</span>
+<span class="comment-copy"><code>hexdump</code> it's just a useful command…  it's easy to make sure the rest of the data was being written correctly, having all the output there reminded me that the original filename is included as well and hence would be visible when you're comparing the files</span>
+<span class="comment-copy">Note that BSD <code>gzip</code> (e.g. OSX) treats <code>-n</code> as an instruction to not save the file name in the archive</span>

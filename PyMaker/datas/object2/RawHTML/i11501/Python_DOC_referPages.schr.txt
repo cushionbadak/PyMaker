@@ -1,0 +1,107 @@
+<div class="post-text" itemprop="text">
+<p>There's a surprise here:</p>
+<pre><code>&gt;&gt;&gt; class B:
+...     print(locals())
+...     def foo(self):
+...         print(locals())
+...         print(__class__ in locals().values())
+...         
+{'__module__': '__main__', '__qualname__': 'B'}
+&gt;&gt;&gt; B().foo()
+{'__class__': &lt;class '__main__.B'&gt;, 'self': &lt;__main__.B object at 0x7fffe916b4a8&gt;}
+True
+</code></pre>
+<p>It seems like the mere mention of <code>__class__</code> is explicitly checked by the parser? Otherwise we should get something like</p>
+<pre><code>NameError: name '__class__' is not defined
+</code></pre>
+<p>Indeed, if you modify to only check the key instead, i.e. check for <code>'__class__' in locals()</code>, then we only have <code>self</code> in scope as expected.  </p>
+<p>How does it happen that this variable gets magically injected into scope?  My guess is this is something to do with <code>super</code> - but I didn't use <code>super</code>, so why does the compiler create an implicit closure reference here if it isn't needed?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is a weird interaction in Python 3's implementation of no-argument <code>super</code>. An access to <code>super</code> in a method triggers the addition of a hidden <code>__class__</code> closure variable referring to the class that defines the method. The parser special-cases a load of the name <code>super</code> in a method by also adding <code>__class__</code> to the method's symbol table, and then the rest of the relevant code all looks for <code>__class__</code> instead of <code>super</code>. However, if you try to access <code>__class__</code> yourself, all the code looking for <code>__class__</code> sees it and thinks it should do the <code>super</code> handling!</p>
+<p><a href="https://github.com/python/cpython/blob/3.5/Python/symtable.c#L1468" rel="nofollow noreferrer">Here's where it adds the name <code>__class__</code> to the symbol table if it sees <code>super</code></a>:</p>
+<pre><code>case Name_kind:
+    if (!symtable_add_def(st, e-&gt;v.Name.id,
+                          e-&gt;v.Name.ctx == Load ? USE : DEF_LOCAL))
+        VISIT_QUIT(st, 0);
+    /* Special-case super: it counts as a use of __class__ */
+    if (e-&gt;v.Name.ctx == Load &amp;&amp;
+        st-&gt;st_cur-&gt;ste_type == FunctionBlock &amp;&amp;
+        !PyUnicode_CompareWithASCIIString(e-&gt;v.Name.id, "super")) {
+        if (!GET_IDENTIFIER(__class__) ||
+            !symtable_add_def(st, __class__, USE))
+            VISIT_QUIT(st, 0);
+    }
+    break;
+</code></pre>
+<p>Here's <a href="https://github.com/python/cpython/blob/3.5/Python/symtable.c#L574" rel="nofollow noreferrer"><code>drop_class_free</code></a>, which sets <code>ste_needs_class_closure</code>:</p>
+<pre><code>static int
+drop_class_free(PySTEntryObject *ste, PyObject *free)
+{
+    int res;
+    if (!GET_IDENTIFIER(__class__))
+        return 0;
+    res = PySet_Discard(free, __class__);
+    if (res &lt; 0)
+        return 0;
+    if (res)
+        ste-&gt;ste_needs_class_closure = 1;
+    return 1;
+}
+</code></pre>
+<p>The <a href="https://github.com/python/cpython/blob/3.5/Python/compile.c#L550" rel="nofollow noreferrer">compiler section</a> that checks <code>ste_needs_class_closure</code> and creates the implicit cell:</p>
+<pre><code>if (u-&gt;u_ste-&gt;ste_needs_class_closure) {
+    /* Cook up an implicit __class__ cell. */
+    _Py_IDENTIFIER(__class__);
+    PyObject *tuple, *name, *zero;
+    int res;
+    assert(u-&gt;u_scope_type == COMPILER_SCOPE_CLASS);
+    assert(PyDict_Size(u-&gt;u_cellvars) == 0);
+    name = _PyUnicode_FromId(&amp;PyId___class__);
+    if (!name) {
+        compiler_unit_free(u);
+        return 0;
+    }
+    ...
+</code></pre>
+<p>There's more relevant code, but it's too much to include all of it. <a href="https://github.com/python/cpython/blob/3.5/Python/compile.c" rel="nofollow noreferrer"><code>Python/compile.c</code></a> and <a href="https://github.com/python/cpython/blob/3.5/Python/symtable.c" rel="nofollow noreferrer"><code>Python/symtable.c</code></a> are where to look if you want to see more.</p>
+<p>You can get some weird bugs if you try to use a variable named <code>__class__</code>:</p>
+<pre><code>class Foo:
+    def f(self):
+        __class__ = 3
+        super()
+
+Foo().f()
+</code></pre>
+<p>Output:</p>
+<pre><code>Traceback (most recent call last):
+  File "./prog.py", line 6, in &lt;module&gt;
+  File "./prog.py", line 4, in f
+RuntimeError: super(): __class__ cell not found
+</code></pre>
+<p>The assignment to <code>__class__</code> means <code>__class__</code> is a local variable instead of a closure variable, so the closure cell <code>super()</code> needs isn't there.</p>
+<pre><code>def f():
+    __class__ = 2
+    class Foo:
+        def f(self):
+            print(__class__)
+
+    Foo().f()
+
+f()
+</code></pre>
+<p>Output:</p>
+<pre><code>&lt;class '__main__.f.&lt;locals&gt;.Foo'&gt;
+</code></pre>
+<p>Even though there's an actual <code>__class__</code> variable in the enclosing scope, the special-casing of <code>__class__</code> means you get the class instead of the enclosing scope's variable value.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://docs.python.org/3/reference/datamodel.html#creating-the-class-object">https://docs.python.org/3/reference/datamodel.html#creating-the-class-object</a></p>
+<blockquote>
+<p><code>__class__</code> is an implicit closure reference created by the compiler if any methods in a class body refer to either <code>__class__</code> or super. This allows the zero argument form of <code>super()</code> to correctly identify the class being defined based on lexical scoping, while the class or instance that was used to make the current call is identified based on the first argument passed to the method.</p>
+</blockquote>
+</div>
+<span class="comment-copy">This is <i>documented</i>? Well, now I feel silly about digging through the source for this. This is a better answer than mine.</span>
+<span class="comment-copy">Neither answer really explains to me why the reference needs to be created when super wasn't used.</span>
+<span class="comment-copy">@wim: It doesn't need to be created. It just is anyway. I'm guessing the implementation just happened to work that way and then they documented it because it wasn't a big enough deal to be worth changing, rather than this being by design.</span>
+<span class="comment-copy">@user2357112 I'll have to disagree - your answer is much better.  The fact that it's documented doesn't tell us anything about how the magic trick works, and it only offers an unconvincing explanation for why it's there at all.</span>

@@ -1,0 +1,170 @@
+<div class="post-text" itemprop="text">
+<p>I am trying to write a memoization library that uses <a href="https://docs.python.org/3.4/library/shelve.html" rel="nofollow">shelve</a> to store the return values persistently. If I have memoized functions calling other memoized functions, I am wondering about how to correctly open the shelf file.</p>
+<pre><code>import shelve
+import functools
+
+
+def cache(filename):
+    def decorating_function(user_function):
+        def wrapper(*args, **kwds):
+            key = str(hash(functools._make_key(args, kwds, typed=False)))
+            with shelve.open(filename, writeback=True) as cache:
+                if key in cache:
+                    return cache[key]
+                else:
+                    result = user_function(*args, **kwds)
+                    cache[key] = result
+                    return result
+
+        return functools.update_wrapper(wrapper, user_function)
+
+    return decorating_function
+
+
+@cache(filename='cache')
+def expensive_calculation():
+    print('inside function')
+    return
+
+
+@cache(filename='cache')
+def other_expensive_calculation():
+    print('outside function')
+    return expensive_calculation()
+
+other_expensive_calculation()
+</code></pre>
+<p>Except this doesn't work</p>
+<pre><code>$ python3 shelve_test.py
+outside function
+Traceback (most recent call last):
+  File "shelve_test.py", line 33, in &lt;module&gt;
+    other_expensive_calculation()
+  File "shelve_test.py", line 13, in wrapper
+    result = user_function(*args, **kwds)
+  File "shelve_test.py", line 31, in other_expensive_calculation
+    return expensive_calculation()
+  File "shelve_test.py", line 9, in wrapper
+    with shelve.open(filename, writeback=True) as cache:
+  File "/usr/local/Cellar/python3/3.4.1/Frameworks/Python.framework/Versions/3.4/lib/python3.4/shelve.py", line 239, in open
+    return DbfilenameShelf(filename, flag, protocol, writeback)
+  File "/usr/local/Cellar/python3/3.4.1/Frameworks/Python.framework/Versions/3.4/lib/python3.4/shelve.py", line 223, in __init__
+    Shelf.__init__(self, dbm.open(filename, flag), protocol, writeback)
+  File "/usr/local/Cellar/python3/3.4.1/Frameworks/Python.framework/Versions/3.4/lib/python3.4/dbm/__init__.py", line 94, in open
+    return mod.open(file, flag, mode)
+_gdbm.error: [Errno 35] Resource temporarily unavailable
+</code></pre>
+<p>What you recommend for a solution to this sort of problem.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Rather than trying to nest calls to open (which as you have discovered, does not work), you could make your decorator maintain a reference to the handle returned by <code>shelve.open</code>, and then if it exists and is still open, re-use that for subsequent calls:</p>
+<pre><code>import shelve
+import functools
+
+def _check_cache(cache_, key, func, args, kwargs):
+    if key in cache_:
+        print("Using cached results")
+        return cache_[key]
+    else:
+        print("No cached results, calling function")
+        result = func(*args, **kwargs)
+        cache_[key] = result
+        return result
+
+def cache(filename):
+    def decorating_function(user_function):
+        def wrapper(*args, **kwds):
+            args_key = str(hash(functools._make_key(args, kwds, typed=False)))
+            func_key = '.'.join([user_function.__module__, user_function.__name__])
+            key = func_key + args_key
+            handle_name = "{}_handle".format(filename)
+            if (hasattr(cache, handle_name) and
+                not hasattr(getattr(cache, handle_name).dict, "closed")
+               ):
+                print("Using open handle")
+                return _check_cache(getattr(cache, handle_name), key, 
+                                    user_function, args, kwds)
+            else:
+                print("Opening handle")
+                with shelve.open(filename, writeback=True) as c:
+                    setattr(cache, handle_name, c)  # Save a reference to the open handle
+                    return _check_cache(c, key, user_function, args, kwds)
+
+        return functools.update_wrapper(wrapper, user_function)
+    return decorating_function
+
+
+@cache(filename='cache')
+def expensive_calculation():
+    print('inside function')
+    return
+
+
+@cache(filename='cache')
+def other_expensive_calculation():
+    print('outside function')
+    return expensive_calculation()
+
+other_expensive_calculation()
+print("Again")
+other_expensive_calculation()
+</code></pre>
+<p>Output:</p>
+<pre><code>Opening handle
+No cached results, calling function
+outside function
+Using open handle
+No cached results, calling function
+inside function
+Again
+Opening handle
+Using cached results
+</code></pre>
+<p><strong>Edit:</strong></p>
+<p>You could also implement the decorator using a <a href="https://docs.python.org/3.3/library/weakref.html#weakref.WeakValueDictionary" rel="nofollow"><code>WeakValueDictionary</code></a>, which looks a bit more readable:</p>
+<pre><code>from weakref import WeakValueDictionary
+
+_handle_dict = WeakValueDictionary()
+def cache(filename):
+    def decorating_function(user_function):
+        def wrapper(*args, **kwds):
+            args_key = str(hash(functools._make_key(args, kwds, typed=False)))
+            func_key = '.'.join([user_function.__module__, user_function.__name__])
+            key = func_key + args_key
+            handle_name = "{}_handle".format(filename)
+            if handle_name in _handle_dict:
+                print("Using open handle")
+                return _check_cache(_handle_dict[handle_name], key, 
+                                    user_function, args, kwds)
+            else:
+                print("Opening handle")
+                with shelve.open(filename, writeback=True) as c:
+                    _handle_dict[handle_name] = c
+                    return _check_cache(c, key, user_function, args, kwds)
+
+        return functools.update_wrapper(wrapper, user_function)
+    return decorating_function
+</code></pre>
+<p>As soon as there are no other references to a handle, it will be deleted from the dictionary. Since our handle only goes out of scope when the outer-most call to a decorated function ends, we'll always have an entry in the dict while a handle is open, and no entry right after it closes.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, you may not have nested <a href="https://docs.python.org/3/library/shelve.html" rel="noreferrer"><code>shelve</code></a> instances with the same filename. </p>
+<blockquote>
+<p>The shelve module does not support concurrent read/write access to shelved objects. (Multiple simultaneous read accesses are safe.) When a program has a shelf open for writing, no other program should have it open for reading or writing. Unix file locking can be used to solve this, but this differs across Unix versions and requires knowledge about the database implementation used.</p>
+</blockquote>
+<p><a href="https://docs.python.org/3/library/shelve.html#restrictions" rel="noreferrer">https://docs.python.org/3/library/shelve.html#restrictions</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You are opening the file twice but never actually closing it to update the file for whatever use. Use <code>f.close ()</code> at the end.</p>
+</div>
+<span class="comment-copy">I think you should not have two open writing pointers to the same file.. that will almost certainly lead to undesired behaviour ... instead use <code>file.seek(0)</code> if you want to go back to the beginning of an open file</span>
+<span class="comment-copy">OK, makes sense, but I don't really wanna go back to the beginning of any files. I basically want to the second <code>open</code> to use the already opened file of the first, if it has already been opened, if not then open it.</span>
+<span class="comment-copy">its obviously still open since you are still within its context block unless you explicitly closed it somewhere</span>
+<span class="comment-copy">@dano updated again, with working (except not) example</span>
+<span class="comment-copy">Given your updated example, the real question is not "<i>can <code>open</code> be called in a nested fashion</i>?", but rather, "<i>can <code>shelve.open</code> be called in a nested fashion</i>?".</span>
+<span class="comment-copy">Doesn't this <code>with shelve.open(filename, writeback=True) as c:</code> close the shelf after that block? In which case it won't be open the next time?</span>
+<span class="comment-copy">@saul.shanabrook Yes, but the decorator checks for that. with the <code>not hasattr(getattr(cache, handle_name).dict, "closed")</code> part of the <code>if</code> statement. <code>cache.&lt;handle name&gt;.dict</code> will only have a <code>closed</code> attribute if the handle is closed. If we find it, we open the handle again.</span>
+<span class="comment-copy">@saul.shanabrook Also I just edited my answer so that the decorator supports using keeping handles for multiple cache files. And I updated the output section to reflect the output when the cache doesn't already exist.</span>
+<span class="comment-copy">I get an error when I run this script: <a href="https://gist.github.com/saulshanabrook/e5000eebeffde91c7453" rel="nofollow noreferrer">gist.github.com/saulshanabrook/e5000eebeffde91c7453</a></span>
+<span class="comment-copy">yep the updated version works. Thanks so much! this is perfect</span>
+<span class="comment-copy">Just looked it over. Youre not updating from the first part so there is nowhere for the "there" to go as it doesnt existbyet. Its like opening two windows of it</span>

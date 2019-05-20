@@ -1,0 +1,445 @@
+<div class="post-text" itemprop="text">
+<p>I have a website where the user enters math equations (expressions) and then those equations are evaluated against data (constants) provided by the website. The math operations needed include symbols, arithmetic operations, <code>min()</code>, <code>max()</code> and some other basic functions. A sample equation could be:</p>
+<pre><code>max(a * b + 100, a / b - 200)
+</code></pre>
+<p>One could simply <code>eval()</code> this using Python, but as we all know this leads compromising the site. What would be the safe approach of doing math equation evaluation? </p>
+<ul>
+<li><p>What math equation parsing and evaluation engines there are for Python</p></li>
+<li><p>If one chooses to use Python itself to evaluate the expression are there any Python sandboxes which would limit the Python, so that only user supplier operators and functions are available. Full-fledged Python, like defining functions, should be totally disabled. Subprocesses are ok (see <a href="http://pypy.readthedocs.org/en/latest/sandbox.html">PyPy sandbox</a>). Specially, for loops and other holes for exploiting memory and CPU usage should be closed.</p></li>
+<li><p>Any other approaches e.g. by using a command line binary (bc)?</p></li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>Disclaimer: I'm the Alexer mentioned in the code in the other answer. To be honest, I kind of suggested the bytecode parsing approach only half-jokingly, since I happened to have 99% of the code lying around for an unrelated project and so could whip together a POC in like a couple of minutes. That said, there shouldn't be anything wrong with it, per se; it's just that it's a more complex machinery that is needed for this task. In fact, you <em>should</em> be able to get away with just disassembling the code [checking the opcodes against a whitelist], checking that the constants and names are valid, and executing it with plain, evil eval after that. You should just lose the ability to insert paranoid extra checks all over the execution. (Another disclaimer: I still wouldn't feel comfortable enough to do it with eval)</p>
+<p>Anyway, I had a boring moment, so I wrote some code to do this the smart way; using the AST instead of the bytecode. It's just an extra flag to <code>compile()</code>. (Or just <code>ast.parse()</code>, since you'll want the types from the module anyway)</p>
+<pre><code>import ast
+import operator
+
+_operations = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.div,
+        ast.Pow: operator.pow,
+}
+
+def _safe_eval(node, variables, functions):
+        if isinstance(node, ast.Num):
+                return node.n
+        elif isinstance(node, ast.Name):
+                return variables[node.id] # KeyError -&gt; Unsafe variable
+        elif isinstance(node, ast.BinOp):
+                op = _operations[node.op.__class__] # KeyError -&gt; Unsafe operation
+                left = _safe_eval(node.left, variables, functions)
+                right = _safe_eval(node.right, variables, functions)
+                if isinstance(node.op, ast.Pow):
+                        assert right &lt; 100
+                return op(left, right)
+        elif isinstance(node, ast.Call):
+                assert not node.keywords and not node.starargs and not node.kwargs
+                assert isinstance(node.func, ast.Name), 'Unsafe function derivation'
+                func = functions[node.func.id] # KeyError -&gt; Unsafe function
+                args = [_safe_eval(arg, variables, functions) for arg in node.args]
+                return func(*args)
+
+        assert False, 'Unsafe operation'
+
+def safe_eval(expr, variables={}, functions={}):
+        node = ast.parse(expr, '&lt;string&gt;', 'eval').body
+        return _safe_eval(node, variables, functions)
+
+if __name__ == '__main__':
+        import math
+
+        print safe_eval('sin(a*pi/b)', dict(a=1, b=2, pi=math.pi), dict(sin=math.sin))
+</code></pre>
+<p>The same thing applies to this as to the bytecode version; if you check the operations against a whitelist and check that the names and values are valid, you should be able to get away with calling eval on the AST. (But again, I still wouldn't do it. Because paranoid. And paranoia is good when eval is concerned)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There is a relatively easy of doing this in Python without third party packages.</p>
+<ul>
+<li><p>Using <code>compile()</code> to prepare a single-line Python expression to be bytecode for <code>eval()</code></p></li>
+<li><p>Not running the bytecode through <code>eval()</code>, but instead run it in your custom opcode loop and only implement opcodes which you really need. E.g. no built-ins, no attribute access, so the sandbox cannot escaped.</p></li>
+</ul>
+<p>However there are some gotchas, like preparing for CPU exhaustion and memory exhaustion, which are not specific to this method and are issue on other approaches too.</p>
+<p><a href="http://opensourcehacker.com/2014/10/29/safe-evaluation-of-math-expressions-in-pure-python/">Here is a full blog post about the topic</a>. <a href="https://gist.github.com/miohtama/34a83d870a14aa7e580d">Here is a related gist</a>. Below is shortened sample code.</p>
+<pre><code>""""
+
+    The orignal author: Alexer / #python.fi
+
+"""
+
+import opcode
+import dis
+import sys
+import multiprocessing
+import time
+
+# Python 3 required
+assert sys.version_info[0] == 3, "No country for old snakes"
+
+
+class UnknownSymbol(Exception):
+    """ There was a function or constant in the expression we don't support. """
+
+
+class BadValue(Exception):
+    """ The user tried to input dangerously big value. """
+
+    MAX_ALLOWED_VALUE = 2**63
+
+
+class BadCompilingInput(Exception):
+    """ The user tried to input something which might cause compiler to slow down. """
+
+
+def disassemble(co):
+    """ Loop through Python bytecode and match instructions  with our internal opcodes.
+
+    :param co: Python code object
+    """
+    code = co.co_code
+    n = len(code)
+    i = 0
+    extended_arg = 0
+    result = []
+    while i &lt; n:
+        op = code[i]
+
+        curi = i
+        i = i+1
+        if op &gt;= dis.HAVE_ARGUMENT:
+            # Python 2
+            # oparg = ord(code[i]) + ord(code[i+1])*256 + extended_arg
+            oparg = code[i] + code[i+1] * 256 + extended_arg
+            extended_arg = 0
+            i = i+2
+            if op == dis.EXTENDED_ARG:
+                # Python 2
+                #extended_arg = oparg*65536L
+                extended_arg = oparg*65536
+        else:
+            oparg = None
+
+        # print(opcode.opname[op])
+
+        opv = globals()[opcode.opname[op].replace('+', '_')](co, curi, i, op, oparg)
+
+        result.append(opv)
+
+    return result
+
+# For the opcodes see dis.py
+# (Copy-paste)
+# https://docs.python.org/2/library/dis.html
+
+class Opcode:
+    """ Base class for out internal opcodes. """
+    args = 0
+    pops = 0
+    pushes = 0
+    def __init__(self, co, i, nexti, op, oparg):
+        self.co = co
+        self.i = i
+        self.nexti = nexti
+        self.op = op
+        self.oparg = oparg
+
+    def get_pops(self):
+        return self.pops
+
+    def get_pushes(self):
+        return self.pushes
+
+    def touch_value(self, stack, frame):
+        assert self.pushes == 0
+        for i in range(self.pops):
+            stack.pop()
+
+
+class OpcodeArg(Opcode):
+    args = 1
+
+
+class OpcodeConst(OpcodeArg):
+    def get_arg(self):
+        return self.co.co_consts[self.oparg]
+
+
+class OpcodeName(OpcodeArg):
+    def get_arg(self):
+        return self.co.co_names[self.oparg]
+
+
+class POP_TOP(Opcode):
+    """Removes the top-of-stack (TOS) item."""
+    pops = 1
+    def touch_value(self, stack, frame):
+        stack.pop()
+
+
+class DUP_TOP(Opcode):
+    """Duplicates the reference on top of the stack."""
+    # XXX: +-1
+    pops = 1
+    pushes = 2
+    def touch_value(self, stack, frame):
+        stack[-1:] = 2 * stack[-1:]
+
+
+class ROT_TWO(Opcode):
+    """Swaps the two top-most stack items."""
+    pops = 2
+    pushes = 2
+    def touch_value(self, stack, frame):
+        stack[-2:] = stack[-2:][::-1]
+
+
+class ROT_THREE(Opcode):
+    """Lifts second and third stack item one position up, moves top down to position three."""
+    pops = 3
+    pushes = 3
+    direct = True
+    def touch_value(self, stack, frame):
+        v3, v2, v1 = stack[-3:]
+        stack[-3:] = [v1, v3, v2]
+
+
+class ROT_FOUR(Opcode):
+    """Lifts second, third and forth stack item one position up, moves top down to position four."""
+    pops = 4
+    pushes = 4
+    direct = True
+    def touch_value(self, stack, frame):
+        v4, v3, v2, v1 = stack[-3:]
+        stack[-3:] = [v1, v4, v3, v2]
+
+
+class UNARY(Opcode):
+    """Unary Operations take the top of the stack, apply the operation, and push the result back on the stack."""
+    pops = 1
+    pushes = 1
+
+
+class UNARY_POSITIVE(UNARY):
+    """Implements TOS = +TOS."""
+    def touch_value(self, stack, frame):
+        stack[-1] = +stack[-1]
+
+
+class UNARY_NEGATIVE(UNARY):
+    """Implements TOS = -TOS."""
+    def touch_value(self, stack, frame):
+        stack[-1] = -stack[-1]
+
+
+class BINARY(Opcode):
+    """Binary operations remove the top of the stack (TOS) and the second top-most stack item (TOS1) from the stack. They perform the operation, and put the result back on the stack."""
+    pops = 2
+    pushes = 1
+
+
+class BINARY_POWER(BINARY):
+    """Implements TOS = TOS1 ** TOS."""
+    def touch_value(self, stack, frame):
+        TOS1, TOS = stack[-2:]
+        print(TOS1, TOS)
+        if abs(TOS1) &gt; BadValue.MAX_ALLOWED_VALUE or abs(TOS) &gt; BadValue.MAX_ALLOWED_VALUE:
+            raise BadValue("The value for exponent was too big")
+
+        stack[-2:] = [TOS1 ** TOS]
+
+
+class BINARY_MULTIPLY(BINARY):
+    """Implements TOS = TOS1 * TOS."""
+    def touch_value(self, stack, frame):
+        TOS1, TOS = stack[-2:]
+        stack[-2:] = [TOS1 * TOS]
+
+
+class BINARY_DIVIDE(BINARY):
+    """Implements TOS = TOS1 / TOS when from __future__ import division is not in effect."""
+    def touch_value(self, stack, frame):
+        TOS1, TOS = stack[-2:]
+        stack[-2:] = [TOS1 / TOS]
+
+
+class BINARY_MODULO(BINARY):
+    """Implements TOS = TOS1 % TOS."""
+    def touch_value(self, stack, frame):
+        TOS1, TOS = stack[-2:]
+        stack[-2:] = [TOS1 % TOS]
+
+
+class BINARY_ADD(BINARY):
+    """Implements TOS = TOS1 + TOS."""
+    def touch_value(self, stack, frame):
+        TOS1, TOS = stack[-2:]
+        stack[-2:] = [TOS1 + TOS]
+
+
+class BINARY_SUBTRACT(BINARY):
+    """Implements TOS = TOS1 - TOS."""
+    def touch_value(self, stack, frame):
+        TOS1, TOS = stack[-2:]
+        stack[-2:] = [TOS1 - TOS]
+
+
+class BINARY_FLOOR_DIVIDE(BINARY):
+    """Implements TOS = TOS1 // TOS."""
+    def touch_value(self, stack, frame):
+        TOS1, TOS = stack[-2:]
+        stack[-2:] = [TOS1 // TOS]
+
+
+class BINARY_TRUE_DIVIDE(BINARY):
+    """Implements TOS = TOS1 / TOS when from __future__ import division is in effect."""
+    def touch_value(self, stack, frame):
+        TOS1, TOS = stack[-2:]
+        stack[-2:] = [TOS1 / TOS]
+
+
+class BINARY_LSHIFT(BINARY):
+    """Implements TOS = TOS1 &lt;&lt; TOS."""
+    def touch_value(self, stack, frame):
+        TOS1, TOS = stack[-2:]
+        stack[-2:] = [TOS1 &lt;&lt; TOS]
+
+
+class BINARY_RSHIFT(BINARY):
+    """Implements TOS = TOS1 &gt;&gt; TOS."""
+    def touch_value(self, stack, frame):
+        TOS1, TOS = stack[-2:]
+        stack[-2:] = [TOS1 &gt;&gt; TOS]
+
+
+class BINARY_AND(BINARY):
+    """Implements TOS = TOS1 &amp; TOS."""
+    def touch_value(self, stack, frame):
+        TOS1, TOS = stack[-2:]
+        stack[-2:] = [TOS1 &amp; TOS]
+
+
+class BINARY_XOR(BINARY):
+    """Implements TOS = TOS1 ^ TOS."""
+    def touch_value(self, stack, frame):
+        TOS1, TOS = stack[-2:]
+        stack[-2:] = [TOS1 ^ TOS]
+
+
+class BINARY_OR(BINARY):
+    """Implements TOS = TOS1 | TOS."""
+    def touch_value(self, stack, frame):
+        TOS1, TOS = stack[-2:]
+        stack[-2:] = [TOS1 | TOS]
+
+
+class RETURN_VALUE(Opcode):
+    """Returns with TOS to the caller of the function."""
+    pops = 1
+    final = True
+    def touch_value(self, stack, frame):
+        value = stack.pop()
+        return value
+
+
+class LOAD_CONST(OpcodeConst):
+    """Pushes co_consts[consti] onto the stack.""" # consti
+    pushes = 1
+    def touch_value(self, stack, frame):
+        # XXX moo: Validate type
+        value = self.get_arg()
+        assert isinstance(value, (int, float))
+        stack.append(value)
+
+
+class LOAD_NAME(OpcodeName):
+    """Pushes the value associated with co_names[namei] onto the stack.""" # namei
+    pushes = 1
+    def touch_value(self, stack, frame):
+        # XXX moo: Get name from dict of valid variables/functions
+        name = self.get_arg()
+        if name not in frame:
+            raise UnknownSymbol("Does not know symbol {}".format(name))
+        stack.append(frame[name])
+
+
+class CALL_FUNCTION(OpcodeArg):
+    """Calls a function. The low byte of argc indicates the number of positional parameters, the high byte the number of keyword parameters. On the stack, the opcode finds the keyword parameters first. For each keyword argument, the value is on top of the key. Below the keyword parameters, the positional parameters are on the stack, with the right-most parameter on top. Below the parameters, the function object to call is on the stack. Pops all function arguments, and the function itself off the stack, and pushes the return value.""" # argc
+    pops = None
+    pushes = 1
+
+    def get_pops(self):
+        args = self.oparg &amp; 0xff
+        kwargs = (self.oparg &gt;&gt; 8) &amp; 0xff
+        return 1 + args + 2 * kwargs
+
+    def touch_value(self, stack, frame):
+        argc = self.oparg &amp; 0xff
+        kwargc = (self.oparg &gt;&gt; 8) &amp; 0xff
+        assert kwargc == 0
+        if argc &gt; 0:
+            args = stack[-argc:]
+            stack[:] = stack[:-argc]
+        else:
+            args = []
+        func = stack.pop()
+
+        assert func in frame.values(), "Uh-oh somebody injected bad function. This does not happen."
+
+        result = func(*args)
+        stack.append(result)
+
+
+def check_for_pow(expr):
+    """ Python evaluates power operator during the compile time if its on constants.
+
+    You can do CPU / memory burning attack with ``2**999999999999999999999**9999999999999``.
+    We mainly care about memory now, as we catch timeoutting in any case.
+
+    We just disable pow and do not care about it.
+    """
+    if "**" in expr:
+        raise BadCompilingInput("Power operation is not allowed")
+
+
+def _safe_eval(expr, functions_and_constants={}, check_compiling_input=True):
+    """ Evaluate a Pythonic math expression and return the output as a string.
+
+    The expr is limited to 1024 characters / 1024 operations
+    to prevent CPU burning or memory stealing.
+
+    :param functions_and_constants: Supplied "built-in" data for evaluation
+    """
+
+    # Some safety checks
+    assert len(expr) &lt; 1024
+
+    # Check for potential bad compiler input
+    if check_compiling_input:
+        check_for_pow(expr)
+
+    # Compile Python source code to Python code for eval()
+    code = compile(expr, '', 'eval')
+
+    # Dissect bytecode back to Python opcodes
+    ops = disassemble(code)
+    assert len(ops) &lt; 1024
+
+    stack = []
+    for op in ops:
+        value = op.touch_value(stack, functions_and_constants)
+
+    return value
+</code></pre>
+</div>
+<span class="comment-copy">Have you tried googling "python safe eval"? This produces a number of highly relevant resources, including some on this site.</span>
+<span class="comment-copy">Naturally I have. In fact I have been working with RestrictedPython library in the past: <a href="https://pypi.python.org/pypi/RestrictedPython" rel="nofollow noreferrer">pypi.python.org/pypi/RestrictedPython</a> - I am looking little bit more insight what Google can give you</span>
+<span class="comment-copy">Also found this solution (which doesn't do symbols) <a href="http://stackoverflow.com/a/11952343/315168">stackoverflow.com/a/11952343/315168</a></span>
+<span class="comment-copy">I think that code needs to come with a formal proof of safety and correctness. :-)</span>
+<span class="comment-copy">have you considered client-side Python: <a href="http://www.skulpt.org/" rel="nofollow noreferrer">skulpt.org</a> or Emscripten <a href="http://repl.it/languages/Python" rel="nofollow noreferrer">repl.it/languages/Python</a> for your web-site?</span>
+<span class="comment-copy">Do I need to update this to {ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,} for Python 3?</span>
+<span class="comment-copy">numpy.safe_eval is a wrapper around the builtin ast.literal_eval (<a href="https://docs.python.org/3/library/ast.html#ast.literal_eval" rel="nofollow noreferrer">docs.python.org/3/library/ast.html#ast.literal_eval</a> ). Is that similar to your answer?</span>
+<span class="comment-copy">@jimbo1qaz: Yeah, adding <code>{ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv}</code> should be the only change needed for Python 3. As you already noticed, <code>ast.literal_eval()</code> is exactly what it says on the tin: It evaluates literal values, that is, numbers, strings, tuples, lists, dictionaries, and the like. So it's not meant for evaluating math operations, which is what the question asked. I think even the support for addition is just there so that it supports complex literals, eg. <code>(2+3j)</code>.</span>
+<span class="comment-copy">@AdamEasterling: If you look more closely, the code actually checks that the exponent for power operations stays less than 100, as an example as to how you might prevent such denial of service attacks, and just replacing with 99 won't work either, because of the order of operations for exponentiation. But you're still, of course, correct: Even though it grows a lot slower, with proper parenthesization, it's possible to make the left argument grow fast enough for denial of service. A proper protection would limit the actual result length by checking eg. <code>len(str(left)) * right &lt; 1000</code> instead.</span>
+<span class="comment-copy">Ah yes, you're right about order of operations. My suggestion that <code>99**99**99**99</code> would break your solution is not correct, since first it would calculate the <i>last</i> <code>99**99</code> pair, then try <code>99**</code> against that, which would fail due to the check of the right side of the POW operation. (One small note: The assert should probably be a raise exception instead. If Python is started with the -O argument, asserts are stripped out. Usually it is recommended to raise exceptions when validating user input.)</span>

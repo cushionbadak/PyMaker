@@ -1,0 +1,175 @@
+<div class="post-text" itemprop="text">
+<p>I need to dynamically load several potentially unsafe modules for testing purpose.</p>
+<p>Regarding security, my script is executed by a low-access user.</p>
+<p>Although, I still need a way to elegantly make the import process timeout as I have no guarantee that the module script will terminate. By example, it could contain a call to <code>input</code> or an infinite loop.</p>
+<p>I am currently using <code>Thread.join</code> with a <code>timeout</code>, but this does not fully solve the issue since the script is then still alive in the background and there is no way to kill a thread.</p>
+<pre><code>from threading import Thread
+import importlib.util
+
+class ReturnThread(Thread):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._return = None
+
+    def run(self):
+        if self._target is not None:
+            self._return = self._target(*self._args, **self._kwargs)
+
+    def join(self, *args, **kwargs):
+        super().join(*args, **kwargs)
+        return self._return
+
+def loader(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module) # This may run into an infinite loop
+    return module
+
+module_loader = ReturnThread(loader, ('module_name', 'module/path'))
+module_loader.start()
+module = module_loader.join(timeout=0.1)
+
+# The thread might still be alive here
+if module is None:
+    ...
+else:
+    ...
+</code></pre>
+<p>How can I import a module, but return <code>None</code> if the script timeouts?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can't reliably kill importing a module. You are essentially executing live code in your own interpreter, so all bets are off.</p>
+<h2>Never import untrusted code</h2>
+<p>First of all, there is no way to safely import unsafe modules from an untrusted source. It doesn't matter if you are using a low-access user. <strong>NEVER IMPORT UNTRUSTED CODE</strong>. The moment the code is imported it could have exploited security holes in your system well beyond the Python process itself. Python is a general purpose programming language, not a sandboxed environment, and any code you import has the full run of your system</p>
+<p>Instead of using a low-access user, <strong>at the very least</strong> run this is a virtual machine. The virtual machine environment can be set up from a known-good snapshot, without network access, and be shut down when a time limit has been reached. You can then compare the snapshots to see what, if anything, the code has attempted to do. Any security breach at that level is short-lived and without value. Also see <a href="https://softwareengineering.stackexchange.com/questions/191623/best-practices-for-execution-of-untrusted-code"><em>Best practices for execution of untrusted code</em></a> over on Software Engineering Stack Exchange.</p>
+<h2>You can't stop the code from undoing your work</h2>
+<p>Next, because you can't control what the imported code does, it can trivially interfere with any attempts to time out the code. The first thing the imported code could do is revoke the protections you put in place! Imported code can access all of Python's global state, including the code that triggered the import. The code could set the <a href="https://docs.python.org/3/library/sys.html#sys.setswitchinterval" rel="nofollow noreferrer">thread switch interval</a> to the maximum value (internally, an unsigned long modelling milliseconds, so the max is <code>((2 ** 32) - 1)</code> milliseconds, just a smidgen under 71 minutes 35 seconds) to mess with scheduling.</p>
+<h2>You can't stop threads, reliably, if they don't want to be stopped</h2>
+<p>Exiting a thread in Python is <a href="https://docs.python.org/3/library/_thread.html#_thread.exit" rel="nofollow noreferrer">handled by raising a exception</a>:</p>
+<blockquote>
+<p>Raise the <code>SystemExit</code> exception. <strong>When not caught</strong>, this will cause the thread to exit silently.</p>
+</blockquote>
+<p>(Bold emphasis mine.)</p>
+<p>From pure Python code, you can only exit a thread from code <em>running in that thread</em>, but there is a way around this, see below.</p>
+<p>But you can't guarantee that the code you are importing isn't just catching and handling all exceptions; if that's the case, the code will just keep on running. At that point it becomes a weapons race; can your thread manage to insert the exception at the point the other thread is inside an exception handler? Then you can exit that thread, otherwise, you lose. You'd have to keep trying until you succeed.</p>
+<h2>A thread that waits on blocking I/O or started a blocking operation in a native extension can't (easily) be killed</h2>
+<p>If the code you import waits on blocking I/O (such as an <code>input()</code> call) then you can't interrupt that call. Raising an exception does nothing, and you can't use signals (as Python handles those on the main thread <em>only</em>). You'd have to find and close every open I/O channel they could be blocked on. This is outside of the scope of my answer here, there are just too many ways to start I/O operations.</p>
+<p>If the code started something implemented in native code (a Python extension) and <em>that</em> blocks, all bets are off entirely.</p>
+<h2>Your interpreter state can be hosed by the time you stop them</h2>
+<p>The code you import could have done anything by the time you managed to stop them. Imported modules could have been replaced. Source code on disk can have been altered. You can't be certain that no other threads have been started. Anything is possible in Python, so assume that it has happened.</p>
+<h2>If you wanted to do this, anyway</h2>
+<p>With those caveats in mind, so you accept that</p>
+<ul>
+<li>The code you import can do malicious things to the OS they are running in, without you being able to stop them from within the same process or even OS</li>
+<li>The code you import could stop your code from working.</li>
+<li>The code you import might have imported and started things you didn't want importing or started.</li>
+<li>The code might start operations that prevent you from stopping the thread altogether</li>
+</ul>
+<p>then you can time out imports by running them in a separate thread, and then raise a <code>SystemExit</code> exception in the thread. You can raise exceptions in another thread by calling the <a href="https://docs.python.org/3/c-api/init.html#c.PyThreadState_SetAsyncExc" rel="nofollow noreferrer"><code>PyThreadState_SetAsyncExc</code> C-API function</a> via the <a href="https://docs.python.org/3/library/ctypes.html#accessing-values-exported-from-dlls" rel="nofollow noreferrer"><code>ctypes.pythonapi</code> object</a>. The Python test suite <a href="https://github.com/python/cpython/blob/260ec2c36abd73bac51489108409160427979ede/Lib/test/test_threading.py#L179-L267" rel="nofollow noreferrer">actually uses this path in a test</a>, I used that as a template for my solution below.</p>
+<p>So here is a full implementation that does just that, and raises an custom <code>UninterruptableImport</code> exception (a subclass of <code>ImportError</code>) if the import could not be interrupted. If the import raised an exception, then that exception is re-raised in the thread that started the import process:</p>
+<pre><code>"""Import a module within a timeframe
+
+Uses the PyThreadState_SetAsyncExc C API and a signal handler to interrupt
+the stack of calls triggered from an import within a timeframe
+
+No guarantees are made as to the state of the interpreter after interrupting
+
+"""
+
+import ctypes
+import importlib
+import random
+import sys
+import threading
+import time
+
+_set_async_exc = ctypes.pythonapi.PyThreadState_SetAsyncExc
+_set_async_exc.argtypes = (ctypes.c_ulong, ctypes.py_object)
+_system_exit = ctypes.py_object(SystemExit)
+
+
+class UninterruptableImport(ImportError):
+    pass
+
+
+class TimeLimitedImporter():
+    def __init__(self, modulename, timeout=5):
+        self.modulename = modulename
+        self.module = None
+        self.exception = None
+        self.timeout = timeout
+
+        self._started = None
+        self._started_event = threading.Event()
+        self._importer = threading.Thread(target=self._import, daemon=True)
+        self._importer.start()
+        self._started_event.wait()
+
+    def _import(self):
+        self._started = time.time()
+        self._started_event.set()
+        timer = threading.Timer(self.timeout, self.exit)
+        timer.start()
+        try:
+            self.module = importlib.import_module(self.modulename)
+        except Exception as e:
+            self.exception = e
+        finally:
+            timer.cancel()
+
+    def result(self, timeout=None):
+        # give the importer a chance to finish first
+        if timeout is not None:
+            timeout += max(time.time() + self.timeout - self._started, 0)
+        self._importer.join(timeout)
+        if self._importer.is_alive():
+            raise UninterruptableImport(
+                f"Could not interrupt the import of {self.modulename}")
+        if self.module is not None:
+            return self.module
+        if self.exception is not None:
+            raise self.exception
+
+    def exit(self):
+        target_id = self._importer.ident
+        if target_id is None:
+            return
+        # set a very low switch interval to be able to interrupt an exception
+        # handler if SystemExit is being caught
+        old_interval = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+
+        try:
+            # repeatedly raise SystemExit until the import thread has exited.
+            # If the exception is being caught by a an exception handler,
+            # our only hope is to raise it again *while inside the handler*
+            while True:
+                _set_async_exc(target_id, _system_exit)
+
+                # short randomised wait times to 'surprise' an exception
+                # handler
+                self._importer.join(
+                    timeout=random.uniform(1e-4, 1e-5)
+                )
+                if not self._importer.is_alive():
+                    return
+        finally:
+            sys.setswitchinterval(old_interval)
+
+
+def import_with_timeout(modulename, import_timeout=5, exit_timeout=1):
+    importer = TimeLimitedImporter(modulename, import_timeout)
+    return importer.result(exit_timeout)
+</code></pre>
+<p>If the code can't be killed, it'll be running in a daemon thread, meaning you can at least exit Python gracefully.</p>
+<p>Use it like this:</p>
+<pre><code>module = import_with_timeout(modulename)
+</code></pre>
+<p>for a default 5 second timeout, and a 1 second wait to see if the import really is unkillable.</p>
+</div>
+<span class="comment-copy">importing module modifies global interpreter state, there is no safe way to interrupt it, python doesn’t allow that. besides python doesn’t expose a thread killing method.</span>
+<span class="comment-copy">but you could achieve the goal by doing stuff in child process, i could write an answer if you accept this .</span>
+<span class="comment-copy">@georgexsh There are of course some assumptions to be done. I am aware that if the module's author is aware this is what I am doing this with their script, they can pretty much break any attempt. Although this is aimed at building a correction script for grading Python coding assignments, so we can assume that there should be nothing too nasty in the modules. Since my script is rarely ran against more than a hundred assignments, threading kind of works, but it is not elegant.</span>
+<span class="comment-copy">That being said, what must be caught and interrupted would be mainly infinite loops and undesired input calls.</span>
+<span class="comment-copy">no, pass a module object between process is not easy, because you cant pickle it. instead, move most of the grading logic to the child process, send back the result to parent. the advantage is, you could clean up a rogue process reliably, always start from a fresh state.</span>
+<span class="comment-copy">very informative, just found another related post: <a href="https://stackoverflow.com/questions/323972/is-there-any-way-to-kill-a-thread" title="is there any way to kill a thread">stackoverflow.com/questions/323972/…</a></span>

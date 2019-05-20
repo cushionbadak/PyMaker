@@ -1,0 +1,108 @@
+<div class="post-text" itemprop="text">
+<p>I have written an application with flask and uses celery for a long running task. While load testing I noticed that the celery tasks are not releasing memory even after completing the task. So I googled and found this group discussion..</p>
+<p><a href="https://groups.google.com/forum/#!topic/celery-users/jVc3I3kPtlw" rel="nofollow">https://groups.google.com/forum/#!topic/celery-users/jVc3I3kPtlw</a></p>
+<p>In that discussion it says, thats how python works.</p>
+<p>Also the article at <a href="https://hbfs.wordpress.com/2013/01/08/python-memory-management-part-ii/" rel="nofollow">https://hbfs.wordpress.com/2013/01/08/python-memory-management-part-ii/</a> says  </p>
+<p>"But from the OS’s perspective, your program’s size is the total (maximum) memory allocated to Python. Since Python returns memory to the OS on the heap (that allocates other objects than small objects) only on Windows, if you run on Linux, you can only see the total memory used by your program increase."</p>
+<p>And I use Linux. So I wrote the below script to verify it.</p>
+<pre><code>import gc
+def memory_usage_psutil():
+    # return the memory usage in MB
+    import resource
+    print 'Memory usage: %s (MB)' % (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1000.0)
+
+def fileopen(fname):
+    memory_usage_psutil()# 10 MB
+    f = open(fname)
+    memory_usage_psutil()# 10 MB
+    content = f.read()
+    memory_usage_psutil()# 14 MB
+
+def fun(fname):
+    memory_usage_psutil() # 10 MB
+    fileopen(fname)
+    gc.collect()
+    memory_usage_psutil() # 14 MB
+
+import sys
+from time import sleep
+if __name__ == '__main__':
+    fun(sys.argv[1])
+    for _ in range(60):
+        gc.collect()
+        memory_usage_psutil()#14 MB ...
+        sleep(1)
+</code></pre>
+<p>The input was a 4MB file. Even after returning from the 'fileopen' function the 4MB memory was not released. I checked htop output while the loop was running, the resident memory stays at 14MB. So unless the process is stopped the memory stays with it.</p>
+<p>So if the celery worker is not killed after its task is finished it is going to keep the memory for itself. I know I can use <strong>max_tasks_per_child</strong> config value to kill the process and spawn a new one. <strong>Is there any other way to return the memory to OS from a python process?.</strong></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think your measurement method and interpretation is a bit off. You are using <code>ru_maxrss</code> of <a href="https://docs.python.org/3/library/resource.html#resource.getrusage" rel="nofollow noreferrer"><code>resource.getrusage</code></a>, which is the "high watermark" of the process. See <a href="https://unix.stackexchange.com/questions/30940/getrusage-system-call-what-is-maximum-resident-set-size">this</a> discussion for details on what that means. In short, it is the peak RAM usage of your process, but not necessarily current. Parts of the process could be swapped out etc.</p>
+<p>It also can mean that the process has freed that 4MiB, but the OS has not reclaimed the memory, because it's faster for the process to allocate new 4MiB if it has the memory mapped already. To make it even more complicated programs can and do use <a href="https://en.wikipedia.org/wiki/Free_list" rel="nofollow noreferrer">"free lists"</a>, lists of blocks of memory that are not in active use, but are not freed. This is also a common trick to make future allocations faster.</p>
+<p>I wrote a short script to demonstrate the difference between virtual memory usage and max RSS:</p>
+<pre><code>import numpy as np
+import psutil
+import resource
+
+
+def print_mem():
+    print("----------")
+    print("ru_maxrss: {:.2f}MiB".format(
+            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024))
+    print("virtual_memory.used: {:.2f}MiB".format(
+            psutil.virtual_memory().used / 1024 ** 2))
+
+
+print_mem()
+print("allocating large array (80e6,)...")
+a = np.random.random(int(80e6))
+
+print_mem()
+print("del a")
+del a
+
+print_mem()
+print("read testdata.bin (~400MiB)")
+with open('testdata.bin', 'rb') as f:
+    data = f.read()
+
+print_mem()
+print("del data")
+del data
+
+print_mem()
+</code></pre>
+<p>The results are:</p>
+<pre><code>----------
+ru_maxrss: 22.89MiB
+virtual_memory.used: 8125.66MiB
+allocating large array (80e6,)...
+----------
+ru_maxrss: 633.20MiB
+virtual_memory.used: 8731.85MiB
+del a
+----------
+ru_maxrss: 633.20MiB
+virtual_memory.used: 8121.66MiB
+read testdata.bin (~400MiB)
+----------
+ru_maxrss: 633.20MiB
+virtual_memory.used: 8513.11MiB
+del data
+----------
+ru_maxrss: 633.20MiB
+virtual_memory.used: 8123.22MiB
+</code></pre>
+<p>It is clear how the <code>ru_maxrss</code> remembers the maximum RSS, but the current usage has dropped in the end.</p>
+<p>Note on <code>psutil.virtual_memory().used</code>:</p>
+<blockquote>
+<p><strong>used:</strong> memory used, calculated differently depending on the platform and designed for informational purposes only.</p>
+</blockquote>
+</div>
+<span class="comment-copy">That article is BS actually. The memory is likewise returned to the OS in Linux. Earlier this week there was this question about a program where <a href="http://stackoverflow.com/questions/36548518/variable-assignment-faster-than-one-liner/36549633#36549633">slowdown was caused by Python returning memory to OS too eagerly</a></span>
+<span class="comment-copy">However the problem is that the heuristics of the arena allocator usually are <b>bad by itself</b> and it does not manage to free full arenas then.</span>
+<span class="comment-copy">But htop, top and 'cat /proc/&lt;pid&gt;/stat' is showing the same 14 MB RES. Are htop and top also showing the max RES as well and not the current usage? Also should not we be worried about the RAM usage rather than the virtual memory used?</span>
+<span class="comment-copy">In that our systems differ. Using your script with an added <code>raw_input()</code> right after <code>content = f.read()</code> to stop progression for observing RSS I see it raise to 10MiB for the time of the function <code>fileopen</code>, after which it drops back to 6.7MiB. Virtual memory usage can be a problem for 32bit systems, if it accumulates per process.</span>
+<span class="comment-copy">Also an interesting question is: does the RSS raise, if you repeat <code>fun(sys.argv[1])</code> in a (infinite) loop? Again on this machine the answer is no, it's a stable 10.8MiB, but this time when I break the loop, the memory is not reclaimed by the OS and I see the same effect of RSS staying at 10.8MiB. Perhaps the OS decided that since it seems the program constantly needs that memory, why reclaim it in between.</span>
+<span class="comment-copy">It seems that even calling <code>fun(...)</code> twice in a row is enough to trigger the effect.</span>
+<span class="comment-copy">Which OS do you use?  On Windows it does return to OS. On linux it does not. I tried it calling twice and yes the memory does not grow. It stays there. I would prefer if it reduce after the use. But that is not happening.</span>

@@ -1,0 +1,274 @@
+<div class="post-text" itemprop="text">
+<p>I have a class A with three attributes a,b,c, where a is calculated from b and c (but this is expensive). Moreover, attributes b and c are likely to change over times. I want to make sure that:</p>
+<ol>
+<li>a is cached once it is calculated and then reproduced from cache</li>
+<li>if b or c change then the next time a is needed it must be recomputed to reflect the change</li>
+</ol>
+<p>the following code seems to work:</p>
+<pre><code>class A():
+
+    def __init__(self, b, c):
+        self._a = None
+        self._b = b
+        self._c = c
+
+    @property
+    def a(self):
+        if is None:
+            self.update_a()
+        return self._a
+
+    def update_a(self):
+        """
+        compute a from b and c
+        """
+        print('this is expensive')
+        self._a = self.b + 2*self.c
+
+    @property
+    def b(self):
+        return self._b
+
+    @b.setter
+    def b(self, value):
+        self._b = value
+        self._a = None #make sure a is recalculated before its next use
+
+    @property
+    def c(self):
+        return self._c
+
+    @c.setter
+    def c(self, value):
+        self._c = value
+        self._a = None #make sure a is recalculated before its next use
+</code></pre>
+<p>however this approach does not seem very good for many reasons:</p>
+<ol>
+<li>the setters of b and c needs to know about a</li>
+<li>it becomes a mess to write and maintain if the dependency-tree grows larger</li>
+<li>it might not be apparent in the code of update_a what its dependencies are</li>
+<li>it leads to a lot of code duplication</li>
+</ol>
+<p>Is there an abstract way to achieve this that does not require me to do all the bookkeeping myself?
+Ideally, I would like to have some sort of decorator which tells the property what its dependencies are so that all the bookkeeping happens under the hood.</p>
+<p>I would like to write:</p>
+<pre><code>@cached_property_depends_on('b', 'c')
+def a(self):
+    return self.b+2*self.c
+</code></pre>
+<p>or something like that.</p>
+<p><strong>EDIT:</strong> I would prefer solutions that do not require that the values assigned to a,b,c be immutable. I am mostly interested in np.arrays and lists but I would like the code to be reusable in many different situations without having to worry about mutability issues.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You could use <code>functools.lru_cache</code>:</p>
+<pre><code>from functools import lru_cache
+from operator import attrgetter
+
+def cached_property_depends_on(*args):
+    attrs = attrgetter(*args)
+    def decorator(func):
+        _cache = lru_cache(maxsize=None)(lambda self, _: func(self))
+        def _with_tracked(self):
+            return _cache(self, attrs(self))
+        return property(_with_tracked, doc=func.__doc__)
+    return decorator
+</code></pre>
+<p>The idea is to retrieve the values of tracked attributes each time the property is accessed, pass them to the memoizing callable, but ignore them during the actual call.</p>
+<p>Given a minimal implementation of the class:</p>
+<pre><code>class A:
+
+    def __init__(self, b, c):
+        self._b = b
+        self._c = c
+
+    @property
+    def b(self):
+        return self._b
+
+    @b.setter
+    def b(self, value):
+        self._b = value
+
+    @property
+    def c(self):
+        return self._c
+
+    @c.setter
+    def c(self, value):
+        self._c = value
+
+    @cached_property_depends_on('b', 'c')
+    def a(self):
+        print('Recomputing a')
+        return self.b + 2 * self.c
+</code></pre>
+<pre><code>a = A(1, 1)
+print(a.a)
+print(a.a)
+a.b = 3
+print(a.a)
+print(a.a)
+a.c = 4
+print(a.a)
+print(a.a)
+</code></pre>
+<p>outputs</p>
+<pre class="lang-none prettyprint-override"><code>Recomputing a
+3
+3
+Recomputing a
+5
+5
+Recomputing a
+11
+11
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Fortunately, a dependency management system like this is easy enough to implement - if you're familiar with <a href="https://docs.python.org/3/howto/descriptor.html" rel="nofollow noreferrer">descriptors</a> and <a href="https://stackoverflow.com/questions/100003/what-are-metaclasses-in-python">metaclasses</a>.</p>
+<p>Our implementation needs 4 things:</p>
+<ol>
+<li>A new type of <code>property</code> that knows which other properties depend on it. When this property's value changes, it will notify all properties that depend on it that they have to re-calculate their value. We'll call this class <code>DependencyProperty</code>.</li>
+<li>Another type of <code>DependencyProperty</code> that caches the value computed by its getter function. We'll call this <code>DependentProperty</code>.</li>
+<li>A metaclass <code>DependencyMeta</code> that connects all the DependentProperties to the correct DependencyProperties.</li>
+<li>A function decorator <code>@cached_dependent_property</code> that turns a getter function into a <code>DependentProperty</code>.</li>
+</ol>
+<p>This is the implementation:</p>
+<pre><code>_sentinel = object()
+
+
+class DependencyProperty(property):
+    """
+    A property that invalidates its dependencies' values when its value changes
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.dependent_properties = set()
+
+    def __set__(self, instance, value):
+        # if the value stayed the same, do nothing
+        try:
+            if self.__get__(instance) is value:
+                return
+        except AttributeError:
+            pass
+
+        # set the new value
+        super().__set__(instance, value)
+
+        # invalidate all dependencies' values
+        for prop in self.dependent_properties:
+            prop.cached_value = _sentinel
+
+    @classmethod
+    def new_for_name(cls, name):
+        name = '_{}'.format(name)
+
+        def getter(instance, owner=None):
+            return getattr(instance, name)
+
+        def setter(instance, value):
+            setattr(instance, name, value)
+
+        return cls(getter, setter)
+
+
+class DependentProperty(DependencyProperty):
+    """
+    A property whose getter function depends on the values of other properties and
+    caches the value computed by the (expensive) getter function.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.cached_value = _sentinel
+
+    def __get__(self, instance, owner=None):
+        if self.cached_value is _sentinel:
+            self.cached_value = super().__get__(instance, owner)
+
+        return self.cached_value
+
+
+def cached_dependent_property(*dependencies):
+    """
+    Method decorator that creates a DependentProperty
+    """
+    def deco(func):
+        prop = DependentProperty(func)
+        # we'll temporarily store the names of the dependencies.
+        # The metaclass will fix this later.
+        prop.dependent_properties = dependencies
+        return prop
+    return deco
+
+
+class DependencyMeta(type):
+    def __new__(mcls, *args, **kwargs):
+        cls = super().__new__(mcls, *args, **kwargs)
+
+        # first, find all dependencies. At this point, we only know their names.
+        dependency_map = {}
+        dependencies = set()
+        for attr_name, attr in vars(cls).items():
+            if isinstance(attr, DependencyProperty):
+                dependency_map[attr] = attr.dependent_properties
+                dependencies.update(attr.dependent_properties)
+                attr.dependent_properties = set()
+
+        # now convert all of them to DependencyProperties, if they aren't
+        for prop_name in dependencies:
+            prop = getattr(cls, prop_name, None)
+            if not isinstance(prop, DependencyProperty):
+                if prop is None:
+                    # it's not even a property, just a normal instance attribute
+                    prop = DependencyProperty.new_for_name(prop_name)
+                else:
+                    # it's a normal property
+                    prop = DependencyProperty(prop.fget, prop.fset, prop.fdel)
+                setattr(cls, prop_name, prop)
+
+        # finally, inject the property objects into each other's dependent_properties attribute
+        for prop, dependency_names in dependency_map.items():
+            for dependency_name in dependency_names:
+                dependency = getattr(cls, dependency_name)
+                dependency.dependent_properties.add(prop)
+
+        return cls
+</code></pre>
+<hr/>
+<p>And finally, some proof that it actually works:</p>
+<pre><code>class A(metaclass=DependencyMeta):
+    def __init__(self, b, c):
+        self.b = b
+        self.c = c
+
+    @property
+    def b(self):
+        return self._b
+
+    @b.setter
+    def b(self, value):
+        self._b = value + 10
+
+    @cached_dependent_property('b', 'c')
+    def a(self):
+        print('doing expensive calculations')
+        return self.b + 2*self.c
+
+
+obj = A(1, 4)
+print('b = {}, c = {}'.format(obj.b, obj.c))
+print('a =', obj.a)
+print('a =', obj.a) # this shouldn't print "doing expensive calculations"
+obj.b = 0
+print('b = {}, c = {}'.format(obj.b, obj.c))
+print('a =', obj.a) # this should print "doing expensive calculations"
+</code></pre>
+</div>
+<span class="comment-copy">I like this approach but it only works if the values stored in b and c are hashable. In my example many attributes are lists or np.arrays so this would not work directly.</span>
+<span class="comment-copy">@TashiWalde maybe you should add a note about that in your question. In that case I would probably check the types of attributes inside <code>cached_property_depends_on</code> and convert unhashable objects to something hashable. <a href="https://stackoverflow.com/q/16589791/2301450">Here are your options for numpy arrays</a>.</span>

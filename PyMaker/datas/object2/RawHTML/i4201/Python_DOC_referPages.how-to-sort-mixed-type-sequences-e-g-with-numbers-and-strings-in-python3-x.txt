@@ -1,0 +1,672 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to replicate (and if possible improve on) Python 2.x's sorting behaviour in 3.x, so that mutually orderable types like <code>int</code>, <code>float</code> etc. are sorted as expected, and mutually unorderable types are grouped within the output.</p>
+<p>Here's an example of what I'm talking about:</p>
+<pre><code>&gt;&gt;&gt; sorted([0, 'one', 2.3, 'four', -5])  # Python 2.x
+[-5, 0, 2.3, 'four', 'one']
+</code></pre>
+<pre><code>&gt;&gt;&gt; sorted([0, 'one', 2.3, 'four', -5])  # Python 3.x
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+TypeError: unorderable types: str() &lt; int()
+</code></pre>
+<p>My previous attempt at this, using a class for the key parameter to <code>sorted()</code> (see 
+<a href="https://stackoverflow.com/q/26567667/1014938">Why does this key class for sorting heterogeneous sequences behave oddly?</a>) is fundamentally broken, because its approach of</p>
+<ol>
+<li>Trying to compare values, and</li>
+<li>If that fails, falling back to comparing the string representation of their types</li>
+</ol>
+<p>can lead to intransitive ordering, as explained by <a href="https://stackoverflow.com/a/26567784/1014938">BrenBarn's excellent answer</a>.</p>
+<p>A naïve approach, which I initially rejected without even trying to code it, would be to use a key function that returns a <code>(type, value)</code> tuple:</p>
+<pre><code>def motley(value):
+    return repr(type(value)), value
+</code></pre>
+<p>However, this doesn't do what I want. In the first place, it breaks the natural ordering of mutually orderable types:</p>
+<pre><code>&gt;&gt;&gt; sorted([0, 123.4, 5, -6, 7.89])
+[-6, 0, 5, 7.89, 123.4]
+&gt;&gt;&gt; sorted([0, 123.4, 5, -6, 7.89], key=motley)
+[7.89, 123.4, -6, 0, 5]
+</code></pre>
+<p>Secondly, it raises an exception when the input contains two objects of the same intrinsically unorderable type:</p>
+<pre><code>&gt;&gt;&gt; sorted([{1:2}, {3:4}], key=motley)
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+TypeError: unorderable types: dict() &lt; dict()
+</code></pre>
+<p>... which admittedly is the standard behaviour in both Python 2.x and 3.x – but ideally I'd like such types to be grouped together (I don't especially care about their ordering, but it would seem in keeping with Python's guarantee of stable sorting that they retain their original order).</p>
+<p>I can work around the first of these problems for numeric types by special-casing them:</p>
+<pre><code>from numbers import Real
+from decimal import Decimal
+
+def motley(value):
+    numeric = Real, Decimal
+    if isinstance(value, numeric):
+        typeinfo = numeric
+    else:
+        typeinfo = type(value)
+    return repr(typeinfo), value
+</code></pre>
+<p>... which works as far as it goes:</p>
+<pre><code>&gt;&gt;&gt; sorted([0, 'one', 2.3, 'four', -5], key=motley)
+[-5, 0, 2.3, 'four', 'one']
+</code></pre>
+<p>... but doesn't account for the fact that there may be other distinct (possibly user-defined) types which are mutually orderable, and of course still fails with intrinsically unorderable types:</p>
+<pre><code>&gt;&gt;&gt; sorted([{1:2}, {3:4}], key=motley)
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+TypeError: unorderable types: dict() &lt; dict()
+</code></pre>
+<p>Is there another approach which solves <strong>both</strong> the problem of arbitrary, distinct-but-mutually-orderable types <strong>and</strong> that of intrinsically unorderable types?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Stupid idea: make a first pass to divide all the different items in groups that can be compared between each other, sort the individual groups and finally concatenate them. I assume that an item is comparable to all members of a group, if it is comparable with the first member of a group. Something like this (Python3):</p>
+<pre><code>import itertools
+
+def python2sort(x):
+    it = iter(x)
+    groups = [[next(it)]]
+    for item in it:
+        for group in groups:
+            try:
+                item &lt; group[0]  # exception if not comparable
+                group.append(item)
+                break
+            except TypeError:
+                continue
+        else:  # did not break, make new group
+            groups.append([item])
+    print(groups)  # for debugging
+    return itertools.chain.from_iterable(sorted(group) for group in groups)
+</code></pre>
+<p>This will have quadratic running time in the pathetic case that none of the items are comparable, but I guess the only way to know that for sure is to check all possible combinations. See the quadratic behavior as a deserved punishment for anyone trying to sort a long list of unsortable items, like complex numbers. In a more common case of a mix of some strings and some integers, the speed should be similar to the speed of a normal sort. Quick test:</p>
+<pre><code>In [19]: x = [0, 'one', 2.3, 'four', -5, 1j, 2j,  -5.5, 13 , 15.3, 'aa', 'zz']
+
+In [20]: list(python2sort(x))
+[[0, 2.3, -5, -5.5, 13, 15.3], ['one', 'four', 'aa', 'zz'], [1j], [2j]]
+Out[20]: [-5.5, -5, 0, 2.3, 13, 15.3, 'aa', 'four', 'one', 'zz', 1j, 2j]
+</code></pre>
+<p>It seems to be a 'stable sort' as well, since the groups are formed in the order the incomparable items are encountered.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This answer aims to faithfully re-create the Python 2 sort order, in Python 3, in every detail.</p>
+<p>The actual Python 2 implementation is quite involved, but <a href="https://hg.python.org/cpython/file/4252bdba6e89/Objects/object.c#l756" rel="nofollow noreferrer"><code>object.c</code>'s <code>default_3way_compare</code></a> does the final fallback after instances have been given a chance to implement normal comparison rules. This is after individual types have been given a chance to compare (via the <code>__cmp__</code> or <code>__lt__</code> hooks).</p>
+<p>Implementing that function as pure Python in a wrapper, plus emulating the exceptions to the rules (<code>dict</code> and complex numbers specifically) gives us the same Python 2 sorting semantics in Python 3:</p>
+<pre><code>from numbers import Number
+
+
+# decorator for type to function mapping special cases
+def per_type_cmp(type_):
+    try:
+        mapping = per_type_cmp.mapping
+    except AttributeError:
+        mapping = per_type_cmp.mapping = {}
+    def decorator(cmpfunc):
+        mapping[type_] = cmpfunc
+        return cmpfunc
+    return decorator
+
+
+class python2_sort_key(object):
+    _unhandled_types = {complex}
+
+    def __init__(self, ob):
+       self._ob = ob
+
+    def __lt__(self, other):
+        _unhandled_types = self._unhandled_types
+        self, other = self._ob, other._ob  # we don't care about the wrapper
+
+        # default_3way_compare is used only if direct comparison failed
+        try:
+            return self &lt; other
+        except TypeError:
+            pass
+
+        # hooks to implement special casing for types, dict in Py2 has
+        # a dedicated __cmp__ method that is gone in Py3 for example.
+        for type_, special_cmp in per_type_cmp.mapping.items():
+            if isinstance(self, type_) and isinstance(other, type_):
+                return special_cmp(self, other)
+
+        # explicitly raise again for types that won't sort in Python 2 either
+        if type(self) in _unhandled_types:
+            raise TypeError('no ordering relation is defined for {}'.format(
+                type(self).__name__))
+        if type(other) in _unhandled_types:
+            raise TypeError('no ordering relation is defined for {}'.format(
+                type(other).__name__))
+
+        # default_3way_compare from Python 2 as Python code
+        # same type but no ordering defined, go by id
+        if type(self) is type(other):
+            return id(self) &lt; id(other)
+
+        # None always comes first
+        if self is None:
+            return True
+        if other is None:
+            return False
+
+        # Sort by typename, but numbers are sorted before other types
+        self_tname = '' if isinstance(self, Number) else type(self).__name__
+        other_tname = '' if isinstance(other, Number) else type(other).__name__
+
+        if self_tname != other_tname:
+            return self_tname &lt; other_tname
+
+        # same typename, or both numbers, but different type objects, order
+        # by the id of the type object
+        return id(type(self)) &lt; id(type(other))
+
+
+@per_type_cmp(dict)
+def dict_cmp(a, b, _s=object()):
+    if len(a) != len(b):
+        return len(a) &lt; len(b)
+    adiff = min((k for k in a if a[k] != b.get(k, _s)), key=python2_sort_key, default=_s)
+    if adiff is _s:
+        # All keys in a have a matching value in b, so the dicts are equal
+        return False
+    bdiff = min((k for k in b if b[k] != a.get(k, _s)), key=python2_sort_key)
+    if adiff != bdiff:
+        return python2_sort_key(adiff) &lt; python2_sort_key(bdiff)
+    return python2_sort_key(a[adiff]) &lt; python2_sort_key(b[bdiff])
+</code></pre>
+<p>I incorporated <a href="https://stackoverflow.com/questions/3484293/is-there-a-description-of-how-cmp-works-for-dict-objects-in-python-2">handling dictionary sorting as implemented in Python 2</a>, since that'd be supported by the type itself via a <code>__cmp__</code> hook. I've stuck to the Python 2 ordering for the keys and values as well, naturally.</p>
+<p>I've also added special casing for complex numbers, as Python 2 raises an exception when you try sort to these:</p>
+<pre><code>&gt;&gt;&gt; sorted([0.0, 1, (1+0j), False, (2+3j)])
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+TypeError: no ordering relation is defined for complex numbers
+</code></pre>
+<p>You may have to add more special cases if you want to emulate Python 2 behaviour exactly.</p>
+<p>If you wanted to sort complex numbers <em>anyway</em> you'll need to consistently put them with the non-numbers group; e.g.:</p>
+<pre><code># Sort by typename, but numbers are sorted before other types
+if isinstance(self, Number) and not isinstance(self, complex):
+    self_tname = ''
+else:
+    self_tname = type(self).__name__
+if isinstance(other, Number) and not isinstance(other, complex):
+    other_tname = ''
+else:
+    other_tname = type(other).__name__
+</code></pre>
+<p>Some test cases:</p>
+<pre><code>&gt;&gt;&gt; sorted([0, 'one', 2.3, 'four', -5], key=python2_sort_key)
+[-5, 0, 2.3, 'four', 'one']
+&gt;&gt;&gt; sorted([0, 123.4, 5, -6, 7.89], key=python2_sort_key)
+[-6, 0, 5, 7.89, 123.4]
+&gt;&gt;&gt; sorted([{1:2}, {3:4}], key=python2_sort_key)
+[{1: 2}, {3: 4}]
+&gt;&gt;&gt; sorted([{1:2}, None, {3:4}], key=python2_sort_key)
+[None, {1: 2}, {3: 4}]
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Not running Python 3 here, but maybe something like this would work.  Test to see if doing a "less than" compare on "value" creates an exception and then do "something" to handle that case, like convert it to a string.</p>
+<p>Of course you'd still need more special handling if there are other types in your list that are not the same type but are mutually orderable.</p>
+<pre><code>from numbers import Real
+from decimal import Decimal
+
+def motley(value):
+    numeric = Real, Decimal
+    if isinstance(value, numeric):
+        typeinfo = numeric
+    else:
+        typeinfo = type(value)
+
+    try:
+        x = value &lt; value
+    except TypeError:
+        value = repr(value)
+
+    return repr(typeinfo), value
+
+&gt;&gt;&gt; print sorted([0, 'one', 2.3, 'four', -5, (2+3j), (1-3j)], key=motley)
+[-5, 0, 2.3, (1-3j), (2+3j), 'four', 'one']
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>To avoid the use of exceptions and going for a type based solution, i came up with this:</p>
+<pre><code>#! /usr/bin/python3
+
+import itertools
+
+def p2Sort(x):
+    notImpl = type(0j.__gt__(0j))
+    it = iter(x)
+    first = next(it)
+    groups = [[first]]
+    types = {type(first):0}
+    for item in it:
+        item_type = type(item)
+        if item_type in types.keys():
+            groups[types[item_type]].append(item)
+        else:
+            types[item_type] = len(types)
+            groups.append([item])
+
+    #debuggng
+    for group in groups:
+        print(group)
+        for it in group:
+            print(type(it),)
+    #
+
+    for i in range(len(groups)):
+        if type(groups[i][0].__gt__(groups[i][0])) == notImpl:
+            continue
+        groups[i] = sorted(groups[i])
+
+    return itertools.chain.from_iterable(group for group in groups)
+
+x = [0j, 'one', 2.3, 'four', -5, 3j, 0j,  -5.5, 13 , 15.3, 'aa', 'zz']
+print(list(p2Sort(x)))
+</code></pre>
+<p>Note that an additional dictionary to hold the different types in list and a type holding variable (notImpl) is needed. Further note, that floats and ints aren't mixed here.</p>
+<p>Output:</p>
+<pre><code>================================================================================
+05.04.2017 18:27:57
+~/Desktop/sorter.py
+--------------------------------------------------------------------------------
+[0j, 3j, 0j]
+&lt;class 'complex'&gt;
+&lt;class 'complex'&gt;
+&lt;class 'complex'&gt;
+['one', 'four', 'aa', 'zz']
+&lt;class 'str'&gt;
+&lt;class 'str'&gt;
+&lt;class 'str'&gt;
+&lt;class 'str'&gt;
+[2.3, -5.5, 15.3]
+&lt;class 'float'&gt;
+&lt;class 'float'&gt;
+&lt;class 'float'&gt;
+[-5, 13]
+&lt;class 'int'&gt;
+&lt;class 'int'&gt;
+[0j, 3j, 0j, 'aa', 'four', 'one', 'zz', -5.5, 2.3, 15.3, -5, 13]
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>One way for Python 3.2+ is to use <a href="https://docs.python.org/3/library/functools.html#functools.cmp_to_key" rel="nofollow noreferrer"><code>functools.cmp_to_key()</code></a>.
+With this you can quickly implement a solution that tries to compare the values and then falls back on comparing the string representation of the types. You can also avoid an error being raised when comparing unordered types and leave the order as in the original case:</p>
+<pre><code>from functools import cmp_to_key
+
+def cmp(a,b):
+    try:
+        return (a &gt; b) - (a &lt; b)
+    except TypeError:
+        s1, s2 = type(a).__name__, type(b).__name__
+        return (s1 &gt; s2) - (s1 &lt; s2)
+</code></pre>
+<p>Examples (input lists taken from <a href="https://stackoverflow.com/a/26652245/6260170">Martijn Pieters's answer</a>):</p>
+<pre><code>sorted([0, 'one', 2.3, 'four', -5], key=cmp_to_key(cmp))
+# [-5, 0, 2.3, 'four', 'one']
+sorted([0, 123.4, 5, -6, 7.89], key=cmp_to_key(cmp))
+# [-6, 0, 5, 7.89, 123.4]
+sorted([{1:2}, {3:4}], key=cmp_to_key(cmp))
+# [{1: 2}, {3: 4}]
+sorted([{1:2}, None, {3:4}], key=cmp_to_key(cmp))
+# [None, {1: 2}, {3: 4}]
+</code></pre>
+<p>This has the disadvantage that the three-way compare is always conducted, increasing the time complexity. However, the solution is low overhead, short, clean and I think <code>cmp_to_key()</code> was developed for this kind of Python 2 emulation use case.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>We can solve this problem in the following way.</p>
+<ol>
+<li>Group by type.</li>
+<li>Find which types are comparable by attempting to compare a single representative of each type.</li>
+<li>Merge groups of comparable types.</li>
+<li>Sort merged groups, if possible.</li>
+<li>yield from (sorted) merged groups</li>
+</ol>
+<p>We can get a deterministic and orderable key function from types by using <code>repr(type(x))</code>. Note that the 'type hierarchy' here is determined by the repr of the types themselves. A flaw in this method is that if two types have identical <code>__repr__</code> (the types themselves, not the instances), you will 'confuse' types. This can be solved by using a key function that returns a tuple <code>(repr(type), id(type))</code>, but I have not implemented that in this solution.</p>
+<p>The advantage of my method over Bas Swinkel's is a cleaner handling of a group of un-orderable elements. We do not have quadratic behavior; instead, the function gives up after the first attempted ordering during sorted()).</p>
+<p>My method functions worst in the scenario where there are an extremely large number of different types in the iterable. This is a rare scenario, but I suppose it could come up.</p>
+<pre><code>def py2sort(iterable):
+        by_type_repr = lambda x: repr(type(x))
+        iterable = sorted(iterable, key = by_type_repr)
+        types = {type_: list(group) for type_, group in groupby(iterable, by_type_repr)}
+
+        def merge_compatible_types(types):
+            representatives = [(type_, items[0]) for (type_, items) in types.items()]
+
+            def mergable_types():
+                for i, (type_0, elem_0) in enumerate(representatives, 1):
+                    for type_1, elem_1 in representatives[i:]:
+                         if _comparable(elem_0, elem_1):
+                             yield type_0, type_1
+
+            def merge_types(a, b):
+                try:
+                    types[a].extend(types[b])
+                    del types[b]
+                except KeyError:
+                    pass # already merged
+
+            for a, b in mergable_types():
+                merge_types(a, b)
+            return types
+
+        def gen_from_sorted_comparable_groups(types):
+            for _, items in types.items():
+                try:
+                    items = sorted(items)
+                except TypeError:
+                    pass #unorderable type
+                yield from items
+        types = merge_compatible_types(types)
+        return list(gen_from_sorted_comparable_groups(types))
+
+    def _comparable(x, y):
+        try:
+            x &lt; y
+        except TypeError:
+            return False
+        else:
+            return True
+
+    if __name__ == '__main__':    
+        print('before py2sort:')
+        test = [2, -11.6, 3, 5.0, (1, '5', 3), (object, object()), complex(2, 3), [list, tuple], Fraction(11, 2), '2', type, str, 'foo', object(), 'bar']    
+        print(test)
+        print('after py2sort:')
+        print(py2sort(test))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'd like to recommend starting this sort of task (like imitation of another system's behaviour very close to this one) with detailed clarifying of the target system. How should it work with different corner cases. One of the best ways to do it - write a bunch of tests to ensure correct behaviour. Having such tests gives:</p>
+<ul>
+<li>Better understandind which elements should precede which</li>
+<li>Basic documenting</li>
+<li>Makes system robust against some refactoring and adding functionality. For example if one more rule is added - how to get sure previous are not gets broken?</li>
+</ul>
+<p>One can write such test cases:</p>
+<p><strong>sort2_test.py</strong></p>
+<pre><code>import unittest
+from sort2 import sorted2
+
+
+class TestSortNumbers(unittest.TestCase):
+    """
+    Verifies numbers are get sorted correctly.
+    """
+
+    def test_sort_empty(self):
+        self.assertEqual(sorted2([]), [])
+
+    def test_sort_one_element_int(self):
+        self.assertEqual(sorted2([1]), [1])
+
+    def test_sort_one_element_real(self):
+        self.assertEqual(sorted2([1.0]), [1.0])
+
+    def test_ints(self):
+        self.assertEqual(sorted2([1, 2]), [1, 2])
+
+    def test_ints_reverse(self):
+        self.assertEqual(sorted2([2, 1]), [1, 2])
+
+
+class TestSortStrings(unittest.TestCase):
+    """
+    Verifies numbers are get sorted correctly.
+    """
+
+    def test_sort_one_element_str(self):
+        self.assertEqual(sorted2(["1.0"]), ["1.0"])
+
+
+class TestSortIntString(unittest.TestCase):
+    """
+    Verifies numbers and strings are get sorted correctly.
+    """
+
+    def test_string_after_int(self):
+        self.assertEqual(sorted2([1, "1"]), [1, "1"])
+        self.assertEqual(sorted2([0, "1"]), [0, "1"])
+        self.assertEqual(sorted2([-1, "1"]), [-1, "1"])
+        self.assertEqual(sorted2(["1", 1]), [1, "1"])
+        self.assertEqual(sorted2(["0", 1]), [1, "0"])
+        self.assertEqual(sorted2(["-1", 1]), [1, "-1"])
+
+
+class TestSortIntDict(unittest.TestCase):
+    """
+    Verifies numbers and dict are get sorted correctly.
+    """
+
+    def test_string_after_int(self):
+        self.assertEqual(sorted2([1, {1: 2}]), [1, {1: 2}])
+        self.assertEqual(sorted2([0, {1: 2}]), [0, {1: 2}])
+        self.assertEqual(sorted2([-1, {1: 2}]), [-1, {1: 2}])
+        self.assertEqual(sorted2([{1: 2}, 1]), [1, {1: 2}])
+        self.assertEqual(sorted2([{1: 2}, 1]), [1, {1: 2}])
+        self.assertEqual(sorted2([{1: 2}, 1]), [1, {1: 2}])
+</code></pre>
+<p>Next one may have such sorting function:</p>
+<p><strong>sort2.py</strong></p>
+<pre><code>from numbers import Real
+from decimal import Decimal
+from itertools import tee, filterfalse
+
+
+def sorted2(iterable):
+    """
+
+    :param iterable: An iterable (array or alike)
+        entity which elements should be sorted.
+    :return: List with sorted elements.
+    """
+    def predicate(x):
+        return isinstance(x, (Real, Decimal))
+
+    t1, t2 = tee(iterable)
+    numbers = filter(predicate, t1)
+    non_numbers = filterfalse(predicate, t2)
+    sorted_numbers = sorted(numbers)
+    sorted_non_numbers = sorted(non_numbers, key=str)
+    return sorted_numbers + sorted_non_numbers
+</code></pre>
+<p>Usage is quite simple and is documented in tests:</p>
+<pre><code>&gt;&gt;&gt; from sort2 import sorted2
+&gt;&gt;&gt; sorted2([1,2,3, "aaa", {3:5}, [1,2,34], {-8:15}])
+[1, 2, 3, [1, 2, 34], 'aaa', {-8: 15}, {3: 5}]
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here is one method of accomplishing this:</p>
+<pre><code>lst = [0, 'one', 2.3, 'four', -5]
+a=[x for x in lst if type(x) == type(1) or type(x) == type(1.1)] 
+b=[y for y in lst if type(y) == type('string')]
+a.sort()
+b.sort()
+c = a+b
+print(c)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I tried to implement the Python 2 sorting c code in python 3 as faithfully as possible.</p>
+<p>Use it like so: <code>mydata.sort(key=py2key())</code> or <code>mydata.sort(key=py2key(lambda x: mykeyfunc))</code></p>
+<pre><code>def default_3way_compare(v, w):  # Yes, this is how Python 2 sorted things :)
+    tv, tw = type(v), type(w)
+    if tv is tw:
+        return -1 if id(v) &lt; id(w) else (1 if id(v) &gt; id(w) else 0)
+    if v is None:
+        return -1
+    if w is None:
+        return 1
+    if isinstance(v, (int, float)):
+        vname = ''
+    else:
+        vname = type(v).__name__
+    if isinstance(w, (int, float)):
+        wname = ''
+    else:
+        wname = type(w).__name__
+    if vname &lt; wname:
+        return -1
+    if vname &gt; wname:
+        return 1
+    return -1 if id(type(v)) &lt; id(type(w)) else 1
+
+def py2key(func=None):  # based on cmp_to_key
+    class K(object):
+        __slots__ = ['obj']
+        __hash__ = None
+
+        def __init__(self, obj):
+            self.obj = func(obj) if func else obj
+
+        def __lt__(self, other):
+            try:
+                return self.obj &lt; other.obj
+            except TypeError:
+                return default_3way_compare(self.obj, other.obj) &lt; 0
+
+        def __gt__(self, other):
+            try:
+                return self.obj &gt; other.obj
+            except TypeError:
+                return default_3way_compare(self.obj, other.obj) &gt; 0
+
+        def __eq__(self, other):
+            try:
+                return self.obj == other.obj
+            except TypeError:
+                return default_3way_compare(self.obj, other.obj) == 0
+
+        def __le__(self, other):
+            try:
+                return self.obj &lt;= other.obj
+            except TypeError:
+                return default_3way_compare(self.obj, other.obj) &lt;= 0
+
+        def __ge__(self, other):
+            try:
+                return self.obj &gt;= other.obj
+            except TypeError:
+                return default_3way_compare(self.obj, other.obj) &gt;= 0
+    return K
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>@martijn-pieters I don't know if list in python2 also has a <code>__cmp__</code> to handle comparing list objects or how it was handled in python2.</p>
+<p>Anyway, in addition to the <a href="https://stackoverflow.com/a/26652245/2889582">@martijn-pieters's answer</a>, I used the following list comparator, so at least it doesn't give different sorted output based on different order of elements in the same input set.</p>
+<p><code>@per_type_cmp(list)
+def list_cmp(a, b):
+    for a_item, b_item in zip(a, b):
+        if a_item == b_item:
+            continue
+        return python2_sort_key(a_item) &lt; python2_sort_key(b_item)
+    return len(a) &lt; len(b)
+</code></p>
+<p>So, joining it with original answer by Martijn: </p>
+<pre><code>from numbers import Number
+
+
+# decorator for type to function mapping special cases
+def per_type_cmp(type_):
+    try:
+        mapping = per_type_cmp.mapping
+    except AttributeError:
+        mapping = per_type_cmp.mapping = {}
+    def decorator(cmpfunc):
+        mapping[type_] = cmpfunc
+        return cmpfunc
+    return decorator
+
+
+class python2_sort_key(object):
+    _unhandled_types = {complex}
+
+    def __init__(self, ob):
+       self._ob = ob
+
+    def __lt__(self, other):
+        _unhandled_types = self._unhandled_types
+        self, other = self._ob, other._ob  # we don't care about the wrapper
+
+        # default_3way_compare is used only if direct comparison failed
+        try:
+            return self &lt; other
+        except TypeError:
+            pass
+
+        # hooks to implement special casing for types, dict in Py2 has
+        # a dedicated __cmp__ method that is gone in Py3 for example.
+        for type_, special_cmp in per_type_cmp.mapping.items():
+            if isinstance(self, type_) and isinstance(other, type_):
+                return special_cmp(self, other)
+
+        # explicitly raise again for types that won't sort in Python 2 either
+        if type(self) in _unhandled_types:
+            raise TypeError('no ordering relation is defined for {}'.format(
+                type(self).__name__))
+        if type(other) in _unhandled_types:
+            raise TypeError('no ordering relation is defined for {}'.format(
+                type(other).__name__))
+
+        # default_3way_compare from Python 2 as Python code
+        # same type but no ordering defined, go by id
+        if type(self) is type(other):
+            return id(self) &lt; id(other)
+
+        # None always comes first
+        if self is None:
+            return True
+        if other is None:
+            return False
+
+        # Sort by typename, but numbers are sorted before other types
+        self_tname = '' if isinstance(self, Number) else type(self).__name__
+        other_tname = '' if isinstance(other, Number) else type(other).__name__
+
+        if self_tname != other_tname:
+            return self_tname &lt; other_tname
+
+        # same typename, or both numbers, but different type objects, order
+        # by the id of the type object
+        return id(type(self)) &lt; id(type(other))
+
+
+@per_type_cmp(dict)
+def dict_cmp(a, b, _s=object()):
+    if len(a) != len(b):
+        return len(a) &lt; len(b)
+    adiff = min((k for k in a if a[k] != b.get(k, _s)), key=python2_sort_key, default=_s)
+    if adiff is _s:
+        # All keys in a have a matching value in b, so the dicts are equal
+        return False
+    bdiff = min((k for k in b if b[k] != a.get(k, _s)), key=python2_sort_key)
+    if adiff != bdiff:
+        return python2_sort_key(adiff) &lt; python2_sort_key(bdiff)
+    return python2_sort_key(a[adiff]) &lt; python2_sort_key(b[bdiff])
+
+@per_type_cmp(list)
+def list_cmp(a, b):
+    for a_item, b_item in zip(a, b):
+        if a_item == b_item:
+            continue
+        return python2_sort_key(a_item) &lt; python2_sort_key(b_item)
+    return len(a) &lt; len(b)
+</code></pre>
+<p>PS: It makes more sense to create it as an comment but I didn't have enough reputation to make a comment. So, I'm creating it as an answer instead.</p>
+</div>
+<span class="comment-copy">Just a little note: Python 2's default behavior is itself potentially intransitive, so there's no ultimate solution.  Modifying my example from the other question, with Python 2, <code>b'z' &lt; (1, 2) &lt; u'a' &lt; b'z'</code> (because <code>'str' &lt; 'tuple' &lt; 'unicode'</code>, but <code>str</code> and <code>unicode</code> are value-comparable in Python 2.  I'm curious, though, what your actual use case is for wanting to do this for arbitrary types (instead of just "manually" grouping, say, numeric types).</span>
+<span class="comment-copy">@BrenBarn mostly idle curiosity - the starting point was wondering how <code>pprint</code> goes about displaying dictionaries with the keys in order, and being more in a mood to think it through than go look at the source. Actually, I should probably go do that now :-)</span>
+<span class="comment-copy">... and, it <a href="https://hg.python.org/cpython/file/3.4/Lib/pprint.py#l71" rel="nofollow noreferrer">turns out</a> to use a variation on the <code>motley</code> class from my previous question! The use of a <code>(str(type(obj)), id(obj))</code> return value is presumably to mitigate the problems you raised with that approach, although I don't think it can do so completely.</span>
+<span class="comment-copy">Yeah.  I mean, all it's trying to do is get something that will look reasonable when it's printed.  I don't think they were concerned with trying cover every possible corner case.  In fact, just playing around with it now, I was able to get it to print values out of order by creating dicts with funky keys.</span>
+<span class="comment-copy">Impressive effort to capture all the idiosyncrasies of Python 2 <code>sort</code>, but can't you make use of <code>functools.cmp_to_key()</code> like I suggest here: <a href="http://stackoverflow.com/a/43349108/6260170">stackoverflow.com/a/43349108/6260170</a> Or I'm overlooking something?</span>
+<span class="comment-copy">@Chris_Rands: <code>cmp_to_key</code> produces an object that provides a <code>__lt__</code> method, just like my solution. (It offers the <a href="https://stackoverflow.com/questions/16362744/how-does-pythons-cmp-to-key-function-work/16362818#16362818">full range of rich comparison methods</a>, but only <code>__lt__</code> really matters).</span>
+<span class="comment-copy">worked so far for us! great work :) some of our infra was really reliant on this behaviour, and not having this would really block the migration to py3. Perhaps something like this should be provided in the six compat library</span>
+<span class="comment-copy">Oops, you got <i>really</i> lucky in that Zero awarded the bounty to you by mistake! Since this cannot be undone, congrats on your lucky break! :-)</span>
+<span class="comment-copy">Well, I still like my answer best anyway...</span>
+<span class="comment-copy">It won't reproduce the Python 2 sort order, however.</span>
+<span class="comment-copy">Well, if you look at his question details, he wasn't caring too much that it EXACTLY duplicate python 2.  He seems most concerned with just handling different types gracefully and not crashing. "I'm trying to replicate (and if possible improve on) Python 2.x's sorting behaviour".  I'm not even sure if the different python 2 versions would guarantee the same sort order between them.</span>
+<span class="comment-copy">Actually it reads "I'm trying to replicate (and if possible improve on) Python 2.x's sorting behaviour in 3.x, so that mutually orderable types like int, float etc. are sorted as expected, and mutually unorderable types are grouped within the output."  I say the simplest solution that does the job is best.</span>
+<span class="comment-copy"><code>cmp_to_key</code> was developed to make it possible to re-use existing <code>cmp()</code> functions. Under the hood it does exactly what my solution does: delegate to a <code>__lt__</code> method on a key object, see <a href="//stackoverflow.com/a/16362818">How does Python's cmp_to_key function work?</a> So your solution is basically a simplified version of my <code>python2_sort_key.__lt__()</code> method, and for <code>a, b</code> read <code>self, other</code>, but adding the complication of having to return an integer value relative to 0.</span>
+<span class="comment-copy">Your solution doesn't handle dictionaries (try sorting <code>[{3:4}, {1: 2}]</code>) or <code>None</code> or numeric values correctly. All that can be added in, but you are then still just implementing the same logic that my solution a already offers, but with the disadvantage that you have to produce that 3-way integer number again rather than a boolean.</span>
+<span class="comment-copy">@MartijnPieters Thanks for the feedback. I certainly don't think my solution is as comprehensive as yours but it seems like a reasonable lightweight option for those seeking this kind of functionality. Sorting <code>[{3:4}, {1: 2}]</code> <code>return</code>s the same order as the input, which is as I describe (I'm not sure what is desired for this case)</span>
+<span class="comment-copy">See <a href="//stackoverflow.com/q/3484293">Is there a description of how __cmp__ works for dict objects in Python 2?</a> for the Python 2 behaviour for dictionaries.</span>
+<span class="comment-copy">@MartijnPieters Indeed, well I did already say in my answer that is has this disadvantage of always doing the 3-way-compare and I agree more could be added depending on the exact desired specification of sort, but I'll leave my answer like this. I'm not expecting the bounty you know, even via a misclick ;)</span>

@@ -1,0 +1,105 @@
+<div class="post-text" itemprop="text">
+<p>I want to create a traceback like the one returned by sys.exc_info()[2].  I don't want a list of lines, I want an actual traceback object:</p>
+<pre><code>&lt;traceback object at 0x7f6575c37e48&gt;
+</code></pre>
+<p>How can I do this?  My goal is to have it include the current stack minus one frame, so it looks the the caller is the most recent call.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There's no documented way to create traceback objects.</p>
+<p>None of the functions in the <a href="https://docs.python.org/3/library/traceback.html" rel="noreferrer"><code>traceback</code></a> module create them. You can of course access the type as <a href="https://docs.python.org/3/library/types.html#types.TracebackType" rel="noreferrer"><code>types.TracebackType</code></a>, but if you call its constructor you just get a <code>TypeError: cannot create 'traceback' instances</code>.</p>
+<p>The reason for this is that tracebacks contain references to internals that you can't actually access or generate from within Python.</p>
+<hr/>
+<p>However, you can access stack frames, and everything else you'd need to simulate a traceback is trivial. You can even write a class that has <code>tb_frame</code>, <code>tb_lasti</code>, <code>tb_lineno</code>, and <code>tb_next</code> attributes (using the info you can get from <a href="https://docs.python.org/3/library/traceback.html#traceback.extract_stack" rel="noreferrer"><code>traceback.extract_stack</code></a> and one of the <a href="https://docs.python.org/3/library/inspect.html#the-interpreter-stack" rel="noreferrer"><code>inspect</code></a> functions), which will look exactly like a traceback to any pure-Python code.</p>
+<p><a href="https://meta.stackexchange.com/questions/66377/what-is-the-xy-problem">So there's a good chance that whatever you <em>really</em> want to do is doable, even though what you're asking for is not.</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you really need to fool another library—especially one written in C and using the non-public API—there are two potential ways to get a real traceback object. I haven't gotten either one to work reliably. Also, both are CPython-specific, require not just using the C API layer but using undocumented types and functions that could change at any moment, and offer the potential for new and exciting opportunities to segfault your interpreter. But if you want to try, they may be useful for a start.</p>
+<hr/>
+<p>The <code>PyTraceBack</code> type is not part of the public API. But (except for being defined in the Python directory instead of the Object directory) it's built as a C API type, just not documented. So, if you look at <a href="https://hg.python.org/cpython/file/default/Include/traceback.h" rel="noreferrer"><code>traceback.h</code></a> and <a href="https://hg.python.org/cpython/file/default/Python/traceback.c" rel="noreferrer"><code>traceback.c</code></a> for your Python version, you'll see that… well, there's no <code>PyTraceBack_New</code>, but there <em>is</em> a <code>PyTraceBack_Here</code> that constructs a new traceback and swaps it into the current exception info. I'm not sure it's valid to call this unless there's a current exception, and if there <em>is</em> a current exception you might be screwing it up by mutating it like this, but with a bit of trial&amp;crash or reading the code, hopefully you can get this to work:</p>
+<pre><code>import ctypes
+import sys
+
+ctypes.pythonapi.PyTraceBack_Here.argtypes = (ctypes.py_object,)
+ctypes.pythonapi.PyTraceBack_Here.restype = ctypes.c_int
+
+def _fake_tb():
+    try:
+        1/0
+    except:
+        frame = sys._getframe(2)
+        if ctypes.pythonapi.PyTraceBack_Here(frame):
+            raise RuntimeError('Oops, probably hosed the interpreter')
+        raise
+
+def get_tb():
+    try:
+        _fake_tb()
+    except ZeroDivisionError as e:
+       return e.__traceback__
+</code></pre>
+<hr/>
+<p>As a fun alternative, we can try to mutate a traceback object on the fly. To get a traceback object, just raise and catch an exception:</p>
+<pre><code>try: 1/0
+except exception as e: tb = e.__traceback__ # or sys.exc_info()[2]
+</code></pre>
+<p>The only problem is that it's pointing at your stack frame, not your caller's, right? If tracebacks were mutable, you could fix that easily:</p>
+<pre><code>tb.tb_lasti, tb.tb_lineno = tb.tb_frame.f_lasti, tb.tb_frame.f_lineno
+tb.tb_frame = tb.tb_frame.f_back
+</code></pre>
+<p>And there's no methods for setting these things, either. Notice that it doesn't have a <code>setattro</code>, and its <code>getattro</code> works by building a <code>__dict__</code> on the fly, so obviously the only way we're getting at this stuff is through the underlying struct. Which you should really build with <code>ctypes.Structure</code>, but as a quick hack:</p>
+<pre><code>p8 = ctypes.cast(id(tb), ctypes.POINTER(ctypes.c_ulong))
+p4 = ctypes.cast(id(tb), ctypes.POINTER(ctypes.c_uint))
+</code></pre>
+<p>Now, for a normal 64-bit build of CPython, <code>p8[:2]</code> / <code>p4[:4]</code> are the normal object header, and after that come the traceback-specific fields, so <code>p8[3]</code> is the <code>tb_frame</code>, and <code>p4[8]</code> and <code>p4[9]</code> are the <code>tb_lasti</code> and <code>tb_lineno</code>, respectively. So:</p>
+<pre><code>p4[8], p4[9] = tb.tb_frame.f_lasti, tb.tb_frame.f_lineno
+</code></pre>
+<p>But the next part is a bit harder, because <code>tb_frame</code> isn't actually a <code>PyObject *</code>, it's just a raw <code>struct _frame *</code>, so off you go to <a href="https://hg.python.org/cpython/file/default/Include/frameobject.h" rel="noreferrer"><code>frameobject.h</code></a>, where you see that it really is a <code>PyFrameObject *</code> so you can just use the same trick again. Just remember to <code>_ctypes.Py_INCREF</code> the frame's next frame and <code>Py_DECREF</code> the frame itself after doing reassigning <code>p8[3]</code> to point at <code>pf8[3]</code>, or as soon as you try to print the traceback you'll segfault and lose all the work you'd done writing this up. :)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since Python 3.7 you can create traceback objects dynamically from Python.<br/>
+To create traceback identical to one created by raise:</p>
+<pre><code>raise Exception()
+</code></pre>
+<p>use this:</p>
+<pre><code>import sys
+import types
+
+def exception_with_traceback(message):
+    tb = None
+    depth = 0
+    while True:
+        try:
+            frame = sys._getframe(depth)
+            depth += 1
+        except ValueError as exc:
+            break
+
+        tb = types.TracebackType(tb, frame, frame.f_lasti, frame.f_lineno)
+
+    return Exception(message).with_traceback(tb)
+</code></pre>
+<p>Relevant documentation is here:</p>
+<ul>
+<li><a href="https://docs.python.org/3/library/types.html#types.TracebackType" rel="nofollow noreferrer">https://docs.python.org/3/library/types.html#types.TracebackType</a></li>
+<li><a href="https://docs.python.org/3/reference/datamodel.html#traceback-objects" rel="nofollow noreferrer">https://docs.python.org/3/reference/datamodel.html#traceback-objects</a></li>
+<li><a href="https://docs.python.org/3/library/sys.html#sys._getframe" rel="nofollow noreferrer">https://docs.python.org/3/library/sys.html#sys._getframe</a></li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>As others have pointed out, it's not possible to create traceback objects. However, you can write your own class that has the same properties:</p>
+<pre><code>from collections import namedtuple
+fake_tb = namedtuple('fake_tb', ('tb_frame', 'tb_lasti', 'tb_lineno', 'tb_next'))
+</code></pre>
+<p>You can still pass instances of this class to some Python functions. Most notably, <a href="https://docs.python.org/3/library/traceback.html#traceback.print_exception" rel="nofollow noreferrer"><code>traceback.print_exception(...)</code></a>, which produces the same output as Python's standard excepthook.</p>
+<p>If you (like me) encountered this problem because you are working on a PyQt-based GUI app, you may also be interested in a more comprehensive solution laid out in <a href="https://fman.io/blog/pyqt-excepthook/" rel="nofollow noreferrer">this blog post</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>"In order to better support dynamic creation of stack traces, types.TracebackType can now be instantiated from Python code, and the tb_next attribute on tracebacks is now writable."</p>
+<p>There is an explanation(in python 3.7) for the same in here(python 3.7) <a href="https://docs.python.org/3/library/types.html#types.TracebackType" rel="nofollow noreferrer">https://docs.python.org/3/library/types.html#types.TracebackType</a></p>
+</div>
+<span class="comment-copy">What do you want this traceback for? The result of <code>traceback.extract_stack</code> and/or <code>inspect.stack</code> isn't a <code>traceback</code> object, but it's not just a list of lines, either. Is one of those sufficient?</span>
+<span class="comment-copy">3rd party library only accepts a traceback object and I didn't feel like hacking it.</span>
+<span class="comment-copy">Does "only accepts a traceback object" mean "checks <code>isinstance(t, types.TracebackType)</code>? If so… well, I wouldn't be surprised if <code>traceback</code> is one of the handful of types that won't allow itself to be used as a base, but I'd at least check first. If not, what <i>does</i> it mean?</span>
+<span class="comment-copy">Jinja2 does this hack plus some more complex things. <a href="https://github.com/mitsuhiko/jinja2/blob/9b4b20aa56fde3a5cd5ac49d4feacd96eacb832d/jinja2/debug.py" rel="nofollow noreferrer">github.com/mitsuhiko/jinja2/blob/…</a></span>
+<span class="comment-copy">@digenishjkl There's some nice stuff there. In particular, dynamically proxying to a real traceback while adding extra functionality is an obvious good idea for many use cases; I should have thought of that...</span>
+<span class="comment-copy">It's also useful when building debuggers in pytest, so you can filter out <code>__tracebackhide__</code> frames.</span>

@@ -1,0 +1,166 @@
+<div class="post-text" itemprop="text">
+<p>From my understanding, when code like the following is run:</p>
+<pre><code>for i in MyObject:
+    print(i)
+</code></pre>
+<p>MyObject's <code>__iter__</code> function is run, and the for loop uses the iterator it returns to run the loop.</p>
+<p>is it possible to access this iterator object mid-loop? Is it a hidden local variable, or something like that?</p>
+<p>I would like to do the following:</p>
+<pre><code>for i in MyObject:
+    blah = forloopiterator()
+    modify_blah(blah)
+    print(i)
+</code></pre>
+<p>I want to do this because I am building a debugger, and I need to modify the iterator after it has been instantiated (adding an object to be iterated during this loop, mid-execution). I am aware that this a hack and should not be done conventionally. Modifying MyObject.items (which is what the iterator is iterating over) directly doesn't work, sicne the iterator only evaluates once. So I need to modify the iterator directly.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It <em>is</em> possible to do what you want to do, as long as you're willing to rely on multiple undocumented internals of your Python interpreter (in my case, CPython 3.7)—but it isn't going to do you any good.</p>
+<hr/>
+<p>The iterator is not exposed to <code>locals</code>, or anywhere else (not even to a debugger). But <a href="https://stackoverflow.com/questions/51937482/accessing-iterator-in-for-in-loop/51938335#comment90826207_51937482">as pointed out by Patrick Haugh</a>, you can get at it indirectly, via <a href="https://docs.python.org/3/library/gc.html#gc.get_referrers" rel="nofollow noreferrer"><code>get_referrers</code></a>. For example:</p>
+<pre><code>for ref in gc.get_referrers(seq):
+    if isinstance(ref, collections.abc.Iterator):
+        break
+else:
+    raise RuntimeError('Oops')
+</code></pre>
+<p>Of course if you have two different iterators to the same list, I don't know if there's any way you can decide between them, but let's ignore that problem.</p>
+<hr/>
+<p>Now, what do you do with this? You've got an iterator over <code>seq</code>, and… now what? You can't replace it with something useful, like an <code>itertools.chain(seq, [1, 2, 3])</code>. There's no public API for mutating list, set, etc. iterators, much less arbitrary iterators.</p>
+<p>if you happen to know it's a list iterator… well, the CPython 3.x <code>listiterator</code> does happen to be mutable. The way they're pickled is by creating an empty iterator and calling <code>__setstate__</code> with a reference to a list and an index:</p>
+<pre><code>&gt;&gt;&gt; print(ref.__reduce__())
+(&lt;function iter&gt;, ([0, 1, 2, 3, 4, 5, 6, 7, 8, 9],), 7)
+&gt;&gt;&gt; ref.__setstate__(3) # resets the iterator to index 3 instead of 7
+&gt;&gt;&gt; ref.__reduce__()[1][0].append(10) # adds another value
+</code></pre>
+<p>But this is all kind of silly, because you could get the same effect by just mutating the original list. In fact:</p>
+<pre><code>&gt;&gt;&gt; ref.__reduce__()[1][0] is seq
+True
+</code></pre>
+<p>So:</p>
+<pre><code>lst = list(range(10))
+for elem in lst:
+  print(elem, end=' ')
+  if elem % 2:
+    lst.append(elem * 2)
+print()
+</code></pre>
+<p>… will print out:</p>
+<pre><code>0 1 2 3 4 5 6 7 8 9 2 6 10 14 18 
+</code></pre>
+<p>… without having to monkey with the iterator at all.</p>
+<hr/>
+<p>You can't do the same thing with a set.</p>
+<p>Mutating a set while you're in the middle of iterating it will affect the iterator, just as mutating a list will—but what it does is indeterminate. After all, sets have arbitrary order, which is only guaranteed to be consistent <em>as long as you don't add or delete</em>. What happens if you add or delete in the middle? You may get a whole different order, meaning you may end up repeating elements you already iterated, and missing ones you never saw. Python implies that this should be illegal in any implementation, and CPython does actually check it:</p>
+<pre><code>s = set(range(10))
+for elem in s:
+  print(elem, end=' ')
+  if elem % 2:
+    s.add(elem * 2)
+print()
+</code></pre>
+<p>This will just immediately raise:</p>
+<pre><code>RuntimeError: Set changed size during iteration
+</code></pre>
+<p>So, what happens if we use the same trick to go behind Python's back, find the <code>set_iterator</code>, and try to change it?</p>
+<pre><code>s = {1, 2, 3}
+for elem in s:
+    print(elem)
+    for ref in gc.get_referrers(seq):
+        if isinstance(ref, collections.abc.Iterator):
+            break
+    else:
+        raise RuntimeError('Oops')
+    print(ref.__reduce__)
+</code></pre>
+<p>What you'll see in this case will be something like:</p>
+<pre><code>2
+(&lt;function iter&gt;, ([1, 3],))
+1
+(&lt;function iter&gt;, ([3],))
+3
+(&lt;function iter&gt;, ([],))
+</code></pre>
+<p>In other words, when you pickle a <code>set_iterator</code>, it creates a list of the remaining elements, and gives you back instructions to build a new listiterator out of that list. Mutating that temporary list obviously has no useful effect.</p>
+<hr/>
+<p>What about a tuple? Obviously you can't just mutate the tuple itself, because tuples are immutable. But what about the iterator?</p>
+<p>Under the covers, in CPython, <code>tuple_iterator</code> shares the same structure and code as <code>listiterator</code> (as does the <code>iterator</code> type that you get from calling <code>iter</code> on an "old-style sequence" type that defines <code>__len__</code> and <code>__getitem__</code> but not <code>__iter__). So, you can do the exact same trick to get at the iterator, and to</code><strong>reduce</strong>` it.</p>
+<p>But once you do, <code>ref.__reduce__()[1][0] is seq</code> is going to be true again—in other words, it's a tuple, the same tuple you already had, and still immutable.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, it is not possible to access this iterator (unless maybe with the Python C API, but that is just a guess). If you need it, assign it to a variable before the loop.</p>
+<pre><code>it = iter(MyObject)
+for i in it:
+  print(i)
+  # do something with it
+</code></pre>
+<p>Keep in mind that manually advancing the iterator can raise a <code>StopIteration</code> exception.</p>
+<pre><code>for i in it:
+  if check_skip_next_element(i):
+    try: next(it)
+    except StopIteration: break
+</code></pre>
+<p>The use of <code>break</code> is discussable. In this case it has the same semantics as <code>continue</code> but you may just use <code>pass</code> if you want to keep going until the end of the for-block.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you want to insert an additional object into a loop mid-iteration in a debugger, you don't need to do it by modifying the iterator. Instead, after the end of the loop, jump to the first line of the loop body, then set the loop variable to the object you want. Here's a PDB example. With the following file:</p>
+<pre><code>import pdb
+
+def f():
+    pdb.set_trace()
+    for i in range(5):
+        print(i)
+f()
+</code></pre>
+<p>I've recorded a debugging session that inserts a <code>15</code> into the loop:</p>
+<pre><code>&gt; /tmp/asdf.py(5)f()
+-&gt; for i in range(5):
+(Pdb) n
+&gt; /tmp/asdf.py(6)f()
+-&gt; print(i)
+(Pdb) n
+0
+&gt; /tmp/asdf.py(5)f()
+-&gt; for i in range(5):
+(Pdb) j 6
+&gt; /tmp/asdf.py(6)f()
+-&gt; print(i)
+(Pdb) i = 15
+(Pdb) n
+15
+&gt; /tmp/asdf.py(5)f()
+-&gt; for i in range(5):
+(Pdb) n
+&gt; /tmp/asdf.py(6)f()
+-&gt; print(i)
+(Pdb) n
+1
+&gt; /tmp/asdf.py(5)f()
+-&gt; for i in range(5):
+(Pdb) c
+2
+3
+4
+</code></pre>
+<p>(Due to a PDB bug, you have to jump, then set the loop variable. PDB will lose the change to the loop variable if you jump immediately after setting it.)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you are not aware of the <code>pdb</code> debugger in python, please give it a try. It's a very interactive debugger I have ever come across.</p>
+<p><a href="https://docs.python.org/2/library/pdb.html" rel="nofollow noreferrer">python debugger</a></p>
+<p>I am sure we can <strong>control the loop iterations manually with pdb.</strong> But altering list mid way, not sure. Give it a try. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>To access the iterator of a given object, you can use the <a href="https://docs.python.org/3/library/functions.html?#iter" rel="nofollow noreferrer">iter()</a> built-in function.</p>
+<pre class="lang-py prettyprint-override"><code>&gt;&gt;&gt; it = iter(MyObject)
+&gt;&gt;&gt; it.next()
+</code></pre>
+</div>
+<span class="comment-copy">Please explain what you are trying to do. Otherwise this will likely suffer the fate of any <a href="http://xyproblem.info/" rel="nofollow noreferrer">XY Problem.</a></span>
+<span class="comment-copy"><i>"MyObject's <code>__iter__</code> function is run"</i> That's not entirely correct. More accurately, it's <code>iter(MyObject)</code>. Objects can be iterable without defining an <code>__iter__</code> method (by defining a <code>__getitem__</code> method).</span>
+<span class="comment-copy">There's no <i>reliable</i> way to access it, no.</span>
+<span class="comment-copy">@DanielPaczuskiBak No, that's not true. For most types (including all of the built-in collections), modifying the object <i>does</i> modify what gets iterated. For example, the built-in <code>listiterator</code> holds the equivalent of a reference to the list and an index. (It may be optimized to something more efficient, like a pointer into the middle of the list's internal storage plus a guard against reallocation instead, but it has to <i>act as if</i> it held a list and an index.)</span>
+<span class="comment-copy">There's a really, really nasty way using <a href="https://docs.python.org/3/library/gc.html#gc.get_referrers" rel="nofollow noreferrer"><code>gc.get_referrers</code></a>.  It would be a little unreliable if you have more than one iterator over whatever iterable though.</span>
+<span class="comment-copy">It was actually a tuple, not a set (my mistake), I am working on a new question.</span>
+<span class="comment-copy">@DanielPaczuskiBak A <code>tuple_iterator</code> will have a different problem. Under the covers, it works just like a <code>listiterator</code>—except that the thing it has a reference to is a tuple. And you obviously can't mutate that tuple.</span>
+<span class="comment-copy">I am trying to write a debugger that plugs into existing code; I cannot add anything prior to the loop, but I can pass a function which is called during the loop, which I am hoping can modify the iterator mid-loop.  Are you 100% sure this is impossible?</span>
+<span class="comment-copy">I am trying to add new items to MyObject mid-loop and ensure that they are iterated on.</span>
+<span class="comment-copy">If you're sure we can control the loop iterations manually with pdb, then show how to do it. But I don't think you can (except maybe by screwing around with the attributes of the current frame object or something). The iterator inside the <code>for</code> statement is not exposed to the locals in pdb any more than it is to the locals in the original code.</span>

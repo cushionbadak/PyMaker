@@ -1,0 +1,143 @@
+<div class="post-text" itemprop="text">
+<p>I've googled <a href="https://www.google.com/search?hl=en&amp;ie=UTF-8&amp;q=python%20calling%20__enter__()%20manually"><code>calling __enter__ manually</code></a> but with no luck. So let's imagine I have <em>MySQL</em> connector class that uses <code>__enter__</code> and <code>__exit__</code> functions (originally used with <code>with</code> statement) to connect/disconnect from a database.</p>
+<p>And let's have a class that uses 2 of these connections (for example for data sync). <em>Note: this is not my real-life scenario, but it seems to be the simplest example</em>. </p>
+<p>Easiest way to make it all work together is class like this:</p>
+<pre><code>class DataSync(object):
+
+    def __init__(self):
+        self.master_connection = MySQLConnection(param_set_1)
+        self.slave_connection = MySQLConnection(param_set_2)
+
+    def __enter__(self):
+            self.master_connection.__enter__()
+            self.slave_connection.__enter__()
+            return self
+
+    def __exit__(self, exc_type, exc, traceback):
+            self.master_connection.__exit__(exc_type, exc, traceback)
+            self.slave_connection.__exit__(exc_type, exc, traceback)
+
+    # Some real operation functions
+
+# Simple usage example
+with DataSync() as sync:
+    records = sync.master_connection.fetch_records()
+    sync.slave_connection.push_records(records)
+</code></pre>
+<p><strong>Q</strong>: Is it okay (is there anything wrong) to call <code>__enter__</code>/<code>__exit__</code> manually like this? </p>
+<p>Pylint 1.1.0 didn't issue any warnings on this, nor have I found any article about it (google link in the beggining).</p>
+<p>And what about calling:</p>
+<pre><code>try:
+    # Db query
+except MySQL.ServerDisconnectedException:
+    self.master_connection.__exit__(None, None, None)
+    self.master_connection.__enter__()
+    # Retry
+</code></pre>
+<p>Is this a good/bad practice? Why?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, there's nothing wrong with that. There are even places in the standard library that do it. Like the <a href="https://hg.python.org/cpython/file/767fd62b59a9/Lib/multiprocessing/synchronize.py#l95"><code>multiprocessing</code> module</a>:</p>
+<pre><code>class SemLock(object):
+
+    def __init__(self, kind, value, maxvalue, *, ctx):
+            ...
+            try:
+                sl = self._semlock = _multiprocessing.SemLock(
+                    kind, value, maxvalue, self._make_name(),
+                    unlink_now)
+            except FileExistsError:
+                pass
+    ...
+
+    def __enter__(self):
+        return self._semlock.__enter__()
+
+    def __exit__(self, *args):
+        return self._semlock.__exit__(*args)
+</code></pre>
+<p>Or the <a href="https://hg.python.org/cpython/file/767fd62b59a9/Lib/tempfile.py#l410"><code>tempfile</code> module</a>:</p>
+<pre><code>class _TemporaryFileWrapper:
+
+    def __init__(self, file, name, delete=True):
+        self.file = file
+        self.name = name
+        self.delete = delete
+        self._closer = _TemporaryFileCloser(file, name, delete)
+
+    ...
+
+    # The underlying __enter__ method returns the wrong object
+    # (self.file) so override it to return the wrapper
+    def __enter__(self):
+        self.file.__enter__()
+        return self
+
+    # Need to trap __exit__ as well to ensure the file gets
+    # deleted when used in a with statement
+    def __exit__(self, exc, value, tb):
+        result = self.file.__exit__(exc, value, tb)
+        self.close()
+        return result
+</code></pre>
+<p>The standard library examples aren't calling <code>__enter__</code>/<code>__exit__</code> for two objects, but if you've got an object that's responsible for creating/destroying the context for multiple objects instead of just one, calling <code>__enter__</code>/<code>__exit__</code> for all of them is fine.</p>
+<p>The only potential gotcha is properly handling the return values of the <code>__enter__</code> <code>__exit__</code> calls for the objects you're managing. With <code>__enter__</code>, you need to make sure you're returning whatever <code>state</code> is required for the user of your wrapper object to get back from the <code>with ... as &lt;state&gt;:</code> call. With <code>__exit__</code>, you need to decide if you want to propagate any exception that occurred inside the context (by returning <code>False</code>), or suppress it (by returning <code>True</code>). Your managed objects could try to do it either way, you need to decide what makes sense for the wrapper object.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your first example is not a good idea:</p>
+<ol>
+<li><p>What happens if <code>slave_connection.__enter__</code> throws an exception:</p>
+<ul>
+<li><code>master_connection</code> acquires its resource</li>
+<li><code>slave_connection</code> fails</li>
+<li><code>DataSync.__enter__</code> propogates the exception</li>
+<li><code>DataSync.__exit__</code> does not run</li>
+<li><code>master_connection</code> is never cleaned up!</li>
+<li>Potential for Bad Things</li>
+</ul></li>
+<li><p>What happens if <code>master_connection.__exit__</code> throws an exception?</p>
+<ul>
+<li><code>DataSync.__exit__</code> finished early</li>
+<li><code>slave_connection</code> is never cleaned up!</li>
+<li>Potential for Bad Things</li>
+</ul></li>
+</ol>
+<hr/>
+<p><code>contextlib.ExitStack</code> can help here:</p>
+<pre><code>def __enter__(self):
+    with ExitStack() as stack:
+        stack.enter_context(self.master_connection)
+        stack.enter_context(self.slave_connection)
+        self._stack = stack.pop_all()
+    return self
+
+def __exit__(self, exc_type, exc, traceback):
+    self._stack.__exit__(self, exc_type, exc, traceback)
+</code></pre>
+<p>Asking the same questions:</p>
+<ol>
+<li><p>What happens if <code>slave_connection.__enter__</code> throws an exception:</p>
+<ul>
+<li>The with block is exited, and <code>stack</code> cleans up <code>master_connection</code></li>
+<li>Everything is ok!</li>
+</ul></li>
+<li><p>What happens if <code>master_connection.__exit__</code> throws an exception?</p>
+<ul>
+<li>Doesn't matter, <code>slave_connection</code> gets cleaned up before this is called</li>
+<li>Everything is ok!</li>
+</ul></li>
+<li><p>Ok, what happens if <code>slave_connection.__exit__</code> throws an exception?</p>
+<ul>
+<li><code>ExitStack</code> makes sure to call <code>master_connection.__exit__</code> whatever happens to the slave connection</li>
+<li>Everything is ok!</li>
+</ul></li>
+</ol>
+<hr/>
+<p>There's nothing wrong with calling <code>__enter__</code> directly, but if you need to call it on more than one object, make sure you clean up properly!</p>
+</div>
+<span class="comment-copy">I'd say its fine, see as <a href="https://mail.python.org/pipermail/tutor/2003-October/025932.html" rel="nofollow noreferrer">we are all consenting adults here</a>, or you could use something like <a href="https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack" rel="nofollow noreferrer">ExitStack</a>, which will do the calling for you.</span>
+<span class="comment-copy">The __exit__ method will be called in the with statement at any rate, not so when calling those methods manually, afaik.</span>
+<span class="comment-copy">@XORcist I've added sample usage example... In provided case (I believe) you have to call it manually.</span>
+<span class="comment-copy">I failed to mention that I ran Python 3.2 at the time and according to <a href="https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack" rel="nofollow noreferrer"><code>contextlib.ExitStack</code> documentation</a> it was added in <code>3.3</code>, so at the time dano's most accurate, but I agree that for 3.3+ this is the proper way of doing this.</span>
+<span class="comment-copy">@Vyktor: There's always the <a href="https://pypi.python.org/pypi/contextlib2" rel="nofollow noreferrer"><code>contextlib2</code></a> backport for earlier versions! Even before ExitStack, you could have achieved safety with some careful try/finallys</span>
+<span class="comment-copy">@Eric what's your opinion on combining it with the flask hooks <code>before_request</code> and <code>after_request</code>? For example calling <code>__enter__</code> inside <code>before_request</code> and <code>__exit__</code> in <code>after_request</code>?</span>

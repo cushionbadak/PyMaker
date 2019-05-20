@@ -1,0 +1,169 @@
+<div class="post-text" itemprop="text">
+<p>I have been experimenting with <code>asyncio</code> for a little while and read the <a href="https://www.python.org/dev/peps/pep-3156/" rel="nofollow noreferrer">PEPs</a>; a few tutorials; and even the <a href="https://www.safaribooksonline.com/library/view/using-asyncio-in/9781491999691/" rel="nofollow noreferrer">O'Reilly book</a>.</p>
+<p>I think I got the hang of it, but I'm still puzzled by the behavior of <code>loop.close()</code> which I can't quite figure out when it is "safe" to invoke.</p>
+<p>Distilled to its simplest, my use case is a bunch of blocking "old school" calls, which I wrap in the <code>run_in_executor()</code> and an outer coroutine; if any of those calls goes wrong, I want to stop progress, cancel the ones still outstanding, print a sensible log and then (hopefully, cleanly) get out of the way.</p>
+<p>Say, something like this:</p>
+<pre><code>import asyncio
+import time
+
+
+def blocking(num):
+    time.sleep(num)
+    if num == 2:
+        raise ValueError("don't like 2")
+    return num
+
+
+async def my_coro(loop, num):
+    try:
+        result = await loop.run_in_executor(None, blocking, num)
+        print(f"Coro {num} done")
+        return result
+    except asyncio.CancelledError:
+        # Do some cleanup here.
+        print(f"man, I was canceled: {num}")
+
+
+def main():
+    loop = asyncio.get_event_loop()
+    tasks = []
+    for num in range(5):
+        tasks.append(loop.create_task(my_coro(loop, num)))
+
+    try:
+        # No point in waiting; if any of the tasks go wrong, I
+        # just want to abandon everything. The ALL_DONE is not
+        # a good solution here.
+        future = asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        done, pending = loop.run_until_complete(future)
+        if pending:
+            print(f"Still {len(pending)} tasks pending")
+            # I tried putting a stop() - with/without a run_forever()
+            # after the for - same exception raised.
+            #  loop.stop()
+            for future in pending:
+                future.cancel()
+
+        for task in done:
+            res = task.result()
+            print("Task returned", res)
+    except ValueError as error:
+        print("Outer except --", error)
+    finally:
+        # I also tried placing the run_forever() here,
+        # before the stop() - no dice.
+        loop.stop()
+        if pending:
+            print("Waiting for pending futures to finish...")
+            loop.run_forever()
+        loop.close()
+</code></pre>
+<p>I tried several variants of the <code>stop()</code> and <code>run_forever()</code> calls, the "run_forever first, then stop" seems to be the one to use according <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.AbstractEventLoop.run_forever" rel="nofollow noreferrer">to the pydoc</a> and, without the call to <code>close()</code> yields a satisfying:</p>
+<pre><code>Coro 0 done
+Coro 1 done
+Still 2 tasks pending
+Task returned 1
+Task returned 0
+Outer except -- don't like 2
+Waiting for pending futures to finish...
+man, I was canceled: 4
+man, I was canceled: 3
+
+Process finished with exit code 0
+</code></pre>
+<p>However, when the call to <code>close()</code> is added (as shown above) I get two exceptions:</p>
+<pre><code>exception calling callback for &lt;Future at 0x104f21438 state=finished returned int&gt;
+Traceback (most recent call last):
+  File "/Library/Frameworks/Python.framework/Versions/3.6/lib/python3.6/concurrent/futures/_base.py", line 324, in _invoke_callbacks
+    callback(self)
+  File "/Library/Frameworks/Python.framework/Versions/3.6/lib/python3.6/asyncio/futures.py", line 414, in _call_set_state
+    dest_loop.call_soon_threadsafe(_set_state, destination, source)
+  File "/Library/Frameworks/Python.framework/Versions/3.6/lib/python3.6/asyncio/base_events.py", line 620, in call_soon_threadsafe
+    self._check_closed()
+  File "/Library/Frameworks/Python.framework/Versions/3.6/lib/python3.6/asyncio/base_events.py", line 357, in _check_closed
+    raise RuntimeError('Event loop is closed')
+RuntimeError: Event loop is closed
+</code></pre>
+<p>which is at best annoying, but to me, totally puzzling: and, to make matter worse, I've been unable to figure out what would The Right Way of handling such a situation.</p>
+<p>Thus, two questions:</p>
+<ul>
+<li><p>what am I missing? how should I modify the code above in a way that with the call to <code>close()</code> included does not raise?</p></li>
+<li><p>what actually happens if I don't call <code>close()</code> - in this trivial case, I presume it's largely redundant; but what might the consequences be in a "real" production code?</p></li>
+</ul>
+<p>For my own personal satisfaction, also:</p>
+<ul>
+<li>why does it raise at all? what more does the loop want from the coros/tasks: they either exited; raised; or were canceled: isn't this enough to keep it happy?</li>
+</ul>
+<p>Many thanks in advance for any suggestions you may have!</p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>Distilled to its simplest, my use case is a bunch of blocking "old school" calls, which I wrap in the <code>run_in_executor()</code> and an outer coroutine; if any of those calls goes wrong, I want to stop progress, cancel the ones still outstanding</p>
+</blockquote>
+<p>This can't work as envisioned because <code>run_in_executor</code> submits the function to a thread pool, and OS threads can't be cancelled in Python (or in other languages that expose them). Canceling the future returned by <code>run_in_executor</code> will attempt to cancel the underlying <a href="https://docs.python.org/3/library/concurrent.futures.html#future-objects" rel="nofollow noreferrer"><code>concurrent.futures.Future</code></a>, but that will only have effect if the blocking function is not yet running, e.g. because the thread pool is busy. Once it starts to execute, it cannot be safely cancelled. Support for safe and reliable cancellation is one of the benefits of using <code>asyncio</code> compared to threads.</p>
+<p>If you are dealing with synchronous code, be it a legacy blocking call or longer-running CPU-bound code, you should run it with <code>run_in_executor</code> and incorporate a way to interrupt it. For example, the code could occasionally check a <code>stop_requested</code> flag and exit if that is true, perhaps by raising an exception. Then you can "cancel" those tasks by setting the appropriate flag or flags.</p>
+<blockquote>
+<p>how should I modify the code above in a way that with the call to close() included does not raise?</p>
+</blockquote>
+<p>As far as I can tell, there is currently no way to do so without modifications to <code>blocking</code> and the top-level code. <code>run_in_executor</code> will insist on informing the event loop of the result, and this fails when the event loop is closed. It doesn't help that the asyncio future is cancelled, because the cancellation check is performed in the event loop thread, and the error occurs before that, when <code>call_soon_threadsafe</code> is called by the worker thread. (It might be possible to move the check to the worker thread, but it should be carefully analyzed whether it leads a race condition between the call to <code>cancel()</code> and the actual check.)</p>
+<blockquote>
+<p>why does it raise at all? what more does the loop want from the coros/tasks: they either exited; raised; or were canceled: isn't this enough to keep it happy?</p>
+</blockquote>
+<p>It wants the blocking functions passed to <code>run_in_executor</code> (literally called <code>blocking</code> in the question) that have already been started to finish running before the event loop is closed. You cancelled the asyncio future, but the underlying concurrent future still wants to "phone home", finding the loop closed.</p>
+<p>It is not obvious whether this is a bug in asyncio, or if you are simply not supposed to close an event loop until you somehow ensure that all work submitted to <code>run_in_executor</code> is done. Doing so requires the following changes:</p>
+<ul>
+<li>Don't attempt to cancel the pending futures. Canceling them looks correct superficially, but it prevents you from being able to <code>wait()</code> for those futures, as asyncio will consider them complete.</li>
+<li>Instead, send an application-specific event to your background tasks informing them that they need to abort.</li>
+<li>Call <code>loop.run_until_complete(asyncio.wait(pending))</code> before <code>loop.close()</code>.</li>
+</ul>
+<p>With these modifications (except for the application-specific event - I simply let the <code>sleep()</code>s finish their course), the exception did not appear.</p>
+<blockquote>
+<p>what actually happens if I don't call <code>close()</code> - in this trivial case, I presume it's largely redundant; but what might the consequences be in a "real" production code?</p>
+</blockquote>
+<p>Since a typical event loop runs as long as the application, there should be no issue in not call <code>close()</code> at the very end of the program. The operating system will clean up the resources on program exit anyway.</p>
+<p>Calling <code>loop.close()</code> is important for event loops that have a clear lifetime. For example, a library might create a fresh event loop for a specific task, run it in a dedicated thread, and dispose of it. Failing to close such a loop could leak its internal resources (such as the pipe it uses for inter-thread wakeup) and cause the program to fail. Another example are test suites, which often start a new event loop for each unit test to ensure separation of test environments.</p>
+<p><hr/>
+<strong>EDIT:</strong> I <a href="https://bugs.python.org/issue33469" rel="nofollow noreferrer">filed a bug</a> for this issue.<br/>
+<strong>EDIT 2:</strong> The bug was <a href="https://github.com/python/cpython/commit/fdccfe09f0b10776645fdb04a0783d6864c32b21" rel="nofollow noreferrer">fixed</a> by devs.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Until the <a href="https://bugs.python.org/issue33469" rel="nofollow noreferrer">upstream issue</a> is fixed, another way to work around the problem is by replacing the use of <code>run_in_executor</code> with a custom version without the flaw. While rolling one's own <code>run_in_executor</code> sounds like a bad idea at first, it is in fact only a small glue between a <a href="https://docs.python.org/3/library/concurrent.futures.html#future-objects" rel="nofollow noreferrer"><code>concurrent.futures</code></a> and an <a href="https://docs.python.org/3/library/asyncio-task.html#future" rel="nofollow noreferrer"><code>asyncio</code></a> future.</p>
+<p>A simple version of <code>run_in_executor</code> can be cleanly implemented using the public API of those two classes:</p>
+<pre><code>def run_in_executor(executor, fn, *args):
+    """Submit FN to EXECUTOR and return an asyncio future."""
+    loop = asyncio.get_event_loop()
+    if args:
+        fn = functools.partial(fn, *args)
+    work_future = executor.submit(fn)
+    aio_future = loop.create_future()
+    aio_cancelled = False
+
+    def work_done(_f):
+        if not aio_cancelled:
+            loop.call_soon_threadsafe(set_result)
+
+    def check_cancel(_f):
+        nonlocal aio_cancelled
+        if aio_future.cancelled():
+            work_future.cancel()
+            aio_cancelled = True
+
+    def set_result():
+        if work_future.cancelled():
+            aio_future.cancel()
+        elif work_future.exception() is not None:
+            aio_future.set_exception(work_future.exception())
+        else:
+            aio_future.set_result(work_future.result())
+
+    work_future.add_done_callback(work_done)
+    aio_future.add_done_callback(check_cancel)
+
+    return aio_future
+</code></pre>
+<p>When <code>loop.run_in_executor(blocking)</code> is replaced with <code>run_in_executor(executor, blocking)</code>, <code>executor</code> being a <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ThreadPoolExecutor" rel="nofollow noreferrer"><code>ThreadPoolExecutor</code></a> created in <code>main()</code>, the code works without other modifications.</p>
+<p>Of course, in this variant the synchronous functions will continue running in the other thread to completion despite being canceled -- but that is unavoidable without modifying them to support explicit interruption.</p>
+</div>
+<span class="comment-copy">Thank you for the detailed answer (and raising the bug - I had a hunch it really "wasn't me" but I'm really a n00b when it comes to <code>asyncio</code>).  Also, wanted to clarify <code>blocking()</code> (yes, the name was deliberate) in "real life" would be doing its work in chunks: so while, yes, I'm fully aware a thread cannot be truly canceled reliably, I wanted to use the <code>CanceledError</code> as the signal to give up work.  Thanks again for the obvious time it took to explain the issue, this is helpful way beyond the immediate use-case.</span>
+<span class="comment-copy">@Marco Using <code>CancelledError</code> won't work because the exception will only appear in asyncio code, it won't be injected into the other thread (nor is there a reliable Python mechanism to do so). Occasional checks of an "abort" flag is an ugly but necessary evil when dealing with these things.</span>
+<span class="comment-copy">absolutely, I totally get that (that's why the <code>try: except</code> is in the coroutine, not the <code>blocking</code> one).  That's also why the example is "contrived and simplified" - in that it doesn't capture the need to have a "lock-controlled" <code>_canceled</code> flag that is set in the coro and checked (every so often) in the blocking call.</span>

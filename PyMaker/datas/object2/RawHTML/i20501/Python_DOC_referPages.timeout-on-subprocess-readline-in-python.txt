@@ -1,0 +1,245 @@
+<div class="post-text" itemprop="text">
+<p>I have a small issue that I'm not quite sure how to solve. Here is a minimal example:</p>
+<h3>What I have</h3>
+<pre><code>scan_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+while(some_criterium):
+    line = scan_process.stdout.readline()
+    some_criterium = do_something(line)
+</code></pre>
+<h3>What I would like</h3>
+<pre><code>scan_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+while(some_criterium):
+    line = scan_process.stdout.readline()
+    if nothing_happens_after_10s:
+        break
+    else:
+        some_criterium = do_something(line)
+</code></pre>
+<p>I read a line from a subprocess and do something with it. What I want is to exit if no line arrived after a fixed time interval. Any recommendations? </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Thanks for all the answers!
+I found a way to solve my problem by simply using select.poll to peek into stdout.</p>
+<pre><code>import select
+...
+scan_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+poll_obj = select.poll()
+poll_obj.register(scan_process.stdout, select.POLLIN)   
+while(some_criterium and not time_limit):
+    poll_result = poll_obj.poll(0)
+    if poll_result:
+        line = scan_process.stdout.readline()
+        some_criterium = do_something(line)
+    update(time_limit)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's a portable solution that enforces the timeout for reading a single line using <a href="https://docs.python.org/3/library/asyncio" rel="noreferrer"><code>asyncio</code></a>:</p>
+<pre><code>#!/usr/bin/env python3
+import asyncio
+import sys
+from asyncio.subprocess import PIPE, STDOUT
+
+async def run_command(*args, timeout=None):
+    # start child process
+    # NOTE: universal_newlines parameter is not supported
+    process = await asyncio.create_subprocess_exec(*args,
+            stdout=PIPE, stderr=STDOUT)
+
+    # read line (sequence of bytes ending with b'\n') asynchronously
+    while True:
+        try:
+            line = await asyncio.wait_for(process.stdout.readline(), timeout)
+        except asyncio.TimeoutError:
+            pass
+        else:
+            if not line: # EOF
+                break
+            elif do_something(line): 
+                continue # while some criterium is satisfied
+        process.kill() # timeout or some criterium is not satisfied
+        break
+    return await process.wait() # wait for the child process to exit
+
+
+if sys.platform == "win32":
+    loop = asyncio.ProactorEventLoop() # for subprocess' pipes on Windows
+    asyncio.set_event_loop(loop)
+else:
+    loop = asyncio.get_event_loop()
+
+returncode = loop.run_until_complete(run_command("cmd", "arg 1", "arg 2",
+                                                 timeout=10))
+loop.close()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I used something a bit more general in python (IIRC also pieced together from SO questions, but I cannot recall which ones).</p>
+<pre><code>import thread
+from threading import Timer
+
+def run_with_timeout(timeout, default, f, *args, **kwargs):
+    if not timeout:
+        return f(*args, **kwargs)
+    try:
+        timeout_timer = Timer(timeout, thread.interrupt_main)
+        timeout_timer.start()
+        result = f(*args, **kwargs)
+        return result
+    except KeyboardInterrupt:
+        return default
+    finally:
+        timeout_timer.cancel()
+</code></pre>
+<p>Be warned, though, this uses an interrupt to stop whatever function you give it. This might not be a good idea for all functions and it also prevents you from closing the program with ctrl+c during the timeout (i.e. ctrl+c will be handled as a timeout)
+You could use this an call it like:</p>
+<pre><code>scan_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+while(some_criterium):
+    line = run_with_timeout(timeout, None, scan_process.stdout.readline)
+    if line is None:
+        break
+    else:
+        some_criterium = do_something(line)
+</code></pre>
+<p>Might be a bit overkill, though. I suspect there is a simpler option for your case that I don't know.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>In Python 3, a timeout option has been added to the subprocess module. Using a structure like</p>
+<pre><code>try:
+    o, e = process.communicate(timeout=10)
+except TimeoutExpired:
+    process.kill()
+    o, e = process.communicate()
+
+analyze(o)
+</code></pre>
+<p>would be a proper solution.</p>
+<p>Since the output is expected to contain a new line character, it's safe to assume that it is text (as in printable, readable), in which case <code>universal_newlines=True</code> flag is strongly recommended.</p>
+<p>If Python2 is a must, please use <a href="https://pypi.python.org/pypi/subprocess32/" rel="nofollow noreferrer">https://pypi.python.org/pypi/subprocess32/</a> (backport)</p>
+<p>For a pure-python Python 2 solution, look at <a href="https://stackoverflow.com/questions/1191374/subprocess-with-timeout">Using module 'subprocess' with timeout</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Try using signal.alarm:</p>
+<pre><code>#timeout.py
+import signal,sys
+
+def timeout(sig,frm):
+  print "This is taking too long..."
+  sys.exit(1)
+
+signal.signal(signal.SIGALRM, timeout)
+signal.alarm(10)
+byte=0
+
+while 'IT' not in open('/dev/urandom').read(2):
+  byte+=2
+print "I got IT in %s byte(s)!" % byte
+</code></pre>
+<p>A couple of runs to show it works:</p>
+<pre><code>$ python timeout.py 
+This is taking too long...
+$ python timeout.py 
+I got IT in 4672 byte(s)!
+</code></pre>
+<p>For more detailed example see <a href="http://pguides.net/python-tutorial/python-timeout-a-function/" rel="nofollow">pGuides</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>A portable solution is to use a thread to kill the child process if reading a line takes too long:</p>
+<pre><code>#!/usr/bin/env python3
+from subprocess import Popen, PIPE, STDOUT
+
+timeout = 10
+with Popen(command, stdout=PIPE, stderr=STDOUT,
+           universal_newlines=True) as process:  # text mode
+    # kill process in timeout seconds unless the timer is restarted
+    watchdog = WatchdogTimer(timeout, callback=process.kill, daemon=True)
+    watchdog.start()
+    for line in process.stdout:
+        # don't invoke the watcthdog callback if do_something() takes too long
+        with watchdog.blocked:
+            if not do_something(line):  # some criterium is not satisfied
+                process.kill()
+                break
+            watchdog.restart()  # restart timer just before reading the next line
+    watchdog.cancel()
+</code></pre>
+<p>where <code>WatchdogTimer</code> class is like <code>threading.Timer</code> that can be restarted and/or blocked:</p>
+<pre><code>from threading import Event, Lock, Thread
+from subprocess import Popen, PIPE, STDOUT
+from time import monotonic  # use time.time or monotonic.monotonic on Python 2
+
+class WatchdogTimer(Thread):
+    """Run *callback* in *timeout* seconds unless the timer is restarted."""
+
+    def __init__(self, timeout, callback, *args, timer=monotonic, **kwargs):
+        super().__init__(**kwargs)
+        self.timeout = timeout
+        self.callback = callback
+        self.args = args
+        self.timer = timer
+        self.cancelled = Event()
+        self.blocked = Lock()
+
+    def run(self):
+        self.restart() # don't start timer until `.start()` is called
+        # wait until timeout happens or the timer is canceled
+        while not self.cancelled.wait(self.deadline - self.timer()):
+            # don't test the timeout while something else holds the lock
+            # allow the timer to be restarted while blocked
+            with self.blocked:
+                if self.deadline &lt;= self.timer() and not self.cancelled.is_set():
+                    return self.callback(*self.args)  # on timeout
+
+    def restart(self):
+        """Restart the watchdog timer."""
+        self.deadline = self.timer() + self.timeout
+
+    def cancel(self):
+        self.cancelled.set()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>while your (Tom's) solution works, using <code>select()</code> in the <code>C</code> idiom is more compact. this is the equivalent of your answer</p>
+<pre><code>from select import select
+scan_process = subprocess.Popen(command, 
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                bufsize=1)  # line buffered
+while some_criterium and not time_limit:
+    poll_result = select([scan_process.stdout], [], [], time_limit)[0]
+</code></pre>
+<p>the rest is the same.</p>
+<p>see <code>pydoc select.select</code>.</p>
+<p>[Note: this is Unix-specific, as are some of the other answers.]</p>
+<p>[Note 2: edited to add line buffering as per OP request]</p>
+<p>[Note 3: the line buffering may not be reliable in all circumstances, leading to readline() blocking]</p>
+</div>
+<span class="comment-copy">related: <a href="http://stackoverflow.com/q/375427/4279">Non-blocking read on a subprocess.PIPE in python</a></span>
+<span class="comment-copy">related: <a href="http://stackoverflow.com/q/4417962/4279">Stop reading process output in Python without hang?</a></span>
+<span class="comment-copy"><i>whispers</i> criterion</span>
+<span class="comment-copy">while this appears to work, it's not robust -- consider if your child process outputs something without a new line. <code>select</code>/<code>poll</code> will trigger, but <code>readline</code> will block indefinitely.</span>
+<span class="comment-copy">May not work on Windows, where <code>select.poll()</code> only works for sockets. <a href="https://docs.python.org/2/library/select.html" rel="nofollow noreferrer">docs.python.org/2/library/select.html</a></span>
+<span class="comment-copy">I haven't tested the solution in Windows, so you might be right, I know it's working under OSX and Linux.</span>
+<span class="comment-copy">@gentimouton: <a href="http://stackoverflow.com/a/34114767/4279"><code>asyncio</code> can read subprocess' output asynchroniously in a portable manner</a></span>
+<span class="comment-copy">@DimaTisnek, so if there is no line return at all, the program will still be blocked by the readline forever?</span>
+<span class="comment-copy">This is awesome, great work!  I would suggest <code>process.stdout.read()</code> instead of <code>readline()</code> for someone else who may have more than just one expected line.</span>
+<span class="comment-copy">@jftuga: <code>.read()</code> would be incorrect here. The question is about <code>.readline()</code>. If you need all the output then it is simpler to use <code>.communicate()</code> with timeout. Read <a href="http://stackoverflow.com/questions/10756383/timeout-on-subprocess-readline-in-python/34114767?noredirect=1#comment55978734_10756738">my comment under the answer that uses <code>.communicate()</code></a>.</span>
+<span class="comment-copy">what is the <code>await asyncio.wait_for( ....</code>? It throws syntaxerror.</span>
+<span class="comment-copy">This syntax thing works only with python 3.3 +.</span>
+<span class="comment-copy">@JanKaifer yes. Both the link to Python 3 docs and the explicit shebang <code>#!... python3</code> point to Python 3. The current Python version is 3.6. The syntax in the answer is Python 3.5 (released in 2015).</span>
+<span class="comment-copy">it is not necessary to create a new thread for each line: <a href="http://stackoverflow.com/a/34115590/4279">a single watchdog thread is enough</a></span>
+<span class="comment-copy">Works like a charm and should be picked as best :-) Thanks, @Flogo!</span>
+<span class="comment-copy">Isn't it better to put the first two lines inside try-block i.e. "timeout_timer = Timer( ....upto.... timer.start()" outside try-except?</span>
+<span class="comment-copy">@AshKetchum: the line <code>timeout_timer.start()</code> should be in the try-block. Imagine you have a very short time limit and there is a context switch after starting the thread and before entering the try-block. That could theoretically lead to a <code>KeyboardInterrupt</code> sent to the main thread. The line initializing the Timer could be outside, I guess.</span>
+<span class="comment-copy"><code>import _thread</code></span>
+<span class="comment-copy"><code>.communicate()</code> waits for the child process to finish. It doesn't answer OPs question if there could be more than one line e.g., imagine a subprocess yields a line every 9 seconds: your code fails on the 2nd line while OPs pseudo-code would read all lines successfully -- it is the difference between the total timeout and a timeout on a single read operation (readline in this case). btw, there is the opposite problem in networking: <code>timeout</code> parameter limits only a single (socket) operation usually -- you have to write your own code to enforce the total timeout limit.</span>
+<span class="comment-copy">This answer is wrong. Please read the question properly.</span>
+<span class="comment-copy">It's off-topic.</span>
+<span class="comment-copy">not for the question</span>
+<span class="comment-copy">This is Unix-only, won't work on Windows as SIGALRM and signal.alarm are unavailable.</span>
+<span class="comment-copy">Also doesn't work in sub-threads.</span>
+<span class="comment-copy">note: this as as well as @Tom's answer doesn't work on Windows and it resets the timeout if any input is received. OP wants to reset the timeout only if a newline is received (though it is straightforward to accommodate this requirement).</span>
+<span class="comment-copy">thanks, I added a caveat to make that clear.</span>
+<span class="comment-copy">also, to avoid blocking on <code>.readline()</code> like in @Tom's answer, use <code>os.read(scan_process.stdout.fileno(), 512)</code> after the <code>select</code> (it is also not 100% percent safe if something else has access to the pipe) but it is less likely to block after the <code>select</code> than <code>.readline()</code>.</span>
+<span class="comment-copy">I thought the whole idea was to block until either a line is read or timeout has been reached?... sorry if I'm misunderstanding.</span>
+<span class="comment-copy">You don't know whether child's stdout is line-buffered (<code>bufsize=1</code> has no effect on the child process; it only regulates the buffer used in the parent to read the output) and typically the stdout is block-buffered if it is redirected to a pipe i.e., <code>select()</code> may return without the full line being available.</span>

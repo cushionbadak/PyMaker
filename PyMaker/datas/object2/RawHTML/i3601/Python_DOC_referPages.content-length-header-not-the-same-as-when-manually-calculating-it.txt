@@ -1,0 +1,108 @@
+<div class="post-text" itemprop="text">
+<p>An answer here (<a href="https://stackoverflow.com/questions/24688479/size-of-raw-response-in-bytes">Size of raw response in bytes</a>) says : </p>
+<blockquote>
+<p>Just take the <code>len()</code> of the content of the response:</p>
+<pre><code>&gt;&gt;&gt; response = requests.get('https://github.com/')
+&gt;&gt;&gt; len(response.content)
+51671
+</code></pre>
+</blockquote>
+<p>However doing that does not get the accurate content length. For example check out this python code:</p>
+<pre><code>import sys
+import requests
+
+def proccessUrl(url):
+    try:
+        r = requests.get(url)
+        print("Correct Content Length: "+r.headers['Content-Length'])
+        print("bytes of r.text       : "+str(sys.getsizeof(r.text)))
+        print("bytes of r.content    : "+str(sys.getsizeof(r.content)))
+        print("len r.text            : "+str(len(r.text)))
+        print("len r.content         : "+str(len(r.content)))
+    except Exception as e:
+        print(str(e))
+
+#this url contains a content-length header, we will use that to see if the content length we calculate is the same.
+proccessUrl("https://stackoverflow.com")
+</code></pre>
+<p>If we try and manually calculate the content length and compare it to what is in the header, we get an answer that is much larger? </p>
+<pre><code>Correct Content Length: 51504
+bytes of r.text       : 515142
+bytes of r.content    : 257623
+len r.text            : 257552
+len r.content         : 257606
+</code></pre>
+<p>Why does <code>len(r.content)</code> not return the correct content length? And how can we manually calculate it accurately if the header is missing? </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <code>Content-Length</code> header reflects the body of the response. That's not the same thing as the length of the <code>text</code> or <code>content</code> attributes, because the response could be <em>compressed</em>. <code>requests</code> decompresses the response for you.</p>
+<p>You'd have to bypass a lot of internal plumbing to get the original, compressed, raw content, and then you have to access some more internals if you want the <code>response</code> object to still work correctly. The 'easiest' method is to enable streaming, then reading from the raw socket:</p>
+<pre><code>from io import BytesIO
+
+r = requests.get(url, stream=True)
+# read directly from the raw urllib3 connection
+raw_content = r.raw.read()
+content_length = len(raw_content)
+# replace the internal file-object to serve the data again
+r.raw._fp = BytesIO(raw_content)
+</code></pre>
+<p>Demo:</p>
+<pre><code>&gt;&gt;&gt; import requests
+&gt;&gt;&gt; from io import BytesIO
+&gt;&gt;&gt; url = "https://stackoverflow.com"
+&gt;&gt;&gt; r = requests.get(url, stream=True)
+&gt;&gt;&gt; r.headers['Content-Encoding'] # a compressed response
+'gzip'
+&gt;&gt;&gt; r.headers['Content-Length']   # the raw response contains 52055 bytes of compressed data
+'52055'
+&gt;&gt;&gt; r.headers['Content-Type']     # we are served UTF-8 HTML data
+'text/html; charset=utf-8'
+&gt;&gt;&gt; raw_content = r.raw.read()
+&gt;&gt;&gt; len(raw_content)              # the raw content body length
+52055
+&gt;&gt;&gt; r.raw._fp = BytesIO(raw_content)
+&gt;&gt;&gt; len(r.content)    # the decompressed binary content, byte count
+258719
+&gt;&gt;&gt; len(r.text)       # the Unicode content decoded from UTF-8, character count
+258658
+</code></pre>
+<p>This reads the full response into memory, so don't use this if you expect large responses! In that case, you could instead use <code>shutil.copyfileobj()</code> to copy the data from the <code>r.raw</code> file to a <a href="https://docs.python.org/3/library/tempfile.html#tempfile.SpooledTemporaryFile" rel="nofollow noreferrer">spooled temporary file</a> (which will switch to an on-disk file once a certain size is reached), get the file size of that file, then stuff that file onto <code>r.raw._fp</code>.</p>
+<p>A function that adds a <code>Content-Type</code> header to any request that is missing that header would look like this:</p>
+<pre><code>import requests
+import shutil
+import tempfile
+
+def ensure_content_length(
+    url, *args, method='GET', session=None, max_size=2**20,  # 1Mb
+    **kwargs
+):
+    kwargs['stream'] = True
+    session = session or requests.Session()
+    r = session.request(method, url, *args, **kwargs)
+    if 'Content-Length' not in r.headers:
+        # stream content into a temporary file so we can get the real size
+        spool = tempfile.SpooledTemporaryFile(max_size)
+        shutil.copyfileobj(r.raw, spool)
+        r.headers['Content-Length'] = str(spool.tell())
+        spool.seek(0)
+        # replace the original socket with our temporary file
+        r.raw._fp.close()
+        r.raw._fp = spool
+    return r
+</code></pre>
+<p>This accepts an existing session, and lets you specify the request method too. Adjust <code>max_size</code> as needed for your memory constraints. Demo on <code>https://github.com</code>, which lacks a <code>Content-Length</code> header:</p>
+<pre><code>&gt;&gt;&gt; r = ensure_content_length('https://github.com/')
+&gt;&gt;&gt; r
+&lt;Response [200]&gt;
+&gt;&gt;&gt; r.headers['Content-Length']
+'14490'
+&gt;&gt;&gt; len(r.content)
+54814
+</code></pre>
+<p>Note that if there is no <code>Content-Encoding</code> header present or the value for that header is set to <code>identity</code>, and the <code>Content-Length</code> is available, then just you can rely on <code>Content-Length</code> being the full size of the response. That's because then there is obviously no compression applied.</p>
+<p>As a side note: you should not use <code>sys.getsizeof()</code> if what your are after is the length of a <code>bytes</code> or <code>str</code> object (the number of bytes or characters in that object). <code>sys.getsizeof()</code> gives you the internal memory footprint of a Python object, which covers more than just the number of bytes or characters in that object. See <a href="https://stackoverflow.com/questions/17574076/what-is-the-difference-between-len-and-sys-getsizeof-methods-in-python">What is the difference between len() and sys.getsizeof() methods in python?</a></p>
+</div>
+<span class="comment-copy"><code>sys.getsizeof</code> does <b>not produce the length of the data</b>. Instead, it gives you the memory footprint of the internal Python data structures, which is related but far from the same thing. Do not use <code>sys.getsizeof</code> in this context. See <a href="//stackoverflow.com/q/17574076">What is the difference between len() and sys.getsizeof() methods in python?</a></span>
+<span class="comment-copy">Ahh that makes a lot more sense man, thank you. So len of <code>r.raw.read()</code> was what i needed. I tried raw earlier but didn't think to use <code>read()</code> with it. The link on the difference between <code>len</code> and <code>sys.getsizeof</code> is also very helpful. Cheers.</span>
+<span class="comment-copy">"The 'easiest' method is to enable streaming, then reading from the raw socket" Aha. Lol. Thanks again.</span>
+<span class="comment-copy">@JonathanLaliberte: the internals of <code>requests</code> are such that there is no option to disable the decompression there.</span>

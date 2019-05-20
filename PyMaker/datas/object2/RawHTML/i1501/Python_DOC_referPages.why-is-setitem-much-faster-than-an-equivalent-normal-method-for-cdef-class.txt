@@ -1,0 +1,132 @@
+<div class="post-text" itemprop="text">
+<p>It looks like, for Cython's cdef-classes, using class special methods is sometimes faster than identical "usual" method, for example <code>__setitem__</code> is 3 times faster than <code>setitem</code>:</p>
+<pre><code>%%cython
+cdef class CyA:
+    def __setitem__(self, index, val):
+        pass
+    def setitem(self, index, val):
+        pass
+</code></pre>
+<p>and now:</p>
+<pre><code>cy_a=CyA()
+%timeit cy_a[0]=3              # 32.4 ns ± 0.195 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+%timeit cy_a.setitem(0,3)      # 97.5 ns ± 0.389 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+</code></pre>
+<p>This neither the "normal" behavior for Python, for which the special functions are even somewhat slower (and obviosly slower than the Cython-equivalent):</p>
+<pre><code>class PyA:
+    def __setitem__(self, index, val):
+        pass
+    def setitem(self, index, val):
+        pass
+
+py_a=PyA()
+%timeit py_a[0]=3           # 198 ns ± 2.51 ns per loop (mean ± std. dev. of 7 runs, 1000000 loops each)
+%timeit py_a.setitem(0,3)   # 123 ns ± 0.619 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+</code></pre>
+<p>nor this is the case in Cython for all special functions:</p>
+<pre><code>%%cython
+cdef class CyA:
+    ...
+    def __len__(self):
+        return 1
+    def len(self):
+        return 1
+</code></pre>
+<p>which leads to:</p>
+<pre><code>cy_a=CyA()
+%timeit len(cy_a)    #  59.6 ns ± 0.233 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+%timeit cy_a.len()   #  66.5 ns ± 0.326 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+</code></pre>
+<p>i.e. almost identical running times.</p>
+<p>Why is <code>__setitem__(...)</code> so much faster, than <code>setitem(...)</code> in a cdef-class, even if both are cythonized?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There's quite a bit of overhead for a generic Python method call - Python looks up the relevant attribute (a dictionary lookup), ensures that the attribute is a callable object, and once it's called handles the result. This overhead also applies to generic <code>def</code> functions for <code>cdef</code> classes (the only difference being is that the implementation of the method is defined in C).</p>
+<p>However, special methods on C/Cython classes can be optimised, as follows:</p>
+<h2>Lookup speed</h2>
+<p>As a shortcut,
+<code>PyTypeObject</code> in the Python C API defines a number of different "slots" - direct function pointers for special methods. For <code>__setitem__</code> there's actually two available: <a href="https://docs.python.org/3/c-api/typeobj.html#c.PyMappingMethods.mp_ass_subscript" rel="nofollow noreferrer"><code>PyMappingMethods.mp_ass_subscript</code></a> which corresponds to a generic "mapping" call, and <a href="https://docs.python.org/3/c-api/typeobj.html#c.PySequenceMethods.sq_ass_item" rel="nofollow noreferrer"><code>PySequenceMethods.sq_ass_item</code></a>, which lets you use an int as the indexer directly and corresponds to the C API function <a href="https://docs.python.org/3/c-api/sequence.html#c.PySequence_SetItem" rel="nofollow noreferrer"><code>PySequence_SetItem</code></a>.</p>
+<p>For a <code>cdef class</code>, Cython only seems to generate the first (generic) one, so the speedup isn't from passing a C <code>int</code> directly. Cython does not fill these slots when generating a non-<code>cdef</code> class.</p>
+<p>The advantage of these is that (for a C/Cython class) finding the <a href="https://github.com/python/cpython/blob/621cebe81b1e6c8de10425955bf532d31ee4df42/Objects/abstract.c#L188" rel="nofollow noreferrer"><code>__setitem__</code> function just involves a couple of pointer NULL checks followed by a C function call</a>. This also applies to <code>__len__</code> which is also defined by slots in <code>PyTypeObject</code></p>
+<p>In contrast,</p>
+<ul>
+<li><p>for a Python class calling <code>__setitem__</code>, it instead <a href="https://github.com/python/cpython/blob/1c607155c9e363489036ae6258b165a3fae75134/Objects/typeobject.c#L6175" rel="nofollow noreferrer">uses a default implementation</a> which does a dictionary lookup for the string <code>"__setitem__"</code>.</p></li>
+<li><p>For either a <code>cdef</code> or Python class calling a non-special <code>def</code> function, the attribute is looked up from the class/instance dictionary (which is slower)</p></li>
+</ul>
+<p>Note that if the <code>setitem</code> regular function were to be defined in a <code>cdef class</code> as <code>cpdef</code> instead (and called from Cython) then Cython implements its own mechanism for a speedy lookup.</p>
+<h2>Calling efficiency</h2>
+<p>Having found the attribute it must be called. Where the special functions have been retrieved from <code>PyTypeObject</code> (e.g. <code>__setitem__</code> and <code>__len__</code> on a <code>cdef class</code>), they are simply C function pointers and so can be called directly.</p>
+<p>For every other case the <code>PyObject</code> retrieved from attribute lookup must evaluated to see if it's a callable, then called.</p>
+<h2>Return handling</h2>
+<p>When <code>__setitem__</code> is called from <code>PyTypeObject</code> as a special function the return value is an int, which is simply used as an error flag. No reference counting or handling of Python objects is needed.</p>
+<p>When <code>__len__</code> is called from a <code>PyTypeObject</code> as a special function, the return type is a <code>Py_ssize_t</code>, which must be converted to a Python object and then destroyed when no longer needed.</p>
+<p>For normal functions (e.g. <code>setitem</code> called from a Python or Cython class, or <code>__setitem__</code> defined in a Python class), the return value is a <code>PyObject*</code>, which must be reference counted/destroyed appropriately.</p>
+<hr/>
+<p>In summary,  the difference is really to do with shortcuts in finding and calling the function rather than whether the contents of the function is Cythonized.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>@DavidW's answer hits the nail on the head, here are some more experiments and details which corroborate his answer.</p>
+<p><strong>Calling a special function which returns ´None`is fast, no matter how many arguments:</strong></p>
+<pre><code>%%cython
+cdef class CyA:
+# special functions
+    def __setitem__(self, index, val):
+        pass
+    def __getitem__(self, index):
+        pass
+</code></pre>
+<p>and now</p>
+<pre><code>a=CyA()  
+%timeit a[0]    # 29.8 ns ± 1.9 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+%timeit a[0]=3  # 29.3 ns ± 0.942 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+</code></pre>
+<p>The signature of the functions is known, there is no need to construct <code>*args</code>, <code>**kwargs</code>. The look-up in the slot is as fast as it gets.</p>
+<p><strong>Overhead of calling a normal function depends on the number of arguments</strong>:</p>
+<pre><code>%%cython
+cdef class CyA:
+...
+# normal functions:   
+    def fun0(self):
+        pass    
+    def fun1(self, arg):
+        pass    
+    def fun2(self, arg1, arg2):
+        pass
+</code></pre>
+<p>and now:</p>
+<pre><code>a=CyA()  
+...
+%timeit a.fun0()     # 64.1 ns ± 2.49 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)     
+%timeit a.fun1(1)    # 67.6 ns ± 0.785 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each) 
+%timeit a.fun2(2,3)  # 94.7 ns ± 1.04 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+</code></pre>
+<p>The overhead is bigger than for calling of methods from slots, but also bigger if there have (at least) two arguments (not taking <code>self</code> into account): <code>65ns</code> vs <code>95ns</code>.</p>
+<p>The reason: cython-methods can be one of the following types</p>
+<ol>
+<li><a href="https://docs.python.org/3/c-api/structures.html#METH_NOARGS" rel="nofollow noreferrer"><code>METH_NOARGS</code></a> - only with argument <code>self</code></li>
+<li><a href="https://docs.python.org/3/c-api/structures.html#METH_O" rel="nofollow noreferrer"><code>METH_O</code></a> - only with <code>self</code> + one argument</li>
+<li><a href="https://docs.python.org/3/c-api/structures.html#METH_VARARGS" rel="nofollow noreferrer"><code>METH_VARARGS|METH_KEYWORDS</code></a> - with arbitrary number of elements</li>
+</ol>
+<p>The method <code>fun2</code> is of third type, thus in order to be called it Python has to construct list <code>*args</code>, which leads to additional overhead.</p>
+<p>** Returning from a special method can have more overhead as from normal method":</p>
+<pre><code>%%cython
+cdef class CyA:
+...
+def __len__(self):
+    return 1  # return 1000 would be slightly slower
+def len(self):
+    return 1
+</code></pre>
+<p>leads to:</p>
+<pre><code>a=CyA()
+...  
+%timeit len(a)   # 52.1 ns ± 1.57 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+%timeit a.len()  # 57.3 ns ± 1.39 ns per loop (mean ± std. dev. of 7 runs, 10000000 loops each)
+</code></pre>
+<p>As @DavidW has pointed out, for <code>__len__</code>, in every call a "new" int-object must be constructed from returned <code>Py_ssize_t</code> (in the case of <code>1</code> it is an integer from the pool, so it is not really constructed - but it were in case of bigger numbers).</p>
+<p>This is not the case for <code>len()</code>: for this special implementation, Cython initializes a global object, which is returned by <code>len()</code> - increasing the reference counter doesn't cost much (compared to creating an integer!).</p>
+<p>Thus, both <code>__len__</code> and <code>len()</code> run approximately equally fast - but the time is spent for different things (creating integer vs. lookup overhead).</p>
+</div>
+<span class="comment-copy">I haven't worked with optimizing python code with Cython, only with regular python interpreter, but there are many types of optimizations that python does, and they might not seem like much, but when It get's down to Python Byte Code, the difference from using a function to do something or using a <i>built in</i> feature, makes a lot of difference on the number of instructions used, in the Byte Code Stack, you could use the <code>dis</code> module to explore more.</span>
+<span class="comment-copy">Sorry, either my question isn't clear enough (it is about <code>cdef-class.__setitem__</code> vs <code>cdef-class.setitem()</code> and not cdef-class vs python-class) or I miss some crucial points in your answer, because I don't understand how it explains why <code>__setitem__</code> is faster</span>
+<span class="comment-copy">For a <code>cdef class</code>, <code>__setitem__</code> is a slot in the <code>PyTypeObject</code>, so it can be found by by a couple of <code>NULL</code> checks on C pointers followed by a C function call. It's also known not to return anything so there's no handling of returned objects. For the other cases (<code>setitem</code> on both <code>cdef</code> and python classes, <code>__setitem__</code> on a Python class) you need to look up the function in the object's dictionary then call a Python callable, then handle a result. I'll look at my answer later to see if I can clarify a bit more</span>

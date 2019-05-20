@@ -1,0 +1,117 @@
+<div class="post-text" itemprop="text">
+<p>Suppose I am embedding the CPython interpreter into a larger program, written in C.  The C component of the program occasionally needs to call functions written in Python, supplying callback functions to them as arguments.</p>
+<p>Using the CPython <a href="https://docs.python.org/3/extending/" rel="nofollow noreferrer">extending and embedding</a> APIs, how do I construct a Python "callable" object that wraps a C pointer-to-function, so that I can pass that object to Python code and have the Python code successfully call back into the C code?</p>
+<blockquote>
+<p><em>Note: this is a revised version of a question <a href="https://stackoverflow.com/questions/50381150/extending-python-with-c-passing-callback-function-of-c-to-python-and-invoking-c/50382792">originally posted</a> by user <a href="https://stackoverflow.com/users/1489866/dhanasubbu">dhanasubbu</a>, which I answered, but which was then deleted.  I think it was actually a good question, so I have converted what I wrote into a self-answer to my own statement of the question.  Alternative answers are welcome.</em></p>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<p>To define an extension type that is “callable” in the sense Python uses that
+term, you fill the <code>tp_call</code> slot of the type object, which is the C equivalent of the <code>__call__</code> special method.  The function that goes in that slot will be a glue routine that calls the actual C callback.  Here’s code for the simplest case, when the C callback takes no arguments and returns nothing.</p>
+<pre><code>typedef struct {
+    PyObject_HEAD
+    /* Type-specific fields go here. */
+    void (*cfun)(void);  /* or whatever parameters it actually takes */
+} CallbackObj;
+
+static PyObject *Callback_call(PyObject *self, PyObject *args, PyObject *kw)
+{
+    /* check that no arguments were passed */
+    const char no_kwargs[] = { 0 };
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "", no_kwargs))
+        return 0;
+
+    CallbackObj *cself = (CallbackObj *)self;
+    cself-&gt;cfun();
+    Py_RETURN_NONE;
+}
+
+static PyTypeObject CallbackType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "mymodule.Callback",
+    .tp_doc = "Callback function passed to foo, bar, and baz.",
+    .tp_basicsize = sizeof(CallbackObj),
+    .tp_itemsize = 0,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = PyType_GenericNew,
+    .tp_call = Callback_call,
+};
+</code></pre>
+<p>Instantiate the type object with <code>PyType_Ready</code> as usual.  Don’t put it in any module visible to Python, though, because Python code can’t correctly create instances of this type.  (Because of this, I haven’t bothered with a <code>tp_init</code> function; just make sure you always initialize <code>-&gt;cfun</code> after creating instances from C, or <code>Callback_call</code> will crash.)</p>
+<p>Now, suppose the actual function you need to call is named <code>real_callback</code>, and the Python function that you want to pass it to is named <code>function_to_call</code>.  First you create one of the callback objects, by
+calling the type object, as usual, and initialize its <code>-&gt;cfun</code> field:</p>
+<pre><code> PyObject *args = PyTuple_New(0);
+ CallbackObj *cb = (CallbackObj *)PyObject_CallObject(
+     (PyObject *)CallbackType, args);
+ Py_DECREF(args);
+ cb-&gt;cfun = real_callback;
+</code></pre>
+<p>Then you put <code>cb</code> into an argument tuple, and call the Python function
+object with that, as usual.</p>
+<pre><code> args = Py_BuildValue("(O)", cb);
+ PyObject *ret = PyObject_CallObject(function_to_call, args);
+ Py_DECREF(args);
+ Py_DECREF(cb);
+ // do stuff with ret, here, perhaps
+ Py_DECREF(ret);
+</code></pre>
+<p>Extending this to more complex cases, where the C callback needs to take arguments and/or return values and/or raise Python exceptions on error and/or receive “closure” information from the outer context, is left as an exercise.  </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'd be tempted to use the standard library <a href="https://docs.python.org/3/library/ctypes.html" rel="nofollow noreferrer">ctypes module</a> since it already contains appropriate wrappers for C function pointers, and can automatically deal with conversions from Python types to C types for wide variety of arguments.</p>
+<p>I've written a working example in Cython since it's an easy way of mixing Python and C, but it should show how to use these objects:</p>
+<pre><code>cdef extern from *:
+    """
+    int f(int x) {
+       return x*2;
+    }
+    """
+    int f(int f)
+</code></pre>
+<p>I define an example function <code>f</code> (in the docstring, which Cython incorporates directly into the compiled file).</p>
+<pre><code>import ctypes
+from libc.stdint cimport intptr_t
+
+def make_f_wrapper():
+    func_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int)
+    cdef intptr_t f_ptr = &lt;intptr_t&gt;&amp;f
+    return func_type(f_ptr)
+</code></pre>
+<p>This is a Cython (pretty close to Python syntax) version of the creation of a ctypes pointer to <code>f</code>. I define the arguments of the function, convert the <code>f</code> pointer to an appropriately sized integer, then initialize the wrapper object with that integer.</p>
+<pre><code>cdef extern from *:
+    """
+    PyObject* make_f_wrapper_c_impl() {
+        PyObject *ctypes_module = NULL, *CFUNCTYPE = NULL, *c_int = NULL, 
+                 *func_type = NULL, *ptr_value = NULL, *result = NULL;
+
+        ctypes_module = PyImport_ImportModule("ctypes");
+        if (ctypes_module == NULL) goto cleanup;
+        CFUNCTYPE = PyObject_GetAttrString(ctypes_module,"CFUNCTYPE");
+        if (CFUNCTYPE == NULL) goto cleanup;
+        c_int = PyObject_GetAttrString(ctypes_module,"c_int");
+        if (c_int == NULL) goto cleanup;
+        func_type = PyObject_CallFunctionObjArgs(CFUNCTYPE,c_int,c_int,NULL);
+        if (func_type == NULL) goto cleanup;
+        ptr_value = PyLong_FromVoidPtr(&amp;f);
+        if (ptr_value == NULL) goto cleanup;
+        result = PyObject_CallFunctionObjArgs(func_type,ptr_value,NULL);
+
+        cleanup:
+        Py_XDECREF(ptr_value);
+        Py_XDECREF(func_type);
+        Py_XDECREF(c_int);
+        Py_XDECREF(CFUNCTYPE);
+        Py_XDECREF(ctypes_module);
+        return result;
+    }
+    """
+    object make_f_wrapper_c_impl()
+
+def make_f_wrapper_c():
+    return make_f_wrapper_c_impl()
+</code></pre>
+<p>The code above is a C translation of the Pythony code above - it does exactly the same thing but is a bit more convoluted since it uses the C API. It just uses the ctypes module through its Python interface. Once again the C code is embedded in a Cython file through a docstring; however similar code could be used in a directly written C API module.</p>
+<p>(All these Cython snippets combine to form one long working example)</p>
+</div>
+<span class="comment-copy">... I would appreciate it if the people closevoting this question as "too broad" would explain why they think so.  It seems like a sensibly scoped question to me!</span>
+<span class="comment-copy">I agree. It's got a clear scope and topic and, since you've answered it, we know it's not too broad to answer. If you really think the question is too broad to help people find the answer, it'd be better to edit it to be more specific rather than throwing it out altogether.</span>

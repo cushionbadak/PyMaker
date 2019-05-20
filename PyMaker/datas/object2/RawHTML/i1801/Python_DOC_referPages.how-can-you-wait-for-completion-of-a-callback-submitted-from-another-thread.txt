@@ -1,0 +1,141 @@
+<div class="post-text" itemprop="text">
+<p>I have two Python threads that share some state, <code>A</code> and <code>B</code>. At one point, <code>A</code> submits a callback to be run by <code>B</code> on its loop with something like:</p>
+<pre><code># This line is executed by A
+loop.call_soon_threadsafe(callback)
+</code></pre>
+<p>After this I want to continue doing something else, but I want to make sure that <code>callback</code> has been run by <code>B</code> before doing so. Is there any way (besides standard threading synchronization primitives) to make <code>A</code> wait for the completion of the callback? I know <code>call_soon_threadsafe</code> returns a <code>asyncio.Handle</code> object that can cancel the task, but I am not sure whether this can be used for waiting (I still don't know much about <code>asyncio</code>).</p>
+<p>In this case, this callback calls <code>loop.close()</code> and cancels the remaining tasks, and after that, in <code>B</code>, after <code>loop.run_forever()</code> there is a <code>loop.close()</code>. So for this use case in particular a thread-safe mechanism that allows me to know from <code>A</code> when the loop has been effectively closed would also work for me - again, not involving a mutex/condition variable/etc.</p>
+<p>I know that <code>asyncio</code> is not meant to be thread-safe, with very few exceptions, but I wanted to know if a convenient way to achieve this is provided.</p>
+<hr/>
+<p>Here is a very small snippet of what I mean in case it helps.</p>
+<pre><code>import asyncio
+import threading
+import time
+
+def thread_A():
+    print('Thread A')
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=thread_B, args=(loop,)).start()
+    time.sleep(1)
+    handle = loop.call_soon_threadsafe(callback, loop)
+    # How do I wait for the callback to complete before continuing?
+    print('Thread A out')
+
+def thread_B(loop):
+    print('Thread B')
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+    loop.close()
+    print('Thread B out')
+
+def callback(loop):
+    print('Stopping loop')
+    loop.stop()
+
+thread_A()
+</code></pre>
+<hr/>
+<p>I have tried this variation with <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.run_coroutine_threadsafe" rel="nofollow noreferrer"><code>asyncio.run_coroutine_threadsafe</code></a> but it does not work, instead thread <code>A</code> hangs forever. Not sure if I am doing something wrong or it is because I am stopping the loop.</p>
+<pre><code>import asyncio
+import threading
+import time
+
+def thread_A():
+    global future
+    print('Thread A')
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=thread_B, args=(loop,)).start()
+    time.sleep(1)
+    future = asyncio.run_coroutine_threadsafe(callback(loop), loop)
+    future.result()  # Hangs here
+    print('Thread A out')
+
+def thread_B(loop):
+    print('Thread B')
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+    loop.close()
+    print('Thread B out')
+
+async def callback(loop):
+    print('Stopping loop')
+    loop.stop()
+
+thread_A()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Callbacks are set and (mostly) forget. They are not intended to be used for something you need to get a result back from. This is why the handle produced only lets you cancel a callback (<em>this callback is no longer needed</em>), nothing more.</p>
+<p>If you need to wait for a result from an asyncio-managed coroutine in another thread, use a coroutine and schedule it as a task with <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.run_coroutine_threadsafe" rel="nofollow noreferrer"><code>asyncio.run_coroutine_threadsafe()</code></a>; this gives you a <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Future" rel="nofollow noreferrer"><code>Future()</code> instance</a>, which you can then wait for to be done.</p>
+<p>However, stopping the loop with <code>run_coroutine_threadsafe()</code> does require the loop to handle one more round of callbacks than it'll actually be able to run; the <code>Future</code> returned by <code>run_coroutine_threadsafe()</code> would otherwise not be notified of the state change of the task it scheduled. You can remedy this by running <code>asyncio.sleep(0)</code> through <code>loop.run_until_complete()</code> in thread B before closing the loop:</p>
+<pre><code>def thread_A():
+    # ... 
+    # when done, schedule the asyncio loop to exit
+    future = asyncio.run_coroutine_threadsafe(shutdown_loop(loop), loop)
+    future.result()  # wait for the shutdown to complete
+    print("Thread A out")
+
+def thread_B(loop):
+    print("Thread B")
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+    # run one last noop task in the loop to clear remaining callbacks
+    loop.run_until_complete(asyncio.sleep(0))
+    loop.close()
+    print("Thread B out")
+
+async def shutdown_loop(loop):
+    print("Stopping loop")
+    loop.stop()
+</code></pre>
+<p>This is, of course, slightly hacky and depends on the internals of callback management and cross-threading task scheduling to not change. As the default <code>asyncio</code> implementation stands, running a single noop task is plenty for several rounds of callbacks creating more callbacks being handled, but alternative loop implementations may handle this differently.</p>
+<p>So for <em>shutting down</em> the loop, you may be better off using thread-based coordination:</p>
+<pre><code>def thread_A():
+    # ...
+    callback_event = threading.Event()
+    loop.call_soon_threadsafe(callback, loop, callback_event)
+    callback_event.wait()  # wait for the shutdown to complete
+    print("Thread A out")
+
+def thread_B(loop):
+    print("Thread B")
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+    loop.close()
+    print("Thread B out")
+
+def callback(loop, callback_event):
+    print("Stopping loop")
+    loop.stop()
+    callback_event.set()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>Is there any way (besides standard threading synchronization primitives) to make A wait for the completion of the callback?</p>
+</blockquote>
+<p>Normally you'd use <code>run_coroutine_threadsafe</code>, as Martijn initially suggested. But your use of <code>loop.stop()</code> makes the callback somewhat specific. Given that, you are probably best off using the standard thread synchronization primitives, which are in this case very straightforward and can be completely decoupled from the callback implementation and the rest of your code. For example:</p>
+<pre><code>def submit_and_wait(loop, fn, *args):
+    "Submit fn(*args) to loop, and wait until the callback executes."
+    done = threading.Event()
+    def wrap_fn():
+        try:
+            fn(*args)
+        finally:
+            done.set()
+    loop.call_soon_threadsafe(wrap_fn)
+    done.wait()
+</code></pre>
+<p>Instead of using <code>loop.call_soon_threadsafe(callback)</code>, use <code>submit_and_wait(loop, callback)</code>. The threading synchronization is there, but completely hidden inside <code>submit_and_wait</code>.</p>
+</div>
+<span class="comment-copy">Feels like a duplicate. Possibly related:  <a href="https://stackoverflow.com/q/6800984/1531971">stackoverflow.com/q/6800984/1531971</a>, <a href="https://stackoverflow.com/q/35550501/1531971">stackoverflow.com/q/35550501/1531971</a>, <a href="https://stackoverflow.com/q/7836143/1531971">stackoverflow.com/q/7836143/1531971</a></span>
+<span class="comment-copy">@jdv: none of those are using asyncio.</span>
+<span class="comment-copy">If you are using threads, are you actually also using <code>asyncio</code> to run tasks? Or are you only using <code>loop.call_soon_threadsafe(callback)</code> to handle some kind of thread-related task? <code>loop.call_soon_threadsafe(callback)</code> is really only meant for other threads to <i>signal to <code>asyncio</code>-loop-managed code</i>.</span>
+<span class="comment-copy">Ok, how about <a href="https://stackoverflow.com/q/29475007/1531971">stackoverflow.com/q/29475007/1531971</a>, <a href="https://stackoverflow.com/q/44345139/1531971">stackoverflow.com/q/44345139/1531971</a></span>
+<span class="comment-copy">@jdv Thank you, but those are not for multithreaded code.</span>
+<span class="comment-copy">I was just now reading about <code>run_coroutine_threadsafe()</code>. So this would give me a future that I can safely wait on, even from another thread, and even if that task actually stops the loop?</span>
+<span class="comment-copy">I have tried with <code>while fut.running()</code>, but that seems to make thread <code>A</code> finish instantly. Even if I add a <code>time.sleep(1)</code> (for testing only! I know you're supposed to use <code>asyncio.sleep</code>) in <code>callback</code>, <code>future.running()</code> is always false...</span>
+<span class="comment-copy">@jdehesa: the issue I see is that stopping the loop also almost guarantees that the callbacks that pass the signals from the task managing the <code>shutdown_loop()</code> coroutine back to the <code>Future()</code> that thread B holds are also cancelled. The connection is severed here. Shutting down the loop needs a bit more.. handling.</span>
+<span class="comment-copy">@jdehesa: sorry about that, I've worked out what callbacks where being wiped out, and all it takes is a single run through the loop. Scheduling <code>asyncio.sleep(0)</code>, a virtual noop coroutine, with <code>asyncio.run_until_complete()</code>, is enough to have those callbacks cleared out. Run that on Thread B before closing the loop.</span>
+<span class="comment-copy">Yep that works! I may end up using thread-based coordination, like you say, for clarity and reliability, but kudos for working out a way to do it without it.</span>
+<span class="comment-copy">Yes, this works nicely and is really straightforward. I accepted the other answer because it includes a way to solve it without explicit thread synchronization, as proposed in the question, but may end up using something like this too.</span>

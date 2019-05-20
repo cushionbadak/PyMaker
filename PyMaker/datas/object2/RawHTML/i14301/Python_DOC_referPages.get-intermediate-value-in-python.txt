@@ -1,0 +1,86 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to write a Python <code>sys.excepthook</code> which, in addition to printing out the stack trace for the code as you wrote it, also prints out the <code>repr</code> for each evaluated value.</p>
+<p>For example, if I ran the following code:</p>
+<pre><code>def greeting():
+    return 'Hello'
+
+def name():
+    return
+
+greeting() + name()
+</code></pre>
+<p>Instead of just printing out:</p>
+<pre><code>Traceback (most recent call last):
+    File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+        greeting() + name()
+TypeError: cannot concatenate 'str' and 'NoneType' objects
+</code></pre>
+<p>It would also print out <code>'Hello' + None</code> so I can immediately see which value was invalid and know the right area of the code to look in (obviously this is a very simple example).</p>
+<p>I know that the CPU needs to store these intermediate values in some temporary registers... I suspect that internally Python has to do something similar and I'm hoping that there's some way I can access those temporary values, possibly through the <code>inspect</code> module or something similar.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>By the time that <code>sys.exceptionhook()</code> is called, you can't get those intermediary values any more, as they are already gone. Yes, the intermediary results of component expressions are stored somewhere by Python. You can't access that 'somewhere' directly at the time, nor are those kept around at all when an exception occurs.</p>
+<p>In CPython, the standard Python implementation, that 'somewhere' is the <em>stack</em> attached to the current frame of execution (each active function has one). Python code is compiled to <em>bytecode</em>, and an evaluation loop then executes that bytecode, and <a href="https://docs.python.org/3/library/dis.html#python-bytecode-instructions" rel="nofollow noreferrer">individual bytecode instructions</a> in bytecode operate on that stack.</p>
+<p>You can use the <a href="https://docs.python.org/3/library/dis.html#dis.dis" rel="nofollow noreferrer"><code>dis.dis()</code> function</a> to see what bytecode is used for your example expression:</p>
+<pre><code>&gt;&gt;&gt; import dis
+&gt;&gt;&gt; dis.dis("greeting() + name()")
+  1           0 LOAD_NAME                0 (greeting)
+              2 CALL_FUNCTION            0
+              4 LOAD_NAME                1 (name)
+              6 CALL_FUNCTION            0
+              8 BINARY_ADD
+             10 RETURN_VALUE
+</code></pre>
+<p>then look up what those bytecode instructions do:</p>
+<ul>
+<li><a href="https://docs.python.org/3/library/dis.html#opcode-LOAD_NAME" rel="nofollow noreferrer"><code>LOAD_NAME 0</code></a> finds the object named <code>greeting</code> and puts that on the top of the stack (TOS).</li>
+<li><a href="https://docs.python.org/3/library/dis.html#opcode-CALL_FUNCTION" rel="nofollow noreferrer"><code>CALL_FUNCTION 0</code></a> removes 0 elements from the stack to be the arguments for a call, then takes the next object from the stack to be the callable object, calls that object with the arguments, and puts the result as the new TOS.</li>
+<li><a href="https://docs.python.org/3/library/dis.html#opcode-BINARY_ADD" rel="nofollow noreferrer"><code>BINARY_ADD</code></a> takes the top two elements from the stack, adds them up, and puts the result back on TOS.</li>
+</ul>
+<p>So together, <code>LOAD_NAME</code> and <code>CALL_FUNCTION</code> execute a call to a named object, and the top of the stack ends up referencing both results, the <code>name()</code> result on top of the <code>greeting()</code> result. The <code>BINARY_ADD</code> instruction then replaces those two results on the stack with the result of adding them together.</p>
+<p>You don't have access to that stack from within Python, because it is the very act of executing Python bytecode that makes Python work in the first place. Any code that <em>could</em> access the stack would have to deal with the fact that stack is currently being used to execute that Python code!</p>
+<p>But you have a bigger problem. If you look at the CPython source code, you can search for instruction names in the evaluation loop in <code>ceval.c</code>. When you look at the <a href="https://github.com/python/cpython/blob/44467e8ea4cea390b0718702291b4cfe8ddd67ed/Python/ceval.c#L1272-L1296" rel="nofollow noreferrer"><code>BINARY_ADD</code> instruction implementation</a>, you can see that the two input values are removed from the stack <em>before</em> adding them together:</p>
+<pre class="lang-c prettyprint-override"><code>TARGET(BINARY_ADD) {
+    PyObject *right = POP();
+    PyObject *left = TOP();
+    PyObject *sum;
+    // code to set sum as the result of addibg left to right
+    SET_TOP(sum);
+    if (sum == NULL)
+        goto error;
+    DISPATCH();
+}
+</code></pre>
+<p>If <code>BINARY_ADD</code> fails with an exception, <code>sum == NULL</code> is true and <code>goto error</code> is executed to wind down the call stack and propagate the exception along to the first <code>try</code> block or, failing that, eventually calling the <code>sys.excepthook()</code> function. At that point, the intermediary results are gone from the stack. The local <code>right</code> and <code>left</code> pointers in the above block are also long, long gone (C uses block scope, and when <code>goto error</code> is executed the scope is exited so the variables are lost).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Use a pythonic <code>try/except</code> block:</p>
+<pre><code>g = greeting()
+n = name()
+try:
+    g + n
+except:
+    raise ValueError('g: %s, n: %s' % (g, n))
+</code></pre>
+<p>For @LukasGraf, a reading list on "proper Python coding practices":</p>
+<ul>
+<li><a href="http://doughellmann.com/2009/06/19/python-exception-handling-techniques.html" rel="nofollow">Python Exception Handling Techniques</a></li>
+<li><a href="http://eli.thegreenplace.net/2008/08/21/robust-exception-handling/" rel="nofollow">Robust exception handling</a></li>
+<li><a href="http://www.jeffknupp.com/blog/2013/02/06/write-cleaner-python-use-exceptions/" rel="nofollow">Write Cleaner Python: Use Exceptions</a></li>
+<li><a href="https://google-styleguide.googlecode.com/svn/trunk/pyguide.html#Exceptions" rel="nofollow">Google Python Style Guide</a></li>
+<li><a href="https://www.python.org/dev/peps/pep-0008/#programming-recommendations" rel="nofollow">PEP 0008 -- Style Guide for Python Code: Programming Recommendations</a></li>
+<li><a href="http://python.net/~goodger/projects/pycon/2007/idiomatic/handout.html#eafp-vs-lbyl" rel="nofollow">Code Like a Pythonista: Idiomatic Python -- EAFP vs. LBYL</a></li>
+</ul>
+</div>
+<span class="comment-copy">The values are gone by the time the line is executed. You are right that the values are stored somewhere, on the stack actually, but they are popped from it right when the <code>+</code> is evaluated, so at that time, the values are gone. You would have to stop the bytecode evaluation in between to access the values. And that’s something a debugger does; it’s definitely not something that has a place in a normal application.</span>
+<span class="comment-copy">What @poke said. But: The traceback object that <code>sys.excepthook</code> gets passed has a reference <code>traceback.tb_frame</code> to the stack frame where the exception occurred. On that frame, you can access the frame locals with <code>traceback.tb_frame.f_locals</code>. This doesn't help in your example where you're concatenating the <i>results of function calls</i>, but would be of some help for other names that directly reference simple values.</span>
+<span class="comment-copy">You might also be interested in <code>pdb</code>'s port-mortem debugging: See <a href="https://docs.python.org/2/library/pdb.html#pdb.post_mortem" rel="nofollow noreferrer"><code>pdb.post_mortem(tb)</code></a> and <a href="https://docs.python.org/2/library/pdb.html#pdb.pm" rel="nofollow noreferrer"><code>pdb.pm()</code></a></span>
+<span class="comment-copy">Interesting idea: Use a bytecode interpreter written in Python to execute the Python bytecode one-by-one to be able to access the stack directly.</span>
+<span class="comment-copy">@poke that sounds like a ton of work to write and execute ;-) If someone held a gun to my head and said "solve this", I'd probably get the source line from the traceback, turn that into an <a href="https://docs.python.org/2/library/ast.html" rel="nofollow noreferrer"><code>ast</code></a>, break the expression apart and try to evaluate the sub-expressions in the context of the respective stack frame.</span>
+<span class="comment-copy">Thanks. What lead to you finding and answering this nearly four years later?</span>
+<span class="comment-copy">I found it via an invalid flag I was handling on the other answer.</span>
+<span class="comment-copy">The OP phrased his question in a way that makes it pretty clear that he's trying to solve the general case - otherwise he probably wouldn't be using  <code>sys.excepthook</code>, would he? So this does not answer the question either.</span>
+<span class="comment-copy">You're right, but by following proper Python coding practices, this question is moot.</span>
+<span class="comment-copy">Huh? What do you mean by that? This question is totally legitimate, and many frameworks do something very similar to what the OP asks, for good reasons.</span>
+<span class="comment-copy">Python is not a framework, it is a programming language.  Its behavior is similar to most other languages in this case (NPE, anyone?)</span>
+<span class="comment-copy">You don't say. What I'm saying is that it's common practice for <i>Python framworks</i> like Flask, Zope, templating engines like Mako or Jinja, etc. to use <code>sys.excepthook</code> to enrich the stack trace with additional information about the context, frame locals, and so on, in order to have more meaningful traceback in case of <i>unexpected</i> runtime errors. I still have no idea what specifically you're referring to when you say "proper Python coding practices".</span>

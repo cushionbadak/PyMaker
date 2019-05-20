@@ -1,0 +1,144 @@
+<div class="post-text" itemprop="text">
+<p>I just started using Numpy and noticed that iterating through each element in a Numpy array is ~4x slower than doing the same but with a list of lists. I know now that this defeats the purpose of Numpy and I should vectorize the function if possible. My question is though why is it 4x slower. That seems like quite a large amount.</p>
+<p>I ran the tests below using <code>%timeit</code></p>
+<pre><code>import numpy as np
+b = np.eye(1000)
+a = b.tolist()
+
+%timeit b[100][100] #1000000 loops, best of 3: 692 ns per loop
+%timeit a[100][100] #10000000 loops, best of 3: 70.7 ns per loop
+%timeit b[100,100] #1000000 loops, best of 3: 343 ns per loop
+%timeit b.item(100,100) #1000000 loops, best of 3: 297 ns per loop
+</code></pre>
+<p>I tried to use <code>dis.dis</code> to see what was going on under the hood but got:</p>
+<pre><code>TypeError: don't know how to disassemble method-wrapper objects
+</code></pre>
+<p>Then I tried to look at the Numpy source code but couldn't figure out which file corresponded to array element access. I'm curious what accounts for the extra overhead, and more importantly how to figure this out for myself in the future. It seems like python can't be easily compiled to C code so that I can see the difference. But is there a way to see what byte code is generated for each line, to get a sense of the differences?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>In summary: getting an item from a NumPy array requires new Python objects to be created, whereas this is not the case for lists. Also, indexing is more slightly more complicated for NumPy arrays than lists which may add some additional overhead.</p>
+<hr/>
+<p>To recap, the NumPy operations you have listed do the following:</p>
+<ol>
+<li><code>b[100][100]</code> returns row 100 of <code>b</code> as an array, and then gets the value at index 100 of this row, returning the value as an object (e.g. a <code>np.int64</code> type).</li>
+<li><code>b[100,100]</code> returns the value at row 100 and column 100 <em>directly</em> (no intermediate array is returned first).</li>
+<li><code>b.item(100,100)</code> does the same as above <code>b[100,100]</code> except that the value is converted to a native Python type and returned.</li>
+</ol>
+<p>Now of these operation, (1) is slowest because it requires two sequential NumPy indexing operations (I'll explain why this is slower than list indexing below). (2) is quickest because only a single indexing operation is performed. Operation (3) is possibly slower as it is a method call (these are generally slow in Python).</p>
+<p>Why is <em>list</em> access still faster than <code>b[100,100]</code>?</p>
+<h2>Object creation</h2>
+<p>Python lists are arrays of pointers to objects in memory. For example, the list  <code>[1, 2, 3]</code> does not contain those integers directly, but rather pointers to the memory addresses were each integer object already exists. To get an item from the list, Python just returns a reference to the object.</p>
+<p>NumPy arrays are not collections of objects. The array <code>np.array([1, 2, 3])</code> is just a contiguous block of memory with bits set to represent those integer values. To get an integer from this array, a new Python object  must be constructed in memory separate to the array. For instance, an object of <code>np.int64</code> may be returned by the indexing operation: this object did not exist previously and had to be created.</p>
+<h2>Indexing complexity</h2>
+<p>Two other reasons why <code>a[100][100]</code> (getting from the list) is quicker than <code>b[100,100]</code> (getting from the array) are that:</p>
+<ul>
+<li><p>The bytecode opcode <code>BINARY_SUBSCR</code> is executed when indexing both lists and arrays, but it is optimised for the case of Python lists.</p></li>
+<li><p>The internal C function handling integer indexing for Python lists is very short and simple. On the other hand, NumPy indexing is much more complicated and a significant amount of code is executed to determine the type of indexing being used so that the correct value can be returned.</p></li>
+</ul>
+<p>Below, the steps for accessing elements in a list and array with <code>a[100][100]</code> and <code>b[100,100]</code> are described in more detail.</p>
+<h3>Bytecode</h3>
+<p>The same four bytecode opcodes are triggered for both lists and arrays:</p>
+<pre><code>  0 LOAD_NAME                0 (a)           # the list or array
+  3 LOAD_CONST               0 (100)         # index number (tuple for b[100,100])
+  6 BINARY_SUBSCR                            # find correct "getitem" function
+  7 RETURN_VALUE                             # value returned from list or array
+</code></pre>
+<p>Note: if you start chain indexing for multi-dimensional lists, e.g. <code>a[100][100][100]</code>, you start to repeat these bytecode instructions. This does not happen for NumPy arrays using the tuple indexing: <code>b[100,100,100]</code> uses just the four instructions. This is why the gap in the timings begins to close as the number of dimensions increases.</p>
+<h3>Finding the correct "getitem" function</h3>
+<p>The functions for accessing lists and arrays are different and the correct one needs to be found in each case. This task is handled by the <a href="https://hg.python.org/cpython/file/45b1ae1ef318/Python/ceval.c#l1374" rel="noreferrer"><code>BINARY_SUBSCR</code></a> opcode:</p>
+<pre class="lang-C prettyprint-override"><code>w = POP();                                            // our index
+v = TOP();                                            // our list or NumPy array
+if (PyList_CheckExact(v) &amp;&amp; PyInt_CheckExact(w)) {    // do we have a list and an int?
+    /* INLINE: list[int] */
+    Py_ssize_t i = PyInt_AsSsize_t(w);
+        if (i &lt; 0)
+             i += PyList_GET_SIZE(v);
+        if (i &gt;= 0 &amp;&amp; i &lt; PyList_GET_SIZE(v)) {
+             x = PyList_GET_ITEM(v, i);               // call "getitem" for lists
+             Py_INCREF(x);
+        }
+        else
+            goto slow_get;
+     }
+     else
+       slow_get:
+         x = PyObject_GetItem(v, w);                  // else, call another function
+                                                      // to work out what is needed
+     Py_DECREF(v);
+     Py_DECREF(w);
+     SET_TOP(x);
+     if (x != NULL) continue;
+     break;
+</code></pre>
+<p>This code is optimised for Python lists. If the function sees a list, it will quickly call the function <code>PyList_GET_ITEM</code>. This list can now be accessed at the required index (see next section below).</p>
+<p>However, if it doesn't see a list (e.g. we have a NumPy array), it takes the "slow_get" path. This in turn calls another function <a href="https://hg.python.org/cpython/file/ea33b61cac74/Objects/abstract.c#l136" rel="noreferrer"><code>PyObject_GetItem</code></a> to check which "getitem" function the object is mapped to:</p>
+<pre class="lang-C prettyprint-override"><code>PyObject_GetItem(PyObject *o, PyObject *key)
+{
+    PyMappingMethods *m;
+
+    if (o == NULL || key == NULL)
+        return null_error();
+
+    m = o-&gt;ob_type-&gt;tp_as_mapping;
+    if (m &amp;&amp; m-&gt;mp_subscript)
+        return m-&gt;mp_subscript(o, key);
+    ...
+</code></pre>
+<p>In the case of NumPy arrays, the correct function is located in <a href="https://docs.python.org/3/c-api/typeobj.html#c.PyMappingMethods.mp_subscript" rel="noreferrer"><code>mp_subscript</code></a> in the <code>PyMappingMethods</code> structure.</p>
+<p>Notice the additional function calls before this correct "get" function can be called. These calls add to the overhead for <code>b[100]</code>, although how much will depend on how Python/NumPy was compiled, the system architecture, and so on.</p>
+<h3>Getting from a Python list</h3>
+<p>Above it was seen that the function <a href="https://hg.python.org/cpython/file/ea33b61cac74/Objects/listobject.c#l195" rel="noreferrer"><code>PyList_GET_ITEM</code></a> is called. This is a short function that essentially looks like this*:</p>
+<pre class="lang-C prettyprint-override"><code>PyList_GetItem(PyObject *op, Py_ssize_t i)
+{
+    if (!PyList_Check(op)) {                            // check if list
+        PyErr_BadInternalCall();
+        return NULL;
+    }
+    if (i &lt; 0 || i &gt;= Py_SIZE(op)) {                    // check i is in range
+        if (indexerr == NULL) {
+            indexerr = PyUnicode_FromString(
+                "list index out of range");
+            if (indexerr == NULL)
+                return NULL;
+        }
+        PyErr_SetObject(PyExc_IndexError, indexerr);
+        return NULL;
+    }
+    return ((PyListObject *)op) -&gt; ob_item[i];           // return reference to object
+}
+</code></pre>
+<p>* <code>PyList_GET_ITEM</code> <em>is actually the macro form of this function which does the same thing, minus error checking.</em></p>
+<p>This means that getting the item at index <code>i</code> of a Python list is relatively simple. Internally, Python checks whether the type of the item being is a list, whether <code>i</code> is in the correct range for the list, and then returns the reference to the object in the list.</p>
+<h3>Getting from a NumPy array</h3>
+<p>In contrast, NumPy has to do much more work before the value at the requested index can be returned.</p>
+<p>Arrays can be indexed in a variety of different ways and NumPy has to decide which index routine is needed. The various indexing routines are handled largely by code in <a href="https://github.com/numpy/numpy/blob/master/numpy/core/src/multiarray/mapping.c#l141" rel="noreferrer"><code>mapping.c</code></a>. </p>
+<p>Anything used to index NumPy arrays passes through the function <a href="https://github.com/numpy/numpy/blob/master/numpy/core/src/multiarray/mapping.c#l164" rel="noreferrer"><code>prepare_index</code></a> which begins the parsing of the index and stores the information about broadcasting, number of dimensions, and so on. Here is the call signature for the function: </p>
+<pre class="lang-C prettyprint-override"><code>NPY_NO_EXPORT int
+prepare_index(PyArrayObject *self, PyObject *index,
+              npy_index_info *indices,
+              int *num, int *ndim, int *out_fancy_ndim, int allow_boolean)
+
+ /* @param the array being indexed
+  * @param the index object
+  * @param index info struct being filled (size of NPY_MAXDIMS * 2 + 1)
+  * @param number of indices found
+  * @param dimension of the indexing result
+  * @param dimension of the fancy/advanced indices part
+  * @param whether to allow the boolean special case 
+  */
+</code></pre>
+<p>The function has to do a lot of checks. Even for a relatively simple index such as <code>b[100,100]</code>, a lot of information has to be inferred so that NumPy can return a reference (view) to the correct value.</p>
+<p>In conclusion, it takes longer for the "getitem" function for NumPy to be found and the functions handling the indexing of arrays are necessarily more complex than the single function for Python lists.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>When numpy returns the item from one position in the array, it must convert the internal C type (float, double, etc.) value into a Python-typed scalar value (int, long, float). It then returns the reference to the Python-typed value. This conversion takes some time.</p>
+<p>Interestingly enough, the same inefficiency hurts performance in another way, too. I had a Python list that I was indexing into using index values that came from a numpy array. That same conversion occurs to create the Python integer value that is needed to index into a Python list. I had to rewrite my algorithm with an intermediate array of native Python integers.</p>
+</div>
+<span class="comment-copy">Interesting finding. Never seen actual comparison of access times of numpy vs lists. Anyway numpy access to single elements is slow. Probably due to underhood function call. If you add function call to list access the timings will be close. Something like  def funca():      return a[100][100]</span>
+<span class="comment-copy">In its C incarnation, a Python list is basically an array of <code>PyObject</code> pointers. To iterate over it, you increase a pointer, dereference it and you are done, you already have a fully qualified Python object. NumPy arrays are arrays of basic types, in your example probably C <code>int</code>. Getting the value in its <code>int</code> form is about as fast as getting the Python object from the list. But you then have to convert it into a Python object, probably with a call to <a href="https://docs.python.org/3/c-api/long.html#c.PyLong_FromLong" rel="nofollow noreferrer"><code>PyLong_FromLong</code></a> or something similar, hence the extra overhead.</span>
+<span class="comment-copy">@Jaime why not post this an answer? I'm sure this comes up semi-regularly</span>
+<span class="comment-copy">@Jaime Did you mean converting it to a NumPy scalar type rather than Python object?</span>
+<span class="comment-copy">How did you figure out which bytecode opcodes were triggered for list accesses?</span>
+<span class="comment-copy">@emschorsch: I used <code>dis.dis('a[100]')</code> to find the bytecode here.</span>
+<span class="comment-copy">When I try <code>a = [0]*1000; dis'dis('a[100]')</code> I get:  <code>File "/System/Library/Frameworks/Python.framework/Versions/2.7/lib/python2.7/dis.py", line 166, in findlabels     oparg = ord(code[i]) + ord(code[i+1])*256 IndexError: string index out of range</code></span>
+<span class="comment-copy">@emschorsch: In Python 3.4 you can pass some strings to <code>dis</code>. In Python 2, you could write a function and pass that instead, e.g. <code>def get(): return a[100]</code> and then <code>dis.dis(get)</code>.</span>

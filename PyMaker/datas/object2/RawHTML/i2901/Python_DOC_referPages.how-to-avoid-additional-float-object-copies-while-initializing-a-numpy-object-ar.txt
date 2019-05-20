@@ -1,0 +1,101 @@
+<div class="post-text" itemprop="text">
+<p>I naively assumed that assigning a value via ellipsis <code>[...]</code>, e.g.</p>
+<pre><code>a = np.empty(N, dtype=np.object)
+a[...] = 0.0
+</code></pre>
+<p>is basically a faster version of the following naive loop:</p>
+<pre><code>def slow_assign_1d(a, value):
+    for i in range(len(a)):
+        a[i] = value
+</code></pre>
+<p>However this seems not to be the case. Here is an example for different behavior:</p>
+<pre><code>&gt;&gt;&gt; a=np.empty(2, dtype=np.object)
+&gt;&gt;&gt; a[...] = 0.0
+&gt;&gt;&gt; a[0] is a[1]
+False
+</code></pre>
+<p>the object <code>0.0</code> seems to be cloned. Yet when I use the naive slow version:</p>
+<pre><code>&gt;&gt;&gt; a=np.empty(2, dtype=np.object)
+&gt;&gt;&gt; slow_assign(a, 0.0)
+&gt;&gt;&gt; a[0] is a[1]
+True
+</code></pre>
+<p>all elements are the "same".</p>
+<p>Funnily enough, the desired behavior with ellipsis can be observed for example with a custom class:</p>
+<pre><code>&gt;&gt;&gt; class A:
+       pass
+&gt;&gt;&gt; a[...]=A()
+&gt;&gt;&gt; a[0] is a[1]
+True 
+</code></pre>
+<p>Why do get floats this "special" treatment and is there a way for fast initialization with a float values without producing copies?</p>
+<p>NB: <code>np.full(...)</code> and <code>a[:]</code> display the same behavior as <code>a[...]</code>: the object <code>0.0</code> is cloned/its copies are  created.</p>
+<hr/>
+<p><strong>Edit:</strong> As @Till Hoffmann pointed out, the desired behavior for strings and integers is only the case for small integers (-5...255) and short strings (one char), because they come from a pool and there never more than one object of this kind.</p>
+<pre><code>&gt;&gt;&gt; a[...] = 1         # or 'a'
+&gt;&gt;&gt; a[0] is a[1]
+True
+&gt;&gt;&gt; a[...] = 1000      # or 'aa'
+&gt;&gt;&gt; a[0] is a[1]
+False
+</code></pre>
+<p>It seems as if the "desired behavior" is only for types numpy cannot downcast to something, for example:</p>
+<pre><code>&gt;&gt;&gt; class A(float): # can be downcasted to a float
+&gt;&gt;&gt;     pass
+&gt;&gt;&gt; a[...]=A()
+&gt;&gt;&gt; a[0] is a[1]
+False
+</code></pre>
+<p>Even more, <code>a[0]</code> is no longer of type <code>A</code> but of type <code>float</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is actually an issue with the integers rather than the floats. In particular, 
+"small" integers are cached in python such that all of them refer back to the same memory, thus have the same <code>id</code>, and are thus identical when compared with the <code>is</code> operator. The same is not true for floats. See <a href="https://stackoverflow.com/questions/306313/is-operator-behaves-unexpectedly-with-integers">"is" operator behaves unexpectedly with integers</a> for a more in-depth discussion. See <a href="https://docs.python.org/3/c-api/long.html#c.PyLong_FromLong" rel="nofollow noreferrer">https://docs.python.org/3/c-api/long.html#c.PyLong_FromLong</a> for the official definition of "small".</p>
+<hr/>
+<p>Regarding the particular example of <code>A</code> inheriting from <code>float</code>, the <a href="https://docs.scipy.org/doc/numpy/user/basics.indexing.html#assigning-values-to-indexed-arrays" rel="nofollow noreferrer">numpy documentation</a> states that</p>
+<blockquote>
+<p>Note that assignments may result in changes if assigning higher types to lower types [...]</p>
+</blockquote>
+<p>One might argue that, in the example case provided above, no assigning of a higher type to a lower type occurs because <code>np.object</code> should be the most general type. However, inspecting the type of the array elements, it becomes clear that the type is down-cast to a <code>float</code> when assigning using the <code>[...]</code> assignment.</p>
+<pre><code>a = np.empty(2, np.object)
+
+class A(float):
+    pass
+
+a[0] = a[1] = A()
+print(type(a[0]))  # &lt;class '__main__.A'&gt;
+a[...] = A()
+print(type(a[0]))  # &lt;class 'float'&gt;
+</code></pre>
+<p>As an aside: you probably won't be able to save much memory by storing a reference to the object of interest unless the individual objects are very large. E.g. storing a single precision floating point number is cheaper than storing a pointer to it (on a 64bit system). If your objects are indeed very large they are (probably) not down-castable to a primitive type so the problem is unlikely to arise in the first place.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This behavior is a numpy bug: <a href="https://github.com/numpy/numpy/issues/11701" rel="nofollow noreferrer">https://github.com/numpy/numpy/issues/11701</a></p>
+<p>So probably one has to use a workaround until the bug is fixed. I ended up with using the naive slow version implemented/compiled with cython, here for example for one dimension and <code>np.full</code>:</p>
+<pre><code>%%cython
+cimport numpy as np
+import numpy as np
+def cy_full(Py_ssize_t n, object obj):
+    cdef np.ndarray[dtype=object] res = np.empty(n, dtype=object)
+    cdef Py_ssize_t i
+    for i in range(n):
+        res[i]=obj
+    return res
+
+a=cy_full(5, np.nan)
+
+a[0] is a[4]  # True as expected!
+</code></pre>
+<p>There is also no performance disadvantage compared to <code>np.full</code>:</p>
+<pre><code>%timeit cy_full(1000, np.nan)
+# 8.22 µs ± 39.9 ns per loop (mean ± std. dev. of 7 runs, 100000 loops each)
+
+%timeit np.full(1000, np.nan, dtype=np.object)
+# 22.3 µs ± 129 ns per loop (mean ± std. dev. of 7 runs, 10000 loops each)
+</code></pre>
+</div>
+<span class="comment-copy">I may not fully understand why you would want to use ellipsis, doesn't a[:] = 0.0 do the trick after initializing the empty numpy object?</span>
+<span class="comment-copy">@Koen <code>a[:]=0.0</code> has the same behavior as <code>a[...]</code> - object <code>0.0</code> is cloned/copied. I used <code>[...]</code> only because in my actual code the array is multi-dimensional.</span>
+<span class="comment-copy">You are right, I forgot about it and tested only with 0 and strings that consisted of a char, which are also cached in a pool. This explains the difference I have seen...</span>
+<span class="comment-copy">I edited my question, ints and strings were bad examples, making it kind of chameleon question, sorry for that. I hope you have also insight into the second part of the question - how to avoid the copying.</span>
+<span class="comment-copy">Provided a bit more context.</span>

@@ -1,0 +1,102 @@
+<div class="post-text" itemprop="text">
+<p>I was trying to reverse a list in python. 
+There are many methods out there and <code>[::-1]</code> seems to be a great one!
+But I'm curious how <code>[::-1]</code> is done? What's the time complexity of it?</p>
+<p>I searched through CPython repo in github, but I couldn't find any clue.
+My strategy of searching was that I searched the key word: <code>::</code> in CPython repo. 
+Since there is <code>::</code> in the python syntax, i.e. <code>[::-1]</code>, there may be <code>::</code> in the CPython source code so that <code>[::-1]</code> can refer to it and does the reversing. Does this make sense?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>list[...]</code> is using <em>indexing</em>, or more accurate <a href="https://docs.python.org/3/reference/expressions.html#subscriptions" rel="nofollow noreferrer"><em>subscription</em> syntax</a>, and <code>[start:stop:step]</code> is a <a href="https://docs.python.org/3/reference/expressions.html#slicings" rel="nofollow noreferrer"><em>slicing</em></a>. Python 3 passes a <code>slice()</code> object to the subscription call for such cases, there is no <code>::</code> in the CPython source code as that's not how the language parser would threat that part. Slicing notation allows for defaults, an empty slot between in the <code>start:stop:step</code> parts means that a default is picked, and <code>list[::-1]</code> leaves <code>start</code> and <code>stop</code> at defaults (represented by <code>None</code>, and the step value is set to <code>-1</code>.</p>
+<p>All this just means you need to remember to <em>separate syntax from operations</em>. You could analyse the syntax by parsing it into an abstract syntax tree, or by disassembling the bytecode generated for it. When you <a href="https://docs.python.org/3/library/ast.html#ast.parse" rel="nofollow noreferrer">generate an abstract syntax tree</a> for <code>list[::-1]</code> you'll see that the parser separates out the slice part:</p>
+<pre><code>&gt;&gt;&gt; import ast
+&gt;&gt;&gt; ast.dump(ast.parse('list[::-1]', '', 'eval').body)  # expression body only
+"Subscript(value=Name(id='list', ctx=Load()), slice=Slice(lower=None, upper=None, step=UnaryOp(op=USub(), operand=Num(n=1))), ctx=Load())"
+</code></pre>
+<p>So the <code>Subscript()</code> syntax node operates on the name <code>list</code>, passing in a slice. </p>
+<p><a href="https://docs.python.org/3/library/dis.html#dis.dis" rel="nofollow noreferrer">Producing a disassembly</a> for this operation shows the bytecode used:</p>
+<pre><code>&gt;&gt;&gt; dis.dis('list[::-1]')
+  1           0 LOAD_NAME                0 (list)
+              2 LOAD_CONST               0 (None)
+              4 LOAD_CONST               0 (None)
+              6 LOAD_CONST               1 (-1)
+              8 BUILD_SLICE              3
+             10 BINARY_SUBSCR
+             12 RETURN_VALUE
+</code></pre>
+<p>Here the <a href="https://docs.python.org/3/library/dis.html#opcode-BUILD_SLICE" rel="nofollow noreferrer"><code>BUILD_SLICE()</code> bytecode operation</a> takes the top-three elements from the stack (put there by <code>LOAD_CONST</code> operations at indices 2, 4 and 6) to build a <code>slice()</code> object, which is then passed to the <code>list</code> object (next on the stack) with <code>BINARY_SUBSCR</code>. That last bytecode is the <code>Subscript()</code> operation in the AST, and the bytecodes 2-8 are the <code>Slice()</code> object in the AST.</p>
+<p>With the bytecode in hand, you can then head over to the <a href="https://github.com/python/cpython/blob/731ff68eeef58babdf2b32dc9a73b141760c2be9/Python/ceval.c#L926-L3486" rel="nofollow noreferrer">Python bytecode evaluation loop</a> to see what those bytecodes actually <em>do</em>. I'll skip <code>BUILD_SLICE</code>, that's just creating a simple <code>slice()</code> object to hold the <code>start</code>, <code>stop</code> and <code>step</code> values.</p>
+<p>Focusing on the <code>BINARY_SUBSCR</code> opcode, we find:</p>
+<pre class="lang-c prettyprint-override"><code>TARGET(BINARY_SUBSCR) {
+    PyObject *sub = POP();
+    PyObject *container = TOP();
+    PyObject *res = PyObject_GetItem(container, sub);
+    Py_DECREF(container);
+    Py_DECREF(sub);
+    SET_TOP(res);
+    if (res == NULL)
+        goto error;
+    DISPATCH();
+}
+</code></pre>
+<p>So Python takes the top of the stack and puts that in <code>sub</code> (that's the <code>slice()</code> object here), and puts the <code>list</code> reference into <code>container</code>, and then calls <code>PyObject_GetItem(container, sub)</code>. That's it. Next step then is to find <code>PyObject_GetItem()</code>. That's defined in <a href="https://github.com/python/cpython/blob/master/Objects/abstract.c#L142-L185" rel="nofollow noreferrer"><code>abstract.c</code></a>, and the first thing it does is see if the object is a mapping type:</p>
+<pre class="lang-c prettyprint-override"><code>m = o-&gt;ob_type-&gt;tp_as_mapping;
+if (m &amp;&amp; m-&gt;mp_subscript) {
+    PyObject *item = m-&gt;mp_subscript(o, key);
+    assert((item != NULL) ^ (PyErr_Occurred() != NULL));
+    return item;
+}
+</code></pre>
+<p><code>-&gt;ob_type</code> is the object class (<code>type(object)</code> does the same), and <a href="https://docs.python.org/3/c-api/typeobj.html#c.tp_as_mapping" rel="nofollow noreferrer"><code>-&gt;tp_as_mapping</code></a> is set when the <a href="https://docs.python.org/3/c-api/typeobj.html#mapping-structs" rel="nofollow noreferrer">mapping protocol is supported</a>. If the mapping protocol is supported then <code>m-&gt;mp_subscript(o, key);</code> is called with <code>o</code> being the list object, and <code>m</code> being the list mapping support definition.</p>
+<p>Lists support this protocol, because only this protocol supports slice objects (it implements the <a href="https://docs.python.org/3/c-api/typeobj.html#sequence-object-structures" rel="nofollow noreferrer">sequence protocol as well</a>, but that only accepts integers and a much older, more limited form of slicing with just two indices). We can see that <code>list</code> implements the protocol by looking for a <a href="https://github.com/python/cpython/blob/731ff68eeef58babdf2b32dc9a73b141760c2be9/Objects/listobject.c#L2953-L2994" rel="nofollow noreferrer"><code>tp_as_mapping</code> entry in the <code>PyTypeObject PyList_Type</code> type definition</a>:</p>
+<pre class="lang-c prettyprint-override"><code>PyTypeObject PyList_Type = {
+    PyVarObject_HEAD_INIT(&amp;PyType_Type, 0)
+    "list",
+    sizeof(PyListObject),
+    0,
+    // ...
+    &amp;list_as_mapping, /* tp_as_mapping */
+    // ...
+};
+</code></pre>
+<p>which points to <a href="https://github.com/python/cpython/blob/731ff68eeef58babdf2b32dc9a73b141760c2be9/Objects/listobject.c#L2947-L2951" rel="nofollow noreferrer"><code>list_as_mapping</code></a> which is defined as</p>
+<pre class="lang-c prettyprint-override"><code>static PyMappingMethods list_as_mapping = {
+    (lenfunc)list_length,
+    (binaryfunc)list_subscript,
+    (objobjargproc)list_ass_subscript
+};
+</code></pre>
+<p>So now we know where to find the actual implementation for the indexing operation; that implementation is handled by the <a href="https://github.com/python/cpython/blob/731ff68eeef58babdf2b32dc9a73b141760c2be9/Objects/listobject.c#L2731-L2783" rel="nofollow noreferrer"><code>list_subscript()</code> function</a>, which uses <code>PySlice_Check()</code> to check for <code>slice()</code> objects, and then just creates a new list object and copies the indices over:</p>
+<pre class="lang-c prettyprint-override"><code>if (slicelength &lt;= 0) {
+    return PyList_New(0);
+}
+else if (step == 1) {
+    return list_slice(self, start, stop);
+}
+else {
+    result = list_new_prealloc(slicelength);
+    if (!result) return NULL;
+
+
+    src = self-&gt;ob_item;
+    dest = ((PyListObject *)result)-&gt;ob_item;
+    for (cur = start, i = 0; i &lt; slicelength;
+         cur += (size_t)step, i++) {
+        it = src[cur];
+        Py_INCREF(it);
+        dest[i] = it;
+    }
+    Py_SIZE(result) = slicelength;
+    return result;
+}
+</code></pre>
+<p>For a non-empty slice, with a step size of <code>-1</code>, the <code>else</code> branch is taken, where <a href="https://github.com/python/cpython/blob/731ff68eeef58babdf2b32dc9a73b141760c2be9/Objects/listobject.c#L183-L198" rel="nofollow noreferrer"><code>list_new_prealloc()</code></a> creates a new, pre-allocated list to accommodate all slice indices, then a <code>for</code> loop that uses <code>cur += (size_t)step</code> is used to generate the index to copy into the new list. </p>
+<p>For your <code>list[::-1]</code> slice, the <code>list</code> object is passed in a <code>slice(None, None, -1)</code> object, and <code>list_subscript</code> uses the <a href="https://github.com/python/cpython/blob/731ff68eeef58babdf2b32dc9a73b141760c2be9/Objects/sliceobject.c#L195-L238" rel="nofollow noreferrer"><code>PySlice_Unpack()</code></a> and <a href="https://github.com/python/cpython/blob/731ff68eeef58babdf2b32dc9a73b141760c2be9/Objects/sliceobject.c#L240-L280" rel="nofollow noreferrer"><code>PySlice_AdjustIndices()</code> functions</a> to turn that into concrete <code>slicelength</code>, <code>start</code>, <code>stop</code> and <code>step</code> values; for a negative <code>step</code> and <code>start</code> and <code>stop</code> both set to <code>None</code> the end result is that <code>slicelength</code> is set to <code>len(list)</code>, <code>start</code> is set to <code>len(list) - 1</code>, and <code>stop</code> to <code>-1</code>.</p>
+<p>Thus, the effect on the above <code>for</code> loop is that <em>all</em> elements, starting at index <code>len(list) - 1</code> and iterating through to index <code>0</code>, are copied in to the new list object.</p>
+<p>So reversing with <code>list[::-1]</code> is a O(N) operation, for length N of the list (this includes pre-allocation, which takes up to O(N) time to allocate memory for the list references of the new list).</p>
+</div>
+<span class="comment-copy">nice, and time complexity is O(n) presumably</span>
+<span class="comment-copy">@Chris_Rands: exactly.</span>
+<span class="comment-copy">@MartijnPieters thank you!! You know what? After the first sight at your answer, I was looking at Amazon WishList. LOL.  Things are more clear to me now although not thoroughly ( since I just began my programming journey and I don't write C )  Just another quick question: so to understand what's going on behind the python codes, or to write efficient python code, I have to learn C and dig into CPython repo right ?</span>
+<span class="comment-copy">@Denielll: it's not required to learn C, only if you want to know exactly how CPython does things under the hood. Things like the time complexity of slices are <a href="https://wiki.python.org/moin/TimeComplexity" rel="nofollow noreferrer">documented for you on the Python wiki</a> (<i>Get Slice</i>: O(k) average and worst case).</span>
+<span class="comment-copy">@Denielll: I'd start with getting to know Python syntax better, and perhaps try another programming language or two. When you learn multiple programming languages you get a much better feel of how each language solves similar problems, and that can help you understand why Python or another language has the syntax that they have. From there, you can then expand into <i>parsing</i> and <i>compilation</i> and <i>bytecode</i> and such. I gave you my CPython code answer because you seemed to be asking for exactly that.</span>

@@ -1,0 +1,1017 @@
+<div class="post-text" itemprop="text">
+<p>I'm using the <a href="http://docs.python.org/library/subprocess.html" rel="noreferrer">subprocess module</a> to start a subprocess and connect to it's output stream (stdout). I want to be able to execute non-blocking reads on its stdout. Is there a way to make .readline non-blocking or to check if there is data on the stream before I invoke <code>.readline</code>? I'd like this to be portable or at least work under Windows and Linux.</p>
+<p>here is how I do it for now (It's blocking on the <code>.readline</code> if no data is avaible):</p>
+<pre><code>p = subprocess.Popen('myprogram.exe', stdout = subprocess.PIPE)
+output_str = p.stdout.readline()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="https://stackoverflow.com/questions/375427/non-blocking-read-on-a-stream-in-python/4025909#4025909"><code>fcntl</code></a>, <a href="https://stackoverflow.com/questions/375427/non-blocking-read-on-a-stream-in-python/375511#375511"><code>select</code></a>, <a href="https://stackoverflow.com/questions/375427/non-blocking-read-on-a-stream-in-python/437888#437888"><code>asyncproc</code></a> won't help in this case.</p>
+<p>A reliable way to read a stream without blocking regardless of operating system is to use <a href="https://docs.python.org/3/library/queue.html#queue.Queue.get_nowait" rel="noreferrer"><code>Queue.get_nowait()</code></a>:</p>
+<pre><code>import sys
+from subprocess import PIPE, Popen
+from threading  import Thread
+
+try:
+    from queue import Queue, Empty
+except ImportError:
+    from Queue import Queue, Empty  # python 2.x
+
+ON_POSIX = 'posix' in sys.builtin_module_names
+
+def enqueue_output(out, queue):
+    for line in iter(out.readline, b''):
+        queue.put(line)
+    out.close()
+
+p = Popen(['myprogram.exe'], stdout=PIPE, bufsize=1, close_fds=ON_POSIX)
+q = Queue()
+t = Thread(target=enqueue_output, args=(p.stdout, q))
+t.daemon = True # thread dies with the program
+t.start()
+
+# ... do other things here
+
+# read line without blocking
+try:  line = q.get_nowait() # or q.get(timeout=.1)
+except Empty:
+    print('no output yet')
+else: # got line
+    # ... do something with line
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I have often had a similar problem; Python programs I write frequently need to have the ability to execute some primary functionality while simultaneously accepting user input from the command line (stdin). Simply putting the user input handling functionality in another thread doesn't solve the problem because <code>readline()</code> blocks and has no timeout. If the primary functionality is complete and there is no longer any need to wait for further user input I typically want my program to exit, but it can't because <code>readline()</code> is still blocking in the other thread waiting for a line. A solution I have found to this problem is to make stdin a non-blocking file using the fcntl module:</p>
+<pre><code>import fcntl
+import os
+import sys
+
+# make stdin a non-blocking file
+fd = sys.stdin.fileno()
+fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+# user input handling thread
+while mainThreadIsRunning:
+      try: input = sys.stdin.readline()
+      except: continue
+      handleInput(input)
+</code></pre>
+<p>In my opinion this is a bit cleaner than using the select or signal modules to solve this problem but then again it only works on UNIX...</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Python 3.4 introduces new <a href="http://www.python.org/dev/peps/pep-0411/" rel="noreferrer">provisional API</a> for asynchronous IO -- <a href="http://docs.python.org/3/library/asyncio.html" rel="noreferrer"><code>asyncio</code> module</a>. </p>
+<p>The approach is similar to <a href="https://stackoverflow.com/a/5750194/4279"><code>twisted</code>-based answer by @Bryan Ward</a> -- define a protocol and its methods are called as soon as data is ready:</p>
+<pre><code>#!/usr/bin/env python3
+import asyncio
+import os
+
+class SubprocessProtocol(asyncio.SubprocessProtocol):
+    def pipe_data_received(self, fd, data):
+        if fd == 1: # got stdout data (bytes)
+            print(data)
+
+    def connection_lost(self, exc):
+        loop.stop() # end loop.run_forever()
+
+if os.name == 'nt':
+    loop = asyncio.ProactorEventLoop() # for subprocess' pipes on Windows
+    asyncio.set_event_loop(loop)
+else:
+    loop = asyncio.get_event_loop()
+try:
+    loop.run_until_complete(loop.subprocess_exec(SubprocessProtocol, 
+        "myprogram.exe", "arg1", "arg2"))
+    loop.run_forever()
+finally:
+    loop.close()
+</code></pre>
+<p>See <a href="https://docs.python.org/3/library/asyncio-subprocess.html" rel="noreferrer">"Subprocess" in the docs</a>.</p>
+<p>There is a high-level interface <code>asyncio.create_subprocess_exec()</code> that returns <a href="https://docs.python.org/3/library/asyncio-subprocess.html#process" rel="noreferrer"><code>Process</code> objects</a> that allows to read a line asynchroniosly using <a href="https://docs.python.org/3/library/asyncio-stream.html#asyncio.StreamReader" rel="noreferrer"><code>StreamReader.readline()</code> coroutine</a> 
+(with <a href="https://www.python.org/dev/peps/pep-0492/" rel="noreferrer"><code>async</code>/<code>await</code> Python 3.5+ syntax</a>):</p>
+<pre><code>#!/usr/bin/env python3.5
+import asyncio
+import locale
+import sys
+from asyncio.subprocess import PIPE
+from contextlib import closing
+
+async def readline_and_kill(*args):
+    # start child process
+    process = await asyncio.create_subprocess_exec(*args, stdout=PIPE)
+
+    # read line (sequence of bytes ending with b'\n') asynchronously
+    async for line in process.stdout:
+        print("got line:", line.decode(locale.getpreferredencoding(False)))
+        break
+    process.kill()
+    return await process.wait() # wait for the child process to exit
+
+
+if sys.platform == "win32":
+    loop = asyncio.ProactorEventLoop()
+    asyncio.set_event_loop(loop)
+else:
+    loop = asyncio.get_event_loop()
+
+with closing(loop):
+    sys.exit(loop.run_until_complete(readline_and_kill(
+        "myprogram.exe", "arg1", "arg2")))
+</code></pre>
+<p><code>readline_and_kill()</code> performs the following tasks:</p>
+<ul>
+<li>start subprocess, redirect its stdout to a pipe</li>
+<li>read a line from subprocess' stdout asynchronously</li>
+<li>kill subprocess</li>
+<li>wait for it to exit</li>
+</ul>
+<p>Each step could be limited by timeout seconds if necessary.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Try the <a href="http://www.lysator.liu.se/~bellman/download/asyncproc.py" rel="noreferrer">asyncproc</a> module. For example:</p>
+<pre><code>import os
+from asyncproc import Process
+myProc = Process("myprogram.app")
+
+while True:
+    # check to see if process has ended
+    poll = myProc.wait(os.WNOHANG)
+    if poll != None:
+        break
+    # print any new output
+    out = myProc.read()
+    if out != "":
+        print out
+</code></pre>
+<p>The module takes care of all the threading as suggested by S.Lott.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Use select &amp; read(1).  </p>
+<pre><code>import subprocess     #no new requirements
+def readAllSoFar(proc, retVal=''): 
+  while (select.select([proc.stdout],[],[],0)[0]!=[]):   
+    retVal+=proc.stdout.read(1)
+  return retVal
+p = subprocess.Popen(['/bin/ls'], stdout=subprocess.PIPE)
+while not p.poll():
+  print (readAllSoFar(p))
+</code></pre>
+<p>For readline()-like:</p>
+<pre><code>lines = ['']
+while not p.poll():
+  lines = readAllSoFar(p, lines[-1]).split('\n')
+  for a in range(len(lines)-1):
+    print a
+lines = readAllSoFar(p, lines[-1]).split('\n')
+for a in range(len(lines)-1):
+  print a
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can do this really easily in <a href="http://twistedmatrix.com/trac/" rel="noreferrer">Twisted</a>. Depending upon your existing code base, this might not be that easy to use, but if you are building a twisted application, then things like this become almost trivial. You create a <code>ProcessProtocol</code> class, and override the <code>outReceived()</code> method. Twisted (depending upon the reactor used) is usually just a big <code>select()</code> loop with callbacks installed to handle data from different file descriptors (often network sockets). So the <code>outReceived()</code> method is simply installing a callback for handling data coming from <code>STDOUT</code>.  A simple example demonstrating this behavior is as follows:</p>
+<pre><code>from twisted.internet import protocol, reactor
+
+class MyProcessProtocol(protocol.ProcessProtocol):
+
+    def outReceived(self, data):
+        print data
+
+proc = MyProcessProtocol()
+reactor.spawnProcess(proc, './myprogram', ['./myprogram', 'arg1', 'arg2', 'arg3'])
+reactor.run()
+</code></pre>
+<p>The <a href="http://twistedmatrix.com/documents/current/core/howto/process.html" rel="noreferrer">Twisted documentation</a> has some good information on this.</p>
+<p>If you build your entire application around Twisted, it makes asynchronous communication with other processes, local or remote, really elegant like this. On the other hand, if your program isn't built on top of Twisted, this isn't really going to be that helpful. Hopefully this can be helpful to other readers, even if it isn't applicable for your particular application.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>One solution is to make another process to perform your read of the process, or make a thread of the process with a timeout.</p>
+<p>Here's the threaded version of a timeout function:</p>
+<p><a href="http://code.activestate.com/recipes/473878/" rel="noreferrer">http://code.activestate.com/recipes/473878/</a></p>
+<p>However, do you need to read the stdout as it's coming in?
+Another solution may be to dump the output to a file and wait for the process to finish using <strong>p.wait()</strong>.</p>
+<pre><code>f = open('myprogram_output.txt','w')
+p = subprocess.Popen('myprogram.exe', stdout=f)
+p.wait()
+f.close()
+
+
+str = open('myprogram_output.txt','r').read()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Disclaimer: this works only for tornado</p>
+<p>You can do this by setting the fd to be nonblocking and then use ioloop to register callbacks. I have packaged this in an egg called <a href="http://pypi.python.org/pypi/tornado_subprocess/0.1.3">tornado_subprocess</a> and you can install it via PyPI:</p>
+<pre><code>easy_install tornado_subprocess
+</code></pre>
+<p>now you can do something like this:</p>
+<pre><code>import tornado_subprocess
+import tornado.ioloop
+
+    def print_res( status, stdout, stderr ) :
+    print status, stdout, stderr
+    if status == 0:
+        print "OK:"
+        print stdout
+    else:
+        print "ERROR:"
+        print stderr
+
+t = tornado_subprocess.Subprocess( print_res, timeout=30, args=[ "cat", "/etc/passwd" ] )
+t.start()
+tornado.ioloop.IOLoop.instance().start()
+</code></pre>
+<p>you can also use it with a RequestHandler</p>
+<pre><code>class MyHandler(tornado.web.RequestHandler):
+    def on_done(self, status, stdout, stderr):
+        self.write( stdout )
+        self.finish()
+
+    @tornado.web.asynchronous
+    def get(self):
+        t = tornado_subprocess.Subprocess( self.on_done, timeout=30, args=[ "cat", "/etc/passwd" ] )
+        t.start()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Existing solutions did not work for me (details below). What finally worked was to implement readline using read(1) (based on <a href="https://stackoverflow.com/a/883166/2039589">this answer</a>). The latter does not block:</p>
+<pre><code>from subprocess import Popen, PIPE
+from threading import Thread
+def process_output(myprocess): #output-consuming thread
+    nextline = None
+    buf = ''
+    while True:
+        #--- extract line using read(1)
+        out = myprocess.stdout.read(1)
+        if out == '' and myprocess.poll() != None: break
+        if out != '':
+            buf += out
+            if out == '\n':
+                nextline = buf
+                buf = ''
+        if not nextline: continue
+        line = nextline
+        nextline = None
+
+        #--- do whatever you want with line here
+        print 'Line is:', line
+    myprocess.stdout.close()
+
+myprocess = Popen('myprogram.exe', stdout=PIPE) #output-producing process
+p1 = Thread(target=process_output, args=(dcmpid,)) #output-consuming thread
+p1.daemon = True
+p1.start()
+
+#--- do whatever here and then kill process and thread if needed
+if myprocess.poll() == None: #kill process; will automatically stop thread
+    myprocess.kill()
+    myprocess.wait()
+if p1 and p1.is_alive(): #wait for thread to finish
+    p1.join()
+</code></pre>
+<p>Why existing solutions did not work:</p>
+<ol>
+<li>Solutions that require readline (including the Queue based ones) always block. It is difficult (impossible?) to kill the thread that executes readline. It only gets killed when the process that created it finishes, but not when the output-producing process is killed.</li>
+<li>Mixing low-level fcntl with high-level readline calls may not work properly as anonnn has pointed out.</li>
+<li>Using select.poll() is neat, but doesn't work on Windows according to python docs.</li>
+<li>Using third-party libraries seems overkill for this task and adds additional dependencies.</li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<p>This version of non-blocking read <strong>doesn't</strong> require special modules and will work out-of-the-box on majority of Linux distros.</p>
+<pre><code>import os
+import sys
+import time
+import fcntl
+import subprocess
+
+def async_read(fd):
+    # set non-blocking flag while preserving old flags
+    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+    # read char until EOF hit
+    while True:
+        try:
+            ch = os.read(fd.fileno(), 1)
+            # EOF
+            if not ch: break                                                                                                                                                              
+            sys.stdout.write(ch)
+        except OSError:
+            # waiting for data be available on fd
+            pass
+
+def shell(args, async=True):
+    # merge stderr and stdout
+    proc = subprocess.Popen(args, shell=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if async: async_read(proc.stdout)
+    sout, serr = proc.communicate()
+    return (sout, serr)
+
+if __name__ == '__main__':
+    cmd = 'ping 8.8.8.8'
+    sout, serr = shell(cmd.split())
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I add this problem to read some subprocess.Popen stdout.
+Here is my non blocking read solution:</p>
+<pre><code>import fcntl
+
+def non_block_read(output):
+    fd = output.fileno()
+    fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+    try:
+        return output.read()
+    except:
+        return ""
+
+# Use example
+from subprocess import *
+sb = Popen("echo test &amp;&amp; sleep 1000", shell=True, stdout=PIPE)
+sb.kill()
+
+# sb.stdout.read() # &lt;-- This will block
+non_block_read(sb.stdout)
+'test\n'
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here is my code, used to catch every output from subprocess ASAP, including partial lines. It pumps at same time and stdout and stderr in almost correct order.</p>
+<p>Tested and correctly worked on Python 2.7 linux &amp; windows.
+</p>
+<pre><code>#!/usr/bin/python
+#
+# Runner with stdout/stderr catcher
+#
+from sys import argv
+from subprocess import Popen, PIPE
+import os, io
+from threading import Thread
+import Queue
+def __main__():
+    if (len(argv) &gt; 1) and (argv[-1] == "-sub-"):
+        import time, sys
+        print "Application runned!"
+        time.sleep(2)
+        print "Slept 2 second"
+        time.sleep(1)
+        print "Slept 1 additional second",
+        time.sleep(2)
+        sys.stderr.write("Stderr output after 5 seconds")
+        print "Eol on stdin"
+        sys.stderr.write("Eol on stderr\n")
+        time.sleep(1)
+        print "Wow, we have end of work!",
+    else:
+        os.environ["PYTHONUNBUFFERED"]="1"
+        try:
+            p = Popen( argv + ["-sub-"],
+                       bufsize=0, # line-buffered
+                       stdin=PIPE, stdout=PIPE, stderr=PIPE )
+        except WindowsError, W:
+            if W.winerror==193:
+                p = Popen( argv + ["-sub-"],
+                           shell=True, # Try to run via shell
+                           bufsize=0, # line-buffered
+                           stdin=PIPE, stdout=PIPE, stderr=PIPE )
+            else:
+                raise
+        inp = Queue.Queue()
+        sout = io.open(p.stdout.fileno(), 'rb', closefd=False)
+        serr = io.open(p.stderr.fileno(), 'rb', closefd=False)
+        def Pump(stream, category):
+            queue = Queue.Queue()
+            def rdr():
+                while True:
+                    buf = stream.read1(8192)
+                    if len(buf)&gt;0:
+                        queue.put( buf )
+                    else:
+                        queue.put( None )
+                        return
+            def clct():
+                active = True
+                while active:
+                    r = queue.get()
+                    try:
+                        while True:
+                            r1 = queue.get(timeout=0.005)
+                            if r1 is None:
+                                active = False
+                                break
+                            else:
+                                r += r1
+                    except Queue.Empty:
+                        pass
+                    inp.put( (category, r) )
+            for tgt in [rdr, clct]:
+                th = Thread(target=tgt)
+                th.setDaemon(True)
+                th.start()
+        Pump(sout, 'stdout')
+        Pump(serr, 'stderr')
+
+        while p.poll() is None:
+            # App still working
+            try:
+                chan,line = inp.get(timeout = 1.0)
+                if chan=='stdout':
+                    print "STDOUT&gt;&gt;", line, "&lt;?&lt;"
+                elif chan=='stderr':
+                    print " ERROR==", line, "=?="
+            except Queue.Empty:
+                pass
+        print "Finish"
+
+if __name__ == '__main__':
+    __main__()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Adding this answer here since it provides ability to set non-blocking pipes on Windows and Unix.</p>
+<p>All the <code>ctypes</code> details are thanks to <a href="https://stackoverflow.com/questions/34504970">@techtonik's answer</a>.</p>
+<p>There is a slightly modified version to be used both on Unix and Windows systems.</p>
+<ul>
+<li>Python3 compatible <em>(only minor change needed)</em>.</li>
+<li>Includes posix version, and defines exception to use for either.</li>
+</ul>
+<p>This way you can use the same function and exception for Unix and Windows code.</p>
+<pre class="lang-py prettyprint-override"><code># pipe_non_blocking.py (module)
+"""
+Example use:
+
+    p = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            )
+
+    pipe_non_blocking_set(p.stdout.fileno())
+
+    try:
+        data = os.read(p.stdout.fileno(), 1)
+    except PortableBlockingIOError as ex:
+        if not pipe_non_blocking_is_error_blocking(ex):
+            raise ex
+"""
+
+
+__all__ = (
+    "pipe_non_blocking_set",
+    "pipe_non_blocking_is_error_blocking",
+    "PortableBlockingIOError",
+    )
+
+import os
+
+
+if os.name == "nt":
+    def pipe_non_blocking_set(fd):
+        # Constant could define globally but avoid polluting the name-space
+        # thanks to: https://stackoverflow.com/questions/34504970
+        import msvcrt
+
+        from ctypes import windll, byref, wintypes, WinError, POINTER
+        from ctypes.wintypes import HANDLE, DWORD, BOOL
+
+        LPDWORD = POINTER(DWORD)
+
+        PIPE_NOWAIT = wintypes.DWORD(0x00000001)
+
+        def pipe_no_wait(pipefd):
+            SetNamedPipeHandleState = windll.kernel32.SetNamedPipeHandleState
+            SetNamedPipeHandleState.argtypes = [HANDLE, LPDWORD, LPDWORD, LPDWORD]
+            SetNamedPipeHandleState.restype = BOOL
+
+            h = msvcrt.get_osfhandle(pipefd)
+
+            res = windll.kernel32.SetNamedPipeHandleState(h, byref(PIPE_NOWAIT), None, None)
+            if res == 0:
+                print(WinError())
+                return False
+            return True
+
+        return pipe_no_wait(fd)
+
+    def pipe_non_blocking_is_error_blocking(ex):
+        if not isinstance(ex, PortableBlockingIOError):
+            return False
+        from ctypes import GetLastError
+        ERROR_NO_DATA = 232
+
+        return (GetLastError() == ERROR_NO_DATA)
+
+    PortableBlockingIOError = OSError
+else:
+    def pipe_non_blocking_set(fd):
+        import fcntl
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        return True
+
+    def pipe_non_blocking_is_error_blocking(ex):
+        if not isinstance(ex, PortableBlockingIOError):
+            return False
+        return True
+
+    PortableBlockingIOError = BlockingIOError
+</code></pre>
+<p>To avoid reading incomplete data, I ended up writing my own readline generator (which returns the byte string for each line).</p>
+<p>Its a generator so you can for example...</p>
+<pre><code>def non_blocking_readlines(f, chunk=1024):
+    """
+    Iterate over lines, yielding b'' when nothings left
+    or when new data is not yet available.
+
+    stdout_iter = iter(non_blocking_readlines(process.stdout))
+
+    line = next(stdout_iter)  # will be a line or b''.
+    """
+    import os
+
+    from .pipe_non_blocking import (
+            pipe_non_blocking_set,
+            pipe_non_blocking_is_error_blocking,
+            PortableBlockingIOError,
+            )
+
+    fd = f.fileno()
+    pipe_non_blocking_set(fd)
+
+    blocks = []
+
+    while True:
+        try:
+            data = os.read(fd, chunk)
+            if not data:
+                # case were reading finishes with no trailing newline
+                yield b''.join(blocks)
+                blocks.clear()
+        except PortableBlockingIOError as ex:
+            if not pipe_non_blocking_is_error_blocking(ex):
+                raise ex
+
+            yield b''
+            continue
+
+        while True:
+            n = data.find(b'\n')
+            if n == -1:
+                break
+
+            yield b''.join(blocks) + data[:n + 1]
+            data = data[n + 1:]
+            blocks.clear()
+        blocks.append(data)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <a href="http://www.python.org/doc/2.5.2/lib/module-select.html" rel="nofollow noreferrer">select</a> module helps you determine where the next useful input is.</p>
+<p>However, you're almost always happier with separate threads.  One does a blocking read the stdin, another does wherever it is you don't want blocked.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>why bothering thread&amp;queue?
+unlike readline(), BufferedReader.read1() wont block waiting for \r\n, it returns ASAP if there is any output coming in.</p>
+<pre><code>#!/usr/bin/python
+from subprocess import Popen, PIPE, STDOUT
+import io
+
+def __main__():
+    try:
+        p = Popen( ["ping", "-n", "3", "127.0.0.1"], stdin=PIPE, stdout=PIPE, stderr=STDOUT )
+    except: print("Popen failed"); quit()
+    sout = io.open(p.stdout.fileno(), 'rb', closefd=False)
+    while True:
+        buf = sout.read1(1024)
+        if len(buf) == 0: break
+        print buf,
+
+if __name__ == '__main__':
+    __main__()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>In my case I needed a logging module that catches the output from the background applications and augments it(adding time-stamps, colors, etc.).</p>
+<p>I ended up with a background thread that does the actual I/O. Following code is only for POSIX platforms. I stripped non-essential parts. </p>
+<p>If someone is going to use this beast for long runs consider managing open descriptors. In my case it was not a big problem.</p>
+<pre><code># -*- python -*-
+import fcntl
+import threading
+import sys, os, errno
+import subprocess
+
+class Logger(threading.Thread):
+    def __init__(self, *modules):
+        threading.Thread.__init__(self)
+        try:
+            from select import epoll, EPOLLIN
+            self.__poll = epoll()
+            self.__evt = EPOLLIN
+            self.__to = -1
+        except:
+            from select import poll, POLLIN
+            print 'epoll is not available'
+            self.__poll = poll()
+            self.__evt = POLLIN
+            self.__to = 100
+        self.__fds = {}
+        self.daemon = True
+        self.start()
+
+    def run(self):
+        while True:
+            events = self.__poll.poll(self.__to)
+            for fd, ev in events:
+                if (ev&amp;self.__evt) != self.__evt:
+                    continue
+                try:
+                    self.__fds[fd].run()
+                except Exception, e:
+                    print e
+
+    def add(self, fd, log):
+        assert not self.__fds.has_key(fd)
+        self.__fds[fd] = log
+        self.__poll.register(fd, self.__evt)
+
+class log:
+    logger = Logger()
+
+    def __init__(self, name):
+        self.__name = name
+        self.__piped = False
+
+    def fileno(self):
+        if self.__piped:
+            return self.write
+        self.read, self.write = os.pipe()
+        fl = fcntl.fcntl(self.read, fcntl.F_GETFL)
+        fcntl.fcntl(self.read, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        self.fdRead = os.fdopen(self.read)
+        self.logger.add(self.read, self)
+        self.__piped = True
+        return self.write
+
+    def __run(self, line):
+        self.chat(line, nl=False)
+
+    def run(self):
+        while True:
+            try: line = self.fdRead.readline()
+            except IOError, exc:
+                if exc.errno == errno.EAGAIN:
+                    return
+                raise
+            self.__run(line)
+
+    def chat(self, line, nl=True):
+        if nl: nl = '\n'
+        else: nl = ''
+        sys.stdout.write('[%s] %s%s' % (self.__name, line, nl))
+
+def system(command, param=[], cwd=None, env=None, input=None, output=None):
+    args = [command] + param
+    p = subprocess.Popen(args, cwd=cwd, stdout=output, stderr=output, stdin=input, env=env, bufsize=0)
+    p.wait()
+
+ls = log('ls')
+ls.chat('go')
+system("ls", ['-l', '/'], output=ls)
+
+date = log('date')
+date.chat('go')
+system("date", output=date)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I have created a library based on <a href="https://stackoverflow.com/a/4896288/242451">J. F. Sebastian's solution</a>. You can use it.</p>
+<p><a href="https://github.com/cenkalti/what" rel="nofollow noreferrer">https://github.com/cenkalti/what</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Working from J.F. Sebastian's answer, and several other sources, I've put together a simple subprocess manager. It provides the request non-blocking reading, as well as running several processes in parallel. It doesn't use any OS-specific call (that I'm aware) and thus should work anywhere.</p>
+<p>It's available from pypi, so just <code>pip install shelljob</code>. Refer to the <a href="https://pypi.python.org/pypi/shelljob" rel="nofollow">project page</a> for examples and full docs.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>EDIT: This implementation still blocks. Use J.F.Sebastian's <a href="https://stackoverflow.com/a/4896288/2359288">answer</a> instead.</p>
+<p><strike>I tried the <a href="https://stackoverflow.com/a/4896288/2359288">top answer</a>, but the additional risk and maintenance of thread code was worrisome.</strike></p>
+<p>Looking through the <a href="http://docs.python.org/2.6/library/io.html" rel="nofollow noreferrer">io module</a> (and being limited to 2.6), I found BufferedReader. This is my threadless, non-blocking solution.</p></div>
+<div class="post-text" itemprop="text">
+<p>I recently stumbled upon on the same problem
+I need to read one line at time from stream ( tail run in subprocess )
+in non-blocking mode 
+I wanted to avoid next problems: not to burn cpu, don't read stream by one byte (like readline did ), etc</p>
+<p>Here is my implementation
+<a href="https://gist.github.com/grubberr/5501e1a9760c3eab5e0a" rel="nofollow">https://gist.github.com/grubberr/5501e1a9760c3eab5e0a</a>
+it don't support windows (poll), don't handle EOF,
+but it works for me well</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is a example to run interactive command in subprocess, and the stdout is interactive by using pseudo terminal. You can refer to: <a href="https://stackoverflow.com/a/43012138/3555925">https://stackoverflow.com/a/43012138/3555925</a></p>
+<pre><code>#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import select
+import termios
+import tty
+import pty
+from subprocess import Popen
+
+command = 'bash'
+# command = 'docker run -it --rm centos /bin/bash'.split()
+
+# save original tty setting then set it to raw mode
+old_tty = termios.tcgetattr(sys.stdin)
+tty.setraw(sys.stdin.fileno())
+
+# open pseudo-terminal to interact with subprocess
+master_fd, slave_fd = pty.openpty()
+
+# use os.setsid() make it run in a new process group, or bash job control will not be enabled
+p = Popen(command,
+          preexec_fn=os.setsid,
+          stdin=slave_fd,
+          stdout=slave_fd,
+          stderr=slave_fd,
+          universal_newlines=True)
+
+while p.poll() is None:
+    r, w, e = select.select([sys.stdin, master_fd], [], [])
+    if sys.stdin in r:
+        d = os.read(sys.stdin.fileno(), 10240)
+        os.write(master_fd, d)
+    elif master_fd in r:
+        o = os.read(master_fd, 10240)
+        if o:
+            os.write(sys.stdout.fileno(), o)
+
+# restore tty settings back
+termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>My problem is a bit different as I wanted to collect both stdout and stderr from a running process, but ultimately the same since I wanted to render the output in a widget as its generated.</p>
+<p>I did not want to resort to many of the proposed workarounds using Queues or additional Threads as they should not be necessary to perform such a common task as running another script and collecting its output.</p>
+<p>After reading the proposed solutions and python docs I resolved my issue with the implementation below. Yes it only works for POSIX as I'm using the <code>select</code> function call. </p>
+<p>I agree that the docs are confusing and the implementation is awkward for such a common scripting task. I believe that older versions of python have different defaults for <code>Popen</code> and different explanations so that created a lot of confusion. This seems to work well for both Python 2.7.12 and 3.5.2. </p>
+<p>The key was to set <code>bufsize=1</code> for line buffering and then <code>universal_newlines=True</code> to process as a text file instead of a binary which seems to become the default when setting <code>bufsize=1</code>.</p>
+<pre><code>class workerThread(QThread):
+   def __init__(self, cmd):
+      QThread.__init__(self)
+      self.cmd = cmd
+      self.result = None           ## return code
+      self.error = None            ## flag indicates an error
+      self.errorstr = ""           ## info message about the error
+
+   def __del__(self):
+      self.wait()
+      DEBUG("Thread removed")
+
+   def run(self):
+      cmd_list = self.cmd.split(" ")   
+      try:
+         cmd = subprocess.Popen(cmd_list, bufsize=1, stdin=None
+                                        , universal_newlines=True
+                                        , stderr=subprocess.PIPE
+                                        , stdout=subprocess.PIPE)
+      except OSError:
+         self.error = 1
+         self.errorstr = "Failed to execute " + self.cmd
+         ERROR(self.errorstr)
+      finally:
+         VERBOSE("task started...")
+      import select
+      while True:
+         try:
+            r,w,x = select.select([cmd.stdout, cmd.stderr],[],[])
+            if cmd.stderr in r:
+               line = cmd.stderr.readline()
+               if line != "":
+                  line = line.strip()
+                  self.emit(SIGNAL("update_error(QString)"), line)
+            if cmd.stdout in r:
+               line = cmd.stdout.readline()
+               if line == "":
+                  break
+               line = line.strip()
+               self.emit(SIGNAL("update_output(QString)"), line)
+         except IOError:
+            pass
+      cmd.wait()
+      self.result = cmd.returncode
+      if self.result &lt; 0:
+         self.error = 1
+         self.errorstr = "Task terminated by signal " + str(self.result)
+         ERROR(self.errorstr)
+         return
+      if self.result:
+         self.error = 1
+         self.errorstr = "exit code " + str(self.result)
+         ERROR(self.errorstr)
+         return
+      return
+</code></pre>
+<p>ERROR, DEBUG and VERBOSE are simply macros that print output to the terminal.</p>
+<p>This solution is IMHO 99.99% effective as it still uses the blocking <code>readline</code> function, so we assume the sub process is nice and outputs complete lines. </p>
+<p>I welcome feedback to improve the solution as I am still new to Python.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This solution uses the <code>select</code> module to "read any available data" from an IO stream. This function blocks initially until data is available, but then reads only the data that is available and doesn't block further.</p>
+<p>Given the fact that it uses the <code>select</code> module, this only works on Unix.</p>
+<p>The code is fully PEP8-compliant.</p>
+<pre><code>import select
+
+
+def read_available(input_stream, max_bytes=None):
+    """
+    Blocks until any data is available, then all available data is then read and returned.
+    This function returns an empty string when end of stream is reached.
+
+    Args:
+        input_stream: The stream to read from.
+        max_bytes (int|None): The maximum number of bytes to read. This function may return fewer bytes than this.
+
+    Returns:
+        str
+    """
+    # Prepare local variables
+    input_streams = [input_stream]
+    empty_list = []
+    read_buffer = ""
+
+    # Initially block for input using 'select'
+    if len(select.select(input_streams, empty_list, empty_list)[0]) &gt; 0:
+
+        # Poll read-readiness using 'select'
+        def select_func():
+            return len(select.select(input_streams, empty_list, empty_list, 0)[0]) &gt; 0
+
+        # Create while function based on parameters
+        if max_bytes is not None:
+            def while_func():
+                return (len(read_buffer) &lt; max_bytes) and select_func()
+        else:
+            while_func = select_func
+
+        while True:
+            # Read single byte at a time
+            read_data = input_stream.read(1)
+            if len(read_data) == 0:
+                # End of stream
+                break
+            # Append byte to string buffer
+            read_buffer += read_data
+            # Check if more data is available
+            if not while_func():
+                break
+
+    # Return read buffer
+    return read_buffer
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I also faced the problem described by <a href="https://stackoverflow.com/users/220256/jesse">Jesse</a> and solved it by using "select" as <a href="https://stackoverflow.com/users/1220653/bradley-odell">Bradley</a>, <a href="https://stackoverflow.com/users/456552/andy-jackson">Andy</a> and others did but in a blocking mode to avoid a busy loop. It uses a dummy Pipe as a fake stdin. The select blocks and wait for either stdin or the pipe to be ready. When a key is pressed stdin unblocks the select and the key value can be retrieved with read(1). When a different thread writes to the pipe then the pipe unblocks the select and it can be taken as an indication that the need for stdin is over. Here is some reference code:</p>
+<pre><code>import sys
+import os
+from select import select
+
+# -------------------------------------------------------------------------    
+# Set the pipe (fake stdin) to simulate a final key stroke
+# which will unblock the select statement
+readEnd, writeEnd = os.pipe()
+readFile = os.fdopen(readEnd)
+writeFile = os.fdopen(writeEnd, "w")
+
+# -------------------------------------------------------------------------
+def getKey():
+
+    # Wait for stdin or pipe (fake stdin) to be ready
+    dr,dw,de = select([sys.__stdin__, readFile], [], [])
+
+    # If stdin is the one ready then read it and return value
+    if sys.__stdin__ in dr:
+        return sys.__stdin__.read(1)   # For Windows use ----&gt; getch() from module msvcrt
+
+    # Must finish
+    else:
+        return None
+
+# -------------------------------------------------------------------------
+def breakStdinRead():
+    writeFile.write(' ')
+    writeFile.flush()
+
+# -------------------------------------------------------------------------
+# MAIN CODE
+
+# Get key stroke
+key = getKey()
+
+# Keyboard input
+if key:
+    # ... do your stuff with the key value
+
+# Faked keystroke
+else:
+    # ... use of stdin finished
+
+# -------------------------------------------------------------------------
+# OTHER THREAD CODE
+
+breakStdinRead()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I have the original questioner's problem, but did not wish to invoke threads. I mixed Jesse's solution with a direct read() from the pipe, and my own buffer-handler for line reads (however, my sub-process - ping - always wrote full lines &lt; a system page size). I avoid busy-waiting by only reading in a gobject-registered io watch. These days I usually run code within a gobject MainLoop to avoid threads.</p>
+<pre><code>def set_up_ping(ip, w):
+# run the sub-process
+# watch the resultant pipe
+p = subprocess.Popen(['/bin/ping', ip], stdout=subprocess.PIPE)
+# make stdout a non-blocking file
+fl = fcntl.fcntl(p.stdout, fcntl.F_GETFL)
+fcntl.fcntl(p.stdout, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+stdout_gid = gobject.io_add_watch(p.stdout, gobject.IO_IN, w)
+return stdout_gid # for shutting down
+</code></pre>
+<p>The watcher is</p>
+<pre><code>def watch(f, *other):
+print 'reading',f.read()
+return True
+</code></pre>
+<p>And the main program sets up a ping and then calls gobject mail loop.</p>
+<pre><code>def main():
+set_up_ping('192.168.1.8', watch)
+# discard gid as unused here
+gobject.MainLoop().run()
+</code></pre>
+<p>Any other work is attached to callbacks in gobject.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here is a module that supports non-blocking reads and background writes in python:</p>
+<p><a href="https://pypi.python.org/pypi/python-nonblock" rel="nofollow">https://pypi.python.org/pypi/python-nonblock</a></p>
+<p>Provides a function,</p>
+<p>nonblock_read which will read data from the stream, if available, otherwise return an empty string (or None if the stream is closed on the other side and all possible data has been read)</p>
+<p>You may also consider the python-subprocess2 module,</p>
+<p><a href="https://pypi.python.org/pypi/python-subprocess2" rel="nofollow">https://pypi.python.org/pypi/python-subprocess2</a></p>
+<p>which adds to the subprocess module. So on the object returned from "subprocess.Popen" is added an additional method, runInBackground. This starts a thread and returns an object which will automatically be populated as stuff is written to stdout/stderr, without blocking your main thread.</p>
+<p>Enjoy!</p>
+</div>
+<span class="comment-copy">(Coming from google?) all PIPEs will deadlock when one of the PIPEs' buffer gets filled up and not read. e.g. stdout deadlock when stderr is filled. Never pass a PIPE you don't intend read.</span>
+<span class="comment-copy">@NasserAl-Wohaibi does this mean its better to always create files then?</span>
+<span class="comment-copy">something I've been curious to understand is why its blocking in the first place...I'm asking because I've seen the comment: <code>To avoid deadlocks: careful to: add \n to output, flush output, use     readline() rather than read()</code></span>
+<span class="comment-copy">It is, "by design", waiting to receive inputs.</span>
+<span class="comment-copy">Yes this works for me, I removed a lot though. It includes good practices but not always necessary. Python 3.x 2.X compat and close_fds may be omitted, it will still work. But just be aware of what everything does and don't copy it blindly, even if it just works! (Actually the simplest solution is to use a thread and do a readline as Seb did, Qeues are just an easy way to get the data, there are others, threads are the answer!)</span>
+<span class="comment-copy">Inside the thread, the call to <code>out.readline</code> blocks the thread, and main thread, and I have to wait until readline returns before everything else continues. Any easy way around that? (I'm reading multiple lines from my process, which is also another .py file that's doing DB and things)</span>
+<span class="comment-copy">@Justin: 'out.readline' doesn't block the main thread it is executed in another thread.</span>
+<span class="comment-copy">what if I fail to shut down the subprocess, eg. due to exceptions? the stdout-reader thread won't die and python will hang, even if the main thread exited, isn't it? how could one work around this? python 2.x doesn't support killing the threads, what's worse, doesn't support interrupting them. :( (obviously one should handle the exceptions to assure the subprocess is shut down, but just in case it won't, what can you do?)</span>
+<span class="comment-copy">I've created some friendly wrappers of this in the package <code>shelljob</code> <a href="https://pypi.python.org/pypi/shelljob" rel="nofollow noreferrer">pypi.python.org/pypi/shelljob</a></span>
+<span class="comment-copy">According to the docs, fcntl() can receive either a file descriptor, or an object that has .fileno() method.</span>
+<span class="comment-copy"><a href="http://stackoverflow.com/questions/375427/non-blocking-read-on-a-stream-in-python/1810703#1810703">Jesse's answer</a> is not correct. According to Guido, readline doesn't work correctly with non-blocking mode, and it won't before Python 3000. <a href="http://bugs.python.org/issue1175#msg56041" rel="nofollow noreferrer">bugs.python.org/issue1175#msg56041</a> If you want to use fcntl to set the file to non-blocking mode, you have to use the lower-level os.read() and separate out the lines yourself. Mixing fcntl with high-level calls that perform line buffering is asking for trouble.</span>
+<span class="comment-copy">The use of readline seems incorrect in Python 2. See anonnn's answer <a href="http://stackoverflow.com/questions/375427/non-blocking-read-on-a-stream-in-python/4025909#4025909" title="non blocking read on a stream in python">stackoverflow.com/questions/375427/…</a></span>
+<span class="comment-copy">Please, don't use busy loops. Use poll() with a timeout to wait for the data.</span>
+<span class="comment-copy">replacing readline with read(buffer_size) seem to work perfectly...</span>
+<span class="comment-copy">When I try something like this using python 3.4 coroutines, I only get output once the entire script has run.  I'd like to see a line of output printed, as soon as the subprocess prints a line. Here's what I've got: <a href="http://pastebin.com/qPssFGep" rel="nofollow noreferrer">pastebin.com/qPssFGep</a>.</span>
+<span class="comment-copy">@flutefreak7: <a href="http://stackoverflow.com/q/20503671/4279">buffering issues</a> are unrelated to the current question. Follow the link for possible solutions.</span>
+<span class="comment-copy">thanks!  Solved the problem for my script by simply using <code>print(text, flush=True)</code> so that the printed text would be immediately available to the watcher calling <code>readline</code>. When I tested it with the Fortran-based executable I actually want to wrap/watch, it doesn't buffer it's output, so it behaves as expected.</span>
+<span class="comment-copy">Is it possible to allow the subprocess to persist and perform further read/write operations. <code>readline_and_kill</code>, in your second script, works very much like <code>subprocess.comunicate</code> in that it terminates the process after one read/write operation. I also see that you're using a single pipe, <code>stdout</code>, which subprocess handles as non-blocking. Trying to use both <code>stdout</code> and <code>stderr</code> <a href="http://stackoverflow.com/q/43903740">I find I end up blocking</a>.</span>
+<span class="comment-copy">@Carel the code in the answer works as intended as described in the answer explicitly. It is possible to implement other behavior if desired. Both pipes are equally nonblocking if used, here's an example <a href="http://stackoverflow.com/a/25960956/4279">how to read from both pipes concurrently</a>.</span>
+<span class="comment-copy">Absolutely brilliant. Much easier than the raw subprocess module. Works perfectly for me on Ubuntu.</span>
+<span class="comment-copy">asyncproc doesn't work on windows, and windows doesn't support os.WNOHANG :-(</span>
+<span class="comment-copy">asyncproc is GPL, which further limits its use :-(</span>
+<span class="comment-copy">Thanks. One small thing: It seems that replacing tabs with 8 spaces in asyncproc.py is the way to go :)</span>
+<span class="comment-copy">It doesn't look like you can get the return code of the process that you launched though via asyncproc module; only the output that it generated.</span>
+<span class="comment-copy">no good. <code>select</code> should not work on windows with file descriptors, according to <a href="http://docs.python.org/2/library/select.html" rel="nofollow noreferrer">docs</a></span>
+<span class="comment-copy">no good. <code>select</code> should not work on windows with file descriptors, according to <a href="http://docs.python.org/2/library/select.html" rel="nofollow noreferrer">docs</a></span>
+<span class="comment-copy">@naxa I don't think the <code>select()</code> he's referring to is the same one you are. I'm assuming this because <code>Twisted</code> works on windows...</span>
+<span class="comment-copy">I've added <a href="http://stackoverflow.com/a/20697159/4279">similar solution based on <code>asyncio</code> from stdlib</a>.</span>
+<span class="comment-copy">"Twisted (depending upon the reactor used) is usually just a big select() loop" means there are several reactors to choose between. The <code>select()</code> one is the most portable one on unixes and unix-likes, but there are also two reactors available for Windows: <a href="https://twistedmatrix.com/documents/current/core/howto/choosing-reactor.html#waitformultipleobjects-wfmo-for-win32" rel="nofollow noreferrer">twistedmatrix.com/documents/current/core/howto/…</a></span>
+<span class="comment-copy">seems like <a href="http://code.activestate.com/recipes/473878/" rel="nofollow noreferrer">recpie's</a> thread would not exit after timeout and killing it depends on being able to kill the subprocess (sg. otherwise unrelated in this regard) it reads (a thing you should be able to but just in case you can't..).</span>
+<span class="comment-copy">Thanks for the nice feature! Just to clarify, why can't we simply use <code>threading.Thread</code> for creating new non-blocking processes? I used it in <code>on_message</code> of Tornado websocket instance, and it did the job fine.</span>
+<span class="comment-copy">threading is mostly discouraged in tornado. they are fine for small, short running functions. You can read about it here:  <a href="http://stackoverflow.com/questions/7846323/tornado-web-and-threads" title="tornado web and threads">stackoverflow.com/questions/7846323/tornado-web-and-threads</a> <a href="https://github.com/facebook/tornado/wiki/Threading-and-concurrency" rel="nofollow noreferrer">github.com/facebook/tornado/wiki/Threading-and-concurrency</a></span>
+<span class="comment-copy">@VukasinToroman you really saved me here with this. thank you so much for the tornado_subprocess module :)</span>
+<span class="comment-copy">does this work on windows? (note that <code>select</code>, with file descriptors, <a href="http://docs.python.org/2/library/select.html" rel="nofollow noreferrer">does not</a>)</span>
+<span class="comment-copy">This lib does not use the <code>select</code> call. I haven't tried this under Windows but you would probably run into trouble since the lib is using the <code>fcntl</code> module. So in short: no this probably will not work under Windows.</span>
+<span class="comment-copy">1. <a href="http://stackoverflow.com/a/4896288/4279"><code>q.get_nowait()</code> from my answer</a> must not block, ever, that is the point of using it. 2. The thread that executes readline  (<a href="http://stackoverflow.com/a/4896288"><code>enqueue_output()</code> function</a>) exits on EOF e.g., including the case when the output-producing process is killed. If you believe it is not so; please, provide <a href="http://msmvps.com/blogs/jon_skeet/archive/2010/08/29/writing-the-perfect-question.aspx#Sample-code-and-data" rel="nofollow noreferrer">a complete minimal code example</a> that shows otherwise (maybe as a <a href="http://stackoverflow.com/questions/ask">new question</a>).</span>
+<span class="comment-copy">@sebastian I spent an hour or more trying to come up with a minimal example. In the end I must agree that your answer handles all the cases. I guess it didn't work earlier for me because when I was trying to kill the output-producing process, it was already killed and gave a hard-to-debug error. The hour was well spent, because while coming up with a minimal example, I could come up with a simpler solution.</span>
+<span class="comment-copy">Could you post the simpler solution, too? :) (if it's different from Sebastian's)</span>
+<span class="comment-copy">What is dcmpid?</span>
+<span class="comment-copy">@danger89: I think <code>dcmpid = myprocess</code> .</span>
+<span class="comment-copy">fcntl doesn't work on windows, according to the <a href="http://docs.python.org/2/library/fcntl.html" rel="nofollow noreferrer">docs</a>.</span>
+<span class="comment-copy"><code>fcntl</code> indeed doesn't work on Windows.</span>
+<span class="comment-copy">@anatolytechtonik use <code>msvcrt.kbhit()</code> instead</span>
+<span class="comment-copy">One of the few answers which allow you to read stuff that does not necessarily end with a newline.</span>
+<span class="comment-copy">(1) <a href="http://stackoverflow.com/questions/375427/non-blocking-read-on-a-subprocess-pipe-in-python/35052424#comment21017513_1810703">this comment</a> indicates that <code>readline()</code> doesn't work with non-blocking pipes (such as set using <code>fcntl</code>) on Python 2 -- do you think it is no longer correct? (my answer contains the link (<code>fcntl</code>) that provides the same info but it seems deleted now).  (2) See how <code>multiprocessing.connection.Pipe</code> uses <code>SetNamedPipeHandleState</code></span>
+<span class="comment-copy">I only tested this on Python3. But saw this information too and expect it remains valid. I also wrote my own code to use in-place of readline, I've updated my answer to include it.</span>
+<span class="comment-copy">I think this answer is unhelpful for two reasons: (a) The <i>select</i> module will not work on pipes under Windows (as the provided link clearly states), which defeats the OP's intentions to have a portable solution. (b) Asynchronous threads do not allow for a synchronous dialogue between the parent and the child process. What if the parent process wants to dispatch the next action according to the next line read from the child?!</span>
+<span class="comment-copy">2.6 documentation link -- <a href="http://docs.python.org/library/select.html" rel="nofollow noreferrer">docs.python.org/library/select.html</a></span>
+<span class="comment-copy">select is also not useful in that Python's reads will block even after the select, because it does not have standard C semantics and will not return partial data.</span>
+<span class="comment-copy">A separate thresd for reading from child's output solved my problem which was similar to this. If you need syncronous interaction I guess you can't use this solution (unless you know what output to expect). I would have accepted this answer</span>
+<span class="comment-copy">Will it return ASAP if there is nothing comming in? If it does not it is blocking.</span>
+<span class="comment-copy">@MathieuPagé is right. <code>read1</code> will block if the first underlying read blocks, which happens when the pipe is still open but no input is available.</span>
+<span class="comment-copy">wow, this is a tester module.</span>
+<span class="comment-copy">have you tried <code>for line in iter(p.stdout.readline, ""): # do stuff with the line</code>? It is threadless (single thread) and blocks when your code blocks.</span>
+<span class="comment-copy">@j-f-sebastian Yeah, I eventually reverted to your answer. My implementation still occasionally blocked. I'll edit my answer to warn others not to go down this route.</span>
+<span class="comment-copy"><a href="http://stackoverflow.com/a/4896288/4279">the thread-based  answer</a> does <b>not</b> burn cpu (you can specify arbitrary <code>timeout</code> as in your solution) and <code>.readline()</code> reads <b>more</b> than one byte at a time (<code>bufsize=1</code> means <i>line</i>-buffered (only relevant for writing)). What other problems have you found? Link-only answers are not very useful.</span>
+<span class="comment-copy">In this particular case, you can set stderr=subprocess.STDOUT in the Popen constructor, and get all output from cmd.stdout.readline().</span>
+<span class="comment-copy">NOTE: In order to make this work in Windows the pipe should be replaced by a socket. I didn't try it yet but it should work according to the documentation.</span>
+<span class="comment-copy">I'd like to try out this <b>nonblock</b> module, but I relatively new at some of the Linux procedures.  Exactly how do I install these routines?  I'm running Raspbian Jessie, a flavor of Debian Linux for the Raspberry Pi.  I tried 'sudo apt-get install nonblock' and python-nonblock and both threw an error - not found.  I have downloaded the zip file from this site <a href="https://pypi.python.org/pypi/python-nonblock" rel="nofollow noreferrer">pypi.python.org/pypi/python-nonblock</a>, but don't know what to do with it. Thanks....RDK</span>

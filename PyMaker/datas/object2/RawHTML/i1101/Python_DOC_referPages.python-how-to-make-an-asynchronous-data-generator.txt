@@ -1,0 +1,156 @@
+<div class="post-text" itemprop="text">
+<p>I have a program that loads data and processes it.  Both loading and processing take time, and I'd like to do them in parallel.  </p>
+<p>Here is the synchronous version of my program (where the "loading" and "processing" are done in sequence, and are trivial operations here for the sake of the example):</p>
+<pre><code>import time
+
+def data_loader():
+    for i in range(4):
+        time.sleep(1)  # Simulated loading time
+        yield i
+
+def main():
+    start = time.time()
+    for data in data_loader():
+        time.sleep(1)  # Simulated processing time
+        processed_data = -data*2
+        print(f'At t={time.time()-start:.3g}, processed data {data} into {processed_data}')
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>When I run this, I get output: </p>
+<pre><code>At t=2.01, processed data 0 into 0
+At t=4.01, processed data 1 into -2
+At t=6.02, processed data 2 into -4
+At t=8.02, processed data 3 into -6
+</code></pre>
+<p>The loop runs every 2s, with 1s for loading and 1s for processing.  </p>
+<p>Now, I'd like to make an <strong>asynchronous</strong> version, where the loading and processing are done concurrently (so the loader gets the next data ready while the processor is processing it).  It should then take 2s for the first statement to be printed, and 1s for each statement after that.  Expected output would be similar to: </p>
+<pre><code>At t=2.01, processed data 0 into 0
+At t=3.01, processed data 1 into -2
+At t=4.02, processed data 2 into -4
+At t=5.02, processed data 3 into -6
+</code></pre>
+<p>Ideally, only contents of the <code>main</code> function would have to change (as the <code>data_loader</code> code should not care that it may be used in an asynchronous way).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <a href="https://docs.python.org/3/library/multiprocessing.html" rel="nofollow noreferrer"><code>multiprocessing</code></a> module's utilities may be what you want.</p>
+<pre><code>import time
+import multiprocessing
+
+def data_loader():
+    for i in range(4):
+        time.sleep(1)  # Simulated loading time
+        yield i
+
+
+def process_item(item):
+    time.sleep(1)  # Simulated processing time
+    return (item, -item*2)  # Return the original too.
+
+
+def main():
+    start = time.time()
+    with multiprocessing.Pool() as p:    
+        data_iterator = data_loader()   
+        for (data, processed_data) in p.imap(process_item, data_iterator):
+            print(f'At t={time.time()-start:.3g}, processed data {data} into {processed_data}')
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>This outputs</p>
+<pre><code>At t=2.03, processed data 0 into 0
+At t=3.03, processed data 1 into -2
+At t=4.04, processed data 2 into -4
+At t=5.04, processed data 3 into -6
+</code></pre>
+<p>Depending on your requirements, you may find <code>.imap_unordered()</code> to be faster, and it's also worth knowing that there's a thread-based version of <code>Pool</code> available as <code>multiprocessing.dummy.Pool</code> – this may be useful to avoid IPC overhead if your data is large, and your processing is not done in Python (so you can avoid the GIL).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The key of your problem is in the <strong>actual processing of the data</strong>. I don't know what you're doing with the data in your real program, but it <strong>must be an asynchronous operation</strong> to use asynchronous programming. If you're doing active, blocking CPU-bound processing, you might be better offloading to a separate process, instead, to be able to use multiple CPU cores and do things concurrently. If the actual processing of the data is in fact just the consumption of some asynchronous service, then it can be wrapped in a single asynchronous concurrent thread very effectively.</p>
+<p>In your example, you're using <code>time.sleep()</code> to simulate the processing. Since that example operation can be done asynchronously (by using <code>asyncio.sleep()</code> instead) then the conversion is simple:</p>
+<pre><code>import itertools
+import asyncio
+
+async def data_loader():
+    for i in itertools.count(0):
+        await asyncio.sleep(1)  # Simulated loading time
+        yield i
+
+async def process(data):
+    await asyncio.sleep(1)  # Simulated processing time
+    processed_data = -data*2
+    print(f'At t={loop.time()-start:.3g}, processed data {data} into {processed_data}')
+
+async def main():
+    tasks = []
+    async for data in data_loader():
+        tasks.append(loop.create_task(process(data)))
+    await asyncio.wait(tasks) # wait for all remaining tasks
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    loop.run_until_complete(main())
+    loop.close()
+</code></pre>
+<p>The results, as you expect:</p>
+<pre><code>At t=2, processed data 0 into 0
+At t=3, processed data 1 into -2
+At t=4, processed data 2 into -4
+...
+</code></pre>
+<p>Remember that it only works because <code>time.sleep()</code> has an asynchronous alternative in the form of <code>asyncio.sleep()</code>. Check the operation you're using, to see if it can be written in asynchronous form.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here is a solution that allows you to wrap the dataloader with an <code>iter_asynchronously</code> function.  It solves the problem for now.  (Note however that there is still the problem that if the dataloader is faster than the processing loop, the queue will grow indefinitely.  This could easily be solved by adding a wait in <code>_async_queue_manager</code> if the queue gets to big (but sadly <code>Queue.qsize()</code> is not supported on Mac!))</p>
+<pre><code>import time
+from multiprocessing import Queue, Process
+
+class PoisonPill:
+    pass
+
+def _async_queue_manager(gen_func, queue: Queue):
+    for item in gen_func():
+        queue.put(item)
+    queue.put(PoisonPill)
+
+def iter_asynchronously(gen_func):
+    """ Given a generator function, make it asynchonous.  """
+    q = Queue()
+    p = Process(target=_async_queue_manager, args=(gen_func, q))
+    p.start()
+    while True:
+        item = q.get()
+        if item is PoisonPill:
+            break
+        else:
+            yield item
+
+def data_loader():
+    for i in range(4):
+        time.sleep(1)  # Simulated loading time
+        yield i
+
+def main():
+    start = time.time()
+    for data in iter_asynchronously(data_loader):
+        time.sleep(1)  # Simulated processing time
+        processed_data = -data*2
+        print(f'At t={time.time()-start:.3g}, processed data {data} into {processed_data}')
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>The output is now as desired:</p>
+<pre><code>At t=2.03, processed data 0 into 0
+At t=3.03, processed data 1 into -2
+At t=4.04, processed data 2 into -4
+At t=5.04, processed data 3 into -6
+</code></pre>
+</div>
+<span class="comment-copy">Thank you for this nice answer.  Now I neglected this for simplicity, but what if the processor is stateful?  i.e. we now make it: <code>processed_data = -data*2 - processed_data</code> with <code>processed_data=0</code> before the loop?  It would be nice to have a generic "generator wrapper" that we can just use to make generators asynchronous.</span>
+<span class="comment-copy">You could use <code>multiprocessing.Value</code> to schlep the state between processes. However, if you have state that depends on values processed so far, you can't process new values in parallel anyway, so you won't even need <code>multiprocessing</code>.</span>
+<span class="comment-copy">Thanks for this.  In my application, the "loading" and "processing" are both blocking, CPU-bound operations, so I guess this approach won't work for me, is that correct?</span>
+<span class="comment-copy">@Peter a python process can only run one piece of code at a time, because of the <b>global interpreter lock (GIL)</b>. That said, you're probably mistaken about the nature of your process. In particular the "loading" part is hardly a CPU-bound operation, and is probably related with data input/output which doesn't use the CPU at all and can be written in a non-blocking manner; Are you sure? Can you describe your loading/processing part with more detail, preferably code?</span>

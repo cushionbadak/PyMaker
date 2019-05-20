@@ -1,0 +1,95 @@
+<div class="post-text" itemprop="text">
+<p>I'm currently monitoring a folder using fsevents. Every time a file is added, a code is executed on this file. A new file is added to the folder every second. </p>
+<pre class="lang-py prettyprint-override"><code>from fsevents import Observer, Stream
+
+def file_event_callback(event):
+    # code 256 for adding file to folder
+    if event.mask == 256:
+        fileChanged = event.name
+        # do stuff with fileChanged file
+
+if __name__ == "__main__":
+    observer = Observer()   
+    observer.start()
+    stream = Stream(file_event_callback, 'folder', file_events=True)
+    observer.schedule(stream)
+    observer.join()
+</code></pre>
+<p>This works quite well. The only problem is, that the libary is building a queue for every file added to the folder. The code executed within the file_event_callback can take more then a second. When that happens the other items in the queue should be skipped so that only the newest one is used.  </p>
+<p>How can I skip items from the queue so that only the latest addition to the folder used after the last one is finished?</p>
+<p>I tried using watchdog first but as this has to run on a mac I had some troubles making it work the way I wanted. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I don't know exactly what library you're using, and when you say "this is building a queue…" I have no idea what "this" you're referring to… but an obvious answer is to stick your own <a href="https://docs.python.org/3/library/queue.html#queue.Queue" rel="nofollow">queue</a> in front of whatever it's using, so you can manipulate that queue directly. For example:</p>
+<pre><code>import queue
+import threading
+
+def skip_get(q):
+    value = q.get(block=True)
+    try:
+        while True:
+            value = q.get(block=False)
+    except queue.Empty:
+        return value
+
+q = queue.Queue()
+
+def file_event_callback(event):
+    # code 256 for adding file to folder
+    if event.mask == 256:
+        fileChanged = event.name
+        q.put(fileChanged)
+
+def consumer():
+    while True:
+        fileChanged = skip_get(q)
+        if fileChanged is None:
+            return
+        # do stuff with fileChanged
+</code></pre>
+<p>Now, before you start up the observer, do this:</p>
+<pre><code>t = threading.Thread(target=consumer)
+t.start()
+</code></pre>
+<p>And at the end:</p>
+<pre><code>observer.join()
+q.put(None)
+t.join()
+</code></pre>
+<hr/>
+<p>So, how does this work?</p>
+<p>First, let's look at the consumer side. When you call <code>q.get()</code>, this pops the first thing off the queue. But what if nothing is there? That's what the <code>block</code> argument is for. If it's false, the <code>get</code> will raise a <code>queue.Empty</code> exception. If it's true, the <code>get</code> will wait forever (in a thread-safe way) until something appears to be popped. So, by blocking once, we handle the case where there's nothing to read yet. By then looping without blocking, we consume anything else on the queue, to handle the case where there are too many things to read. Because we keep reassigning <code>value</code> to whatever we popped, what we end up with is the last thing put on the queue.</p>
+<p>Now, let's look at the producer side. When you call <code>q.put(value)</code>, that just puts <code>value</code> on the queue. Unless you've put a size limit on the queue (which I haven't), there's no way this could block, so you don't have to worry about any of that. But now, how do you signal the consumer thread that you're finished? It's going to be waiting in <code>q.get(block=True)</code> forever; the only way to wake it up is to give it some value to pop. By pushing a sentinel value (in this case, <code>None</code> is fine, because it's not valid as a filename), and making the consumer handle that <code>None</code> by quitting, we give ourselves a nice, clean way to shutdown. (And because we never push anything after the <code>None</code>, there's no chance of accidentally skipping it.) So, we can just push <code>None</code>, then be sure that (barring any other bugs) the consumer thread will eventually quit, which means we can do <code>t.join()</code> to wait until it does without fear of deadlock.</p>
+<hr/>
+<p>I mentioned above that you could do this more simply with a <a href="https://docs.python.org/3/library/threading.html#condition-objects" rel="nofollow"><code>Condition</code></a>. If you think about how a queue actually works, it's just a list (or deque, or whatever) protected by a condition: the consumer waits on the condition until there's something available, and the producer makes something available by adding it to the list and signaling the condition. If you only ever want the last value, there's really no reason for the list. So, you can do this:</p>
+<pre><code>class OneQueue(object):
+    def __init__(self):
+        self.value = None
+        self.condition = threading.Condition()
+        self.sentinel = object()
+    def get(self):
+        with self.condition:
+            while self.value is None:
+                self.condition.wait()
+            value, self.value = self.value, None
+            return value
+    def put(self, value):
+        with self.condition:
+            self.value = value
+            self.condition.notify()
+    def close(self):
+        self.put(self.sentinel)
+</code></pre>
+<p>(Because I'm now using <code>None</code> to signal that nothing is available, I had to create a separate sentinel to signal that we're done.)</p>
+<p>The problem with this design is that if the producers puts multiple values while the consumer is too busy to handle them, it can miss some of them—but in this case, that "problem" is exactly what you were looking for.</p>
+<p>Still, using lower-level tools always means there's a lot more to get wrong, and this is especially dangerous with threading synchronization, because it involves problems that are hard to wrap your head around, and hard to debug even when you understand them, so you might be better off using a <code>Queue</code> anyway.</p>
+</div>
+<span class="comment-copy">What is that <code>fsevents</code>? The only library I know of under that name is the one that stopped working reliably with OS X 10.5. There's also the PyObjC bindings and at least two other standalone wrappers (plus various cross-platform things), but I don't think any of them are called just <code>fsevents</code>.</span>
+<span class="comment-copy">Also, "I tried using watchdog first but as this has to run on a mac"… if you mean <a href="https://pypi.python.org/pypi/watchdog/" rel="nofollow noreferrer">this library</a>, last time I looked it worked fine on Mac (using either <code>select.kqueue</code>, native <code>kqueue</code>, PyObjC FSEvents, or one of the other third-party wrappers, depending on what you had installed). What troubles are you having, and which backend are you using?</span>
+<span class="comment-copy">When I was trying to make watchdog work I found this page: <a href="https://pypi.python.org/pypi/MacFSEvents" rel="nofollow noreferrer">pypi.python.org/pypi/MacFSEvents</a></span>
+<span class="comment-copy">OK, you should mention the specific library you're using in the question.</span>
+<span class="comment-copy">ok, will give it a try, thank you so far</span>
+<span class="comment-copy">@Martin: OK, do you understand what I'm doing here? You could actually simplify this pretty easily by just using a single mutable value with a <code>Condition</code>; I only used a queue because you said you wanted to skip the queue, so I figured you'd understand this…</span>
+<span class="comment-copy">I'm quite new to programming and I'm trying to get the concept. I just tested it and I still have the problem that when i add three files to the folder while the programm is still working on the first one, that all the others are executed after the first one is done. How can I prevent that form happening? I only want the latest file added to the folder being used and forget about the others added while the code was still working on the first one</span>
+<span class="comment-copy">@Martin: If the first time through the loop in <code>consumer</code> really takes 3 seconds, and 3 more values have been queued up during that time, the second time through the loop should pop all 3 and use only the last. Try printing out the values that get added to the queue in <code>callback</code>, and the values that get used in <code>consumer</code>.</span>
+<span class="comment-copy">ok, I tested it. Everything works how it should. Thank you a lot for helping out. What exactly is happening in the skip_get() function? How does the block=True/False work? And what does the .put() and .join() at the end do?</span>

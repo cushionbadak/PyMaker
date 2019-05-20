@@ -1,0 +1,748 @@
+<div class="post-text" itemprop="text">
+<p>Python's standard library has modules for <strong>configuration file parsing</strong> (<a href="http://docs.python.org/3/library/configparser.html">configparser</a>), <strong>environment variable reading</strong> (<a href="http://docs.python.org/3/library/os.html#os.environ">os.environ</a>), and <strong>command-line argument parsing</strong> (<a href="http://docs.python.org/3/library/argparse.html">argparse</a>). I want to write a program that does all those, and also:</p>
+<ul>
+<li><p>Has a <strong>cascade of option values</strong>:</p>
+<ul>
+<li>default option values, overridden by</li>
+<li>config file options, overridden by</li>
+<li>environment variables, overridden by</li>
+<li>command-line options.</li>
+</ul></li>
+<li><p>Allows one or more <strong>configuration file locations specified on the command line</strong> with e.g. <code>--config-file foo.conf</code>, and reads that (either instead of, or additional to, the usual configuration file). This must still obey the above cascade.</p></li>
+<li><p>Allows <strong>option definitions in a single place</strong> to determine the parsing behaviour for configuration files and the command line.</p></li>
+<li><p>Unifies the parsed options into a <strong>single collection of option values</strong> for the rest of the program to access without caring where they came from.</p></li>
+</ul>
+<p>Everything I need is apparently in the Python standard library, but they don't work together smoothly.</p>
+<p>How can I achieve this with minimum deviation from the Python standard library?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The argparse module makes this not nuts, as long as you're happy with a config file that looks like command line. (I think this is an advantage, because users will only have to learn one syntax.) Setting <a href="http://docs.python.org/library/argparse.html#fromfile-prefix-chars">fromfile_prefix_chars</a> to, for example, <code>@</code>, makes it so that,</p>
+<pre><code>my_prog --foo=bar
+</code></pre>
+<p>is equivalent to </p>
+<pre><code>my_prog @baz.conf
+</code></pre>
+<p>if <code>@baz.conf</code> is,</p>
+<pre><code>--foo
+bar
+</code></pre>
+<p>You can even have your code look for <code>foo.conf</code> automatically by modifying <code>argv</code></p>
+<pre><code>if os.path.exists('foo.conf'):
+    argv = ['@foo.conf'] + argv
+args = argparser.parse_args(argv)
+</code></pre>
+<p>The format of these configuration files is modifiable by making a subclass of ArgumentParser and adding a <a href="http://docs.python.org/library/argparse.html#customizing-file-parsing">convert_arg_line_to_args</a> method.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><strong>UPDATE:</strong>  I finally got around to putting this on pypi. Install latest version via:</p>
+<pre><code>   pip install configargparser
+</code></pre>
+<p><a href="https://pypi.org/project/ConfigArgParse/" rel="noreferrer">Full help and instructions are here</a>.</p>
+<p><strong>Original post</strong></p>
+<p>Here's a little something that I hacked together. Feel free suggest improvements/bug-reports in the comments:</p>
+<pre class="lang-py prettyprint-override"><code>import argparse
+import ConfigParser
+import os
+
+def _identity(x):
+    return x
+
+_SENTINEL = object()
+
+
+class AddConfigFile(argparse.Action):
+    def __call__(self,parser,namespace,values,option_string=None):
+        # I can never remember if `values` is a list all the time or if it
+        # can be a scalar string; this takes care of both.
+        if isinstance(values,basestring):
+            parser.config_files.append(values)
+        else:
+            parser.config_files.extend(values)
+
+
+class ArgumentConfigEnvParser(argparse.ArgumentParser):
+    def __init__(self,*args,**kwargs):
+        """
+        Added 2 new keyword arguments to the ArgumentParser constructor:
+
+           config --&gt; List of filenames to parse for config goodness
+           default_section --&gt; name of the default section in the config file
+        """
+        self.config_files = kwargs.pop('config',[])  #Must be a list
+        self.default_section = kwargs.pop('default_section','MAIN')
+        self._action_defaults = {}
+        argparse.ArgumentParser.__init__(self,*args,**kwargs)
+
+
+    def add_argument(self,*args,**kwargs):
+        """
+        Works like `ArgumentParser.add_argument`, except that we've added an action:
+
+           config: add a config file to the parser
+
+        This also adds the ability to specify which section of the config file to pull the 
+        data from, via the `section` keyword.  This relies on the (undocumented) fact that
+        `ArgumentParser.add_argument` actually returns the `Action` object that it creates.
+        We need this to reliably get `dest` (although we could probably write a simple
+        function to do this for us).
+        """
+
+        if 'action' in kwargs and kwargs['action'] == 'config':
+            kwargs['action'] = AddConfigFile
+            kwargs['default'] = argparse.SUPPRESS
+
+        # argparse won't know what to do with the section, so 
+        # we'll pop it out and add it back in later.
+        #
+        # We also have to prevent argparse from doing any type conversion,
+        # which is done explicitly in parse_known_args.  
+        #
+        # This way, we can reliably check whether argparse has replaced the default.
+        #
+        section = kwargs.pop('section', self.default_section)
+        type = kwargs.pop('type', _identity)
+        default = kwargs.pop('default', _SENTINEL)
+
+        if default is not argparse.SUPPRESS:
+            kwargs.update(default=_SENTINEL)
+        else:  
+            kwargs.update(default=argparse.SUPPRESS)
+
+        action = argparse.ArgumentParser.add_argument(self,*args,**kwargs)
+        kwargs.update(section=section, type=type, default=default)
+        self._action_defaults[action.dest] = (args,kwargs)
+        return action
+
+    def parse_known_args(self,args=None, namespace=None):
+        # `parse_args` calls `parse_known_args`, so we should be okay with this...
+        ns, argv = argparse.ArgumentParser.parse_known_args(self, args=args, namespace=namespace)
+        config_parser = ConfigParser.SafeConfigParser()
+        config_files = [os.path.expanduser(os.path.expandvars(x)) for x in self.config_files]
+        config_parser.read(config_files)
+
+        for dest,(args,init_dict) in self._action_defaults.items():
+            type_converter = init_dict['type']
+            default = init_dict['default']
+            obj = default
+
+            if getattr(ns,dest,_SENTINEL) is not _SENTINEL: # found on command line
+                obj = getattr(ns,dest)
+            else: # not found on commandline
+                try:  # get from config file
+                    obj = config_parser.get(init_dict['section'],dest)
+                except (ConfigParser.NoSectionError, ConfigParser.NoOptionError): # Nope, not in config file
+                    try: # get from environment
+                        obj = os.environ[dest.upper()]
+                    except KeyError:
+                        pass
+
+            if obj is _SENTINEL:
+                setattr(ns,dest,None)
+            elif obj is argparse.SUPPRESS:
+                pass
+            else:
+                setattr(ns,dest,type_converter(obj))
+
+        return ns, argv
+
+
+if __name__ == '__main__':
+    fake_config = """
+[MAIN]
+foo:bar
+bar:1
+"""
+    with open('_config.file','w') as fout:
+        fout.write(fake_config)
+
+    parser = ArgumentConfigEnvParser()
+    parser.add_argument('--config-file', action='config', help="location of config file")
+    parser.add_argument('--foo', type=str, action='store', default="grape", help="don't know what foo does ...")
+    parser.add_argument('--bar', type=int, default=7, action='store', help="This is an integer (I hope)")
+    parser.add_argument('--baz', type=float, action='store', help="This is an float(I hope)")
+    parser.add_argument('--qux', type=int, default='6', action='store', help="this is another int")
+    ns = parser.parse_args([])
+
+    parser_defaults = {'foo':"grape",'bar':7,'baz':None,'qux':6}
+    config_defaults = {'foo':'bar','bar':1}
+    env_defaults = {"baz":3.14159}
+
+    # This should be the defaults we gave the parser
+    print ns
+    assert ns.__dict__ == parser_defaults
+
+    # This should be the defaults we gave the parser + config defaults
+    d = parser_defaults.copy()
+    d.update(config_defaults)
+    ns = parser.parse_args(['--config-file','_config.file'])
+    print ns
+    assert ns.__dict__ == d
+
+    os.environ['BAZ'] = "3.14159"
+
+    # This should be the parser defaults + config defaults + env_defaults
+    d = parser_defaults.copy()
+    d.update(config_defaults)
+    d.update(env_defaults)
+    ns = parser.parse_args(['--config-file','_config.file'])
+    print ns
+    assert ns.__dict__ == d
+
+    # This should be the parser defaults + config defaults + env_defaults + commandline
+    commandline = {'foo':'3','qux':4} 
+    d = parser_defaults.copy()
+    d.update(config_defaults)
+    d.update(env_defaults)
+    d.update(commandline)
+    ns = parser.parse_args(['--config-file','_config.file','--foo=3','--qux=4'])
+    print ns
+    assert ns.__dict__ == d
+
+    os.remove('_config.file')
+</code></pre>
+<h1>TODO</h1>
+<p>This implementation is still incomplete.  Here's a partial TODO list:</p>
+<ul>
+<li>(easy) Interaction with <a href="http://docs.python.org/dev/library/argparse.html#parser-defaults" rel="noreferrer">parser defaults</a></li>
+<li>(easy) If type conversion doesn't work, check against how <code>argparse</code> handles <a href="http://docs.python.org/dev/library/argparse.html#exiting-methods" rel="noreferrer">error messages</a> </li>
+</ul>
+<h2>Conform to documented behavior</h2>
+<ul>
+<li>(easy) Write a function that figures out <code>dest</code> from <code>args</code> in <code>add_argument</code>, instead of relying on the <code>Action</code> object</li>
+<li>(trivial) Write a <code>parse_args</code> function which uses <code>parse_known_args</code>.  (e.g. copy <code>parse_args</code> from the <code>cpython</code> implementation to guarantee it calls <code>parse_known_args</code>.)  </li>
+</ul>
+<h2>Less Easy Stuff…</h2>
+<p>I haven't tried any of this yet. It's unlikely—but still possible!—that it could just work…</p>
+<ul>
+<li>(hard?) <a href="http://docs.python.org/dev/library/argparse.html#mutual-exclusion" rel="noreferrer">Mutual Exclusion</a></li>
+<li>(hard?) <a href="http://docs.python.org/dev/library/argparse.html#argument-groups" rel="noreferrer">Argument Groups</a>  (If implemented, these groups should get a <code>section</code> in the config file.)</li>
+<li>(hard?) <a href="http://docs.python.org/dev/library/argparse.html#sub-commands" rel="noreferrer">Sub Commands</a>  (Sub-commands should also get a <code>section</code> in the config file.)</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>There's library that does exactly this called <a href="https://pypi.python.org/pypi/configglue/" rel="noreferrer">configglue</a>.</p>
+<blockquote>
+<p>configglue is a library that glues together python's
+  optparse.OptionParser and ConfigParser.ConfigParser, so that you don't
+  have to repeat yourself when you want to export the same options to a
+  configuration file and a commandline interface.</p>
+</blockquote>
+<p>It also <a href="http://pythonhosted.org/configglue/topics/environment-variables.html" rel="noreferrer">supports</a> environment variables.</p>
+<p>There's also another library called <a href="https://pypi.python.org/pypi/ConfigArgParse" rel="noreferrer">ConfigArgParse</a> which is</p>
+<blockquote>
+<p>A drop-in replacement for argparse that allows options to also be set
+  via config files and/or environment variables.</p>
+</blockquote>
+<p>You might be interested in PyCon talk about configuration by Łukasz Langa - <a href="http://pyvideo.org/video/1772/let-them-configure" rel="noreferrer"><em>Let Them Configure!</em></a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>While I haven't tried it by my own, there is <a href="https://pypi.python.org/pypi/ConfigArgParse" rel="noreferrer">ConfigArgParse</a> library which states that it does most of things that you want:</p>
+<blockquote>
+<p>A drop-in replacement for argparse that allows options to also be set via config files and/or environment variables.</p>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<p>It seems the standard library doesn't address this, leaving each programmer to cobble <code>configparser</code> and <code>argparse</code> and <code>os.environ</code> all together in clunky ways.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The Python standard library does not provide this, as far as I know. I solved this for myself by writing code to use <code>optparse</code> and <code>ConfigParser</code> to parse the command line and config files, and provide an abstraction layer on top of them. However, you would need this as a separate dependency, which from your earlier comment seems to be unpalatable.</p>
+<p>If you want to look at the code I wrote, it's at <a href="http://liw.fi/cliapp/" rel="noreferrer">http://liw.fi/cliapp/</a>. It's integrated into my "command line application framework" library, since that's a large part of what the framework needs to do.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>To hit all those requirements, I would recommend writing your own library that uses both [opt|arg]parse and configparser for the underlying functionality. </p>
+<p>Given the first two and the last requirement, I'd say you want:</p>
+<p>Step one: Do a command line parser pass that only looks for the --config-file option. </p>
+<p>Step two: Parse the config file. </p>
+<p>Step three: set up a second command line parser pass using the output of the config file pass as the defaults.</p>
+<p>The third requirement likely means you have to design your own option definition system to expose all the functionality of optparse and configparser that you care about, and write some plumbing to do conversions in between.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I was tried something like this recently, using "optparse".</p>
+<p>I set it up as a sub-class of OptonParser, with a '--Store' and a '--Check' command.</p>
+<p>The code below should pretty much have you covered. You just need to define your own 'load' and 'store' methods which accept/return dictionaries and you're prey much set.</p>
+<pre><code>
+class SmartParse(optparse.OptionParser):
+    def __init__(self,defaults,*args,**kwargs):
+        self.smartDefaults=defaults
+        optparse.OptionParser.__init__(self,*args,**kwargs)
+        fileGroup = optparse.OptionGroup(self,'handle stored defaults')
+        fileGroup.add_option(
+            '-S','--Store',
+            dest='Action',
+            action='store_const',const='Store',
+            help='store command line settings'
+        )
+        fileGroup.add_option(
+            '-C','--Check',
+            dest='Action',
+            action='store_const',const='Check',
+            help ='check stored settings'
+        )
+        self.add_option_group(fileGroup)
+    def parse_args(self,*args,**kwargs):
+        (options,arguments) = optparse.OptionParser.parse_args(self,*args,**kwargs)
+        action = options.__dict__.pop('Action')
+        if action == 'Check':
+            assert all(
+                value is None 
+                for (key,value) in options.__dict__.iteritems() 
+            )
+            print 'defaults:',self.smartDefaults
+            print 'config:',self.load()
+            sys.exit()
+        elif action == 'Store':
+            self.store(options.__dict__)
+            sys.exit()
+        else:
+            config=self.load()
+            commandline=dict(
+                [key,val] 
+                for (key,val) in options.__dict__.iteritems() 
+                if val is not None
+            )
+            result = {}
+            result.update(self.defaults)
+            result.update(config)
+            result.update(commandline)
+            return result,arguments
+    def load(self):
+        return {}
+    def store(self,optionDict):
+        print 'Storing:',optionDict
+
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's a module I hacked together that reads command-line arguments, environment settings, ini files, and keyring values as well. It's also available in a <a href="https://gist.github.com/ziadsawalha/8044909" rel="nofollow">gist</a>.</p>
+<pre><code>"""
+Configuration Parser
+
+Configurable parser that will parse config files, environment variables,
+keyring, and command-line arguments.
+
+
+
+Example test.ini file:
+
+    [defaults]
+    gini=10
+
+    [app]
+    xini = 50
+
+Example test.arg file:
+
+    --xfarg=30
+
+Example test.py file:
+
+    import os
+    import sys
+
+    import config
+
+
+    def main(argv):
+        '''Test.'''
+        options = [
+            config.Option("xpos",
+                          help="positional argument",
+                          nargs='?',
+                          default="all",
+                          env="APP_XPOS"),
+            config.Option("--xarg",
+                          help="optional argument",
+                          default=1,
+                          type=int,
+                          env="APP_XARG"),
+            config.Option("--xenv",
+                          help="environment argument",
+                          default=1,
+                          type=int,
+                          env="APP_XENV"),
+            config.Option("--xfarg",
+                          help="@file argument",
+                          default=1,
+                          type=int,
+                          env="APP_XFARG"),
+            config.Option("--xini",
+                          help="ini argument",
+                          default=1,
+                          type=int,
+                          ini_section="app",
+                          env="APP_XINI"),
+            config.Option("--gini",
+                          help="global ini argument",
+                          default=1,
+                          type=int,
+                          env="APP_GINI"),
+            config.Option("--karg",
+                          help="secret keyring arg",
+                          default=-1,
+                          type=int),
+        ]
+        ini_file_paths = [
+            '/etc/default/app.ini',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'test.ini')
+        ]
+
+        # default usage
+        conf = config.Config(prog='app', options=options,
+                             ini_paths=ini_file_paths)
+        conf.parse()
+        print conf
+
+        # advanced usage
+        cli_args = conf.parse_cli(argv=argv)
+        env = conf.parse_env()
+        secrets = conf.parse_keyring(namespace="app")
+        ini = conf.parse_ini(ini_file_paths)
+        sources = {}
+        if ini:
+            for key, value in ini.iteritems():
+                conf[key] = value
+                sources[key] = "ini-file"
+        if secrets:
+            for key, value in secrets.iteritems():
+                conf[key] = value
+                sources[key] = "keyring"
+        if env:
+            for key, value in env.iteritems():
+                conf[key] = value
+                sources[key] = "environment"
+        if cli_args:
+            for key, value in cli_args.iteritems():
+                conf[key] = value
+                sources[key] = "command-line"
+        print '\n'.join(['%s:\t%s' % (k, v) for k, v in sources.items()])
+
+
+    if __name__ == "__main__":
+        if config.keyring:
+            config.keyring.set_password("app", "karg", "13")
+        main(sys.argv)
+
+Example results:
+
+    $APP_XENV=10 python test.py api --xarg=2 @test.arg
+    &lt;Config xpos=api, gini=1, xenv=10, xini=50, karg=13, xarg=2, xfarg=30&gt;
+    xpos:   command-line
+    xenv:   environment
+    xini:   ini-file
+    karg:   keyring
+    xarg:   command-line
+    xfarg:  command-line
+
+
+"""
+import argparse
+import ConfigParser
+import copy
+import os
+import sys
+
+try:
+    import keyring
+except ImportError:
+    keyring = None
+
+
+class Option(object):
+    """Holds a configuration option and the names and locations for it.
+
+    Instantiate options using the same arguments as you would for an
+    add_arguments call in argparse. However, you have two additional kwargs
+    available:
+
+        env: the name of the environment variable to use for this option
+        ini_section: the ini file section to look this value up from
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.args = args or []
+        self.kwargs = kwargs or {}
+
+    def add_argument(self, parser, **override_kwargs):
+        """Add an option to a an argparse parser."""
+        kwargs = {}
+        if self.kwargs:
+            kwargs = copy.copy(self.kwargs)
+            try:
+                del kwargs['env']
+            except KeyError:
+                pass
+            try:
+                del kwargs['ini_section']
+            except KeyError:
+                pass
+        kwargs.update(override_kwargs)
+        parser.add_argument(*self.args, **kwargs)
+
+    @property
+    def type(self):
+        """The type of the option.
+
+        Should be a callable to parse options.
+        """
+        return self.kwargs.get("type", str)
+
+    @property
+    def name(self):
+        """The name of the option as determined from the args."""
+        for arg in self.args:
+            if arg.startswith("--"):
+                return arg[2:].replace("-", "_")
+            elif arg.startswith("-"):
+                continue
+            else:
+                return arg.replace("-", "_")
+
+    @property
+    def default(self):
+        """The default for the option."""
+        return self.kwargs.get("default")
+
+
+class Config(object):
+    """Parses configuration sources."""
+
+    def __init__(self, options=None, ini_paths=None, **parser_kwargs):
+        """Initialize with list of options.
+
+        :param ini_paths: optional paths to ini files to look up values from
+        :param parser_kwargs: kwargs used to init argparse parsers.
+        """
+        self._parser_kwargs = parser_kwargs or {}
+        self._ini_paths = ini_paths or []
+        self._options = copy.copy(options) or []
+        self._values = {option.name: option.default
+                        for option in self._options}
+        self._parser = argparse.ArgumentParser(**parser_kwargs)
+        self.pass_thru_args = []
+
+    @property
+    def prog(self):
+        """Program name."""
+        return self._parser.prog
+
+    def __getitem__(self, key):
+        return self._values[key]
+
+    def __setitem__(self, key, value):
+        self._values[key] = value
+
+    def __delitem__(self, key):
+        del self._values[key]
+
+    def __contains__(self, key):
+        return key in self._values
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def get(self, key, *args):
+        """
+        Return the value for key if it exists otherwise the default.
+        """
+        return self._values.get(key, *args)
+
+    def __getattr__(self, attr):
+        if attr in self._values:
+            return self._values[attr]
+        else:
+            raise AttributeError("'config' object has no attribute '%s'"
+                                 % attr)
+
+    def build_parser(self, options, **override_kwargs):
+        """."""
+        kwargs = copy.copy(self._parser_kwargs)
+        kwargs.update(override_kwargs)
+        if 'fromfile_prefix_chars' not in kwargs:
+            kwargs['fromfile_prefix_chars'] = '@'
+        parser = argparse.ArgumentParser(**kwargs)
+        if options:
+            for option in options:
+                option.add_argument(parser)
+        return parser
+
+    def parse_cli(self, argv=None):
+        """Parse command-line arguments into values."""
+        if not argv:
+            argv = sys.argv
+        options = []
+        for option in self._options:
+            temp = Option(*option.args, **option.kwargs)
+            temp.kwargs['default'] = argparse.SUPPRESS
+            options.append(temp)
+        parser = self.build_parser(options=options)
+        parsed, extras = parser.parse_known_args(argv[1:])
+        if extras:
+            valid, pass_thru = self.parse_passthru_args(argv[1:])
+            parsed, extras = parser.parse_known_args(valid)
+            if extras:
+                raise AttributeError("Unrecognized arguments: %s" %
+                                     ' ,'.join(extras))
+            self.pass_thru_args = pass_thru + extras
+        return vars(parsed)
+
+    def parse_env(self):
+        results = {}
+        for option in self._options:
+            env_var = option.kwargs.get('env')
+            if env_var and env_var in os.environ:
+                value = os.environ[env_var]
+                results[option.name] = option.type(value)
+        return results
+
+    def get_defaults(self):
+        """Use argparse to determine and return dict of defaults."""
+        parser = self.build_parser(options=self._options)
+        parsed, _ = parser.parse_known_args([])
+        return vars(parsed)
+
+    def parse_ini(self, paths=None):
+        """Parse config files and return configuration options.
+
+        Expects array of files that are in ini format.
+        :param paths: list of paths to files to parse (uses ConfigParse logic).
+                      If not supplied, uses the ini_paths value supplied on
+                      initialization.
+        """
+        results = {}
+        config = ConfigParser.SafeConfigParser()
+        config.read(paths or self._ini_paths)
+        for option in self._options:
+            ini_section = option.kwargs.get('ini_section')
+            if ini_section:
+                try:
+                    value = config.get(ini_section, option.name)
+                    results[option.name] = option.type(value)
+                except ConfigParser.NoSectionError:
+                    pass
+        return results
+
+    def parse_keyring(self, namespace=None):
+        """."""
+        results = {}
+        if not keyring:
+            return results
+        if not namespace:
+            namespace = self.prog
+        for option in self._options:
+            secret = keyring.get_password(namespace, option.name)
+            if secret:
+                results[option.name] = option.type(secret)
+        return results
+
+    def parse(self, argv=None):
+        """."""
+        defaults = self.get_defaults()
+        args = self.parse_cli(argv=argv)
+        env = self.parse_env()
+        secrets = self.parse_keyring()
+        ini = self.parse_ini()
+
+        results = defaults
+        results.update(ini)
+        results.update(secrets)
+        results.update(env)
+        results.update(args)
+
+        self._values = results
+        return self
+
+    @staticmethod
+    def parse_passthru_args(argv):
+        """Handles arguments to be passed thru to a subprocess using '--'.
+
+        :returns: tuple of two lists; args and pass-thru-args
+        """
+        if '--' in argv:
+            dashdash = argv.index("--")
+            if dashdash == 0:
+                return argv[1:], []
+            elif dashdash &gt; 0:
+                return argv[0:dashdash], argv[dashdash + 1:]
+        return argv, []
+
+    def __repr__(self):
+        return "&lt;Config %s&gt;" % ', '.join([
+            '%s=%s' % (k, v) for k, v in self._values.iteritems()])
+
+
+def comma_separated_strings(value):
+    """Handles comma-separated arguments passed in command-line."""
+    return map(str, value.split(","))
+
+
+def comma_separated_pairs(value):
+    """Handles comma-separated key/values passed in command-line."""
+    pairs = value.split(",")
+    results = {}
+    for pair in pairs:
+        key, pair_value = pair.split('=')
+        results[key] = pair_value
+    return results
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The library <a href="https://github.com/d2207197/confect" rel="nofollow noreferrer">confect</a> I built is precisely to meet most of your needs. </p>
+<ul>
+<li>It can load configuration file multiple times through given file paths or module name.</li>
+<li>It loads configurations from environment variables with a given prefix.</li>
+<li><p>It can attach command line options to some <a href="https://click.palletsprojects.com/" rel="nofollow noreferrer">click</a> commands</p>
+<p>(sorry, it's not argparse, but <a href="https://click.palletsprojects.com/" rel="nofollow noreferrer">click</a> is better and much more advanced. <code>confect</code> might support argparse in the future release).</p></li>
+<li>Most importantly, <code>confect</code> loads Python configuration files not JSON/YMAL/TOML/INI. Just like IPython profile file or DJANGO settings file, Python configuration file is flexible and easier to maintain.</li>
+</ul>
+<p>For more information, please check the README.rst in the <a href="https://github.com/d2207197/confect" rel="nofollow noreferrer">project repository</a>. Be aware of that it supports only Python3.6 up.</p>
+<h1>Examples</h1>
+<h2>Attaching command line options</h2>
+<pre class="lang-python prettyprint-override"><code>import click
+from proj_X.core import conf
+
+@click.command()
+@conf.click_options
+def cli():
+    click.echo(f'cache_expire = {conf.api.cache_expire}')
+
+if __name__ == '__main__':
+    cli()
+</code></pre>
+<p>It automatically creates a comprehensive help message with all properties and default values declared.</p>
+<pre><code>$ python -m proj_X.cli --help
+Usage: cli.py [OPTIONS]
+
+Options:
+  --api-cache_expire INTEGER  [default: 86400]
+  --api-cache_prefix TEXT     [default: proj_X_cache]
+  --api-url_base_path TEXT    [default: api/v2/]
+  --db-db_name TEXT           [default: proj_x]
+  --db-username TEXT          [default: proj_x_admin]
+  --db-password TEXT          [default: your_password]
+  --db-host TEXT              [default: 127.0.0.1]
+  --help                      Show this message and exit.
+</code></pre>
+<h2>Loading environment variables</h2>
+<p>It only needs one line to load environment variables</p>
+<pre class="lang-python prettyprint-override"><code>conf.load_envvars('proj_X')
+</code></pre>
+</div>
+<span class="comment-copy">I really like this question.  I've been considering doing something like this for a long time ... I'm glad <code>jterrace</code> gave a bounty here to push me over the edge enough to try my hand at doing something like this :)</span>
+<span class="comment-copy"><b>Excellent</b> question!  It’s amazing this hasn’t been solved by a popular package (or by the standard library itself) a long time ago.</span>
+<span class="comment-copy">Until someone provides a better alternative, this is the right answer. I've been using argparse, and didn't even look at this feature. Nice!</span>
+<span class="comment-copy">but this doesn't have an answer for environment variables?</span>
+<span class="comment-copy">@jterrace: This SO answer may work for you: <a href="http://stackoverflow.com/a/10551190/400793">stackoverflow.com/a/10551190/400793</a></span>
+<span class="comment-copy">do you mind throwing this into a github repo so everyone can improve on this?</span>
+<span class="comment-copy">@brent.payne -- <a href="https://github.com/mgilson/configargparser" rel="nofollow noreferrer">github.com/mgilson/configargparser</a> -- If I'm gonna release this as real code, I decided to take a little time tonight to clean it up a bit.  :-)</span>
+<span class="comment-copy">FWIW, I finally got around to putting this on pypi -- You <i>should</i> be able to install it via <code>pip install configargparser</code></span>
+<span class="comment-copy">@mgilson - I updated your post. This package deserves more use!</span>
+<span class="comment-copy">I <a href="https://answers.launchpad.net/configglue/+question/232503" rel="nofollow noreferrer">asked</a> if there are any plans to support argparse module.</span>
+<span class="comment-copy">I tried it, ConfigArgParse is very convenient and indeed a drop-in replacement.</span>
+<span class="comment-copy">This is rather further from “minimum deviation from the Python standard library” than I'd hoped for.</span>
+<span class="comment-copy">optparse is deprecated, of course.</span>
+<span class="comment-copy">but still useful if you want to remain compatible with older versions of Python</span>
+<span class="comment-copy">&gt; sorry, it's not argparse, but click is better and much more advanced […] Regardless of the merits of a third-party library, that makes this not an answer to the question.</span>

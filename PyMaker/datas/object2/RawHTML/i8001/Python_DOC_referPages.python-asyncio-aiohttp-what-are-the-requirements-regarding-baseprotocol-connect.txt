@@ -1,0 +1,92 @@
+<div class="post-text" itemprop="text">
+<p>The python <a href="https://docs.python.org/3/library/asyncio-protocol.html#asyncio.BaseProtocol.connection_lost" rel="nofollow noreferrer">documentation</a> for <code>connection_lost</code> states: </p>
+<blockquote>
+<p>connection_made() and connection_lost() are called exactly once per successful connection.</p>
+</blockquote>
+<p>Further down there's also the following state machine:</p>
+<blockquote>
+<p>start -&gt; connection_made() [-&gt; data_received() *] [-&gt; eof_received() ?] -&gt; connection_lost() -&gt; end</p>
+</blockquote>
+<p>Also, the <a href="https://docs.python.org/3/library/asyncio-protocol.html#asyncio.BaseTransport.close" rel="nofollow noreferrer">documentation</a> for <code>BaseTransport.close()</code> states:</p>
+<blockquote>
+<p>After all buffered data is flushed, the protocol’s connection_lost() method will be called with None as its argument.</p>
+</blockquote>
+<p>and the <a href="https://docs.python.org/3/library/asyncio-protocol.html#asyncio.WriteTransport.abort" rel="nofollow noreferrer">documentation</a> for <code>WriteTransport.abort()</code> states:</p>
+<blockquote>
+<p>The protocol’s connection_lost() method will eventually be called with None as its argument.</p>
+</blockquote>
+<p>This seems to me to indicate the following responsibilities:</p>
+<ol>
+<li>The transport <em>must</em>, if it has called <code>connection_made()</code>, later also call <code>connection_lost()</code> on the protocol (regardless of whether the connection is lost because of a call to <code>close()</code>, a call to <code>abort()</code> or an issue with the underlying connection).</li>
+<li>The protocol <em>must not</em> assume that I/O has finished when a call to <code>close()</code> or <code>abort()</code> returns. It must wait for the call to <code>connection_lost()</code>. In particular, after <code>close()</code> or <code>abort()</code> returns, there may be work relating to the transport still scheduled on the event loop.</li>
+</ol>
+<p>With that in mind, consider the following trivial aiohttp client program, using SSL:</p>
+<pre class="lang-py prettyprint-override"><code>import aiohttp
+import asyncio
+
+async def main():
+    conn = aiohttp.TCPConnector(verify_ssl=False)
+    async with aiohttp.ClientSession(connector=conn) as session:
+        async with session.post('https://whatevs/') as resp:
+            resp.raise_for_status()
+
+loop = asyncio.get_event_loop()
+try:
+    loop.run_until_complete(main())
+finally:
+    loop.close()
+</code></pre>
+<p>Running this on my (windows) machine appears to work
+correctly. However, if I put breakpoints or print statements into the
+<code>connection_made()</code> and <code>connection_lost()</code> methods of aiohttp's
+<code>ResponseHandler</code> class (a protocol implementation), I see that
+<code>connection_made()</code> is called but <code>connection_lost()</code> is not.</p>
+<p>The transport used is <code>_SSLProtocolTransport</code>, defined in asyncio's
+<code>sslproto.py</code> file. Its <code>close()</code> method <em>is</em> called, and it sets off
+a shutdown process. Due to the nature of SSL this shutdown process is
+necessarily asynchronous, and the expectation appears to be that once
+the shutdown is complete the <code>SSLProtocol</code> underlying the
+<code>_SSLProtocolTransport</code> would, from its <code>_finalize()</code> method, close
+<em>its</em> underlying transport. This would then cause a call to
+<code>connection_lost</code> to bubble up the stack. However, none of this
+asynchronous stuff actually happens. aiohttp appears to just call
+<code>close()</code> and immediately discard the <code>_SSLProtocolTransport</code> (the
+method where it does this is not even a coroutine), and the transport
+never progresses with its shutdown sequence and never calls
+<code>connection_lost()</code>.</p>
+<p>So my question is: is this a bug in aiohttp and/or aysncio's SSL
+protocol/transport, or am I misinterpreting the documentation as
+regards the responsitilities of the transport and protocol?</p>
+<h1>Why I'm Asking This</h1>
+<p>The reason for this question is that I have written an SSL transport
+of my own, to allow me to use PyOpenSSL with asyncio, instead of the
+standard library <code>ssl</code> module. In my implementation, after the call to
+my <code>close()</code> method returns, there are still callbacks queued on the
+event loop (scheduled with <code>call_soon()</code>). This is necessary in order
+for the asynchronous shutdown sequence to be performed correctly, and
+I expect the protocol to give my transport a chance to complete the
+process and call <code>connection_lost()</code>.</p>
+<p>When I use my transport with aiohttp, the <code>__aexit__</code> method of the
+<code>ClientSession</code> created in the code above calls its own <code>close()</code>
+method (not a coroutine), which causes my transport to be closed,
+without waiting for <code>connection_lost()</code>. The event loop is then closed
+and the module finalised while the transport is still alive and
+performing I/O, resulting in a variety of errors.</p>
+<p>I'm trying to figure out whether this is my fault or a bug in aiohttp
+(and perhaps also asyncio's SSL transport). If it's my fault, I need
+to know how I'm supposed to perform this asynchronous shutdown. I
+could in principle handle it at the top level by running the event
+loop until it's empty before calling loop.close(), but I don't see any
+way to do that (there's <code>Task.all_tasks()</code> but that doesn't work for
+things scheduled with <code>call_soon</code>). Even if I can do that somehow, it
+would seem exceptionally ugly and is certainly not described as a
+standard requirement for shutting down after such work in any
+documentation I've seen for asyncio or aiohttp.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I suggest you to create an issue in aiohttp bug tracker and copy your question into it.
+IMHO Stack Overflow is not the best place for discussing questions like this.</p>
+</div>
+<span class="comment-copy">So you think it's a bug in aiohttp? If so, that's an answer to the question, which is a generic one about the requirements on transports and protocols in asyncio. I don't want to submit a bug report to aiohttp if it's doing nothing wrong. As I explained, these errors only occur when I use my own transport and my immediate suspicion is that I've coded it wrong.</span>
+<span class="comment-copy">Further investigation reveals that in the trivial case above the underlying <code>_SelectorSocketTransport</code> is actually leaked because <code>close()</code> is never called on it, so <code>remove_reader()</code> is never called. The transport remains alive in a reference cycle with the event loop until the runtime is shut down. That is very definitely wrong, so I think this is unarguably a bug in aiohttp. I'll raise an issue for it.</span>
+<span class="comment-copy">Well, it's a bug in <i>something</i> - whether it's in aiohttp or asyncio isn't 100% clear</span>

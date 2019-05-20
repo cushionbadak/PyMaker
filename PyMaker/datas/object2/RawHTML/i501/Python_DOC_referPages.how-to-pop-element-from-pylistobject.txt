@@ -1,0 +1,76 @@
+<div class="post-text" itemprop="text">
+<p>Lets say I have a <code>PyListObject</code>, and I want to append a <code>PyObject</code> then I can use <code>PyList_Append</code> API which is documented in <a href="https://docs.python.org/3.3/c-api/list.html?highlight=m#list-objects" rel="nofollow noreferrer"><code>List Objects C-API</code></a>. But for my use case I want to <code>pop</code> an element from the <code>PyListObject</code>(i.e. <code>my_list.pop()</code> in python layer).</p>
+<p>But the <strong>List Objects C-API</strong> documentation does not mention anything about <code>pop</code> operation.</p>
+<p>So is there any document available about <code>PyListPop</code> API function?.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, the <code>list.pop</code> method is not directly available via the C-API on <code>PyListObject</code>s.</p>
+<p>Given that <code>list.pop</code> already exists and is implemented in C you could simply look up what the CPython implementation does:</p>
+<pre class="lang-c prettyprint-override"><code>static PyObject *
+list_pop_impl(PyListObject *self, Py_ssize_t index)
+{
+    PyObject *v;
+    int status;
+
+    if (Py_SIZE(self) == 0) {
+        /* Special-case most common failure cause */
+        PyErr_SetString(PyExc_IndexError, "pop from empty list");
+        return NULL;
+    }
+    if (index &lt; 0)
+        index += Py_SIZE(self);
+    if (index &lt; 0 || index &gt;= Py_SIZE(self)) {
+        PyErr_SetString(PyExc_IndexError, "pop index out of range");
+        return NULL;
+    }
+    v = self-&gt;ob_item[index];
+    if (index == Py_SIZE(self) - 1) {
+        status = list_resize(self, Py_SIZE(self) - 1);
+        if (status &gt;= 0)
+            return v; /* and v now owns the reference the list had */
+        else
+            return NULL;
+    }
+    Py_INCREF(v);
+    status = list_ass_slice(self, index, index+1, (PyObject *)NULL);
+    if (status &lt; 0) {
+        Py_DECREF(v);
+        return NULL;
+    }
+    return v;
+}
+</code></pre>
+<p><a href="https://github.com/python/cpython/blob/v3.7.2/Objects/listobject.c#L953-L997" rel="nofollow noreferrer">Source for CPython 3.7.2</a></p>
+<p>This includes a lot of functions that are not (easily) accessible for a C extension and it also handles popping from a specific index (even negative ones). Personally I wouldn't even bother to re-implement it but just call the <code>pop</code> method with <a href="https://docs.python.org/c-api/object.html#c.PyObject_CallMethod" rel="nofollow noreferrer"><code>PyObject_CallMethod</code></a>:</p>
+<pre class="lang-c prettyprint-override"><code>PyObject *
+list_pop(PyObject *lst){
+    return PyObject_CallMethod(lst, "pop", "n", Py_SIZE(lst) - 1);
+}
+</code></pre>
+<p>It might be a bit slower than a re-implementation but it should be "safer" - one cannot accidentally mess up invariants of the list object (for example resize conditions).</p>
+<p>Another implementation is present in <a href="https://github.com/cython/cython/blob/0.29.5/Cython/Utility/Optimize.c#L104-L111" rel="nofollow noreferrer">Cython</a></p>
+<pre class="lang-c prettyprint-override"><code>static CYTHON_INLINE PyObject* __Pyx_PyList_Pop(PyObject* L) {
+    /* Check that both the size is positive and no reallocation shrinking needs to be done. */
+    if (likely(PyList_GET_SIZE(L) &gt; (((PyListObject*)L)-&gt;allocated &gt;&gt; 1))) {
+        Py_SIZE(L) -= 1;
+        return PyList_GET_ITEM(L, PyList_GET_SIZE(L));
+    }
+    return CALL_UNBOUND_METHOD(PyList_Type, "pop", L);
+}
+</code></pre>
+<p>That could also be adapted for your use-case.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You will have to roll it out by yourself. Here is a possible implementation (without error checking):</p>
+<pre class="lang-c prettyprint-override"><code>PyObject *my_pop_from_list(PyListObject *lst){
+    //TODO: check lst isn't empty
+    Py_SIZE(lst) -= 1;                                 // forget last element 
+    return PyList_GET_ITEM(lst, PyList_GET_SIZE(lst)); // return last element
+}
+</code></pre>
+<p><a href="https://docs.python.org/3/c-api/structures.html#c.Py_SIZE" rel="nofollow noreferrer"><code>Py_SIZE</code></a> is just a macro to access <code>lst-&gt;ob_size</code>, which we decrease while executing <code>pop</code>. </p>
+<p>Also versions without error checking, i.e. <code>PyList_GET_ITEM</code> and <code>PyList_GET_SIZE</code>, are used, because once it is established (see TODO-comment), that the list isn't empty - nothing could go wrong.</p>
+<p>The caller receives a new reference, albeit <code>PyList_GET_ITEM</code> returns a borrowed one: decreasing the size of the list the way we did in the code above, makes list "forget" the reference without decreasing the reference counter.</p>
+<p>As @MSeifert has pointed out, this version doesn't change the size of the underlying array, the same way <code>list.pop()</code> would do (if only half or less of the underlying array is used after pop).  This could be seen as "feature" of the above implementation - trading speed for memory.</p>
+</div>
+<span class="comment-copy">Note that this implementation won't resize the lists internal array what the actual <code>list.pop</code> implementation does. This might lead to needing more memory than necessary.</span>

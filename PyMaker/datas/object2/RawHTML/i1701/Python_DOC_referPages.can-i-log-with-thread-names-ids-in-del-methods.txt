@@ -1,0 +1,36 @@
+<div class="post-text" itemprop="text">
+<p>In the Python stdlib's <code>logging</code> library, using the <code>%(thread)</code> or <code>%(threadName)</code> macro (<a href="https://docs.python.org/3/library/logging.html#logrecord-attributes" rel="nofollow noreferrer">documented here</a>) calls <code>threading.current_thread</code> (<a href="https://github.com/python/cpython/blob/fd512d76456b65c529a5bc58d8cfe73e4a10de7a/Lib/logging/__init__.py#L342-L344" rel="nofollow noreferrer">code</a>), which takes out a <code>threading</code>-internal lock.</p>
+<p>This, <a href="https://docs.python.org/3/reference/datamodel.html#object.__del__" rel="nofollow noreferrer">as per the warnings in the <code>__del__</code> documentation</a>, causes a problem if you want to log inside <code>__del__</code>. We've run into <a href="https://datastax-oss.atlassian.net/browse/PYTHON-1038" rel="nofollow noreferrer">a single-threaded deadlocking issue</a> caused by this.</p>
+<p>So, my question: <strong>is there an always-safe way to log from inside <code>__del__</code> methods</strong>? It'd be nice to log information about, in our case, connections being closed as the result of their owners being GC'd, but this can cause problems in the (perhaps unlikely) case that a user turns on debug logging <em>and</em> adds threading information to their debug configuration. I have found some posts about <a href="https://codewithoutrules.com/2017/08/16/concurrency-python/" rel="nofollow noreferrer">more explicit resource-sharing in <code>__del__</code></a>, but none about the stdlib logging behavior.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <a href="https://github.com/python/cpython/blob/v3.7.1/Lib/threading.py#L1206" rel="nofollow noreferrer">CPython stdlib version</a> of <code>threading.current_thread()</code> doesn't actually take a lock. The issue you ran into is particular to eventlet, which does a bunch of monkey-patching to mess with the threading system. While one approach could be to stop using eventlet, that'd probably require you to rewrite your whole application, and it doesn't fix any of the other ways you might end up trying to take a lock while logging - for example, if a <code>__str__</code> method turns out to need a lock.</p>
+<p>The closest thing to a safe way to log within <code>__del__</code>, or to do any complex work in <code>__del__</code>, is probably to instead have <code>__del__</code> send a message telling some other code to do the logging instead. This would introduce a delay between <code>__del__</code> and the actual logging, but such a delay is essentially unavoidable, because we must delay the logging until the resources it needs are available. It would also not guarantee that the logging call and the <code>__del__</code> happen on the same thread; in a non-eventlet context, it's probably safe to call <code>current_thread()</code> to figure out which thread is handling <code>__del__</code>, but with eventlet, there probably isn't a good way.</p>
+<p>Most ways of sending the message would have similar thread-safety or reentrancy issues, but Python 3.7 adds the <a href="https://docs.python.org/3/library/queue.html#simplequeue-objects" rel="nofollow noreferrer"><code>queue.SimpleQueue</code></a> class with a <code>put</code> method designed to be reentrant. Using it to manage your <code>__del__</code>-logging messages might look something like</p>
+<pre><code>import queue
+del_log_queue = queue.SimpleQueue()
+
+def stop_del_logging():
+    del_log_queue.put(None)
+
+...
+
+def __del__(self):
+    del_log_queue.put((tuple, of, relevant, information))
+
+...
+
+# in some other thread
+
+while True:
+    info = del_log_queue.get()
+    if info is None:
+        break
+    relevant_logger.log(do_something_with(info))
+</code></pre>
+<p>In a non-eventlet context, it might be safe to have a <a href="https://docs.python.org/3/library/logging.handlers.html#queuehandler" rel="nofollow noreferrer"><code>logging.QueueHandler</code></a> and <a href="https://docs.python.org/3/library/logging.handlers.html#logging.handlers.QueueListener" rel="nofollow noreferrer"><code>logging.QueueListener</code></a> handle the SimpleQueue, but with eventlet, that won't work, because we need to delay creation of the LogRecord until we're out of <code>__del__</code>.</p>
+</div>
+<span class="comment-copy">What about just storing the thread name as an instance variable when you start the thread?</span>
+<span class="comment-copy">@larsks: You still wouldn't know which thread the logging call is executing on. You'd need to call <code>threading.current_thread()</code>, which would produce the same deadlock.</span>
+<span class="comment-copy">Incidentally, there's a <a href="https://www.python.org/dev/peps/pep-0556/" rel="nofollow noreferrer">proposal</a> for a mode where the GC runs on its own thread, which would make some of these problems easier. I'm not sure if that proposal is going anywhere, though.</span>
+<span class="comment-copy"><code>What about just storing the thread name as an instance variable when you start the thread?</code> -- in our case that's not worth the overhead of adding that instance variable to every single <code>debug</code> call. And, as @user2357112 mentioned, this wouldn't solve the issue anyway.</span>

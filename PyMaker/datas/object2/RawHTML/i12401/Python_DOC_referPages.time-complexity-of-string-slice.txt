@@ -1,0 +1,79 @@
+<div class="post-text" itemprop="text">
+<p>What's the time complexity of slicing a Python string? Given that Python strings are immutable, I can imagine slicing them being either <code>O(1)</code> or <code>O(n)</code> depending upon how slicing is implemented.</p>
+<p>I need to write a function that iterates over all suffixes of a (potentially big) string. I could avoid slicing the string by representing a suffix as a tuple of the entire string plus an index to start reading characters from, but that's ugly. If instead I naively write my function like this:</p>
+<pre><code>def do_something_on_all_suffixes(big_string):
+    for i in range(len(big_string)):
+        suffix = big_string[i:]
+        some_constant_time_operation(suffix)
+</code></pre>
+<p>... will its time complexity be <code>O(n)</code> or <code>O(n<sup>2</sup>)</code>, where <code>n</code> is <code>len(big_string)</code>?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Short answer: <code>str</code> slices, in general, copy. That means that your function that does a slice for each of your string's <code>n</code> suffixes is doing <code>O(n<sup>2</sup>)</code> work. That said, you can avoid copies if you can work with <code>bytes</code>-like objects using <a href="https://docs.python.org/3/library/stdtypes.html#memoryview" rel="nofollow noreferrer"><code>memoryview</code>s to get zero-copy views of the original bytes data</a>. See <strong>How you can do zero copy slicing</strong> below for how to make it work.</p>
+<p>Long answer: (C)Python <code>str</code> do not slice by referencing a view of a subset of the data. There are exactly three modes of operation for <code>str</code> slicing:</p>
+<ol>
+<li>Complete slice, e.g. <code>mystr[:]</code>: Returns a reference to the exact same <code>str</code> (not just shared data, the same actual object, <code>mystr is mystr[:]</code> since <code>str</code> is immutable so there is no risk to doing so)</li>
+<li>The zero length slice and (implementation dependent) cached length 1 slices; the empty string is a singleton (<code>mystr[1:1] is mystr[2:2] is ''</code>), and low ordinal strings of length one are cached singletons as well (on CPython 3.5.0, it looks like all characters representable in latin-1, that is Unicode ordinals in <code>range(256)</code>, are cached)</li>
+<li>All other slices: The sliced <code>str</code> is copied at creation time, and thereafter unrelated to the original <code>str</code></li>
+</ol>
+<p>The reason why #3 is the general rule is to avoid issues with large <code>str</code> being kept in memory by a view of a small portion of it. If you had a 1GB file, read it in and sliced it like so (yes, it's wasteful when you can seek, this is for illustration):</p>
+<pre><code>with open(myfile) as f:
+    data = f.read()[-1024:]
+</code></pre>
+<p>then you'd have 1 GB of data being held in memory to support a view that shows the final 1 KB, a serious waste. Since slices are usually smallish, it's almost always faster to copy on slice instead of create views. It also means <code>str</code> can be simpler; it needs to know its size, but it need not track an offset into the data as well.</p>
+<h2>How you can do zero copy slicing</h2>
+<p>There <strong>are</strong> ways to perform view based slicing in Python, and in Python 2, it will work on <code>str</code> (because <code>str</code> is bytes-like in Python 2, supporting the <a href="https://docs.python.org/3/c-api/buffer.html#bufferobjects" rel="nofollow noreferrer">buffer protocol</a>). With Py2 <code>str</code> and Py3 <code>bytes</code> (as well as many other data types like <code>bytearray</code>, <code>array.array</code>, <code>numpy</code> arrays, <code>mmap.mmap</code>s, etc.), you can create a <a href="https://docs.python.org/3/library/stdtypes.html#memoryview" rel="nofollow noreferrer"><code>memoryview</code> that is a zero copy view of the original object</a>, and can be sliced without copying data. So if you can use (or encode) to Py2 <code>str</code>/Py3 <code>bytes</code>, and your function can work with arbitrary <code>bytes</code>-like objects, then you could do:</p>
+<pre><code>def do_something_on_all_suffixes(big_string):
+    # In Py3, may need to encode as latin-1 or the like
+    remaining_suffix = memoryview(big_string)
+    # Rather than explicit loop, just replace view with one shorter view
+    # on each loop
+    while remaining_suffix:  # Stop when we've sliced to empty view
+        some_constant_time_operation(remaining_suffix)
+        remaining_suffix = remaining_suffix[1:]
+</code></pre>
+<p>The slices of <code>memoryview</code>s do make new view objects (they're just ultra-lightweight with fixed size unrelated to the amount of data they view), just not any data, so <code>some_constant_time_operation</code> can store a copy if needed and it won't be changed when we slice it down later. Should you need a proper copy as Py2 <code>str</code>/Py3 <code>bytes</code>, you can call <code>.tobytes()</code> to get the raw <code>bytes</code> obj, or (in Py3 only it appears), decode it directly to a <code>str</code> that copies from the buffer, e.g. <code>str(remaining_suffix[10:20], 'latin-1')</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It all depends on how big your slices are. I threw together the following two benchmarks. The first slices the entire string and the second only a little bit. Curve fitting with <a href="http://www.xuru.org/rt/PR.asp" rel="nofollow noreferrer">this tool</a> gives</p>
+<pre><code># s[1:-1]
+y = 0.09 x^2 + 10.66 x - 3.25
+
+# s[1:1000]
+y = -0.15 x + 17.13706461
+</code></pre>
+<p>The first looks quite linear for slices of strings up to 4MB. I guess this really measures the time taken to construct a second string. The second is pretty constant, although it's so fast it's probably not that stable.</p>
+<p><a href="https://i.stack.imgur.com/ok96Im.png" rel="nofollow noreferrer"><img alt="enter image description here" src="https://i.stack.imgur.com/ok96Im.png"/></a><a href="https://i.stack.imgur.com/vMkK8m.png" rel="nofollow noreferrer"><img alt="enter image description here" src="https://i.stack.imgur.com/vMkK8m.png"/></a></p>
+<pre><code>import time
+
+def go(n):
+    start = time.time()
+    s = "abcd" * n
+    for j in xrange(50000):
+
+        #benchmark one
+        a = s[1:-1]
+
+        #benchmark two
+        a = s[1:1000]
+
+    end = time.time()
+    return (end - start) * 1000
+
+for n in range(1000, 100000, 5000):
+    print n/1000.0, go(n)
+</code></pre>
+</div>
+<span class="comment-copy">Do you actually care about the complexity, or if it will be "fast enough" for you?  If the latter, the best thing to do would be to try the simpler code to write &amp; if ti is fast enough, the complexity doesn't matter.</span>
+<span class="comment-copy">@MarkAmery would you consider building a <i>Suffix Array</i> or is this irrelevant? This has guaranteed complexity of <code>O(n)</code> for strings with length <code>n</code></span>
+<span class="comment-copy">related: <a href="http://stackoverflow.com/a/13574862/4279"><code>sorted(xrange(n), key=lambda i: buffer(data, i))</code> is used to create a suffix array</a></span>
+<span class="comment-copy">Related: <a href="https://stackoverflow.com/q/5722006/364696">Does Python do slice-by-reference on strings?</a></span>
+<span class="comment-copy">Interesting. I wonder if there's a cunning way that Python could work around the reason you give for point #3 and get <code>O(1)</code> slices without the horrible memory implications. A question for me to pose on Programmers or CS Stack Exchange, maybe...</span>
+<span class="comment-copy">Why pose a question when you can write a patch to Cpython for your clever scheme and submit it for review to the Python Development Team. It is almost certain that they haven't given any thought to the matter and will likely appreciate your contribution.</span>
+<span class="comment-copy">@msw: They've <a href="https://mail.python.org/pipermail/python-ideas/2011-December/012993.html" rel="nofollow noreferrer">looked at <code>strview</code> as a possibility</a>; nothing has come of it so far. Early proposals (without a dedicated view type) were <a href="https://bugs.python.org/issue26077#msg258374" rel="nofollow noreferrer">rejected because of the "keep-alive effect"</a> where huge <code>str</code> stick around due to a small slice; only explicit use of views would be considered (so the keep alive effect is explicit).</span>
+<span class="comment-copy">@MarkAmery: I just added a lengthy explanation on how you can (in some cases) use <code>memoryview</code> to do view slicing instead of copy slicing. If you're on Py2 with <code>str</code> or Py3 and can encode to a <code>bytes</code> object once up front, and the function can use <code>bytes</code>-like objects, that will be enough.</span>
+<span class="comment-copy">Very thorough answer! +1</span>
+<span class="comment-copy">Well the term <code>0.086 x^2 + 10.66 x - 3.25</code> is not very linear to me :) but yes for relatively small <code>n</code> looks linear...</span>
+<span class="comment-copy">@YannisP. I presume (and hope!) that the <code>0.086 x^2</code> is just the curve fitter being oversensitive to random variation, rather than slicing really being an <code>O(n^2)</code> operation. Slicing being <code>O(n^2)</code> would be appalling!</span>
+<span class="comment-copy">Fair enough. Also it would make good sense to me if Python and other programming languages, copy the memory locations of the start and the end of a string slice, rather than the entire string, thus yielding <code>O(1)</code> for the slicing</span>
+<span class="comment-copy">@YannisP. yes... but I guess that would make the code for garbage collecting strings more complicated than simply implementing slices with copying, and possibly introduce performance problems at collection time. It's a complicated problem and I can't quite figure out at first glance whether it's possible to get <code>O(1)</code> slicing without either hurting the efficiency of garbage collection or losing the ability to garbage collect giant strings when there's still a living reference to a tiny slice of them.</span>

@@ -1,0 +1,348 @@
+<div class="post-text" itemprop="text">
+<p>I have successfully used Cython for the first time to significantly speed up packing nibbles from one list of integers (<em>bytes</em>) into another (see <a href="https://stackoverflow.com/questions/47371520/faster-bit-level-data-packing">Faster bit-level data packing</a>), e.g. packing the two sequential bytes <code>0x0A</code> and <code>0x0B</code> into <code>0xAB</code>.</p>
+<pre><code>def pack(it):
+    """Cythonize python nibble packing loop, typed"""
+    cdef unsigned int n = len(it)//2
+    cdef unsigned int i
+    return [ (it[i*2]//16)&lt;&lt;4 | it[i*2+1]//16 for i in range(n) ]
+</code></pre>
+<p>While the resulting speed is satisfactory, I am curious whether this can be taken further by making better use of the input and output lists.</p>
+<p><code>cython3 -a pack.cyx</code> generates a very "cythonic" HTML report that I unfortunately am not experienced enough to draw any useful conclusions from.</p>
+<p>From a C point of view the loop should "simply" access two unsigned int arrays. Possibly, using a wider data type (16/32 bit) could further speed this up proportionally.</p>
+<p>The question is: (how) can <a href="https://docs.python.org/3/library/stdtypes.html#binary-sequence-types-bytes-bytearray-memoryview" rel="nofollow noreferrer">Python [binary/immutable] sequence types</a> be typed as <code>unsigned int array</code> for Cython?</p>
+<hr/>
+<p>Using array as suggested in <a href="https://stackoverflow.com/questions/11689967/">How to convert python array to cython array?</a> does not seem to make it faster (and the array needs to be created from bytes object beforehand), nor does typing the parameter as <code>list</code> instead of <code>object</code> (same as no type) or using for loop instead of list comprehension:</p>
+<pre><code>def packx(list it):
+    """Cythonize python nibble packing loop, typed"""
+    cdef unsigned int n = len(it)//2
+    cdef unsigned int i
+    cdef list r = [0]*n
+    for i in range(n):
+        r[i] = (it[i*2]//16)&lt;&lt;4 | it[i*2+1]//16
+    return r
+</code></pre>
+<hr/>
+<p>I think my earlier test just specified an array.array as input, but following the comments I've now just tried</p>
+<pre><code>from cpython cimport array
+import array
+
+def packa(array.array a):
+    """Cythonize python nibble packing loop, typed"""
+    cdef unsigned int n = len(a)//2
+    cdef unsigned int i
+    cdef unsigned int b[256*64/2]
+    for i in range(n):
+        b[i] = (a[i*2]//16)&lt;&lt;4 | a[i*2+1]//16;
+
+    cdef array.array c = array.array("B", b)
+    return c
+</code></pre>
+<p>which compiles but </p>
+<pre><code>ima = array.array("B", imd) # unsigned char (1 Byte)
+pa = packa(ima)
+packed = pa.tolist()
+</code></pre>
+<p>segfaults.
+I find the documentation a bit sparse, so any hints on what the problem is here and how to allocate the array for output data are appreciated.</p>
+<p><hr/>
+Taking @ead's first approach, plus combining division and shifting (seems to save a microsecond:</p>
+<pre><code>#cython: boundscheck=False, wraparound=False
+
+def packa(char[::1] a):
+    """Cythonize python nibble packing loop, typed with array"""
+
+    cdef unsigned int n = len(a)//2
+    cdef unsigned int i
+
+    # cdef unsigned int b[256*64/2]
+    cdef array.array res = array.array('B', [])
+    array.resize(res, n)
+
+    for i in range(n):
+        res.data.as_chars[i] = ( a[i*2] &amp; 0xF0 ) | (a[i*2+1] &gt;&gt; 4);
+
+    return res
+</code></pre>
+<p>compiles much longer, but runs much faster:</p>
+<pre><code>python3 -m timeit -s 'from pack import packa; import array; data = array.array("B", bytes([0]*256*64))' 'packa(data)'
+1000 loops, best of 3: 236 usec per loop
+</code></pre>
+<p>Amazing! But, with the additional bytes-to-array and array-to-list conversion</p>
+<pre><code>ima = array.array("B", imd) # unsigned char (1 Byte)
+pa = packa(ima)
+packed = pa.tolist() # bytes would probably also do
+</code></pre>
+<p>it now only takes about 1.7 ms - very cool!</p>
+<hr/>
+<p>Down to 150 us timed or approx. 0.4 ms actual:</p>
+<pre><code>from cython cimport boundscheck, wraparound
+from cpython cimport array
+import array
+
+@boundscheck(False)
+@wraparound(False)
+def pack(const unsigned char[::1] di):
+    cdef:
+        unsigned int i, n = len(di)
+        unsigned char h, l, r
+        array.array do = array.array('B')
+
+    array.resize(do, n&gt;&gt;1)
+
+    for i in range(0, n, 2):
+        h = di[i] &amp; 0xF0
+        l = di[i+1] &gt;&gt; 4
+        r = h | l
+        do.data.as_uchars[i&gt;&gt;1] = r
+
+    return do
+</code></pre>
+<p>I'm not converting the result array to a list anymore, this is done automatically by py-spidev when writing, and the total time is about the same: 10 ms (@ 10 MHz).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you wanna to be as fast as C you should not use list with python-integers inside but an <code>array.array</code>. It is possible to get a speed-up of around 140 for your python+list code by using cython+<code>array.array</code>.</p>
+<p>Here are some ideas how to make your code faster with cython. As benchmark I choose a list with 1000 elements (big enough and cache-misses have no effects yet):</p>
+<pre><code>import random
+l=[random.randint(0,15) for _ in range(1000)]
+</code></pre>
+<p>As baseline, your python-implementation with list:</p>
+<pre><code>def packx(it):
+    n = len(it)//2
+    r = [0]*n
+    for i in range(n):
+        r[i] = (it[i*2]%16)&lt;&lt;4 | it[i*2+1]%16
+    return r
+
+%timeit packx(l)
+143 µs ± 1.95 µs per loop (mean ± std. dev. of 7 runs, 10000 loops each)
+</code></pre>
+<p>By the way, I use <code>%</code> instead of <code>//</code>, which is probably what you want, otherwise you would get only <code>0</code>s as result (only lower bits have data in your description).</p>
+<p>After cythonizing the same function (with <code>%%cython</code>-magic) we get a speed-up of around 2:</p>
+<pre><code>%timeit packx(l)
+77.6 µs ± 1.28 µs per loop (mean ± std. dev. of 7 runs, 10000 loops each)
+</code></pre>
+<p>Let's look at the html produced by option <code>-a</code>, we see the following for the line corresponding to the <code>for</code>-loop:</p>
+<pre><code>..... 
+__pyx_t_2 = PyNumber_Multiply(__pyx_v_i, __pyx_int_2); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 6, __pyx_L1_error)
+ __Pyx_GOTREF(__pyx_t_2);
+ __pyx_t_5 = PyObject_GetItem(__pyx_v_it, __pyx_t_2); if (unlikely(!__pyx_t_5)) __PYX_ERR(0, 6, __pyx_L1_error)
+ __Pyx_GOTREF(__pyx_t_5);
+ __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
+ __pyx_t_2 = __Pyx_PyInt_RemainderObjC(__pyx_t_5, __pyx_int_16, 16, 0); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 6, __pyx_L1_error)
+...
+</code></pre>
+<p><code>Py_NumberMultiply</code> means that we use slow python-multiplication, <code>Pyx_DECREF</code>- all temporaries are slow python-objects. We need to change that! </p>
+<p>Let's pass not a list but an <code>array.array</code> of bytes to our function and return an <code>array.array</code> of bytes back. Lists have full fledged python objects inside, <code>array.array</code>the lowly raw c-data which is faster:</p>
+<pre><code>%%cython
+from cpython cimport array
+def cy_apackx(char[::1] it):
+    cdef unsigned int n = len(it)//2
+    cdef unsigned int i
+    cdef array.array res = array.array('b', [])
+    array.resize(res, n)
+    for i in range(n):
+        res.data.as_chars[i] = (it[i*2]%16)&lt;&lt;4 | it[i*2+1]%16
+    return res
+
+import array
+a=array.array('B', l)
+%timeit cy_apackx(a)
+19.2 µs ± 316 ns per loop (mean ± std. dev. of 7 runs, 100000 loops each)
+</code></pre>
+<p>Better, but let take a look at the generated html, there is still some slow python-code:</p>
+<pre><code> __pyx_t_2 = __Pyx_PyInt_From_long(((__Pyx_mod_long((*((char *) ( /* dim=0 */ ((char *) (((char *) __pyx_v_it.data) + __pyx_t_7)) ))), 16) &lt;&lt; 4) | __Pyx_mod_long((*((char *) ( /* dim=0 */ ((char *) (((char *) __pyx_v_it.data) + __pyx_t_8)) ))), 16))); if (unlikely(!__pyx_t_2)) __PYX_ERR(0, 9, __pyx_L1_error)
+__Pyx_GOTREF(__pyx_t_2);
+ if (unlikely(__Pyx_SetItemInt(((PyObject *)__pyx_v_res), __pyx_v_i, __pyx_t_2, unsigned int, 0, __Pyx_PyInt_From_unsigned_int, 0, 0, 1) &lt; 0)) __PYX_ERR(0, 9, __pyx_L1_error)
+ __Pyx_DECREF(__pyx_t_2); __pyx_t_2 = 0;
+</code></pre>
+<p>We still use a python-setter for array (<code>__Pax_SetItemInt</code>) and for this a python objecct <code>__pyx_t_2</code> is needed, to avoid this we use <code>array.data.as_chars</code>:</p>
+<pre><code>%%cython
+from cpython cimport array
+def cy_apackx(char[::1] it):
+    cdef unsigned int n = len(it)//2
+    cdef unsigned int i
+    cdef array.array res = array.array('B', [])
+    array.resize(res, n)
+    for i in range(n):
+        res.data.as_chars[i] = (it[i*2]%16)&lt;&lt;4 | it[i*2+1]%16  ##HERE!
+return res
+
+%timeit cy_apackx(a)
+1.86 µs ± 30.5 ns per loop (mean ± std. dev. of 7 runs, 1000000 loops each)
+</code></pre>
+<p>Much better, but let's take a look at html again, and we see some calls to <code>__Pyx_RaiseBufferIndexError</code> - this safety costs some time, so let's switch it off:</p>
+<pre><code>%%cython
+from cpython cimport array    
+import cython
+@cython.boundscheck(False) # switch of safety-checks
+@cython.wraparound(False) # switch of safety-checks
+def cy_apackx(char[::1] it):
+    cdef unsigned int n = len(it)//2
+    cdef unsigned int i
+    cdef array.array res = array.array('B', [])
+    array.resize(res, n)
+    for i in range(n):
+        res.data.as_chars[i] = (it[i*2]%16)&lt;&lt;4 | it[i*2+1]%16  ##HERE!
+    return res
+
+%timeit cy_apackx(a)
+1.53 µs ± 11.5 ns per loop (mean ± std. dev. of 7 runs, 1000000 loops each)
+</code></pre>
+<p>When we look at the generated html, we see:</p>
+<pre><code>__pyx_t_7 = (__pyx_v_i * 2);
+__pyx_t_8 = ((__pyx_v_i * 2) + 1);
+(__pyx_v_res-&gt;data.as_chars[__pyx_v_i]) = ((__Pyx_mod_long((*((char *) ( /* dim=0 */ ((char *) (((char *) __pyx_v_it.data) + __pyx_t_7)) ))), 16) &lt;&lt; 4) | __Pyx_mod_long((*((char *) ( /* dim=0 */ ((char *) (((char *) __pyx_v_it.data) + __pyx_t_8)) ))), 16));
+</code></pre>
+<p>No python-stuff! Good so far. However, I'm not sure about <code>__Pyx_mod_long</code>, its definition is:</p>
+<pre><code>static CYTHON_INLINE long __Pyx_mod_long(long a, long b) {
+   long r = a % b;
+   r += ((r != 0) &amp; ((r ^ b) &lt; 0)) * b;
+   return r;
+}
+</code></pre>
+<p>So C and Python have differences for <code>mod</code> of negative numbers and it must be taken into account. This function-definition, albeit inlined, will prevent the C-compiler from optimizing <code>a%16</code> as <code>a&amp;15</code>. We have only positive numbers, so no need to care about them, thus we need to do the <code>a&amp;15</code>-trick by ourselves:</p>
+<pre><code>%%cython
+from cpython cimport array
+import cython
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def cy_apackx(char[::1] it):
+    cdef unsigned int n = len(it)//2
+    cdef unsigned int i
+    cdef array.array res = array.array('B', [])
+    array.resize(res, n)
+    for i in range(n):
+        res.data.as_chars[i] = (it[i*2]&amp;15)&lt;&lt;4 | (it[i*2+1]&amp;15)
+    return res
+
+%timeit cy_apackx(a)
+1.02 µs ± 8.63 ns per loop (mean ± std. dev. of 7 runs, 1000000 loops each)
+</code></pre>
+<p>I'm also satified with the resulting C-code/html (only one line):</p>
+<pre><code>(__pyx_v_res-&gt;data.as_chars[__pyx_v_i]) = ((((*((char *) ( /* dim=0 */ ((char *) (((char *) __pyx_v_it.data) + __pyx_t_7)) ))) &amp; 15) &lt;&lt; 4) | ((*((char *) ( /* dim=0 */ ((char *) (((char *) __pyx_v_it.data) + __pyx_t_8)) ))) &amp; 15));
+</code></pre>
+<p><strong>Conclusion:</strong> In the sum that means speed up of 140 (140 µs vs 1.02 µs)- not bad! Another interesting point: the calculation itself takes about 2 µs (and that comprises less than optimal bound checking and division) - 138 µs are for creating, registering and deleting temporary python objects.</p>
+<hr/>
+<p>If you need the upper bits and can assume that lower bits are without dirt (otherwise <code>&amp;250</code> can help), you can use:</p>
+<pre><code>from cpython cimport array
+import cython
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def cy_apackx(char[::1] it):
+    cdef unsigned int n = len(it)//2
+    cdef unsigned int i
+    cdef array.array res = array.array('B', [])
+    array.resize(res, n)
+    for i in range(n):
+        res.data.as_chars[i] = it[i*2] | (it[i*2+1]&gt;&gt;4)
+    return res
+
+%timeit cy_apackx(a)
+819 ns ± 8.24 ns per loop (mean ± std. dev. of 7 runs, 1000000 loops each)
+</code></pre>
+<hr/>
+<p>Another interesting question is which costs have the operations if list is used. If we start with the "improved" version:</p>
+<pre><code>%%cython
+def cy_packx(it):
+    cdef unsigned int n = len(it)//2
+    cdef unsigned int i
+    res=[0]*n
+    for i in range(n):
+        res[i] = it[i*2] | (it[i*2+1]&gt;&gt;4))
+    return res
+
+%timeit cy_packx(l)
+20.7 µs ± 450 ns per loop (mean ± std. dev. of 7 runs, 10000 loops each)
+</code></pre>
+<p>we see, that reducing the number of integer operation leads to a big speed-up. That is due to the fact, that python-integers are immutable and every operation creates a new temporary object, which is costly. Eliminating operations means also eliminating costly temporaries.</p>
+<p>However, <code>it[i*2] | (it[i*2+1]&gt;&gt;4)</code> is done with python-integer, as next step we make it <code>cdef</code>-operations:</p>
+<pre><code>%%cython   
+def cy_packx(it):
+    cdef unsigned int n = len(it)//2
+    cdef unsigned int i
+    cdef unsigned char a,b
+    res=[0]*n
+    for i in range(n):
+        a=it[i*2]
+        b=it[i*2+1]  # ensures next operations are fast
+        res[i]= a | (b&gt;&gt;4)
+    return res   
+
+    %timeit cy_packx(l)
+    7.3 µs ± 880 ns per loop (mean ± std. dev. of 7 runs, 100000 loops each)
+</code></pre>
+<p>I don't know how it can be improved further, thus we have 7.3 µs for list vs. 1 µs for <code>array.array</code>.</p>
+<hr/>
+<p>Last question, what is the costs break down of the list version? I  order to avoid being optimized away by the C-compiler, we use a slightly different baseline function:</p>
+<pre><code>%%cython
+def cy_packx(it):
+        cdef unsigned int n = len(it)//2
+        cdef unsigned int i
+        cdef unsigned char a,b
+        cdef unsigned char s = 0
+        res=[0]*n
+        for i in range(n):
+            a=it[i*2]
+            b=it[i*2+1]  # ensures next operations are fast
+            s+=a | (b&gt;&gt;4)
+            res[i]= s
+        return res
+%timeit cy_packx(l)
+
+In [79]: %timeit cy_packx(l)
+7.67 µs ± 106 ns per loop (mean ± std. dev. of 7 runs, 100000 loops each)
+</code></pre>
+<p>The usage of  the <code>s</code> variable means, it does not get optimized away in the second version:</p>
+<pre><code>%%cython   
+def cy_packx(it):
+        cdef unsigned int n = len(it)//2
+        cdef unsigned int i
+        cdef unsigned char a,b
+        cdef unsigned char s = 0
+        res=[0]*n
+        for i in range(n):
+            a=it[i*2]
+            b=it[i*2+1]  # ensures next operations are fast
+            s+=a | (b&gt;&gt;4)
+        res[0]=s
+        return res 
+
+In [81]: %timeit cy_packx(l)
+5.46 µs ± 72.7 ns per loop (mean ± std. dev. of 7 runs, 100000 loops each)
+</code></pre>
+<p>About 2 µs or about 30% are the costs for creating new integer objects. What are the costs of the memory allocation? </p>
+<pre><code>%%cython   
+def cy_packx(it):
+        cdef unsigned int n = len(it)//2
+        cdef unsigned int i
+        cdef unsigned char a,b
+        cdef unsigned char s = 0
+        for i in range(n):
+            a=it[i*2]
+            b=it[i*2+1]  # ensures next operations are fast
+            s+=a | (b&gt;&gt;4)
+        return s 
+
+In [84]: %timeit cy_packx(l)
+3.84 µs ± 43.2 ns per loop (mean ± std. dev. of 7 runs, 100000 loops each)
+</code></pre>
+<p>That leads to the following performance break down of the list-version:</p>
+<pre><code>                    Time(in µs)      Percentage(in %)
+     all                7.7                 100
+     calculation          1                  12
+     alloc memory       1.6                  21
+     create ints        2.2                  29
+     access data/cast   2.6                  38
+</code></pre>
+<p>I must confess, I expected <code>create ints</code> to play a bigger role and didn't thing accessing the data in the list and casting it to <code>char</code>s will cost that much.</p>
+</div>
+<span class="comment-copy">Have you tried the plain numpy approach: <code>np.array(it,dtype=np.uint8).view(dtype=np.uint16)</code>?</span>
+<span class="comment-copy">@DavidW Would this not just result in <code>0x0A0B</code>? Then it's not what I am looking for.</span>
+<span class="comment-copy">@DavidW It results in decimal 2826 (<code>0x0B0A</code>, depending on endianess). But thanks for the input!</span>
+<span class="comment-copy">Do you really know, what is slowing your down? Measure it first, and you will be surprised! You approach is <code>python-ints-&gt;c-ints-&gt;calc new c-ints-&gt;create-python ints</code> I didn't measure, but my guess would be that the last step <code>c-ints-&gt;reate-python-ints</code> is the bottle neck (but as I didn't measure it, I maybe mistaken). There is no gain in speeding up  the calcultion with c-ints. The only way I see is to use <code>array.array</code>  (or numpy array) instead of list in your python-program, so the last step isn't needed.</span>
+<span class="comment-copy">You're right - this can't be done by reinterpretting the memory I think</span>
+<span class="comment-copy">Thank you! I'll only be able to test in about 20 hrs. Source data will be 8 bits but needs to be reduced to 4 bits, thus the division by 16 (equivalent to &gt;&gt; 4, so further optimization possible). <code>0x0A</code> was meant to show the nibbles clearly. I will update accordingly. In the meantime, could you point me to documentation on the <code>char[::1] it</code> slicing syntax?</span>
+<span class="comment-copy">@handle you can take a look at typed memory views: <a href="http://cython.readthedocs.io/en/latest/src/userguide/memoryviews.html" rel="nofollow noreferrer">cython.readthedocs.io/en/latest/src/userguide/memoryviews.html</a></span>
+<span class="comment-copy">@handle I also improved the list-version somewhat, it might still be an option for you.</span>
+<span class="comment-copy">Thanks again, down to 1.7 ms for the whole conversion via array (see updated question). Will look into your further improvements in about 8 hrs.</span>
+<span class="comment-copy">The array (conversion) should not be necessary as Cython is supposed to support <code>bytes</code> as either char* or memoryview, unfortunately I also get this error: <a href="https://github.com/cython/cython/issues/1682" rel="nofollow noreferrer">github.com/cython/cython/issues/1682</a>. It works with <code>bytearray</code>though I yet have to figure out how to return the computed data.</span>

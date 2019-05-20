@@ -1,0 +1,152 @@
+<div class="post-text" itemprop="text">
+<p>Doing something like</p>
+<pre><code>import numpy as np
+a = np.random.rand(10**4, 10**4)
+b = np.dot(a, a)
+</code></pre>
+<p>uses multiple cores, and it runs nicely.</p>
+<p>The elements in <code>a</code>, though, are 64-bit floats (or 32-bit in 32-bit platforms?), and I'd like to multiply 8-bit integer arrays. Trying the following, though:</p>
+<pre><code>a = np.random.randint(2, size=(n, n)).astype(np.int8)
+</code></pre>
+<p>results in the dot product not using multiple cores, and thus running ~1000x slower on my PC.</p>
+<pre><code>array: np.random.randint(2, size=shape).astype(dtype)
+
+dtype    shape          %time (average)
+
+float32 (2000, 2000)    62.5 ms
+float32 (3000, 3000)    219 ms
+float32 (4000, 4000)    328 ms
+float32 (10000, 10000)  4.09 s
+
+int8    (2000, 2000)    13 seconds
+int8    (3000, 3000)    3min 26s
+int8    (4000, 4000)    12min 20s
+int8    (10000, 10000)  It didn't finish in 6 hours
+
+float16 (2000, 2000)    2min 25s
+float16 (3000, 3000)    Not tested
+float16 (4000, 4000)    Not tested
+float16 (10000, 10000)  Not tested
+</code></pre>
+<p>I understand NumPy uses BLAS, which doesn't support integers, but if I use the SciPy BLAS wrappers, ie.</p>
+<pre><code>import scipy.linalg.blas as blas
+a = np.random.randint(2, size=(n, n)).astype(np.int8)
+b = blas.sgemm(alpha=1.0, a=a, b=a)
+</code></pre>
+<p>the computation <em>is</em> multi-threaded. Now, <code>blas.sgemm</code> runs with exactly the same timing as <code>np.dot</code> for float32's, but for non-floats it converts everything to <code>float32</code> and outputs floats, which is something <code>np.dot</code> doesn't do. (In addition, <code>b</code> is now in <code>F_CONTIGUOUS</code> order, which is a lesser issue). </p>
+<p>So, if I want to do integer matrix multiplication, I have to do one of the following:</p>
+<ol>
+<li>Use NumPy's painfully slow <code>np.dot</code> and be glad I get to keep the 8-bit integers.</li>
+<li>Use SciPy's <code>sgemm</code> and use up 4x memory.</li>
+<li>Use Numpy's <code>np.float16</code> and only use up 2x memory, with the caveat that <code>np.dot</code> is much slower on float16 arrays than on float32 arrays, more so than int8.</li>
+<li>Find an optimized library for multi-threaded integer matrix multiplication (actually, <strong>Mathematica</strong> does this, but I'd prefer a Python solution), ideally supporting 1-bit arrays, although 8-bit arrays is also fine... (I'm actually aiming to do multiplication of matrices over the finite field Z/2Z, and I know I can do this with <strong>Sage</strong>, which is quite Pythonic, but, again, is there something strictly Python?)</li>
+</ol>
+<p>Can I follow option 4? Does such a library exist?</p>
+<p>Disclaimer: I'm actually running NumPy + MKL, but I've tried a similar test on vanilly NumPy, with similar results.</p>
+</div>
+<div class="post-text" itemprop="text">
+<ul>
+<li><strong>Option 5 - Roll a custom solution:</strong> Partition the matrix product in a few sub-products and perform these in parallel. This can be relatively easy implemented with standard Python modules. The sub-products are computed with <code>numpy.dot</code>, which releases the global interpreter lock. Thus, it is possible to use <a href="https://docs.python.org/3/library/threading.html" rel="nofollow">threads</a> which are relatively lightweight and can access the arrays from the main thread for memory efficiency.</li>
+</ul>
+<p>Implementation:</p>
+<pre><code>import numpy as np
+from numpy.testing import assert_array_equal
+import threading
+from time import time
+
+
+def blockshaped(arr, nrows, ncols):
+    """
+    Return an array of shape (nrows, ncols, n, m) where
+    n * nrows, m * ncols = arr.shape.
+    This should be a view of the original array.
+    """
+    h, w = arr.shape
+    n, m = h // nrows, w // ncols
+    return arr.reshape(nrows, n, ncols, m).swapaxes(1, 2)
+
+
+def do_dot(a, b, out):
+    #np.dot(a, b, out)  # does not work. maybe because out is not C-contiguous?
+    out[:] = np.dot(a, b)  # less efficient because the output is stored in a temporary array?
+
+
+def pardot(a, b, nblocks, mblocks, dot_func=do_dot):
+    """
+    Return the matrix product a * b.
+    The product is split into nblocks * mblocks partitions that are performed
+    in parallel threads.
+    """
+    n_jobs = nblocks * mblocks
+    print('running {} jobs in parallel'.format(n_jobs))
+
+    out = np.empty((a.shape[0], b.shape[1]), dtype=a.dtype)
+
+    out_blocks = blockshaped(out, nblocks, mblocks)
+    a_blocks = blockshaped(a, nblocks, 1)
+    b_blocks = blockshaped(b, 1, mblocks)
+
+    threads = []
+    for i in range(nblocks):
+        for j in range(mblocks):
+            th = threading.Thread(target=dot_func, 
+                                  args=(a_blocks[i, 0, :, :], 
+                                        b_blocks[0, j, :, :], 
+                                        out_blocks[i, j, :, :]))
+            th.start()
+            threads.append(th)
+
+    for th in threads:
+        th.join()
+
+    return out
+
+
+if __name__ == '__main__':
+    a = np.ones((4, 3), dtype=int)
+    b = np.arange(18, dtype=int).reshape(3, 6)
+    assert_array_equal(pardot(a, b, 2, 2), np.dot(a, b))
+
+    a = np.random.randn(1500, 1500).astype(int)
+
+    start = time()
+    pardot(a, a, 2, 4)
+    time_par = time() - start
+    print('pardot: {:.2f} seconds taken'.format(time_par))
+
+    start = time()
+    np.dot(a, a)
+    time_dot = time() - start
+    print('np.dot: {:.2f} seconds taken'.format(time_dot))
+</code></pre>
+<p>With this implementation I get a speedup of approximately x4, which is the physical number of cores in my machine:</p>
+<pre><code>running 8 jobs in parallel
+pardot: 5.45 seconds taken
+np.dot: 22.30 seconds taken
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>"<a href="https://stackoverflow.com/q/45373679/1682419">Why is it faster to perform float by float matrix multiplication compared to int by int?</a>" explains <em>why</em> integers are so slow: First, the CPUs have high-throughput floating point pipelines. Second, BLAS has no integer-type.</p>
+<p><strong>Workaround:</strong> Converting the matrices to <code>float32</code> values gets big speedups. How's 90x speedup on a 2015 MacBook Pro? (Using <code>float64</code> is half as good.)</p>
+<pre><code>import numpy as np
+import time
+
+def timeit(callable):
+    start = time.time()
+    callable()
+    end = time.time()
+    return end - start
+
+a = np.random.random_integers(0, 9, size=(1000, 1000)).astype(np.int8)
+
+timeit(lambda: a.dot(a))  # ≈0.9 sec
+timeit(lambda: a.astype(np.float32).dot(a.astype(np.float32)).astype(np.int8) )  # ≈0.01 sec
+</code></pre>
+</div>
+<span class="comment-copy">About your option n°4, maybe you could have a look on <a href="https://pypi.python.org/pypi/pycuda" rel="nofollow noreferrer">PyCuda</a> or on <a href="http://deeplearning.net/software/theano/" rel="nofollow noreferrer">Theano</a> ? They allow large operations to be done on the GPU (with an easy interface with numpy) an quite good performances.</span>
+<span class="comment-copy">As a possible answer to option 4, <a href="https://bitbucket.org/malb/m4ri" rel="nofollow noreferrer">bitbucket.org/malb/m4ri</a> looks interesting. "M4RI is a library for fast arithmetic with dense matrices over F2." I guess that's what Sage is already using, but I don't see any reason why you couldn't use it directly from Python, with a suitable Cython wrapper. (In fact, you might be able to find such a wrapper already in the Sage sources.)</span>
+<span class="comment-copy">Nobody mentioned <code>numpy.einsum</code> yet, but that might be a good option 5.</span>
+<span class="comment-copy">Note that you will need to cast the result to something bigger if you want to avoid integer overflow. If each element is either 0 or 1, you need an integer format that can hold values up to at least <code>n</code> in order to guarantee no overflow. For your example where <code>n=10000</code>, (u)int16 ought to be enough. Are your real matrices sparse, by any chance? If so, you would be much better off using <code>scipy.sparse.csr_matrix</code>.</span>
+<span class="comment-copy">Could you give some more context for the overall problem you are trying to solve? Multiplying big integer matrices together is a rather unusual thing to do. It would be particularly useful to know more about the properties of these matrices. Are the values always either 0 or 1? If they can be larger then you may well find yourself ultimately constrained by the largest integer that can be represented using uint64. How are the matrices generated? Do they have any special structure (e.g. symmetry, blocks, bands etc.)?</span>
+<span class="comment-copy">It works! This is the <code>O(n**3)</code> matrix product, which does exactly <code>n**2</code> dot products, correct?</span>
+<span class="comment-copy">It splits the Matrix product into a number of smaller Matrix products. In the extreme case this can be vector dot products.</span>

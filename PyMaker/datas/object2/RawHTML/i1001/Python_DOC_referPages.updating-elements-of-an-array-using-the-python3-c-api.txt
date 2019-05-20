@@ -1,0 +1,146 @@
+<div class="post-text" itemprop="text">
+<p>I have a module method which takes in a python list, and then outputs the same list with all items multiplied by 100.</p>
+<p>I've attemped to follow <a href="https://docs.python.org/3/c-api/intro.html" rel="nofollow noreferrer">the C intro here</a> as close as possible but still running into issues.</p>
+<pre><code>static PyObject *
+test_update_list(PyObject *self, PyObject *args)
+{
+    PyObject *listObj = NULL;
+    PyObject *item = NULL;
+    PyObject *mult = PyLong_FromLong(100);
+    PyObject *incremented_item = NULL;
+
+    if (!PyArg_ParseTuple(args, "O", &amp;listObj))
+    {
+        return NULL;
+    }
+
+    /* get the number of lines passed to us */
+    Py_ssize_t numLines = PyList_Size(listObj);
+
+    /* should raise an error here. */
+    if (numLines &lt; 0) return NULL; /* Not a list */
+
+    for (Py_ssize_t i=0; i&lt;numLines; i++) {
+        // pick the item 
+        item = PyList_GetItem(listObj, i);
+
+        if (mult == NULL)
+            goto error;
+
+        // increment it
+        incremented_item = PyNumber_Add(item, mult);
+
+        if (incremented_item == NULL)
+            goto error;
+
+        // update the list item
+        if (PyObject_SetItem(listObj, i, incremented_item) &lt; 0)
+            goto error;
+
+    }
+error:
+    Py_XDECREF(item);
+    Py_XDECREF(mult);
+    Py_XDECREF(incremented_item);
+    return listObj;
+};
+</code></pre>
+<p>The above complies fine, however when I run in ipython, I get the below error.</p>
+<p>If I take away the error handling I get a seg fault.</p>
+<pre><code>---------------------------------------------------------------------------
+SystemError                               Traceback (most recent call last)
+SystemError: null argument to internal routine
+
+The above exception was the direct cause of the following exception:
+
+SystemError                               Traceback (most recent call last)
+&lt;ipython-input-3-da275aa3369f&gt; in &lt;module&gt;()
+----&gt; 1 testadd.test_update_list([1,2,3])
+
+SystemError: &lt;built-in function ulist&gt; returned a result with an error set
+</code></pre>
+<p>Any help is appreciated.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>So you have a number of issues that all need to be corrected. I've listed them all under separate headings so you can go through them one at a time.</p>
+<h1>Always returning <code>listObj</code></h1>
+<p>When you get an error in your for loop, you would <code>goto</code> the error label, which was still returning the list. By returning this list you hide that there was an error in your function. You must <em>always</em> return <code>NULL</code> when you expect your function to raise an exception.</p>
+<h1>Does not increment <code>listObj</code> ref count on return</h1>
+<p>When your function is invoked you are given a borrowed reference to your arguments. When you return one of those arguments you are creating a new reference to your list, and so <em>must</em> increment its reference count. Otherwise the interpreter will have a reference count that is one lower than the number of actual references to the object. This will end up with a bug where the interpreter deallocates your list when there is only 1 reference rather than 0! This could result in a seg fault, or it could in the worst case scenario result in random parts of the program access the that has since been deallocated and allocated for some other object.</p>
+<h1>Uses <code>PyObject_SetItem</code> with primitive</h1>
+<p><a href="https://docs.python.org/3/c-api/object.html#c.PyObject_SetItem" rel="nofollow noreferrer"><code>PyObject_SetItem</code></a> can be used with dicts and other class that implements <code>obj[key] = val</code>. So you cannot supply it with an argument of type <code>Py_ssize_t</code>. Instead, use <a href="https://docs.python.org/3/c-api/list.html#c.PyList_SetItem" rel="nofollow noreferrer"><code>PyList_SetItem</code></a> which only accepts <code>Py_ssize_t</code> as its index argument.</p>
+<h1>Bad memory handling of <code>item</code> and <code>incremented_item</code></h1>
+<p><code>PyObject_SetItem</code> and <code>PyList_SetItem</code> both handle decreasing the reference count of the object that was already at the position that was being set. So we don't need to worry about managing the reference count of <code>item</code> as we are only working with a reference <em>borrowed</em> from the list. These pair of functions also steal a reference to <code>incremented_item</code>, and so we don't need to worry about managing its reference count either.</p>
+<h1>Memory leak on incorrect arguments</h1>
+<p>For example, when you call your function with an int. You will create a new reference to the 100 int object, but because you <code>return NULL</code> rather than <code>goto error</code>, this reference will be lost. As such you need to handle such scenarios differently. In my solution, I move the <code>PyLong_FromLong</code> call to after the arg and type checking. In this way we are only create this new* object once we are guaranteed it will be used.</p>
+<h1>Working code</h1>
+<p>Side note: I removed the goto statements as there was only one left, and so it made more sense to do the error handling at that point rather than later.</p>
+<pre class="lang-c prettyprint-override"><code>static PyObject *
+testadd_update_list(PyObject *self, PyObject *args)
+{
+    PyObject *listObj = NULL;
+    PyObject *item = NULL;
+    PyObject *mult = NULL;
+    PyObject *incremented_item = NULL;
+    Py_ssize_t numLines;
+
+    if (!PyArg_ParseTuple(args, "O:update_list", &amp;listObj))
+    {
+        return NULL;
+    }
+    if (!PyList_Check(listObj)) {
+        PyErr_BadArgument();
+        return NULL;
+    }
+
+    /* get the number of lines passed to us */
+    // Don't want to rely on the error checking of this function as it gives a weird stack trace. 
+    // Instead, we use Py_ListCheck() and PyErr_BadArgument() as above. Since list is definitely 
+    // a list now, then PyList_Size will never throw an error, and so we could use 
+    // PyList_GET_SIZE(listObj) instead.
+    numLines = PyList_Size(listObj);
+
+    // only initialise mult here, otherwise the above returns would create a memory leak
+    mult = PyLong_FromLong(100);
+    if (mult == NULL) {
+        return NULL;
+    }
+
+    for (Py_ssize_t i=0; i&lt;numLines; i++) {
+        // pick the item 
+        // It is possible for this line to raise an error, but our invariants should
+        // ensure no error is ever raised. `list` is always of type list and `i` is always 
+        // in bounds.
+        item = PyList_GetItem(listObj, i);
+
+        // increment it, and check for type errors or memory errors
+        incremented_item = PyNumber_Add(item, mult);
+        if (incremented_item == NULL) {
+            // ERROR!
+            Py_DECREF(mult);
+            return NULL;
+        }
+
+        // update the list item
+        // We definitely have a list, and our index is in bounds, so we should never see an error 
+        // here.
+        PyList_SetItem(listObj, i, incremented_item);
+        // PyList_SetItem steals our reference to incremented_item, and so we must be careful in 
+        // how we handle incremented_item now. Either incremented_item will not be our 
+        // responsibility any more or it is NULL. As such, we can just remove our Py_XDECREF call
+    }
+
+    // success!
+    // We are returning a *new reference* to listObj. We must increment its ref count as a result!
+    Py_INCREF(listObj);
+    Py_DECREF(mult);
+    return listObj;
+}
+</code></pre>
+<h3>Footnote:</h3>
+<p>* <code>PyLong_FromLong(100)</code> doesn't actually create a new object, but rather returns a new reference to an existing object. Integers with low values (<code>0 &lt;= i &lt; 128</code> I think) are all cached and this same object is returned when needed. This is an implementation detail that is meant to avoid high levels of allocating and deallocating integers for small values, and so improve the performance of Python.</p>
+</div>
+<span class="comment-copy">How did you compile this file? The compiler should be spitting out all sorts of warnings. Most important of which is that you are passing a primitive C int to <code>PyObject_SetItem</code> instead of a python int object. Perhaps you meant to use <code>PyList_SetItem</code>?</span>
+<span class="comment-copy"><code>PyList_Size</code> sets an error; you don’t have to.  You <i>must</i> return <code>NULL</code> on every error.  Check <code>mult</code> just once, on creation.  <code>PyNumber_Add</code> doesn’t multiply.  Also, declare your variables closer to their (real) initializations, so you don’t feel the need to give them meaningless initial values.</span>
+<span class="comment-copy">Very clear breakdown of where I was going wrong cheers. To answer your original questions, I was compiling using <code>python setup.py build</code>. The one warning I got was indeed about passing a C int to <code>PyObject_SetItem</code>.</span>
+<span class="comment-copy">Actually integer values between -5 and 256 are in the integer pool <a href="https://docs.python.org/3/c-api/long.html#c.PyLong_FromLong" rel="nofollow noreferrer">docs.python.org/3/c-api/long.html#c.PyLong_FromLong</a></span>

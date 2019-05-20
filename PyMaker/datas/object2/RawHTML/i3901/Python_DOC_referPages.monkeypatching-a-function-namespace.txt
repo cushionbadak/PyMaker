@@ -1,0 +1,44 @@
+<div class="post-text" itemprop="text">
+<p>Inspired by <a href="https://stackoverflow.com/q/50477609/674039">"Define @property on function"</a>, I tried to override a function's namespace:</p>
+<pre><code>&gt;&gt;&gt; class MyDict(dict):
+...     def __getitem__(self, item):
+...         if item == 'k2':
+...             return 'v2'
+...         return super().__getitem__(item)
+...     
+&gt;&gt;&gt; def f():
+...     pass
+... 
+... 
+&gt;&gt;&gt; f.__dict__ = MyDict({'k1': 'v1'})
+&gt;&gt;&gt; 
+&gt;&gt;&gt; f.k1
+'v1'
+&gt;&gt;&gt; f.k2
+AttributeError: 'function' object has no attribute 'k2'
+</code></pre>
+<p>Why can <code>f.k1</code> resolve, but <code>f.k2</code> can't?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Short version: Because CPython's <code>PyDict_GetItem</code> function isn't subclass friendly (it's not intended to be, to be clear; <code>PyDict_*</code> functions are all specialized to <code>PyDict_Object</code> itself, not generalized mappings).</p>
+<p>Long version: Retrieving an attribute invokes <code>PyObject_GetAttr</code>. For classes which don't explicitly define a custom <code>tp_getattro</code> or <code>tp_getattr</code> (and <a href="https://github.com/python/cpython/blob/3.6/Objects/funcobject.c#L628" rel="noreferrer"><code>PyFunction_Type</code> does not</a>), this ends up <a href="https://github.com/python/cpython/blob/3.6/Objects/object.c#L1124" rel="noreferrer">calling <code>PyObject_GenericGetAttr</code></a>. Assuming nothing is found on the class itself, <code>PyObject_GenericGetAttr</code> (well, the private API function that implements it) <a href="https://github.com/python/cpython/blob/3.6/Objects/object.c#L1092" rel="noreferrer">retrieves <code>__dict__</code> as normal, then calls <code>PyDict_GetItem</code> to retrieve the value</a>. <code>PyDict_GetItem</code> explicitly uses <code>dict</code>'s C-level internals to perform the access, bypassing any custom <code>__getitem__</code> you might have defined. So your custom <code>__getitem__</code> is never invoked; for all practical purposes, your <code>dict</code> subclass is just a <code>dict</code>.</p>
+<p>I originally hoped that you <em>might</em> be able to make this particular case work via <a href="https://docs.python.org/3/reference/datamodel.html?highlight=__missing__#object.__missing__" rel="noreferrer">the officially supported <code>__missing__</code> hook</a>, but it turns out that's only invoked when the equivalent of <code>__getitem__</code> (<code>dict_subscript</code>) is invoked, not through the C level direct access APIs like <code>PyDict_GetItem</code> (which don't go through <code>dict_subscript</code> at all).</p>
+<p>Basically, CPython seems to have made a choice to prioritize performance over complete flexibility here. Any <code>dict</code> subclass used as <code>__dict__</code> will be accessed as if it were a plain <code>dict</code> (which might get a little screwy if the subclass is doing some magic to store one value while pretending it stores a different value, since the magic is bypassed), and all mappings that aren't <code>dict</code> subclasses are rejected at time of assignment (you get a <code>TypeError</code> when you try to assign them to <code>f.__dict__</code>).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The first sentence in the documentation for <code>__getitem__</code> reads:  "Called to implement evaluation of self[key]."  You are assuming (hoping) that the evaluation of <code>f.k1</code> performs the explicit operation <code>f.__dict__["k1"]</code>, but it doesn't.  If you put a print statement in the first line of <code>__getitem__</code> you will see that this function never gets called by your code.</p>
+<p>I'm not sure why this is, but I suspect that it's for performance reasons.  In any case, I can't think of a good use case for replacing a function's <code>__dict__</code>.  There are way too many ways that can fail.</p>
+</div>
+<span class="comment-copy">Why not overload <a href="https://docs.python.org/2/reference/datamodel.html#object.__getattr__" rel="nofollow noreferrer"><code>getattr</code></a> instead? Also, unless I'm mistaken <code>__getitem__</code> overloads the index <code>[]</code> operator; I think what you were looking for was <code>__getattribute__</code>.</span>
+<span class="comment-copy">@SeanBreckenridge - I'm not so sure about that. The function's <code>__getattribute__</code> (actually, its <code>tp_getattro</code> slot) should end up doing a getitem on the dict.</span>
+<span class="comment-copy">@SeanBreckenridge: To make (most) special methods (begin and end with <code>__</code>) work, they have to be defined on the class itself, not per-instance. As the OP's linked question's answers note, functions themselves are instances of the shared, immutable class <code>function</code>; you can't add a custom <code>__getattr__</code> to the class at all, and even if adding <code>__getattr__</code> works per-instance, there's a decent chance that might get fixed on a subsequent release to improve performance (since special methods are documented as being class level, not instance level anyway, it's not a big back compat concern).</span>
+<span class="comment-copy">@ShadowRanger I see, that makes sense. Thanks for the explanation.</span>
+<span class="comment-copy">Any feedback from the 2 downvoters?</span>
+<span class="comment-copy">It does seem to be a CPython weirdness. <code>f.k2</code> is working normally on pypy.</span>
+<span class="comment-copy">This seems bug in CPython to me. They use PyDict_* API calls to access the dict, rather than the abstract PyMapping_* calls - therefore, they shouldn't allow to set <code>__dict__</code> to a subclass in the first place.</span>
+<span class="comment-copy">@wim If they used <code>PyMapping_*</code> calls, they'd allow any arbitrary mapping, not just <code>dict</code> subclasses. The point of allowing <code>dict</code> subclasses is to allow things like <code>OrderedDict</code>, <code>defaultdict</code>, and <code>Counter</code>—which don't override <code>__getitem__</code>.</span>
+<span class="comment-copy">@wim: Agreed. The one quirk that might justify it is that <code>PyDict_CheckExact</code> (which would prohibit subclasses) would also prohibit <code>collections.OrderedDict</code> (which is a subclass, but fully compatible with <code>dict</code> as of 3.5, when it was reimplemented in C and made largely API compatible with <code>dict</code>). Using <code>OrderedDict</code> for <code>__dict__</code> is kind of nice since it means your attributes iterate in a defined order (and in fact, in 3.6/3.7, making <code>dict</code> itself ordered was a justified by how nice this feature is). Blocking <code>dict</code> subclasses would prevent 3.5 code from having ordered attributes.</span>
+<span class="comment-copy">@abarnert: That said, none of the features of <code>defaultdict</code> or <code>Counter</code> would be used when implicitly accessed via <code>__dict__</code> (their hooks are bypassed too), so it's not a huge benefit (unless you're doing something terrible like alternating direct access to the instance stored <code>__dict__</code> and indirect access via attribute lookups).</span>
+<span class="comment-copy">I think it's because the <code>type(f)</code> is <code>types.FunctionType</code> and special methods are not looked-up in the instance's dictionary, but the instance's class instead.</span>
+<span class="comment-copy">@martineau: No special methods on the function itself are involved here; we're replacing the instance's <code>__dict__</code> with a <code>dict</code> subclass, and that <code>dict</code> subclass has the special method (which is properly defined on the class, not the instance). Paul is on the right track; the operation performed is roughly like <code>dict.__getitem__(f.__dict__, 'k1')</code> (which would bypass <code>__getitem__</code> overloads anyway), except it's not really <code>__getitem__</code> it's more like <code>__cpython_internal_getitem_that_cant_be_overridden_and_doesnt_invoke_missing_hook__</code>.</span>
+<span class="comment-copy">This doesn't really answer the question.</span>

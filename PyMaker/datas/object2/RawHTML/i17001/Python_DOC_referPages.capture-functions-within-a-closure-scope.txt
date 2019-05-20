@@ -1,0 +1,124 @@
+<div class="post-text" itemprop="text">
+<p>Python3 added a <code>__prepare__</code> so that you could substitute the type of dictionary used to gather items from a class declaration (see <a href="https://docs.python.org/3/reference/datamodel.html#customizing-class-creation" rel="nofollow">here</a>.) Using <code>__prepare__</code> I can set up the class to allow multiple definitions of the <em>same</em> member function.</p>
+<pre><code>class MultiType(type):
+
+    @classmethod
+    def __prepare__(metacls, name, bases, **kwds):
+        return collections.defaultdict(list)
+
+
+class Foo(metaclass=MultiType):
+    def bar(self, x):
+        return x - 1
+
+    def bar(self, x):
+        return x
+</code></pre>
+<p>At the module level, I could play some tricks using a decorator:</p>
+<pre><code>def capture(f):
+    module = importlib.import_module(f.__module__)
+    if not hasattr(module, 'my_cache'):
+        setattr(module, 'my_cache', [])
+    module.my_cache.append(f)
+
+    @functools.wraps(f)
+    def _wrapper(*args, **kwargs):
+        return (func(*args, **kwargs) for func in module.my_cache)
+    return _wrapper
+
+@capture
+def foo(x):
+    return x - 1
+
+@capture
+def foo(x):
+    return 42
+</code></pre>
+<p>However, if I do this within a closure, I could potentially add things scoped at the module level which should not be.</p>
+<pre><code>def foo(x):
+    @some_awesome_deco
+    def bar(y):
+        return y
+
+    @some_awesome_deco
+    def bar(y):
+        return 24
+
+    return bar(x+1)
+</code></pre>
+<p>Is there a way to identify and capture the functions declared within the scope of a closure so that I can handle these differently than functions declared at module scope without having to reference the closed over function (i.e. <code>@some_awesome_deco(foo)</code>?)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If all you need to support is CPython, then your decorator could look at the <a href="https://docs.python.org/3/library/sys.html#sys._getframe" rel="nofollow"><code>sys._getframe(1)</code></a> frame object, which represents the execution frame for the code executing the decorator. If the <code>frame.f_locals</code> dictionary is the same object as the <code>frame.f_globals</code> dictionary you are at module level. If not, you are in a nested scope.</p>
+<p>You'll have to generate some kind of scope key however; you <em>may</em> get away with storing something in <code>f_locals</code> (which won't actually affect the actual locals). Just remember that locals (as well as the frame) are cleared when a function exits. I'd return a special callable instead, one that is mutable, so you can refer to it on subsequent decorator calls. You'd be able to retrieve that object with <code>frame.f_locals[decorated_function.__name__]</code>, for example.</p>
+<p>See the <a href="https://docs.python.org/3/library/inspect.html#types-and-members" rel="nofollow"><code>inspect</code> module documenation</a> for an overview of what attributes you can expect to find on a frame object.</p>
+<p>Demo:</p>
+<pre><code>&gt;&gt;&gt; import sys
+&gt;&gt;&gt; def nested_scope_detector(func):
+...     frame = sys._getframe(1)
+...     nested_scope = frame.f_globals is not frame.f_locals
+...     redefinition = func.__name__ in frame.f_locals
+...     if nested_scope: print('{!r} is located in a nested scope.'.format(func))
+...     if redefinition: print('Redefining {!r}, previously bound to {!r}'.format(
+...         func.__name__, frame.f_locals[func.__name__]))
+...     return func
+... 
+&gt;&gt;&gt; @nested_scope_detector
+... def foo(): pass
+... 
+&gt;&gt;&gt; @nested_scope_detector
+... def foo(): pass
+... 
+Redefining 'foo', previously bound to &lt;function foo at 0x10e931d08&gt;
+&gt;&gt;&gt; def bar():
+...     @nested_scope_detector
+...     def foo(): pass
+...     @nested_scope_detector
+...     def foo(): pass
+... 
+&gt;&gt;&gt; bar()
+&lt;function bar.&lt;locals&gt;.foo at 0x10eb4ef28&gt; is located in a nested scope.
+&lt;function bar.&lt;locals&gt;.foo at 0x10eb4eea0&gt; is located in a nested scope.
+Redefining 'foo', previously bound to &lt;function bar.&lt;locals&gt;.foo at 0x10eb4ef28&gt;
+</code></pre>
+<p>As such, you could use a function attribute on the returned wrapper function to store your functions:</p>
+<pre><code>def capture(f):
+    locals = sys._getframe(1).f_locals
+    preexisting = locals.get(f.__name__)
+    if preexisting is not None and hasattr(preexisting, 'functions'):
+        preexisting.functions.append(f)
+        return preexisting
+
+    @functools.wraps(f)
+    def _wrapper(*args, **kwargs):
+        return (func(*args, **kwargs) for func in _wrapper.functions)
+    _wrapper.functions = [f]
+    return _wrapper
+</code></pre>
+<p>and it'll work in any scope:</p>
+<pre><code>&gt;&gt;&gt; @capture
+... def foo(): return 'bar'
+... 
+&gt;&gt;&gt; @capture
+... def foo(): return 'baz'
+... 
+&gt;&gt;&gt; foo()
+&lt;generator object &lt;genexpr&gt; at 0x10eb45ee8&gt;
+&gt;&gt;&gt; list(foo())
+['bar', 'baz']
+&gt;&gt;&gt; def bar():
+...     @capture
+...     def foo(): return 'bar'
+...     @capture
+...     def foo(): return 'baz'
+...     return foo
+... 
+&gt;&gt;&gt; list(bar()())
+['bar', 'baz']
+</code></pre>
+</div>
+<span class="comment-copy">This would happen at import time or always at runtime? I've not actually used the <code>sys._getframe</code> function.</span>
+<span class="comment-copy">@wheaties: In a nested scope, always at runtime when the function is executed. Only the global scope is executed at import time.</span>
+<span class="comment-copy">@wheaties: decorators are just functions that are executed when the decorated object is being loaded.</span>
+<span class="comment-copy">@eryksun: that's actually more support than we had any right to expect!</span>
+<span class="comment-copy">@eryksun: I think the OP should not concern himself with scoping at all, really. Next thing we'll see someone use the decorator on a lambda in a dictionary comprehension and wonder what strange scope they wandered into then..</span>

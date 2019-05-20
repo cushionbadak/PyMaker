@@ -1,0 +1,57 @@
+<div class="post-text" itemprop="text">
+<p>The "traditional" way for a library to take file input is to do something like this:</p>
+<pre><code>def foo(file_obj):
+    data = file_obj.read()
+    # Do other things here
+</code></pre>
+<p>The client code is responsible for opening the file, seeking to the appropriate point (if necessary), and closing it.  If the client wants to hand us a pipe or socket (or a <code>StringIO</code>, for that matter), they can do that and it Just Works.</p>
+<p>But this isn't compatible with asyncio, which requires a syntax more like this:</p>
+<pre><code>def foo(file_obj):
+    data = yield from file_obj.read()
+    # Do other things here
+</code></pre>
+<p>Naturally, this syntax only works with asyncio objects; trying to use it with traditional file objects makes a mess.  The reverse is also true.</p>
+<p>Worse, it seems to me there's no way to wrap this <code>yield from</code> inside a traditional <code>.read()</code> method, because we need to yield all the way up to the event loop, not just at the site where the reading happens.  The gevent library does do something like this, but I don't see how to adapt their greenlet code into generators.</p>
+<p>If I'm writing a library that handles file input, how should I deal with this situation?  Do I need two versions of the <code>foo()</code> function?  I have many such functions; duplicating all of them is not scalable.</p>
+<p>I could tell my client developers to use <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.BaseEventLoop.run_in_executor" rel="nofollow"><code>run_in_executor()</code></a> or some equivalent, but that feels like working against asyncio instead of with it.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is one of the downsides of explicit asynchronous frameworks. Unlike <code>gevent</code>, which can monkeypatch synchronous code to make it asynchronous without any code changes, you can't make synchronous code <code>asyncio</code>-compatible without rewriting it to use <code>asyncio.coroutine</code> and <code>yield from</code> (or at least <code>asyncio.Futures</code> and callbacks) all the way down.</p>
+<p>There's no way that I know of to have the same function work properly in both an <code>asyncio</code> and normal, synchronous context; any code that's <code>asyncio</code> compatible is going to rely on the event loop to be running to drive the asynchronous portions, so it won't work in a normal context, and  synchronous code is always going to end up blocking the event loop if its run in an <code>asyncio</code> context. This is why you generally see <code>asyncio</code>-specific (or at least asynchronous framework-specific) versions of libraries alongside synchronous versions. There's just no good way to present a unified API that works with both.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Having considered this some more, I've come to the conclusion that it is possible to do this, but it's not exactly beautiful.</p>
+<p>Start with the traditional version of <code>foo()</code>:</p>
+<pre><code>def foo(file_obj):
+    data = file_obj.read()
+    # Do other things here
+</code></pre>
+<p>We need to pass a file object which will behave "correctly" here.  When the file object needs to do I/O, it should follow this process:</p>
+<ol>
+<li>It creates a new <a href="https://docs.python.org/3/library/threading.html#threading.Event" rel="nofollow">event</a>.</li>
+<li>It creates a closure which, when invoked, performs the necessary I/O and then sets the event.</li>
+<li>It hands the closure off to the event loop using <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.BaseEventLoop.call_soon_threadsafe" rel="nofollow"><code>call_soon_threadsafe()</code></a>.</li>
+<li>It blocks on the event.</li>
+</ol>
+<p>Here's some example code:</p>
+<pre><code>import asyncio, threading
+
+# inside the file object class
+def read(self):
+    event = threading.Event()
+    def closure():
+        # self.reader is an asyncio StreamReader or similar
+        self._tmp = yield from self.reader.read()
+        event.set()
+    asyncio.get_event_loop().call_soon_threadsafe(closure)
+    event.wait()
+    return self._tmp
+</code></pre>
+<p>We then arrange for <code>foo(file_obj)</code> to be run in an executor (e.g. using <code>run_in_executor()</code> as suggested in the OP).</p>
+<p>The nice thing about this technique is that it works even if the author of <code>foo()</code> has no knowledge of <code>asyncio</code>.  It also ensures I/O is served on the event loop, which could be desirable in certain circumstances.</p>
+</div>
+<span class="comment-copy">Reading from a normal file doesn't block; you immediately get all the bytes available in the file, and when they're all gone the call completes. So, there's no need to <code>yield from</code> - you're never going to return control the event loop anyway. See <a href="https://groups.google.com/forum/#!topic/python-tulip/MvpkQeetWZA" rel="nofollow noreferrer">here</a> for more info.</span>
+<span class="comment-copy">@dano: Sure, but what if the client code passes us an asyncio socket?</span>
+<span class="comment-copy">If your API needs to be able to deal with both <code>asyncio</code>-compatible objects and regular file objects, you're probably going to need to add logic to <code>foo</code> that will detect the difference and do the right thing. E.g. call <code>out = file_obj.read()</code>, and if <code>out</code> is something other than a <code>bytes</code> object, <code>yield from</code> it. There's no way to make the FS read truly asynchronous, other than to run it in a thread.</span>
+<span class="comment-copy">It's not so much that I <i>need</i> to be able to handle asyncio objects as that I don't want to inconvenience people who happen to be writing something using asyncio and want to call into my library.</span>
+<span class="comment-copy">You may take a look on <a href="https://github.com/Tinche/aiofiles" rel="nofollow noreferrer">aiofiles library</a>.</span>

@@ -1,0 +1,140 @@
+<div class="post-text" itemprop="text">
+<p>I have this Cython code (simplified):</p>
+<pre><code>class Callback:
+    async def foo(self):
+        print('called')
+
+cdef void call_foo(void* callback):
+    print('call_foo')
+    asyncio.wait_for(&lt;object&gt;callback.foo())
+
+async def py_call_foo():
+    call_foo(Callback())
+
+async def example():
+    loop.run_until_complete(py_call_foo())
+</code></pre>
+<p>What happens though: I get <code>RuntimeWarning: coroutine Callback.foo was never awaited</code>. And, in fact, it is never called.  However, <code>call_foo</code> is called.</p>
+<p>Any idea what's going on / how to get it to actually wait for <code>Callback.foo</code> to complete?</p>
+<hr/>
+<h3>Extended version</h3>
+<p>In the example above some important details are missing: In particular, it is really difficult to get hold of return value from <code>call_foo</code>.  The real project setup has this:</p>
+<ol>
+<li><p>Bison parser that has rules.  Rules are given a reference to specially crafted struct, let's call it <code>ParserState</code>.  This struct contains references to callbacks, which are called by parser when rules match.</p></li>
+<li><p>In Cython code, there's a class, let's call it <code>Parser</code>, that users of the package are supposed to extend to make their custom parsers.  This class has methods which then need to be called from callbacks of <code>ParserState</code>.</p></li>
+<li><p>Parsing is supposed to happen like this:</p>
+<pre><code>async def parse_file(file, parser):
+    cdef ParserState state = allocate_parser_state(
+        rule_callbacks,
+        parser,
+        file,
+    )
+    parse_with_bison(state)
+</code></pre></li>
+</ol>
+<p>The callbacks are of a general shape:</p>
+<pre><code>ctypedef void(callback*)(char* text, void* parser)
+</code></pre>
+<p>I have to admit I don't know how exactly <code>asyncio</code> implements <code>await</code>, and so I don't know if it is in general possible to do this with the setup that I have.  My ultimate goal though is that multiple Python functions be able to iteratively parse different files, all at the same time more or less.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your problem is mixing synchronous with asynchronous code. Case in point:</p>
+<pre><code>async def example():
+    loop.run_until_complete(py_call_foo())
+</code></pre>
+<p>This is similar to putting a subroutine in a Thread, but never starting it.
+Even when started, this is a deadlock: the synchronous part would prevent the asynchronous part from running.</p>
+<hr/>
+<h3>Asynchronous code must be <code>await</code>ed</h3>
+<p>An <code>async def</code> coroutine is similar to a <code>def ...: yield</code> generator: calling it only instantiates it. You must interact with it to actually run it:</p>
+<pre><code>def foo():
+     print('running!')
+     yield 1
+
+bar = foo()  # no output!
+print(next(bar))  # prints `running!` followed by `1`
+</code></pre>
+<p>Similarly, when you have an <code>async def</code> coroutine, you must either <code>await</code> it or schedule it in an event loop. Since <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.wait_for" rel="nofollow noreferrer"><code>asyncio.wait_for</code></a> produces a coroutine, and you never <code>await</code> or schedule it, it is not run. This is the cause for your RuntimeWarning.</p>
+<p>Note that the purpose of putting a coroutine into <code>asyncio.wait_for</code> is purely to <em>add a timeout</em>. It is not meant to <code>await</code> or run the coroutine by itself.</p>
+<pre><code>async def call_foo(callback):
+    print('call_foo')
+    await asyncio.wait_for(callback.foo(), timeout=2)
+
+asyncio.get_event_loop().run_until_complete(call_foo(Callback()))
+</code></pre>
+<h3>Asynchronous functions need asynchronous instructions</h3>
+<p>The key for asynchronous programming is that it is <em>cooperative</em>: Only one coroutine executes <em>until it yields control</em>. Afterwards, another coroutine executes <em>until it yields control</em>. This means that any coroutine blocking <em>without</em> yielding control blocks all other coroutines as well.</p>
+<p>In general, if something performs work without an <code>await</code> context, it is blocking. Notably, <code>loop.run_until_complete</code> is blocking. You have to call it from a synchronous function:</p>
+<pre><code>loop = asyncio.get_event_loop()
+
+# async def function uses await
+async def py_call_foo():
+    await call_foo(Callback())
+
+# non-await function is not async
+def example():
+    loop.run_until_complete(py_call_foo())
+
+example()
+</code></pre>
+<h3>Return values from coroutines</h3>
+<p>A coroutine can <code>return</code> results like a regular function.</p>
+<pre><code>async def make_result():
+    await asyncio.sleep(0)
+    return 1
+</code></pre>
+<p>If you <code>await</code> it from another coroutine, you directly get the return value:</p>
+<pre><code>async def print_result():
+    result = await make_result()
+    print(result)  # prints 1
+
+asyncio.get_event_loop().run_until_complete(print_result())
+</code></pre>
+<p>To get the value from a regular subroutine, use <code>run_until_complete</code> to get the return value:</p>
+<pre><code>def print_result():
+    result = asyncio.get_event_loop().run_until_complete(make_result())
+    print(result)
+
+print_result()
+</code></pre>
+<h3>A <code>cdef/cpdef</code> function cannot be a coroutine</h3>
+<p>Cython supports coroutines via <code>yield from</code> and <code>await</code> only for Python functions. Even for a classical coroutine, a <code>cdef</code> is not possible:</p>
+<pre><code>Error compiling Cython file:
+------------------------------------------------------------
+cdef call_foo(callback):
+    print('call_foo')
+    yield from asyncio.wait_for(callback.foo(), timeout=2)
+   ^
+------------------------------------------------------------
+
+testbed.pyx:10:4: 'yield from' not supported here
+</code></pre>
+<p>You are perfectly fine <em>calling</em> a synchronous <code>cdef</code> function from a coroutine. You are perfectly fine <em>scheduling</em> a coroutine from a <code>cdef</code> function.
+But you cannot <code>await</code> from inside a <code>cdef</code> function, nor <code>await</code> a <code>cdef</code> function. If you need to do that, as in your example, use a regular <code>def</code> function.</p>
+<p>You can however construct and return a coroutine in a <code>cdef</code> function. This allows you to <code>await</code> the result in an outer coroutine:</p>
+<pre><code># inner coroutine
+async def pingpong(what):
+    print('pingpong', what)
+    await asyncio.sleep(0)
+    return what
+
+# cdef layer to instantiate and return coroutine
+cdef make_pingpong():
+    print('make_pingpong')
+    return pingpong('nananana')
+
+# outer coroutine
+async def play():
+    for i in range(3):
+        result = await make_pingpong()
+        print(i, '=&gt;', result)
+
+asyncio.get_event_loop().run_until_complete(play())
+</code></pre>
+<p>Note that despite the <code>await</code>, <code>make_pingpong</code> is not a coroutine. It is merely a factory for coroutines.</p>
+</div>
+<span class="comment-copy">I think you should <code>await call_foo(...)</code> in <code>py_call_foo</code>. Also, you should <code>return asyncio.wait_for(...)</code> in <code>call_foo</code>. Otherwise, the event loop exits before <code>Callback.foo</code> is done running, and asyncio complains.</span>
+<span class="comment-copy">@user4815162342 the problem is, in reality, <code>call_foo</code> is called in C code, and I don't have a way to get return value from that call (more concretely, it is called by code generated by <code>Bison</code>).</span>
+<span class="comment-copy">The suspension is <i>not</i> based on some interpreter trick, it is fully possible to compile it it into efficient machine code (which is what Cython and PyPy do with async functions). Precisely because it doesn't use tricks, it cannot magically transform synchronous code into async. It is possible to do so if the code is non-blocking and based on callbacks - think JavaScript-style "promises" and such. Does the parser you are using support a "push" interface?</span>
+<span class="comment-copy">It is not obvious that parsing using a push interface should be significantly slower; for example, the expat XML parser, known for its efficiency, supports a push interface. Either way, if your parser expects to be "in control" of the parsing process (i.e. not return to the caller until the parsing is done), you will need to use threads or their emulation such as greenlets to run multiple instances concurrently. asyncio is designed to make it easier to program with callbacks by providing suspension primitives that make it appear like you're programming imperatively.</span>
+<span class="comment-copy">That's impressive work, although it does come with a cost that it made the parser fundamentally incompatible with asyncio (and similar forms of cooperative multitasking). I wonder, though, if the cost of <i>one</i> heap allocation (for all tokens) really makes a difference compared to the actual parsing work done by the function?</span>

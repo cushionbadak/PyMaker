@@ -1,0 +1,98 @@
+<div class="post-text" itemprop="text">
+<p>I have a  v2.5 Python code which I cannot control, as it is being exported from a third party software which supports Python v2.5. </p>
+<p>I have Python v3.3 on my machine and I want, somehow, to emulate the v2.5
+using the C API. My main concern is the integer division which differs between v2.x and v3.x.</p>
+<p>For example I have the code below:  </p>
+<pre><code>a=1
+b=a/2
+c=a/2.
+</code></pre>
+<p>I want somehow this to be interpreted (using the v3.x) as:</p>
+<pre><code>a=1
+b=a//2
+c=a/2.
+</code></pre>
+<p>Can I do something about that? Is there any way to interpret the code as if I had Python v2.5? I suppose that the 2to3 script does not work for my case, neither the six module.</p>
+<p>I also found this question relative to mine:
+<a href="https://stackoverflow.com/questions/11372190/python-2-and-python-3-dual-development">Python 2 and Python 3 dual development</a></p>
+<p>Thanks</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This sounds like a bad idea—and you're going to have much more serious problems interpreting Python 2.5 code as Python 3, like every <code>except</code> statement being a syntax error, and strings being the wrong type (or, if you fix that, <code>s[i]</code> returning an int rather than a bytes), and so on.</p>
+<hr/>
+<p>The obvious thing to do here is to port the code to a Python that's still supported.</p>
+<p>If that really is impossible for some reason, the simplest thing to do is probably to write a trivial Python 2.5 wrapper around the code you need to run, which takes its input via <code>sys.argv</code> and/or <code>sys.stdin</code> and returns results via <code>sys.exit</code> and/or <code>sys.stdout</code>. </p>
+<p>Then, you just call it like this:</p>
+<pre><code>p = subprocess.run(['python2.5', 'mywrapper.py', *args], capture_output=True)
+if p.retcode:
+    raise Exception(p.stderr.decode('ascii'))
+results = p.stdout.splitlines().decode('ascii')
+</code></pre>
+<hr/>
+<p>But if you really want to do it, and this is really your only problem… this still isn't the <em>way</em> to do it.</p>
+<p>You'd have to go below the level of the C API, into the internal type objects like <a href="https://github.com/python/cpython/blob/master/Objects/floatobject.c#L1910" rel="nofollow noreferrer"><code>struct PyFloat_Type</code></a>, access their <code>tp_as_number</code> structs, and copy their <code>nb_floordiv</code> functions to their <code>nb_truediv</code> slots. And even that may not change everything.</p>
+<hr/>
+<p>A much better solution is to build an import hook that transforms the AST before compiling it.</p>
+<p>Writing an import hook is probably too big a topic to cover in a couple of paragraphs as a preface to an answer, so see <a href="https://stackoverflow.com/questions/43571737/">this question</a> for that part.</p>
+<p>Now, as for what the import hook actually does, what you want to do is replace the <code>MyLoader.exec_module</code> method. Instead of this:</p>
+<pre><code>def exec_module(self, module):
+    with open(self.filename) as f:
+        data = f.read()
+
+    # manipulate data some way...
+
+    exec(data, vars(module))
+</code></pre>
+<p>You're going to do this:</p>
+<pre><code>def exec_module(self, module):
+    with open(self.filename) as f:
+        data = f.read()
+
+    tree = ast.parse(data)
+
+    # manipulate tree in some way
+
+    code = compile(tree, self.filename, 'exec')
+    exec(code, vars(module))
+</code></pre>
+<p>So, how do we "manipulate tree in some way"? By building a <a href="https://docs.python.org/3/library/ast.html#ast.NodeTransformer" rel="nofollow noreferrer"><code>NodeTransformer</code></a>.</p>
+<p>Every <code>/</code> expression is a <code>BinOp</code> node, where the <code>op</code> is <code>Div</code> node with no attributes, and the <code>left</code> and <code>right</code> are the values to divide. If we want to change it into the same expression but with <code>//</code>, that's the same <code>BinOp</code>, but where the <code>op</code> is <code>FloorDiv</code>.</p>
+<p>So, we can just visit <code>Div</code> nodes and turn them into <code>FloorDiv</code> nodes:</p>
+<pre><code>class DivTransformer(ast.NodeTransformer):
+    def visit_Div(self, node):
+        return ast.copy_location(ast.FloorDiv(), node)
+</code></pre>
+<p>And our "# manipulate tree in some way" becomes:</p>
+<pre><code>tree = DivTransformer().visit(tree)
+</code></pre>
+<hr/>
+<p>If you want to choose between <code>floordiv</code> and <code>truediv</code> depending on whether the divisor is an integral literal, as your examples seem to imply, that's not much harder:</p>
+<pre><code>class DivTransformer(ast.NodeTransformer):
+    def visit_BinOp(self, node):
+        if isinstance(node.op, ast.Div):
+            if isinstance(node.right, ast.Num) and isinstance(node.right.val, int):
+                return ast.copy_location(ast.BinOp(
+                    left=node.left,
+                    op=ast.copy_location(ast.FloorDiv(), node.op),
+                    right=node.right))
+        return node
+</code></pre>
+<hr/>
+<p>But I doubt that's what you actually want. In fact, what you actually want is probably pretty hard to define. You probably want something like:</p>
+<ul>
+<li><code>floordiv</code> if both arguments, at runtime, are integral values</li>
+<li><code>floordiv</code> if the argument that will end up in control of the <code>__*div__</code>/<code>__*rdiv__</code> (by exactly reproducing the rules used by the interpreter for that) is an integral value.</li>
+<li>… something else?</li>
+</ul>
+<p>Anyway, the only way to do this is to replace the <code>BinOp</code> with a <code>Call</code> to a <code>mydiv</code> function, that you write and, e.g., stick in <code>builtins</code>. That function then does the type-switching and whatever else is needed to implement your rule, and then either <code>return a/b</code> or <code>return a//b</code>.</p>
+</div>
+<span class="comment-copy">You mean that <code>a//2</code> does not work? Python3-x <a href="https://docs.python.org/3.1/tutorial/introduction.html#numbers" rel="nofollow noreferrer">explicitly</a> defines that as "integer division".</span>
+<span class="comment-copy">@usr2564301 no, he's saying that he wants his Python3 interpreter to parse <code>b = a/2</code> in a Python2 context, which is to say: <code>b = a//2</code></span>
+<span class="comment-copy">Port the third party library to python 3. Both python 2.5 and python 3.3 have reached support end of life years ago.</span>
+<span class="comment-copy">Or just run the Python 2.5 code as a subprocess in Python 2.5.</span>
+<span class="comment-copy"><i>"I have Python v3.3 on my machine"</i> go get 2.5 as well then. The package manager <a href="https://conda.io/docs/index.html" rel="nofollow noreferrer"><b>conda</b></a> is pretty great about <a href="https://conda.io/docs/user-guide/getting-started.html#managing-python" rel="nofollow noreferrer">treating python itself as a package</a> so you can create separate environments for separate versions.</span>
+<span class="comment-copy">They want to treat <code>a/2.</code> as truediv instead of converting all division to floordiv, though.</span>
+<span class="comment-copy">@user2357112 I added a section to that effect. As stated, that isn't a well-defined requirement. And figuring out how to define it is actually the hard part. For example, do they really want <code>a/2</code> to be truediv even if <code>a</code> is a float?</span>
+<span class="comment-copy">@abarnert Thank you for the answer. Ι will further investigate it as I am new to Python. However, in order to answer to your question, I want, ideally, to do this: python3.interpret_like_python2x(code_v2x). I want to take the same results as those I would have obtained if I had used the python v2.x interpreter.</span>
+<span class="comment-copy">@tsahmatsis Is <code>code_v2x</code> source code? A function object? A module name? …? And, as I mentioned in the question: is there a reason that can't just be <code>subprocess.run(['python2.5', 'code_v2x.py', … some args …], …)</code>? Because that would be by far the easiest thing to do.</span>
+<span class="comment-copy">@abarnert code_v2x is source code that should be interpreted in the same way as Python v2.x does by using v3.x.</span>

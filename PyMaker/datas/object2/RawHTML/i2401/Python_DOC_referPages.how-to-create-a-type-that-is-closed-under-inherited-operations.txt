@@ -1,0 +1,485 @@
+<div class="post-text" itemprop="text">
+<p>In the mathematical sense, a set (or type) is <a href="https://en.wikipedia.org/wiki/Closure_(mathematics)" rel="nofollow noreferrer">closed</a> under an operation if the operation always returns a member of the set itself.</p>
+<p>This question is about making a class that is closed under all operations inherited from its superclasses.</p>
+<p>Consider the following class.</p>
+<pre><code>class MyInt(int):
+    pass
+</code></pre>
+<p>Since <code>__add__</code> has not been overridden, it is not closed under addition.</p>
+<pre><code>x = MyInt(6)
+print(type(x + x))  # &lt;class 'int'&gt;
+</code></pre>
+<p>One very tedious way to make the type closed would be to manually cast back the result of every operation that returns an <code>int</code> to <code>MyInt</code>.</p>
+<p>Here, I automated that process using a metaclass, but this seems like an overly complex solution.</p>
+<pre><code>import functools
+
+class ClosedMeta(type):
+    _register = {}
+
+    def __new__(cls, name, bases, namespace):
+        # A unique id for the class
+        uid = max(cls._register) + 1 if cls._register else 0
+
+        def tail_cast(f):
+            @functools.wraps(f)
+            def wrapper(*args, **kwargs):
+                out = f(*args, **kwargs)
+                if type(out) in bases:
+                    # Since the class does not exist yet, we will recover it later
+                    return cls._register[uid](out)
+                return out
+            return wrapper
+
+        for base in reversed(bases):
+            for name, attr in base.__dict__.items():
+                if callable(attr) and name not in namespace:
+                    namespace[name] = tail_cast(attr)
+
+        subcls = super().__new__(cls, name, bases, namespace)
+        cls._register[uid] = subcls
+        return subcls
+
+class ClosedInt(int, metaclass=ClosedMeta):
+    pass
+</code></pre>
+<p>This fails on some cornercases such as <code>property</code> and methods recovered through <code>__getattribute__</code>. It also fails when the base is not composed only of base types.</p>
+<p>For example, this fails:</p>
+<pre><code>class MyInt(int):
+    pass
+
+class ClosedInt(MyInt, metaclass=ClosedMeta):
+    pass
+
+ClosedInt(1) + ClosedInt(1) # returns the int 2
+</code></pre>
+<p>I attempted to fix this, but it just seems to go deeper and deeper in the rabbit hole.</p>
+<p>This seems like a problem that might have some simple pythonic solution. What would be a other, neater ways to achieve such a closed type?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think that the idea of using a metaclass is the way to go. The trick is to cast the values dynamically when you get them instead of up front. That's basically what python is all about: not knowing quite what you'll get or what's there until you actually get it.</p>
+<p>To do that, you have to redefine <code>__getattribute__</code> and <code>__getattr__</code> on your class with some caveats:</p>
+<ol>
+<li>Operators don't go through the normal attribute access methods. Even defining the right <code>__getattribute__</code> and <code>__getattr__</code> on your metaclass won't help. Dunders have to be overridden explicitly for each class.</li>
+<li>Methods returned by <code>__getattribute__</code> and <code>__getattr__</code> need to have their return values cast to the target type. Same applies to dunders called as operators.</li>
+<li>Some methods should be excepted from #2 to ensure proper operation of the machinery.</li>
+</ol>
+<p>The same basic casting wrapper can be used for all the attribute and method return values. It just needs to recurse exactly oncewhen it's called on the result of <code>__getattribute__</code> or <code>__getattr__</code>.</p>
+<p>The solution shown below does exactly that. It explicitly wraps all dunders that aren't listed as exceptions. All other attributes are either cast immediately or wrapped if they are functions. It allows any method to be customized by checking everything in the <code>__mro__</code>, including the class itself. The solution will work correctly with class and static methods because it stores the casting routine and doesn't rely on <code>type(self)</code> (as some of my previous attempts did). It will correctly exclude any attributes listed in <code>exceptions</code>, not just dunder methods.</p>
+<pre>
+import functools
+
+
+def isdunder(x):
+    return isinstance(x, str) and x.startswith('__') and x.endswith('__')
+
+
+class DunderSet:
+    def __contains__(self, x):
+        return isdunder(x)
+
+
+def wrap_method(method, xtype, cast):
+
+    @functools.wraps(method)
+    def retval(*args, **kwargs):
+        result = method(*args, **kwargs)
+        return cast(result) if type(result) == xtype else result
+
+    return retval
+
+
+def wrap_getter(method, xtype, cast, exceptions):
+    @functools.wraps(method)
+    def retval(self, name, *args, **kwargs):
+        result = method(self, name, *args, **kwargs)
+        return result if name in exceptions else check_type(result, xtype, cast)
+
+    return retval
+
+
+def check_type(value, xtype, cast):
+    if type(value) == xtype:
+        return cast(value)
+    if callable(value):
+        return wrap_method(value, xtype, cast)
+    return value
+
+
+class ClosedMeta(type):
+    def __new__(meta, name, bases, dct, **kwargs):
+        if 'exceptions' in kwargs:
+            exceptions = set([
+                '__new__', '__init__', '__del__',
+                '__init_subclass__', '__instancecheck__', '__subclasscheck__',
+                *map(str, kwargs.pop('exceptions'))
+            ])
+        else:
+            exceptions = DunderSet()
+        target = kwargs.pop('target', bases[0] if bases else object)
+
+        cls = super().__new__(meta, name, bases, dct, **kwargs)
+
+        for base in cls.__mro__:
+            for name, item in base.__dict__.items():
+                if isdunder(name) and (base is cls or name not in dct) and callable(item):
+                    if name in ('__getattribute__', '__getattr__'):
+                        setattr(cls, name, wrap_getter(item, target, cls, exceptions))
+                    elif name not in exceptions:
+                        setattr(cls, name, wrap_method(item, target, cls))
+        return cls
+
+    def __init__(cls, *args, **kwargs):
+        return super().__init__(*args)
+
+
+class MyInt(int):
+    def __contains__(self, x):
+        return x == self
+    def my_op(self, other):
+        return int(self * self // other)
+
+
+class ClosedInt(MyInt, metaclass=ClosedMeta, target=int,
+                exceptions=['__index__', '__int__', '__trunc__', '__hash__']):
+    pass
+
+class MyClass(ClosedInt, metaclass=type):
+    def __add__(self, other):
+        return 1
+
+print(type(MyInt(1) + MyInt(2)))
+print(0 in MyInt(0), 1 in MyInt(0))
+print(type(MyInt(4).my_op(16)))
+
+print(type(ClosedInt(1) + ClosedInt(2)))
+print(0 in ClosedInt(0), 1 in ClosedInt(0))
+print(type(ClosedInt(4).my_op(16)))
+
+print(type(MyClass(1) + ClosedInt(2)))
+</pre>
+<p>The result is</p>
+<pre><code>&lt;class 'int'&gt;
+True False
+&lt;class 'int'&gt; 
+
+&lt;class '__main__.ClosedInt'&gt;
+True False
+&lt;class '__main__.ClosedInt'&gt;
+
+&lt;class 'int'&gt;
+</code></pre>
+<p>The last example is a tribute to <a href="https://stackoverflow.com/a/52341432/2988730">@wim's answer</a>. It shows that you have to <em>want</em> to do this for it to work.</p>
+<p>IDEOne link because I don't have access to a computer right now: <a href="https://ideone.com/iTBFW3" rel="nofollow noreferrer">https://ideone.com/iTBFW3</a></p>
+<p><strong>Appendix 1: Improved default exceptions</strong></p>
+<p>I think that a better default set of exceptions than all dunder methods can be complied by looking carefully through the <a href="https://docs.python.org/3/reference/datamodel.html#special-method-names" rel="nofollow noreferrer">special method names</a> section of the documentation. Methods can be categorized into two broad classes: methods with very specific return types that make the python machinery work, and methods whose output should be checked and wrapped when they return an instance of your type of interest. There is a third category, which is methods that should always be excepted, even when you forget to mention them explicitly.</p>
+<p>Here is a list of the methods that are always excepted:</p>
+<ul>
+<li><code>__new__</code></li>
+<li><code>__init__</code></li>
+<li><code>__del__</code></li>
+<li><code>__init_subclass__</code></li>
+<li><code>__instancecheck__</code></li>
+<li><code>__subclasscheck__</code></li>
+</ul>
+<p>Here is a list of everything that should be excepted by default:</p>
+<ul>
+<li><code>__repr__</code></li>
+<li><code>__str__</code></li>
+<li><code>__bytes__</code></li>
+<li><code>__format__</code></li>
+<li><code>__lt__</code></li>
+<li><code>__le__</code></li>
+<li><code>__eq__</code></li>
+<li><code>__ne__</code></li>
+<li><code>__gt__</code></li>
+<li><code>__ge__</code></li>
+<li><code>__hash__</code></li>
+<li><code>__bool__</code></li>
+<li><code>__setattr__</code></li>
+<li><code>__delattr__</code></li>
+<li><code>__dir__</code></li>
+<li><code>__set__</code></li>
+<li><code>__delete__</code></li>
+<li><code>__set_name__</code></li>
+<li><code>__slots__</code> (not a method, but still)</li>
+<li><code>__len__</code></li>
+<li><code>__length_hint__</code></li>
+<li><code>__setitem__</code></li>
+<li><code>__delitem__</code></li>
+<li><code>__iter__</code></li>
+<li><code>__reversed__</code></li>
+<li><code>__contains__</code></li>
+<li><code>__complex__</code></li>
+<li><code>__int__</code></li>
+<li><code>__float__</code></li>
+<li><code>__index__</code></li>
+<li><code>__enter__</code></li>
+<li><code>__exit__</code></li>
+<li><code>__await__</code></li>
+<li><code>__aiter__</code></li>
+<li><code>__anext__</code></li>
+<li><code>__aenter__</code></li>
+<li><code>__aexit__</code></li>
+</ul>
+<p>If we stash this list into a variable called <code>default_exceptions</code>, the class <code>DunderSet</code> can be removed entirely, and the conditional that extracts <code>exceptions</code> can be replaced by:</p>
+<pre><code>exceptions = set([
+    '__new__', '__init__', '__del__',
+    '__init_subclass__', '__instancecheck__', '__subclasscheck__',
+    *map(str, kwargs.pop('exceptions', default_exceptions))
+])
+</code></pre>
+<p><strong>Appendix 2: Improved targetting</strong></p>
+<p>It should be possible to target multiple types pretty easily. This is especially useful when extending other instances of <code>ClosedMeta</code>, which may not override all the methods we want.</p>
+<p>The first step in doing this is making <code>target</code> into a container of classes instead of a single class reference. Instead of</p>
+<pre><code>target = kwargs.pop('target', bases[0] if bases else object)
+</code></pre>
+<p>do</p>
+<pre><code>target = kwargs.pop('target', bases[:1] if bases else [object])
+try:
+    target = set(target)
+except TypeError:
+    target = {target}
+</code></pre>
+<p>Now replace every occurrence of <code>blah == target</code> (or <code>blah == xtype</code> in the wrappers) with <code>blah in target</code> (or <code>blah in xtype</code>).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think using a class decorator with a black list of methods that should not return objects of the same type would be somewhat more Pythonic:</p>
+<pre><code>class containerize:
+    def __call__(self, obj):
+        if isinstance(obj, type):
+            return self.decorate_class(obj)
+        return self.decorate_callable(obj)
+
+    def decorate_class(self, cls):
+        for name in dir(cls):
+            attr = getattr(cls, name)
+            if callable(attr) and name not in ('__class__', '__init__', '__new__', '__str__', '__repr__', '__getattribute__'):
+                setattr(cls, name, self.decorate_callable(attr))
+        return cls
+
+    def decorate_callable(self, func):
+        def wrapper(obj, *args, **kwargs):
+            return obj.__class__(func(obj, *args, **kwargs))
+        return wrapper
+</code></pre>
+<p>so that:</p>
+<pre><code>class MyInt(int):
+    pass
+
+@containerize()
+class ClosedIntContainer(MyInt):
+    pass
+
+i = ClosedIntContainer(3) + ClosedIntContainer(2)
+print(i, type(i).__name__)
+</code></pre>
+<p>would output:</p>
+<pre><code>5 ClosedIntContainer
+</code></pre>
+<p>and that as a bonus the decorator can be selectively used on individual methods as well:</p>
+<pre><code>class MyInt(int):
+    @containerize()
+    def __add__(self, other):
+        return super().__add__(other)
+
+i = MyInt(3) + MyInt(2)
+print(i, type(i).__name__)
+</code></pre>
+<p>This outputs:</p>
+<pre><code>5 MyInt
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This cannot be done, the data model forbids it. And I can prove it to you:</p>
+<pre><code>&gt;&gt;&gt; class MyClass(ClosedInt, metaclass=type):
+...     def __add__(self, other):
+...         return 'potato'
+...     
+&gt;&gt;&gt; MyClass(1) + ClosedInt(2)
+'potato'
+</code></pre>
+<p>Addition is handled by the left hand object first, and if the left type handles it (i.e. does not return <code>NotImplemented</code> singleton) then <em>nothing</em> about <code>other</code> is considered in this operation.  If the right hand type is a subclass of the left-hand type, you could control the result with the reflected method <code>__radd__</code> - but of course that is impossible in the general case.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Everyone is writing short codes and meta classes while I barely write a decorator. (damn, lol) But I'm gonna share it anyways.</p>
+<pre><code>from functools import wraps
+
+
+class CLOSED:
+    _built_ins = [
+        '__add__', '__sub__', '__mul__', '__floordiv__',
+        '__div__', '__truediv__', '__mod__', '__divmod__',
+        '__pow__', '__lshift__', '__rshift__','__and__',
+        '__or__', '__xor__',
+    ]
+
+    @staticmethod
+    def register_closed(method):  # Or you can use type annotations
+        method.registered = True  # Or you can add the method names as string to closed decorator
+        return method  # In this version you decorate the methods with this
+
+    @staticmethod
+    def closed_method(method, cls):
+        @wraps(method)
+        def wrapper(*a, **kw):
+            return cls(method(*a, **kw))
+
+        return wrapper
+
+    @classmethod
+    def closed_class(klass, cls):
+        for magic in klass._built_ins:
+            _method = getattr(cls, magic, False)
+            if _method:
+                setattr(cls, magic, klass.closed_method(_method, cls))
+
+        for method in dir(cls):
+            c1 = method not in klass._built_ins
+            c2 = method not in dir(object)
+            c3 = getattr(getattr(cls, method), 'registered', False)
+            if all((c1, c2, c3)):
+                _method = getattr(cls, method)
+                setattr(cls, method, klass.closed_method(_method, cls))
+        return cls
+</code></pre>
+<p>Now after you have this long setup, you just decorate the class as you would normally do;  I am too sleepy to make it work with inherited classes so for now you have to decorate the class that inherits from a closed class.</p>
+<pre><code>@CLOSED.closed_class
+class foo(int):
+    @CLOSED.register_closed  # or if you can simply add this to CLOSED.closed_class
+    def bar(self, other):    # if you are certain that every method can be casted to its own class
+        """Basically just the __add__ method"""
+        return self + other
+
+
+print(type(foo(1) + foo(1))); print(foo(1) + foo(1))  # &lt;class '__main__.foo'&gt; 2
+print(type(foo(1).bar(2))); print(foo(1).bar(2))      # &lt;class '__main__.foo'&gt; 3
+
+
+@CLOSED.closed_class
+class baz(foo):
+    pass
+
+print(type(baz(1) + baz(3))); print(baz(1) + baz(3))  # &lt;class '__main__.baz'&gt; 4
+print(type(baz(1).bar(4))); print(baz(1).bar(4))      # &lt;class '__main__.baz'&gt; 5
+</code></pre>
+<p>Feel free to downvote as I'm still not sure if I understood the question correctly. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I still feel there might be a more <em>natural</em> way to accomplish this, but I was able to fix the attempt provided in the question.</p>
+<p>Here are the main points that needed ot be fixed.</p>
+<ul>
+<li><p>We must check methods of all classes in the <em>mro</em>, not only the <em>bases</em>;</p></li>
+<li><p><code>__getattribute__</code> and <code>__getattr__</code> must be treated as special cases;</p></li>
+<li><p>Attributes with <code>__get__</code> must be treated separately;</p></li>
+<li><p>We have to write a list of exceptions as methods such as <code>__int__</code> or  <code>__eq__</code> obviously should return their expected types.</p></li>
+</ul>
+<h2>Code</h2>
+<pre><code>import functools
+
+def get_mro(bases):
+    # We omit 'object' as it is the base type
+    return type('', bases, {}).__mro__[1:-1]
+
+class ClosedMeta(type):
+    _register = {}
+
+    # Some methods return type must not change
+    _exceptions = ('__int__', '__eq__', ...)
+
+    def __new__(cls, name, bases, namespace):
+        # A unique id for the class
+        uid = max(cls._register) + 1 if cls._register else 0
+        mro = get_mro(bases)
+
+        def tail_cast(f):
+            """Cast the return value of f"""
+            @functools.wraps(f)
+            def wrapper(*args, **kwargs):
+                out = f(*args, **kwargs)
+                if type(out) in mro:
+                    # Since the class does not exist yet, we will recover it later
+                    return cls._register[uid](out)
+                return out
+            return wrapper
+
+        def deep_tail_cast(f):
+            """Cast the return value of f or the return value of f(...)"""
+            @functools.wraps(f)
+            def wrapper(*args, **kwargs):
+                out = f(*args, **kwargs)
+                if callable(out):
+                    return tail_cast(out)
+                elif type(out) in mro:
+                    return cls._register[uid](out)
+                else:
+                    return out
+            return wrapper
+
+        class PropertyCast:
+            """Cast the return value of a property"""
+            def __init__(self, prop):
+                self.prop = prop
+
+            def __get__(self, instance, owner):
+                return cls._register[uid](self.prop.__get__(instance, owner))
+
+            def __set__(self, instance, value):
+                return self.prop.__set__(instance, value)
+
+            def __delete__(self, instance):
+                return self.prop.__delete__(instance)
+
+        for base in reversed(mro):
+            for name, attr in base.__dict__.items():
+                if name in ('__getattr__', '__getattribute__'):
+                    namespace[name] = deep_tail_cast(attr)
+                elif callable(attr) and name not in namespace and name not in cls._exceptions:
+                    namespace[name] = tail_cast(attr)
+                elif hasattr(attr, '__get__'):
+                    namespace[name] = PropertyCast(attr)
+
+        subcls = super().__new__(cls, name, bases, namespace)
+        cls._register[uid] = subcls
+        return subcls
+</code></pre>
+<h2>Example</h2>
+<pre><code>class MyInt(int):
+    def __getattr__(self, _):
+        return 1
+
+    @property
+    def foo(self):
+        return 2
+
+class ClosedInt(MyInt, metaclass=ClosedMeta):
+    pass
+
+x = ClosedInt(2)
+print(type(x * x), x * x)
+print(type(x.foo), x.foo)
+print(type(x.bar), x.bar)
+</code></pre>
+<h2>Output</h2>
+<pre><code>&lt;class '__main__.ClosedIntContainer'&gt; 4
+&lt;class '__main__.ClosedIntContainer'&gt; 2
+&lt;class '__main__.ClosedIntContainer'&gt; 1
+</code></pre>
+<p>This still has some issues. By example we still have the tedious task to go through all dunder methods an mark down exceptions to the implemented rules, but unless there is a list of those somewhere, this seems unavoidable.</p>
+</div>
+<span class="comment-copy">So, this mgiht be nitpicky, but <code>class BasicIntContainer(int)</code> is <i>not an int container</i>, it <i>is an int</i>.</span>
+<span class="comment-copy">@juanpa.arrivillaga I might be off in my terminology, how would you call such a construct?</span>
+<span class="comment-copy">It is simply inheritance, an "is-a" relationship in the parlance of OOP. If you hover over the containers tag, you'll see that:  "A container is a class, a data structure, or an abstract data type whose instances are collections of other objects.". So like a <code>list</code> or a <code>dict</code>. Here, a <code>BasicIntContainer</code> instance isn't a collection of other objects, it <i>is a specialized kind of <code>int</code> object</i>. I don't want to distract from an interesting question with more terminology nitpicking. Anyway, I would just rephrase as "how to create a type that is closed under inherited operations"</span>
+<span class="comment-copy">You can easily write a simple decorator if you just want to cast return values to type itself, but the problem with that would be that there may be methods that wouldn't be returning values that would be able to cast to the proper type, if that is the case; you would need to distinguish them somehow, if not you can just decorate the class with a decorator that would decorate every method.</span>
+<span class="comment-copy">@IşıkKaplan For simplification, let's assume that the <code>__new__</code> knows how to cast from all of its superclasses. Also, this decorator solution is basicaly what I implemented with a metaclass. I am currently fixing it, but it is getting very complex and I am for sure forgetting a lot of cornercases.</span>
+<span class="comment-copy">I'm really curious about the downvote. Is there some coding error I missed? I did write this on mobile after all. Perhaps it's late and I spewed some BS by accident?</span>
+<span class="comment-copy">This isn't going to do anything for magic methods, and there's a bunch of small errors like <code>collections.frozenset</code> or <code>map(string, ...)</code>.</span>
+<span class="comment-copy">@user2357112. I've fixed that and a couple of other things. Thanks for the feedback</span>
+<span class="comment-copy">@MadPhysicist I really like how the approach of using class declaration kwargs makes exception an casting explicit. This is a well crafted solution, good job</span>
+<span class="comment-copy">@OlivierMelançon. Thank you. This is an idea I had bouncing around in my head for a while now. I appreciate you giving me the motivation to think it through and write it down.</span>
+<span class="comment-copy">That would be fine since by definition, closure means if <code>x</code> and <code>y</code> are of type <code>T</code>, then <code>x + y</code> is of type <code>T</code>. Here <code>MyClass()</code> is not of type <code>ClosedInt</code>. So the question really applies only if both elements of the operation are of the <code>ClosedInt</code> type</span>
+<span class="comment-copy">Also can not be done, in general case, and the reason is the same - subclasses can override any behavior of parent.</span>
+<span class="comment-copy">@wim. See my attempt. It's not perfect, and of course you can bypass it in a multitude of ways, but I think it'll work if you want to play along.</span>
+<span class="comment-copy">I'm sure there are ways to make it <i>almost</i> work (I am not the downvoter on your answer, by the way). I just wanted to show that any attempt can be defeated, so this is impossible in the general case.</span>
+<span class="comment-copy">I thought I made a clever workaround, but nope. I've added your example to my answer. TIL that you can override the metaclass like that.</span>
+<span class="comment-copy">You can use the class itself as a key, no need for a uid</span>
+<span class="comment-copy">But the class is not created yet</span>

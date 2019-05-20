@@ -1,0 +1,60 @@
+<div class="post-text" itemprop="text">
+<p>I'm having problems with some code that loops through a bunch of .csvs and deletes the final line if there's nothing in it (i.e. files that end with the <code>\n</code> newline character)</p>
+<p>My code works successfully on all files except one, which is the largest file in the directory at 11gb.  The second largest file is 4.5gb.</p>
+<p>The line it fails on is simply:</p>
+<pre><code>with open(path_str,"r+") as my_file:
+</code></pre>
+<p>and I get the following message:</p>
+<pre><code>IOError: [Errno 22] invalid mode ('r+') or filename: 'F:\\Shapefiles\\ab_premium\\processed_csvs\\a.csv'
+</code></pre>
+<p>The <code>path_str</code> I create using <code>os.file.join</code> to avoid errors, and I tried renaming the file to <code>a.csv</code> just to make sure there wasn't anything odd going on with the filename.  This made no difference.</p>
+<p>Even more strangely, the file is happy to open in r mode.  I.e. the following code works fine:</p>
+<pre><code>with open(path_str,"r") as my_file:
+</code></pre>
+<p>I have tried navigating around the file in read mode, and it's happy to read characters at the start, end, and in the middle of the file.</p>
+<p>Does anyone know of any limits on the size of file that Python can deal with or why I might be getting this error?  I'm on Windows 7 64bit and have 16gb of RAM.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The default I/O stack in Python 2 is layered over CRT <code>FILE</code> streams. On Windows these are built on top of a POSIX emulation API that uses file descriptors (which in turn is layered over the user-mode Windows API, which is layered over the kernel-mode I/O system, which itself is a deeply layered system based on I/O request packets; the hardware is down there somewhere...). In the POSIX layer, opening a file with <code>_O_RDWR | _O_TEXT</code> mode (as in "r+"), requires seeking to the end of the file to remove CTRL+Z, if it's present. Here's a quote from the CRT's <a href="https://msdn.microsoft.com/en-us/library/yeby3zcb%28v=vs.90%29.aspx" rel="noreferrer"><code>fopen</code></a> documentation:</p>
+<blockquote>
+<p>Open in text (translated) mode. In this mode, CTRL+Z is interpreted as
+  an end-of-file character on input. In files opened for reading/writing
+  with "a+", fopen checks for a CTRL+Z at the end of the file and
+  removes it, if possible. This is done because using fseek and ftell to
+  move within a file that ends with a CTRL+Z, may cause fseek to behave
+  improperly near the end of the file.</p>
+</blockquote>
+<p>The problem here is that the above check calls the 32-bit <a href="https://msdn.microsoft.com/en-us/library/1yee101t%28v=vs.90%29.aspx" rel="noreferrer"><code>_lseek</code></a> (bear in mind that <code>sizeof long</code> is 4 bytes on 64-bit Windows, unlike most other 64-bit platforms), instead of <code>_lseeki64</code>. Obviously this fails for an 11 GB file. Specifically, <a href="https://msdn.microsoft.com/en-us/library/aa365541" rel="noreferrer"><code>SetFilePointer</code></a> fails because it gets called with a <code>NULL</code> value for <code>lpDistanceToMoveHigh</code>. Here's the return value and <code>LastErrorValue</code> for the latter call:</p>
+<pre class="lang-none prettyprint-override"><code>0:000&gt; kc 2
+Call Site
+KERNELBASE!SetFilePointer
+MSVCR90!lseek_nolock
+
+0:000&gt; r rax                       
+rax=00000000ffffffff
+
+0:000&gt; dt _TEB @$teb LastErrorValue
+ntdll!_TEB
+   +0x068 LastErrorValue : 0x57
+</code></pre>
+<p>The error code 0x57 is <a href="https://msdn.microsoft.com/en-us/library/ms681382#ERROR_INVALID_PARAMETER" rel="noreferrer"><code>ERROR_INVALID_PARAMETER</code></a>. This is referring to <code>lpDistanceToMoveHigh</code> being <code>NULL</code> when trying to seek from the end of a large file.</p>
+<p>To work around this problem with CRT <code>FILE</code> streams, I recommend opening the file using <a href="https://docs.python.org/2/library/io.html#module-interface" rel="noreferrer"><code>io.open</code></a> instead. This is  a backported implementation of Python 3's I/O stack. It always opens files in raw binary mode (<code>_O_BINARY</code>), and it implements its own buffering and text-mode layers on top of the raw layer.</p>
+<pre><code>&gt;&gt;&gt; import io                    
+&gt;&gt;&gt; f = io.open('a.csv', 'r+')
+&gt;&gt;&gt; f     
+&lt;_io.TextIOWrapper name='a.csv' encoding='cp1252'&gt;
+&gt;&gt;&gt; f.buffer   
+&lt;_io.BufferedRandom name='a.csv'&gt;
+&gt;&gt;&gt; f.buffer.raw
+&lt;_io.FileIO name='a.csv' mode='rb+'&gt;
+&gt;&gt;&gt; f.seek(0, os.SEEK_END)
+11811160064L
+</code></pre>
+</div>
+<span class="comment-copy">It must be due to text mode. Does <code>r+b</code> work?</span>
+<span class="comment-copy">Is your program doing anything else with these csv files, or is it simply removing the excess trailing newline(s)?</span>
+<span class="comment-copy">@PM2Ring Thanks. Yes - it's just removing the trailing newlines.  If you have an easier solution to this problem I'm all ears :-)  Here is the code:   <a href="https://gist.github.com/RobinL/9895b764ca3ce61c8e37" rel="nofollow noreferrer">gist.github.com/RobinL/9895b764ca3ce61c8e37</a>.  I didn't ask for an alternative solution in the question because I'm curious to find out the source of this problem.</span>
+<span class="comment-copy">I'm not very familiar with Window, but I <i>suspect</i> that the failure to open <i>might</i> be due to lack of memory for buffering a text file you want to modify. So it would be great if you can test if <code>'r+b'</code> mode works, as Dan D. suggested.</span>
+<span class="comment-copy">Ok! The simple solution is to modify your code to work with a binary file, which on Windows means you'll need to look for <code>\r\n</code> sequences instead of plain <code>\n</code>. You may also be interested in using the <a href="https://docs.python.org/3/library/mmap.html" rel="nofollow noreferrer">mmap</a> module.</span>
+<span class="comment-copy">At last, someone who knows what's <i>really</i> going on. :) I didn't even <i>think</i> about that pesky Ctrl-Z...</span>
+<span class="comment-copy">This is a brilliant answer - exactly the information I was trying to search google for with no success. Thanks.</span>

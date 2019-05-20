@@ -1,0 +1,313 @@
+<div class="post-text" itemprop="text">
+<p>I've written the following code to do a pre-order traversal of a Python <code>dict</code> which may contain other <code>dict</code>s:</p>
+<pre class="lang-python prettyprint-override"><code>def preorder_traversal(obj):
+    yield obj
+    if isinstance(obj, dict):
+        for k, v in obj.iteritems():
+            for o in preorder_traversal(v):
+                yield o
+</code></pre>
+<p>Here are a few examples of its behavior:</p>
+<pre><code>&gt; list(preorder_traversal({}))
+[{}]
+&gt; list(preorder_traversal({'a': 1, 'b': 2}))
+[{'a': 1, 'b': 2}, 1, 2]
+&gt; list(preorder_traversal({'a': {'c': 1}, 'b': 2}))
+[{'a': {'c': 1}, 'b': 2}, {'c': 1}, 1, 2]
+</code></pre>
+<p>It's possible that the tree could get very large, so I'd like to add a mechanism whereby the consumer of the pre-order traversal can abort the search on an entire subtree.</p>
+<p>Here's the code I came up with, including a nose test case. The test fails, as described below.</p>
+<pre class="lang-python prettyprint-override"><code>class IgnoreSubtree(Exception):
+    pass    
+
+def preorder_traversal(obj):
+    try:
+        yield obj
+    except IgnoreSubtree:
+        return
+
+    if isinstance(obj, dict):
+        for k, v in obj.iteritems():
+            iterator = preorder_traversal(v)
+            for o in iterator:
+                try:
+                    yield o
+                except IgnoreSubtree as e:
+                    try:
+                        iterator.throw(e)
+                    except StopIteration:  # WHY?
+                        pass
+
+def test_ignore_subtree():
+    obj = {'a': {'c': 3}, 'b': 2}
+    iterator = preorder_traversal(obj)
+    out = []
+    for o in iterator:
+        out.append(o)
+        if o == {'c': 3}:
+            iterator.throw(IgnoreSubtree)
+
+    eq_([obj, {'c': 3}, 2], out)
+</code></pre>
+<p>The test fails with the following error:</p>
+<pre><code>AssertionError: [{'a': {'c': 3}, 'b': 2}, {'c': 3}, 2] !=
+                [{'a': {'c': 3}, 'b': 2}, {'c': 3}]
+</code></pre>
+<p>i.e. the <code>IgnoreSubtree</code> has also aborted the iteration over k/v pairs in the top-level object, it hasn't just pruned out the <code>{'c': 3}</code> subtree.</p>
+<p>What's wrong with this code? And why is StopIteration being thrown in the commented location above? Is this a reasonable way to implement subtree pruning for this function, or is there a better way to go about it?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>First of all, why is <code>StopIteration</code> raised. Your definition of <code>preorder_traversal</code> starts with:</p>
+<pre><code>try:
+    yield obj
+except IgnoreSubtree:
+    return
+</code></pre>
+<p>In a generator a plain <code>return</code> statement <em>is equivalent to <code>raise StopIteration</code></em>. In python3.3+ you can actually use <code>return value</code> and it is equivalent to <code>raise StopIteration(value)</code>.</p>
+<p>So, you are <code>throw</code>ing in a certain exception, it is being caught by the generator which executes the <code>return</code> and hence raises a <code>StopIteration</code>. Whenever you call <code>send</code>, <code>next</code> or <code>throw</code> a <code>StopIteration</code> may be raised if the generator ends its execution without finding a <code>yield</code>, so the code you are using in the test is doomed to raise a <code>StopIteration</code> whenever skipping a subtree will end the iteration.</p>
+<p>In other words your test is flawed because the <code>throw</code> call can raise an exception even if you have a correct implementation of your generator. So you should either wrap that call in a <code>try</code> statement:</p>
+<pre><code>try:
+    iterator.throw(IgnoreSubtree)
+except StopIteration:
+    break
+</code></pre>
+<p>Alternatively you can use the <a href="https://docs.python.org/3/library/contextlib.html#contextlib.suppress" rel="nofollow"><code>suppress</code></a> context manager to suppress the <code>StopIteration</code>:</p>
+<pre><code>with suppress(StopIteration):
+    for o in iterator:
+        ...
+        iterator.throw(IgnoreSubtree)
+</code></pre>
+<p>If you aren't using python3.4 you can easily reimplement this context manager using the <a href="https://docs.python.org/3/library/contextlib.html#contextlib.contextmanager" rel="nofollow"><code>@contextmanager</code></a> decorator (it's available since python 2.6):</p>
+<pre><code>def suppress(*exceptions):
+    try:
+        yield
+    except exceptions:
+        pass
+</code></pre>
+<p>Your code is basically correct. If you were using python3.3+ you could simplify it to:</p>
+<pre><code>def preorder_traversal(obj):
+    try:
+        yield obj
+    except IgnoreSubtree:
+        return
+    else:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                yield from preorder_traversal(v)
+</code></pre>
+<p>Your implementation doesn't raise any error for me, once the <code>StopIteration</code> is suppressed for the outer <code>throw</code>. Also the result is what you expect.
+Unfortunately without the <code>yield from</code> I don't see any way to simplify the control flow.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As audiodude mentioned, your <code>iterator.throw(IgnoreSubtree)</code> returns <code>iterator</code>'s next value (glossing over the complicated exception handling for a moment), so it is consuming the <code>2</code> that you were expecting to see appended to <code>out</code> on the next iteration of the loop in <code>test_ignore_subtree</code>.</p>
+<p>You also asked about why the <code>StopIteration</code> is being thrown; the sequence of <code>Exception</code>s being thrown/caught is:</p>
+<ul>
+<li><code>iterator.throw(IgnoreSubtree)</code> throws an <code>IgnoreSubtree</code> that is caught in the inner loop of <code>preorder_traversal</code></li>
+<li>that <code>IgnoreSubtree</code> is routed into the inner iterator with <code>iterator.throw(e)</code></li>
+<li>the <code>IgnoreSubtree</code> is caught at <code>except IgnoreSubtree:</code> and <code>return</code> is called; however, <code>iterator.throw(e)</code> wants to get the next value from that inner iterator, which has just <code>return</code>ed, hence a <code>StopIteration</code> is raised.</li>
+<li>before the original <code>iterator.throw(IgnoreSubtree)</code> returns, it goes once more through the outer loop in <code>preorder_traversal</code>, because it wants to return the next value from <code>iterator</code>.</li>
+</ul>
+<p>I hope this helps!</p>
+<p><strong>Update</strong></p>
+<p>Here is an implementation of this basic scheme that I would use, along with passing nosetest:</p>
+<pre><code>from nose.tools import eq_
+
+def preorder_traversal(obj, ignore_only_descendents_of=None, ignore_subtrees=None):
+    if ignore_subtrees and obj in ignore_subtrees:
+        return
+
+    yield obj
+
+    if ignore_only_descendents_of and obj in ignore_only_descendents_of:
+        return
+
+    if isinstance(obj, dict):
+        for k, v in iter(sorted(obj.iteritems())):
+            iterator = preorder_traversal(v, ignore_only_descendents_of, ignore_subtrees)
+            for o in iterator:
+                yield o
+
+
+def test_ignore_subtree():
+    obj = {'a': {'c': 3}, 'b': 2, 'd': {'e': {'f': 4}}, 'g': 5, 'h': 6}
+    ignore_only_descendents_of = [{'e': {'f': 4}}]
+    ignore_subtrees = [{'c': 3}, 5]
+
+    iterator = preorder_traversal(obj, ignore_only_descendents_of, ignore_subtrees)
+    out = []
+
+    for o in iterator:
+        out.append(o)
+
+    expected = [obj, 2, {'e': {'f': 4}}, 6]
+    eq_(expected, out)
+</code></pre>
+<p>Things to note:</p>
+<ul>
+<li>your example allows for excluding the descendents of <code>{'c':3}</code> while including <code>{'c':3}</code> itself; I found this a little confusing, as I would expect you to typically want to exclude a whole subtree including its root, so I've changed <code>preorder_traversal</code> to take two optional lists of things to exclude in each manner.</li>
+<li>moving the subtrees to skip into the iterator itself seems cleaner; you can avoid using <code>Exception</code>s to control flow altogether.</li>
+<li>more complicated example demonstrating the two types of subtree-exclusions.</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>Implementing subtree pruning by <code>throw</code>ing an exception to the iterator results in messy, error-prone code, both in the generator and in the function that consumes it. Looking at some of the answers here makes me think that a filter callback function is a saner approach.</p>
+<p>This would be a generalization of <a href="https://stackoverflow.com/a/26224319/388951">Ryan's answer</a>:</p>
+<pre class="lang-python prettyprint-override"><code>def preorder_traversal(obj, bailout_fn=None):
+    yield obj
+    if bailout_fn and bailout_fn(obj):
+        return
+
+    if isinstance(obj, dict):
+        for k, v in obj.iteritems():
+            for o in preorder_traversal(v, bailout_fn):
+                yield o
+</code></pre>
+<p>And here are some nose tests that demonstrate how it's used:</p>
+<pre class="lang-python prettyprint-override"><code>def test_ignore_subtree():
+    obj = {'a': {'c': 3}, 'b': 2}
+    eq_([obj, {'c': 3}, 3, 2], list(preorder_traversal(obj)))
+
+    iterator = preorder_traversal(obj, lambda o: o == {'c': 3})
+    out = list(iterator)
+    eq_([obj, {'c': 3}, 2], out)
+
+
+def test_ignore_subtree2():
+    obj = {'a': {'c': 3, 'd': 4}, 'b': 2}
+    eq_([obj, {'c': 3, 'd': 4}, 3, 4, 2],
+            list(preorder_traversal(obj)))
+
+    iterator = preorder_traversal(obj, lambda o: o == {'c': 3, 'd': 4})
+    out = list(iterator)
+
+    eq_([obj, {'c': 3, 'd': 4}, 2], out)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think the other answers are overcomplicating things. The generator is correct! The problem is this line in the <em>test</em>: </p>
+<pre><code>iterator.throw(IgnoreSubtree)
+</code></pre>
+<p>Instead, it should be this: </p>
+<pre><code>out.append(iterator.throw(IgnoreSubtree))
+</code></pre>
+<p>The iterator is behaving just as expected. But as others have noted, <code>it.throw</code> returns the next value. You're throwing out the value that follows the subtree pruning because you aren't saving the result of <code>throw</code> in your test! You'd also actually need to catch <code>StopIteration</code> in case sending <code>IgnoreSubtree</code> ends the iterator completely. But it looks to me like no other changes are required. </p>
+<p>Here's the code that shows the difference: </p>
+<pre><code>def test_ignore_subtree(obj, halt, expected):
+    iterator = preorder_traversal(obj)
+    out = []
+    for o in iterator:
+        out.append(o)
+        if o == halt:
+            out.append(iterator.throw(IgnoreSubtree))
+
+    print expected
+    print out
+
+def test_ignore_subtree_wrong(obj, halt, expected):
+    iterator = preorder_traversal(obj)
+    out = []
+    for o in iterator:
+        out.append(o)
+        if o == halt:
+            iterator.throw(IgnoreSubtree)
+
+    print expected
+    print out
+
+print "Test 1"
+obj = {'a': {'c': 3}, 'b': 2}
+halt = {'c': 3}
+expected = [obj, {'c': 3}, 2]
+test_ignore_subtree(obj, halt, expected)
+test_ignore_subtree_wrong(obj, halt, expected)
+print "Test 2"
+obj = {'a': {'c': 3, 'd': 4}, 'b': 6, 'c': 5, 'd': 7}
+halt = 3
+expected = [obj, {'c': 3, 'd': 4}, 3, 5, 6, 7]
+test_ignore_subtree(obj, halt, expected)
+test_ignore_subtree_wrong(obj, halt, expected)
+print "Test 3"
+obj = {'a': {'c': 3, 'd': 4}, 'b': 2}
+halt = 3
+expected = [obj, {'c': 3, 'd': 4}, 3, 2]
+test_ignore_subtree(obj, halt, expected)
+test_ignore_subtree_wrong(obj, halt, expected)
+print "Test 4"
+obj = {'a': {'c': 3, 'd': 4}, 'b': 2, 'c': 5, 'd': 7}
+halt = 3
+expected = [obj, {'c': 3, 'd': 4}, 3, 5, 2, 7]
+test_ignore_subtree(obj, halt, expected)
+test_ignore_subtree_wrong(obj, halt, expected)
+</code></pre>
+<p>And the output (note how the first value after the pruned part of the tree is missing for all the "wrong" outputs:</p>
+<pre><code>Test 1
+[{'a': {'c': 3}, 'b': 2}, {'c': 3}, 2]
+[{'a': {'c': 3}, 'b': 2}, {'c': 3}, 2]
+[{'a': {'c': 3}, 'b': 2}, {'c': 3}, 2]
+[{'a': {'c': 3}, 'b': 2}, {'c': 3}]
+Test 2
+[{'a': {'c': 3, 'd': 4}, 'c': 5, 'b': 6, 'd': 7}, {'c': 3, 'd': 4}, 3, 5, 6, 7]
+[{'a': {'c': 3, 'd': 4}, 'c': 5, 'b': 6, 'd': 7}, {'c': 3, 'd': 4}, 3, 5, 6, 7]
+[{'a': {'c': 3, 'd': 4}, 'c': 5, 'b': 6, 'd': 7}, {'c': 3, 'd': 4}, 3, 5, 6, 7]
+[{'a': {'c': 3, 'd': 4}, 'c': 5, 'b': 6, 'd': 7}, {'c': 3, 'd': 4}, 3, 6, 7]
+Test 3
+[{'a': {'c': 3, 'd': 4}, 'b': 2}, {'c': 3, 'd': 4}, 3, 2]
+[{'a': {'c': 3, 'd': 4}, 'b': 2}, {'c': 3, 'd': 4}, 3, 2]
+[{'a': {'c': 3, 'd': 4}, 'b': 2}, {'c': 3, 'd': 4}, 3, 2]
+[{'a': {'c': 3, 'd': 4}, 'b': 2}, {'c': 3, 'd': 4}, 3]
+Test 4
+[{'a': {'c': 3, 'd': 4}, 'c': 5, 'b': 2, 'd': 7}, {'c': 3, 'd': 4}, 3, 5, 2, 7]
+[{'a': {'c': 3, 'd': 4}, 'c': 5, 'b': 2, 'd': 7}, {'c': 3, 'd': 4}, 3, 5, 2, 7]
+[{'a': {'c': 3, 'd': 4}, 'c': 5, 'b': 2, 'd': 7}, {'c': 3, 'd': 4}, 3, 5, 2, 7]
+[{'a': {'c': 3, 'd': 4}, 'c': 5, 'b': 2, 'd': 7}, {'c': 3, 'd': 4}, 3, 2, 7]
+</code></pre>
+<p>I had to massage the expected values to get the sequence right because dictionaries iterate in an unpredictable order. But I think the results are sound.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I've never posted a second answer before, but I think in this case it's appropriate. The first section of this answer discusses a way to cleaning up the generator interface. The second section discusses <em>when</em> it's most appropriate to use this fix, and when it's more appropriate to replace <code>throw</code> with another construct. </p>
+<p><strong>Cleaning the Interface</strong></p>
+<p>There are two key problems with the generator as it stands. Neither of them have to do with <em>correctness</em> -- it behaves as expected. They have to do with interface. So fix the interface problems with a wrapper function.</p>
+<p>The first problem is that <code>throw</code> returns an important value that the current test discards. So write a wrapper that returns an unimportant value when <code>IgnoreSubtree</code> is called. And the second problem is that when <code>IgnoreSubtree</code> is thrown, sometimes it exhausts the iterator completely. So write a wrapper that catches <code>StopIteration</code> and handles it gracefully. This does both: </p>
+<pre><code>def ptv_wrapper(obj):
+    pt = preorder_traversal(obj)
+    while True:
+        try:
+            o = pt.next()
+            while True:
+                try:
+                    yield o
+                except IgnoreSubtree as e:
+                    yield
+                    o = pt.throw(e)
+                else:
+                    break
+
+        except StopIteration:
+            return
+</code></pre>
+<p>Your above code will work as-is if you use the above as a wrapper around <code>preorder_traversal</code>.</p>
+<p><strong>When to Use <code>throw</code>; When to Use Callbacks; When to Use <code>send</code></strong></p>
+<p>The question of whether to use <code>throw</code> in this case is a difficult one. As <a href="https://stackoverflow.com/a/26225473/577088">danvk</a> has pointed out, this exception-based method uses some pretty complex (and exotic) techniques, and the extra complexity may not be worth it. Additionally, there's something a <em>little</em> fishy about using exceptions for control flow. Generators already do it internally (using <code>StopIteration</code>) so there must be some justification, but it's worth thinking about what that justification is.</p>
+<p>The first question is whether using <code>throw</code> <em>increases</em> or <em>decreases</em> the complexity of the code that already exists. If your use-case does not involve tight coupling between the generator and the consumer, then you're probably better off using callbacks. (And if your code is tightly coupled but doesn't have to be, you should refactor!) However, in some cases, tight coupling is unavoidable. In those cases, using <code>throw</code> (or <code>send</code> -- see below) probably doesn't increase complexity, and might decrease it. Indeed, if you use callbacks in a situation where those callbacks depend on a lot of external state to do what they need to do, then you are probably writing code that has tight coupling <em>and</em> low cohesion -- the worst of both worlds! By using <code>throw</code> or <code>send</code>, you're ensuring that the generator and the state that controls it are close together; coupling will be high, but so will cohesion, which will probably result in less-complex code. </p>
+<p>The second question is whether to use <code>throw</code> or <code>send</code>. The second option ought to be under consideration here, because it's another way for the consumer to signal the generator that something's up. You might think of <code>send</code> as the <a href="https://stackoverflow.com/questions/404795/lbyl-vs-eafp-in-java">LBYL</a> to <code>throw</code>'s <a href="https://stackoverflow.com/questions/404795/lbyl-vs-eafp-in-java">EAFP</a>. Doing so helps provide some intuitions about when to use one or the other. It depends on whether you anticipate passing signals back and forth between generator and consumer frequently. EAFP code that <em>rarely</em> throws exceptions will generally be faster than corresponding LBYL code. But EAFP code that <em>frequently</em> throws exceptions will be much slower than the corresponding LBYL code. This helps to explain why Python iterators use <code>StopIterator</code> instead of tests: in the overwhelming majority of cases, <code>StopIterator</code> will only ever be thrown once! So the cost of that catch and throw becomes fixed overhead that is quickly overwhelmed by other performance bottlenecks.</p>
+<p>This means that if your use of <code>IgnoreSubtree</code> is infrequent (more like Python's use of <code>StopIterator</code>) then you're probably justified in using <code>throw</code>. Otherwise, consider using <code>send</code>.  </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I would direct you to the docs for generator.throw:
+<a href="https://docs.python.org/2/reference/expressions.html#generator.throw" rel="nofollow">https://docs.python.org/2/reference/expressions.html#generator.throw</a></p>
+<p>To quote:</p>
+<blockquote>
+<p>Raises an exception of type type at the point where generator was paused, and returns the next value yielded by the generator function. If the generator exits without yielding another value, a StopIteration exception is raised.</p>
+</blockquote>
+<p>There's no way to "prune out" the <code>{'c': 3}</code> subtree using generator.throw, because the value has already been generated by the time you can do a comparison with it. Additionally, the documentation of generator.throw tells you that it tries to yield a "final" value, so to speak, or else it raises StopIteration if there is no final value that is yielded.</p>
+</div>
+<span class="comment-copy">Thanks for the answer! I'm using Python 2.x, so I can't use <code>yield from</code>. Here's a working version with tests that follows your suggestions: <a href="https://gist.github.com/danvk/ec02c91d43c8f2edbb54" rel="nofollow noreferrer">gist.github.com/danvk/ec02c91d43c8f2edbb54</a>. In practice, the fact that <code>.throw()</code> returns the next value makes this an awkward interface to work with. I wound up passing around a callback function instead.</span>
+<span class="comment-copy">I'm confused by this answer because the original code already suppresses the <code>StopIteration</code> exception. You change <code>pass</code> to <code>break</code>, but they do the same thing; pass allows the <code>for</code> loop to continue, but the iterator is already exhausted, so it stops on its own. I think the actual answer to this problem is <a href="http://stackoverflow.com/a/26225138/577088">much simpler</a>.</span>
+<span class="comment-copy">@ryan-williams pointed out a bug in this approach: what if the value returned by <code>iterator.throw(IgnoreSubtree)</code> is also <code>halt</code>? Then you'd want to <code>throw</code> down another <code>IgnoreSubtree</code>. But what if the result of that is also <code>halt</code>? It gets complicated. The messiness of this makes me feel increasingly strongly that a filter callback function is the better way to do this.</span>
+<span class="comment-copy">Aha, you're right. But I don't see that it's that much more complicated. The generator itself is still fundamentally correct.</span>
+<span class="comment-copy">I'd like to see the consumer that's not "much more complicated". Unless you can somehow stuff the value returned by <code>throw</code> back into the iterator, I don't see how you can correctly consume the output of this generator.</span>
+<span class="comment-copy">Then I think I don't understand what you're saying. <code>halt</code> here is just an arbitrary value passed for the purpose of testing. This isn't how it would actually be used. It just stands in for whatever condition the consumer decides on as the halting condition. Say the iteration is going on for too long; the consumer keeps a time count and when it exceeds a certain value, the consumer sends <code>IgnoreSubtree</code>.</span>
+<span class="comment-copy">@danvk, I misunderstood your first question to be about what happens if <code>IgnoreSubtree</code> exhausts the whole iterator, leading to a <code>StopIteration</code> exception. That's what my "aha" was about, and indeed it does require a bit more logic to handle. But you're saying something else that I haven't understood I think.</span>
+<span class="comment-copy">It's fine that <code>{'c': 3}</code> is generated&amp;mdash;I'd just like to send a message that says "don't look below this node". Hence the importance of this being pre-order traversal.</span>
+<span class="comment-copy">I've written a test which illustrates that this solution does not work here: <a href="https://gist.github.com/danvk/925f6cc25df1c9583157" rel="nofollow noreferrer">gist.github.com/danvk/925f6cc25df1c9583157</a></span>
+<span class="comment-copy">Okay good to know, like I said it was just a hunch, I will edit the answer to remove it.</span>

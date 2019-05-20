@@ -1,0 +1,156 @@
+<div class="post-text" itemprop="text">
+<p>A while ago, I made a Python script which looked similar to this:</p>
+<pre><code>with open("somefile.txt", "r") as f, open("otherfile.txt", "a") as w:
+    for line in f:
+        w.write(line)
+</code></pre>
+<p>Which, of course, worked pretty slowly on a <code>100mb</code> file. </p>
+<p>However, I changed the program to do this</p>
+<pre><code>ls = []
+with open("somefile.txt", "r") as f, open("otherfile.txt", "a") as w:
+    for line in f:
+        ls.append(line)
+        if len(ls) == 100000:
+            w.writelines(ls)
+            del ls[:]
+</code></pre>
+<p>And the file copied much faster. My question is, why does the second method work faster even though the program copies the same number of lines (albeit collects them and prints them one by one)?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I may have found a reason why <code>write</code> is slower than <code>writelines</code>. In looking through the CPython source (3.4.3) I found the code for the <code>write</code> function (took out irrelevent parts).</p>
+<p><code>Modules/_io/fileio.c</code></p>
+<pre><code>static PyObject *
+fileio_write(fileio *self, PyObject *args)
+{
+    Py_buffer pbuf;
+    Py_ssize_t n, len;
+    int err;
+    ...
+    n = write(self-&gt;fd, pbuf.buf, len);
+    ...
+
+    PyBuffer_Release(&amp;pbuf);
+
+    if (n &lt; 0) {
+        if (err == EAGAIN)
+            Py_RETURN_NONE;
+        errno = err;
+        PyErr_SetFromErrno(PyExc_IOError);
+        return NULL;
+    }
+
+    return PyLong_FromSsize_t(n);
+}
+</code></pre>
+<p>If you notice, this function actually <strong>returns a value</strong>, the size of the string that has been written, which is <strong>another function call</strong>.</p>
+<p>I tested this out to see if it actually had a return value, and it did.</p>
+<pre><code>with open('test.txt', 'w+') as f:
+    x = f.write("hello")
+    print(x)
+
+&gt;&gt;&gt; 5
+</code></pre>
+<p>The following is the code for the <code>writelines</code> function implementation in CPython (took out irrelevent parts).</p>
+<p><code>Modules/_io/iobase.c</code></p>
+<pre><code>static PyObject *
+iobase_writelines(PyObject *self, PyObject *args)
+{
+    PyObject *lines, *iter, *res;
+
+    ...
+
+    while (1) {
+        PyObject *line = PyIter_Next(iter);
+        ...
+        res = NULL;
+        do {
+            res = PyObject_CallMethodObjArgs(self, _PyIO_str_write, line, NULL);
+        } while (res == NULL &amp;&amp; _PyIO_trap_eintr());
+        Py_DECREF(line);
+        if (res == NULL) {
+            Py_DECREF(iter);
+            return NULL;
+        }
+        Py_DECREF(res);
+    }
+    Py_DECREF(iter);
+    Py_RETURN_NONE;
+}
+</code></pre>
+<p>If you notice, there is <strong>no return value!</strong> It simply has <code>Py_RETURN_NONE</code> instead of another function call to calculate the size of the written value.</p>
+<p>So, I went ahead and tested that there really wasn't a return value.</p>
+<pre><code>with open('test.txt', 'w+') as f:
+    x = f.writelines(["hello", "hello"])
+    print(x)
+
+&gt;&gt;&gt; None
+</code></pre>
+<p>The extra time that <code>write</code> takes seems to be due to the extra function call taken in the implementation to produce the return value. By using <code>writelines</code>, you skip that step and the fileio is the only bottleneck.</p>
+<p>Edit: <a href="https://docs.python.org/3/library/io.html#io.TextIOBase.write" rel="nofollow"><code>write</code> documentation</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I do not agree with the other answer here.</p>
+<p>It is simply a coincidence. It highly depends on your environment:</p>
+<ul>
+<li>What OS?</li>
+<li>What HDD/CPU?</li>
+<li>What HDD file system format?</li>
+<li>How busy is your CPU/HDD?</li>
+<li>What Python version?</li>
+</ul>
+<p>Both pieces of code do the absolute same thing with tiny differences in performance.</p>
+<p>For me personally <code>.writelines()</code> takes longer to execute then your first example using <code>.write()</code>. Tested with 110MB text file. </p>
+<p><em>I will not post my machine specs on purpose.</em></p>
+<blockquote>
+<p>Test .write(): ------copying took 0.934000015259 seconds (dashes for readability)</p>
+<p>Test .writelines(): copying took 0.936999797821 seconds</p>
+</blockquote>
+<p>Also tested with small and as large as 1.5GB files with the same results. (writelines always beeing slightly slower, up to <strong>0.5sec</strong> difference for <strong>1.5GB file</strong>).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>That's because of that in first part you have to call the method <code>write</code> for all the lines in each iteration which makes your program take much time to run. But in second code although your waste more memory but it performs better because you have called the <code>writelines()</code> method each 100000 line.</p>
+<p>Let see this is source,this is the source of <code>writelines</code> function :</p>
+<pre><code>def writelines(self, list_of_data):
+    """Write a list (or any iterable) of data bytes to the transport.
+
+    The default implementation concatenates the arguments and
+    calls write() on the result.
+    """
+    if not _PY34:
+        # In Python 3.3, bytes.join() doesn't handle memoryview.
+        list_of_data = (
+            bytes(data) if isinstance(data, memoryview) else data
+            for data in list_of_data)
+    self.write(b''.join(list_of_data))
+</code></pre>
+<p>As you can see it joins all the list items and calls the <code>write</code> function  one time.</p>
+<p>Note that joining the data here takes time but its less than the time for calling the <code>write</code> function for each line.But since you use python 3.4 in ,it writes the lines one at a time rather than joining them so it would be much faster than <code>write</code> in this case :</p>
+<blockquote>
+<ul>
+<li><code>cStringIO.writelines()</code> now accepts any iterable argument and writes
+  the lines one at a time rather than joining them and writing once.
+  Made a parallel change to <code>StringIO.writelines()</code>.  Saves memory and
+  makes suitable for use with generator expressions. </li>
+</ul>
+</blockquote>
+</div>
+<span class="comment-copy">This is interesting. I think it may have something to do with the IO operations. <code>writelines</code> might join the list of strings with newlines and write them all at once. I doubt that <code>writelines</code> calls <code>write</code> for every element in the list/generator. I would assume that the speed increase comes from the implmentation in C.</span>
+<span class="comment-copy">Fewer hard drive head seeks between reading and writing?</span>
+<span class="comment-copy">What if you replaced <code>w.writelines(ls)</code> with <code>w.write("\n".join(ls))</code>? How does the speed compare to your existing cases?</span>
+<span class="comment-copy">Your logic is also slightly flawed as you only write when <code>len(ls) == 100000:</code> so potentially you write less lines to one file, also  <code>open("otherfile.txt", "w",buffering=1000) as w:</code> beats writelines for me</span>
+<span class="comment-copy">What's your python version?</span>
+<span class="comment-copy">This is so deep!</span>
+<span class="comment-copy">How exactly does returning length of string make such a difference? I mean, if you run a regular <code>return len(line)</code> it is instantaneous!</span>
+<span class="comment-copy">It seems instantaneous, but compounded thousands of times, it might take a while. Also, returning the length uses more memory.</span>
+<span class="comment-copy">The order of <code>len()</code> is O(1) so i don't think that makes any problem here!</span>
+<span class="comment-copy">I realize that its O(1) but that doesn't mean that that calculation can not be a source of the slowdown. O(1) means it is computed in linear time. It still takes time to compute!</span>
+<span class="comment-copy">Maybe if you use longer lines this will take more time</span>
+<span class="comment-copy">Or shorter ones</span>
+<span class="comment-copy">I think the number of lines makes a difference as well. And if you have a heavenly processor, well, obviously you are getting results :)</span>
+<span class="comment-copy">Last thing you could do is change the number of lines collected to <code>1000000</code> or something</span>
+<span class="comment-copy">I've made a number of different test including short/long lines. My whole point was it is very environment specific rather than python implementation (algorithm) specific.</span>
+<span class="comment-copy">Yes, that's what the code is doing, but you didn't expain why the second method is faster.</span>
+<span class="comment-copy">But surely <code>writelines</code> does more work than <code>write</code> would, so you can't just say "it's better to use the approach that has fewer function calls"</span>
+<span class="comment-copy">@Brobin Yes I'm looking for the reason in source!</span>
+<span class="comment-copy">@Kevin Indeed I would update the answer with that reason!</span>
+<span class="comment-copy">So is the time taken up by opening the file and closing it multiple times? And this does not occur with smaller files because you don't open and close as much?</span>

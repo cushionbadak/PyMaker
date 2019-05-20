@@ -1,0 +1,129 @@
+<div class="post-text" itemprop="text">
+<p>I recently compared the performance of <code>collections.Counter</code> to <code>sorted</code> for comparison checks (if some iterable contains the same elements with the same amount) and while the big-iterable performance of <code>Counter</code> is generally better than <code>sorted</code> it's much slower for short iterables.</p>
+<p>Using <code>line_profiler</code> the bottleneck seems to be the <code>isinstance(iterable, collections.Mapping)</code>-check in <code>Counter.update</code>:</p>
+<pre><code>%load_ext line_profiler  # IPython
+lst = list(range(1000))
+%lprun -f Counter.update Counter(lst)
+</code></pre>
+<p>gives me:</p>
+<pre><code>Timer unit: 5.58547e-07 s
+
+Total time: 0.000244643 s
+File: ...\lib\collections\__init__.py
+Function: update at line 581
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   581                                               def update(*args, **kwds):
+   601         1            8      8.0      1.8          if not args:
+   602                                                       raise TypeError("descriptor 'update' of 'Counter' object "
+   603                                                                       "needs an argument")
+   604         1           12     12.0      2.7          self, *args = args
+   605         1            6      6.0      1.4          if len(args) &gt; 1:
+   606                                                       raise TypeError('expected at most 1 arguments, got %d' % len(args))
+   607         1            5      5.0      1.1          iterable = args[0] if args else None
+   608         1            4      4.0      0.9          if iterable is not None:
+   609         1           72     72.0     16.4              if isinstance(iterable, Mapping):
+   610                                                           if self:
+   611                                                               self_get = self.get
+   612                                                               for elem, count in iterable.items():
+   613                                                                   self[elem] = count + self_get(elem, 0)
+   614                                                           else:
+   615                                                               super(Counter, self).update(iterable) # fast path when counter is empty
+   616                                                       else:
+   617         1          326    326.0     74.4                  _count_elements(self, iterable)
+   618         1            5      5.0      1.1          if kwds:
+   619                                                       self.update(kwds)
+</code></pre>
+<p>So even for length 1000 iterables it takes more than 15% of the time. For even shorter iterables (for example 20 items it increases to 60%).</p>
+<p>I first thought it has something to do with how <code>collections.Mapping</code> uses <code>__subclasshook__</code> but that method isn't called after the first <code>isinstance</code>-check anymore. So why is checking <code>isinstance(iterable, Mapping)</code> so slow?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The performance is really just tied to a collection of checks in <a href="https://svn.python.org/projects/python/trunk/Lib/abc.py" rel="nofollow noreferrer">ABCMeta's <code>__instancecheck__</code></a>, which is called by <a href="https://docs.python.org/3/library/functions.html#isinstance" rel="nofollow noreferrer"><code>isinstance</code></a>.</p>
+<p>The bottom line is that the poor performance witnessed here isn't a result of some missing optimization, but rather just a result of <code>isinstance</code> with abstract base classes being a Python-level operation, as mentioned by Jim. Positive and negative results are cached, but even with cached results you're looking at a few microseconds per loop simply to traverse the conditionals in the <code>__instancecheck__</code> method of the ABCMeta class. </p>
+<hr/>
+<h3>An example</h3>
+<p>Consider some different empty structures. </p>
+<pre><code>&gt;&gt;&gt; d = dict; l = list(); s = pd.Series()
+
+&gt;&gt;&gt; %timeit isinstance(d, collections.abc.Mapping)
+100000 loops, best of 3: 1.99 µs per loop
+
+&gt;&gt;&gt; %timeit isinstance(l, collections.abc.Mapping)
+100000 loops, best of 3: 3.16 µs per loop # caching happening
+
+&gt;&gt;&gt; %timeit isinstance(s, collections.abc.Mapping)
+100000 loops, best of 3: 3.26 µs per loop # caching happening
+</code></pre>
+<p>We can see the performance discrepancy - what accounts for it?</p>
+<p><strong>For a dict</strong> </p>
+<pre><code>&gt;&gt;&gt; %lprun -f abc.ABCMeta.__instancecheck__ isinstance(dict(), collections.abc.Mapping)
+Timer unit: 6.84247e-07 s
+Total time: 1.71062e-05 s
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   178                                               def __instancecheck__(cls, instance):
+   179                                                   """Override for isinstance(instance, cls)."""
+   180                                                   # Inline the cache checking
+   181         1            7      7.0     28.0          subclass = instance.__class__
+   182         1           16     16.0     64.0          if subclass in cls._abc_cache:
+   183         1            2      2.0      8.0              return True
+   184                                                   subtype = type(instance)
+   185                                                   if subtype is subclass:
+   186                                                       if (cls._abc_negative_cache_version ==
+   187                                                           ABCMeta._abc_invalidation_counter and
+   188                                                           subclass in cls._abc_negative_cache):
+   189                                                           return False
+   190                                                       # Fall back to the subclass check.
+   191                                                       return cls.__subclasscheck__(subclass)
+   192                                                   return any(cls.__subclasscheck__(c) for c in {subclass, subtype})
+</code></pre>
+<p><strong>For a list</strong></p>
+<pre><code>&gt;&gt;&gt; %lprun -f abc.ABCMeta.__instancecheck__ isinstance(list(), collections.abc.Mapping)
+Timer unit: 6.84247e-07 s
+Total time: 3.07911e-05 s
+
+Line #      Hits         Time  Per Hit   % Time  Line Contents
+==============================================================
+   178                                               def __instancecheck__(cls, instance):
+   179                                                   """Override for isinstance(instance, cls)."""
+   180                                                   # Inline the cache checking
+   181         1            7      7.0     15.6          subclass = instance.__class__
+   182         1           17     17.0     37.8          if subclass in cls._abc_cache:
+   183                                                       return True
+   184         1            2      2.0      4.4          subtype = type(instance)
+   185         1            2      2.0      4.4          if subtype is subclass:
+   186         1            3      3.0      6.7              if (cls._abc_negative_cache_version ==
+   187         1            2      2.0      4.4                  ABCMeta._abc_invalidation_counter and
+   188         1           10     10.0     22.2                  subclass in cls._abc_negative_cache):
+   189         1            2      2.0      4.4                  return False
+   190                                                       # Fall back to the subclass check.
+   191                                                       return cls.__subclasscheck__(subclass)
+   192                                                   return any(cls.__subclasscheck__(c) for c in {subclass, subtype})
+</code></pre>
+<p>We can see that for a dict, the Mapping abstract classes' <code>_abc_cache</code> </p>
+<pre><code>&gt;&gt;&gt; list(collections.abc.Mapping._abc_cache)
+[dict]
+</code></pre>
+<p>includes our dict, and so the check short-circuits early. For a list evidently the positive cache won't be hit, however the Mapping's <code>_abc_negative_cache</code> contains the list type </p>
+<pre><code>&gt;&gt;&gt; list(collections.abc.Mapping._abc_negative_cache)
+[type,
+ list,
+ generator,
+ pandas.core.series.Series,
+ itertools.chain,
+ int,
+ map]
+</code></pre>
+<p>as well as now the pd.Series type, as a result of calling <code>isinstance</code> more than once with <code>%timeit</code>. In the case that we don't hit the negative cache (like the first iteration for a Series), Python resorts to the regular subclass check with </p>
+<pre><code>cls.__subclasscheck__(subclass)
+</code></pre>
+<p>which can be <em>far</em> slower, resorting to the subclass hook and recursive subclass checks <a href="https://svn.python.org/projects/python/trunk/Lib/abc.py" rel="nofollow noreferrer">seen here</a>, then caches the result for subsequent speedups. </p>
+</div>
+<span class="comment-copy">So your question really boils down to why <code>isinstance</code> checks against abstract base classes are slow? Because I don't think this is iterable and <code>Mapping</code> specific.</span>
+<span class="comment-copy">@Mitch maybe, indeed it seems like the other <code>collections.abc</code> classes are equivally slow in <code>isinstance</code> checks. Do you know what makes these checks with abc's so slow? :)</span>
+<span class="comment-copy">I'm looking into <code>__instancecheck__</code>'s implementation now, and it doesn't seem like there's anything too funky that happens - performance is worse when you miss the cache. Going to give it some more thought.</span>
+<span class="comment-copy"><code>isinstance</code> with an <code>ABCMeta</code> class is a Python level operation, unfortunately. There's many checks going on down there in <code>ABCMeta.__instancecheck__</code> and passing anything other than a mapping will take the slowest path available.</span>
+<span class="comment-copy">This is a dumb question, but I tried running <code>%lprun -f abc.ABCMeta.__instancecheck__ isinstance(list(), collections.abc.Mapping)</code> in the Python console and it doesn't work... how do you make it display that thing with the time for each line of code?</span>
+<span class="comment-copy">@dtgq That <code>%lprun</code> is from the <a href="https://github.com/rkern/line_profiler" rel="nofollow noreferrer"><code>line_profiler</code></a> tool, and you have to load it into your IPython extensions as mentioned in the link.</span>

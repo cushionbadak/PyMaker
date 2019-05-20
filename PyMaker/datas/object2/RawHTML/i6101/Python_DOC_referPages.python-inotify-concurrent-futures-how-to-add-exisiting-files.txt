@@ -1,0 +1,167 @@
+<div class="post-text" itemprop="text">
+<p>I've got this simple script that processes files using <a href="https://github.com/dsoprea/PyInotify" rel="nofollow noreferrer">inotify</a> module and <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Executor.submit" rel="nofollow noreferrer">mulit-threading</a>:</p>
+<pre><code>import concurrent.futures
+
+import inotify.adapters
+
+def main():
+    i = inotify.adapters.Inotify()
+
+    i.add_watch(b'/data')
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        try:
+            for event in i.event_gen():
+                if event is not None:
+                    (header, type_names, watch_path, filename) = event
+                    # inotify event: IN_CLOSE_WRITE
+                    if header.mask == 8:
+                        future = executor.submit(process, filename.decode('utf-8'))
+                        future.add_done_callback(future_callback)
+        finally:
+            i.remove_watch(b'/data')
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>The problem I've got is that the watched directory can have many files before the script is actually started.</p>
+<p>I thought about something like the example below but this won't start "yielding" inotify generator until all existing files are processed and it will also miss new events created during this time:</p>
+<pre><code>import concurrent.futures
+
+import inotify.adapters
+
+def main():
+    i = inotify.adapters.Inotify()
+
+    i.add_watch(b'/data')
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        files = os.listdir('/data')
+        if files:
+            for filename in files:
+                future = executor.submit(run, filename)
+                future.add_done_callback(future_callback)
+        try:
+            for event in i.event_gen():
+                if event is not None:
+                    (header, type_names, watch_path, filename) = event
+                    # inotify event: IN_CLOSE_WRITE
+                    if header.mask == 8:
+                        future = executor.submit(process, filename.decode('utf-8'))
+                        future.add_done_callback(future_callback)
+        finally:
+            i.remove_watch(b'/data')
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>Is there a way to manually send <code>inotify</code> event or perhaps add these files to <code>i.event_gen()</code> generator?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's an example that processes the old files inside one of the workers allowing for new events to be captured in parallel while processing the old, existing files. For the record, even using your linear code, I had no trouble with missing events.</p>
+<p>Also, the PyInotify module is "defunct and no longer available." according to this <a href="https://pypi.python.org/pypi/inotify" rel="nofollow noreferrer">inotify module</a> which I used.</p>
+<pre><code>#!/usr/bin/env python3
+
+import concurrent.futures
+import inotify.adapters
+import time
+import os
+from functools import partial
+
+
+DIRECTORY='.'
+
+
+def run(filename, suffix=''):
+    time.sleep(1)
+    return 'run: ' + filename + suffix
+
+
+def process(filename):
+    return run(filename, suffix=' (inotify)')
+
+
+def future_callback(fut):
+    print('future_callback: ' + fut.result())
+
+
+def do_directory(executor):
+    fn = partial(run, suffix=' (dir list)')
+    for filename in os.listdir(DIRECTORY):
+        future = executor.submit(fn, filename)
+        future.add_done_callback(future_callback)
+
+
+def main():
+    i = inotify.adapters.Inotify()
+
+    i.add_watch(DIRECTORY.encode())
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        # Process the directory in a thread or locally. Not sure if it
+        # is safe to submit to the executor from within one its workers.
+        # Seems like it should be.
+        executor.submit(do_directory, executor)
+        # do_directory(executor)
+        try:
+            for event in i.event_gen():
+                if event is not None:
+                    (header, type_names, watch_path, filename) = event
+                    # inotify event: IN_CLOSE_WRITE
+                    if header.mask == 8:
+                        future = executor.submit(process, filename.decode('utf-8'))
+                        future.add_done_callback(future_callback)
+                        print('Submitted inotify for', filename.decode())
+        except KeyboardInterrupt:
+            pass
+        finally:
+            i.remove_watch(DIRECTORY.encode())
+
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>Test:</p>
+<p>Start with a directory containing 10 files. Start the program, wait 2 seconds, and then create 5 new files. Look for the "submit" messages to see that the events were received and queued while still processing the initial files and that the new files are eventually handled.</p>
+<pre><code>~/p/TEST $ touch A1 A2 A3 A4 A5 A6 A7 A8 A9 A10
+~/p/TEST $ do_test() {
+&gt; rm B*
+&gt; ../inotify-test.py &amp;
+&gt; sleep 2
+&gt; touch B1 B2 B3 B4 B5
+&gt; sleep 5
+&gt; pkill -f inotify-test.py
+&gt; }
+~/p/TEST $ do_test
+[1] 26663
+future_callback: run: A10 (dir list)
+future_callback: run: A4 (dir list)
+future_callback: run: A5 (dir list)
+future_callback: run: A9 (dir list)
+future_callback: run: A2 (dir list)
+Submitted inotify for B1
+Submitted inotify for B2
+Submitted inotify for B3
+Submitted inotify for B4
+Submitted inotify for B5
+future_callback: run: A3 (dir list)
+future_callback: run: A8 (dir list)
+future_callback: run: A1 (dir list)
+future_callback: run: A7 (dir list)
+future_callback: run: A6 (dir list)
+future_callback: run: B1 (inotify)
+future_callback: run: B2 (inotify)
+future_callback: run: B3 (inotify)
+future_callback: run: B4 (inotify)
+future_callback: run: B5 (inotify)
+~/p/TEST $ 
+[1]+  Terminated              ../inotify-test.py
+~/p/TEST $ 
+</code></pre>
+</div>
+<span class="comment-copy">Perhaps you should have a separate function to process the existing files that you submit to your pool?</span>
+<span class="comment-copy">Does creating the generator early help? <code>event_gen = i.event_gen()... process existing files...  for event in event_gen:...</code></span>
+<span class="comment-copy">BTW Your code works fine for me. I created a file while it was processing the existing files and saw an inotify event for the new file.</span>
+<span class="comment-copy">According to this <a href="https://pypi.python.org/pypi/inotify" rel="nofollow noreferrer">inotify</a> module, PyInotify is no longer maintained. I used the other one.</span>
+<span class="comment-copy">Hmm.., if there are many files (it could be thousands in my case), it won't advance to <code>for event in i.event_gen()</code> until <code>for filename in files:</code> is completed</span>
+<span class="comment-copy">Thanks, I don't get any exceptions from <code>do_directory</code> when it runs in a thread, so not sure if it is safe indeed.</span>

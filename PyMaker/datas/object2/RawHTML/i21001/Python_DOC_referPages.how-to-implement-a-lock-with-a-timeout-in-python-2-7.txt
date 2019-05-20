@@ -1,0 +1,424 @@
+<div class="post-text" itemprop="text">
+<p>Is there a way to implement a lock in Python for multithreading purposes whose <code>acquire</code> method can have an arbitrary timeout? The only working solutions I found so far use polling, which</p>
+<ul>
+<li>I find inelegant and inefficient</li>
+<li>Doesn't preserve the bounded waiting / progress guarantee of the lock as a solution to the critical section problem</li>
+</ul>
+<p>Is there a better way to implement this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>to elaborate on Steven's comment suggestion:</p>
+<pre><code>import threading
+import time
+
+lock = threading.Lock()
+cond = threading.Condition(threading.Lock())
+
+def waitLock(timeout):
+    with cond:
+        current_time = start_time = time.time()
+        while current_time &lt; start_time + timeout:
+            if lock.acquire(False):
+                return True
+            else:
+                cond.wait(timeout - current_time + start_time)
+                current_time = time.time()
+    return False
+</code></pre>
+<p>Things to notice:</p>
+<ul>
+<li>there are two <code>threading.Lock()</code> objects, one is internal to the <code>threading.Condition()</code>.  </li>
+<li>when manipulating <code>cond</code>, it's lock is acquired; the <code>wait()</code> operation unlocks it, though, so any number of threads can watch it.</li>
+<li>the wait is embedded inside a for loop that keeps track of the time.  <code>threading.Condition</code> can become notified for reasons other than timeouts, so you still need to track the time if you really want it to expire.</li>
+<li>even with the condition, you still 'poll' the real lock, because its possible for more than one thread to wake and race for the lock.  if the lock.acquire fails, the loop returns to waiting.</li>
+<li>callers of this <code>waitLock</code> function should follow a <code>lock.release()</code> with a <code>cond.notify()</code> so that other threads waiting on it are notified that they should retry aquiring the lock.  This is not shown in the example.</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>My version using thread safe queues <a href="http://docs.python.org/2/library/queue.html" rel="nofollow">http://docs.python.org/2/library/queue.html</a> and their put/get methods that supports timeout.</p>
+<p>Until now is working fine, but if someone can do a peer review on it I'll be grateful.</p>
+<pre><code>"""
+Thread-safe lock mechanism with timeout support module.
+"""
+
+from threading import ThreadError, current_thread
+from Queue import Queue, Full, Empty
+
+
+class TimeoutLock(object):
+    """
+    Thread-safe lock mechanism with timeout support.
+    """
+
+    def __init__(self, mutex=True):
+        """
+        Constructor.
+        Mutex parameter specifies if the lock should behave like a Mutex, and
+        thus use the concept of thread ownership.
+        """
+        self._queue = Queue(maxsize=1)
+        self._owner = None
+        self._mutex = mutex
+
+    def acquire(self, timeout=0):
+        """
+        Acquire the lock.
+        Returns True if the lock was succesfully acquired, False otherwise.
+
+        Timeout:
+        - &lt; 0 : Wait forever.
+        -   0 : No wait.
+        - &gt; 0 : Wait x seconds.
+        """
+        th = current_thread()
+        try:
+            self._queue.put(
+                th, block=(timeout != 0),
+                timeout=(None if timeout &lt; 0 else timeout)
+            )
+        except Full:
+            return False
+
+        self._owner = th
+        return True
+
+    def release(self):
+        """
+        Release the lock.
+        If the lock is configured as a Mutex, only the owner thread can release
+        the lock. If another thread attempts to release the lock a
+        ThreadException is raised.
+        """
+        th = current_thread()
+        if self._mutex and th != self._owner:
+            raise ThreadError('This lock isn\'t owned by this thread.')
+
+        self._owner = None
+        try:
+            self._queue.get(False)
+            return True
+        except Empty:
+            raise ThreadError('This lock was released already.')
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'm doubtful that this can be done.</p>
+<p>If you want to implement this without any sort of polling, then you need the OS to know that the thread is blocked, and the OS needs to be aware of the timeout, in order to unblock the thread after a while. For that, support needs to already exist in the OS; you can't implement this at the Python level.</p>
+<p>(You could have the thread blocked at either OS-level or app-level, and have a mechanism whereby it can be woken up by a different thread at the appropriate time, but then you need that other thread to be effectively polling)</p>
+<p>In general you don't have a truly bounded waiting/progress guarantee of the lock anyway, as your thread will have to wait an unbounded time for a context switch to take place for it to notice that it's been unblocked. So unless you can put an upper bound on the amount of CPU contention going on, you're not going to be able to use the timeout to hit any hard real-time deadlines. But you probably don't need that, otherwise you wouldn't dream of using locks implemented in Python.</p>
+<hr/>
+<p>Due to the Python GIL (Global Interpreter Lock), those polling-based solutions probably aren't as inefficient or as badly unbounded as you think (depending on how they're implemented) (and assuming you're using either CPython or PyPy).</p>
+<p>There's only ever one thread running at a time, and by definition there's another thread that you want to run (the one that holds the lock you're waiting for). The GIL is held for a while by one thread to execute a bunch of bytecodes, then dropped and reacquired to give someone else a chance at it. So if the blocked-with-timeout thread is just in a loop checking the time and yielding to other threads, it will only wake up every so often when it gets the GIL and then almost immediately drop it back to someone else and block on the GIL again. Because this thread could only ever wake up when it gets a turn at the GIL anyway, it will also do this check as soon after the timeout expires as it would be able to resume execution even if the timeout was magically perfect.</p>
+<p>The only time this will cause a lot of inefficiency is if your thread is blocked waiting for the lock-holding thread, which is blocked waiting for something that can't be caused by another Python thread (say, blocked on IO), and there are no other runnable Python threads. Then your polling timeout really will just sit there checking the time repeatedly, which could be bad if you expect this situation to happen for long periods of time.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If somebody needs Python &gt;= 3.2 API:</p>
+<pre class="lang-python prettyprint-override"><code>import threading
+import time
+
+
+class Lock(object):
+    _lock_class = threading.Lock
+
+    def __init__(self):
+        self._lock = self._lock_class()
+        self._cond = threading.Condition(threading.Lock())
+
+    def acquire(self, blocking=True, timeout=-1):
+        if not blocking or timeout == 0:
+            return self._lock.acquire(False)
+        cond = self._cond
+        lock = self._lock
+        if timeout &lt; 0:
+            with cond:
+                while True:
+                    if lock.acquire(False):
+                        return True
+                    else:
+                        cond.wait()
+        else:
+            with cond:
+                current_time = time.time()
+                stop_time = current_time + timeout
+                while current_time &lt; stop_time:
+                    if lock.acquire(False):
+                        return True
+                    else:
+                        cond.wait(stop_time - current_time)
+                        current_time = time.time()
+                return False
+
+    def release(self):
+        with self._cond:
+            self._lock.release()
+            self._cond.notify()
+
+    __enter__ = acquire
+
+    def __exit__(self, t, v, tb):
+        self.release()
+
+
+class RLock(Lock):
+    _lock_class = threading.RLock
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I took <a href="https://stackoverflow.com/users/65696/singlenegationelimination">SingleNegationElimination</a>'s answer and created a class with can be used in a <code>with</code>-statement the following way:</p>
+<pre><code>global_lock = timeout_lock()
+...
+
+with timeout_lock(owner='task_name', lock=global_lock):
+    do()
+    some.stuff()
+</code></pre>
+<p>This way it will only <strong>warn</strong> if the timeout expired (default=1s) and show the owner of the lock for investigation. </p>
+<p>Use it this way and an exception will be thrown after the timeout:</p>
+<pre><code>with timeout_lock(owner='task_name', lock=global_lock, raise_on_timeout=True):
+    do()
+    some.stuff()
+</code></pre>
+<p>The <code>timeout_lock.lock()</code> instance has to be created once and can be used across threads.</p>
+<p>Here is the class - it works for me but feel free to comment and improve:</p>
+<pre><code>class timeout_lock:
+    ''' taken from https://stackoverflow.com/a/8393033/1668622
+    '''
+    class lock:
+        def __init__(self):
+            self.owner = None
+            self.lock = threading.Lock()
+            self.cond = threading.Condition()
+
+        def _release(self):
+            self.owner = None
+            self.lock.release()
+            with self.cond:
+                self.cond.notify()
+
+    def __init__(self, owner, lock, timeout=1, raise_on_timeout=False):
+        self._owner = owner
+        self._lock = lock
+        self._timeout = timeout
+        self._raise_on_timeout = raise_on_timeout
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, type, value, tb):
+        ''' will only be called if __enter__ did not raise '''
+        self.release()
+
+    def acquire(self):
+        if self._raise_on_timeout:
+            if not self._waitLock():
+                raise RuntimeError('"%s" could not aquire lock within %d sec'
+                                   % (self._owner, self._timeout))
+        else:
+            while True:
+                if self._waitLock():
+                    break
+                print('"%s" is waiting for "%s" and is getting bored...'
+                      % (self._owner, self._lock.owner))
+        self._lock.owner = self._owner
+
+    def release(self):
+        self._lock._release()
+
+    def _waitLock(self):
+        with self._lock.cond:
+            _current_t = _start_t = time.time()
+            while _current_t &lt; _start_t + self._timeout:
+                if self._lock.lock.acquire(False):
+                    return True
+                else:
+                    self._lock.cond.wait(self._timeout - _current_t + _start_t)
+                    _current_t = time.time()
+        return False
+</code></pre>
+<p>To be sure the threads really don't interfere and don't wait get notified as soon as possible I wrote a small multithreading test which will sum up the time needed to run all threads:</p>
+<pre><code>def test_lock_guard():
+    import random
+
+    def locking_thread_fn(name, lock, duration, timeout):
+        with timeout_lock(name, lock, timeout=timeout):
+            print('%x: "%s" begins to work..' % (threading.get_ident(), name))
+            time.sleep(duration)
+            print('%x: "%s" finished' % (threading.get_ident(), name))
+
+    _lock = timeout_lock.lock()
+
+    _threads = []
+    _total_d = 0
+    for i in range(3):
+        _d = random.random() * 3
+        _to = random.random() * 2
+        _threads.append(threading.Thread(
+            target=locking_thread_fn, args=('thread%d' % i, _lock, _d, _to)))
+        _total_d += _d
+
+    _t = time.time()
+
+    for t in _threads: t.start()
+    for t in _threads: t.join()
+
+    _t = time.time() - _t
+
+    print('duration: %.2f sec / expected: %.2f (%.1f%%)'
+          % (_t, _total_d, 100 / _total_d * _t))
+</code></pre>
+<p>Output is:</p>
+<pre><code>7f940fc2d700: "thread0" begins to work..
+"thread2" is waiting for "thread0" and is getting bored...
+"thread2" is waiting for "thread0" and is getting bored...
+"thread2" is waiting for "thread0" and is getting bored...
+7f940fc2d700: "thread0" finished
+7f940f42c700: "thread1" begins to work..
+"thread2" is waiting for "thread1" and is getting bored...
+"thread2" is waiting for "thread1" and is getting bored...
+7f940f42c700: "thread1" finished
+"thread2" is waiting for "None" and is getting bored...
+7f940ec2b700: "thread2" begins to work..
+7f940ec2b700: "thread2" finished
+duration: 5.20 sec / expected: 5.20 (100.1%)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Okay, this is already implemented in <strong>python 3.2</strong> or above: 
+     <a href="https://docs.python.org/3/library/threading.html" rel="nofollow noreferrer">https://docs.python.org/3/library/threading.html</a>
+Look for threading.<strong>TIMEOUT_MAX</strong></p>
+<p>But I improved on the test case over frans' version ... though this is already a waste of time if you're on py3.2 or above:</p>
+<pre><code>from unittest.mock import patch, Mock
+import unittest
+
+import os
+import sys
+import logging
+import traceback
+import threading
+import time
+
+from Util import ThreadingUtil
+
+class ThreadingUtilTests(unittest.TestCase):
+
+    def setUp(self):
+        pass
+
+    def tearDown(self):
+        pass
+
+    # https://www.pythoncentral.io/pythons-time-sleep-pause-wait-sleep-stop-your-code/
+    def testTimeoutLock(self):
+
+        faulted = [False, False, False]
+
+        def locking_thread_fn(threadId, lock, duration, timeout):
+            try:
+                threadName = "Thread#" + str(threadId)
+                with ThreadingUtil.TimeoutLock(threadName, lock, timeout=timeout, raise_on_timeout=True):
+                    print('%x: "%s" begins to work..' % (threading.get_ident(), threadName))
+                    time.sleep(duration)
+                    print('%x: "%s" finished' % (threading.get_ident(), threadName))
+            except:
+                faulted[threadId] = True
+
+        _lock = ThreadingUtil.TimeoutLock.lock()
+
+        _sleepDuration = [5, 10, 1]
+        _threads = []
+
+        for i in range(3):
+            _duration = _sleepDuration[i]
+            _timeout = 6
+            print("Wait duration (sec): " + str(_duration) + ", Timeout (sec): " + str(_timeout))
+            _worker = threading.Thread(
+                                        target=locking_thread_fn, 
+                                        args=(i, _lock, _duration, _timeout)
+                                    )
+            _threads.append(_worker)
+
+        for t in _threads: t.start()
+        for t in _threads: t.join()
+
+        self.assertEqual(faulted[0], False)
+        self.assertEqual(faulted[1], False)
+        self.assertEqual(faulted[2], True)
+</code></pre>
+<p>Now under "Util" folder, I have "ThreadingUtil.py":</p>
+<pre><code>import time
+import threading
+
+# https://stackoverflow.com/questions/8392640/how-to-implement-a-lock-with-a-timeout-in-python-2-7
+# https://docs.python.org/3.4/library/asyncio-sync.html#asyncio.Condition
+# https://stackoverflow.com/questions/28664720/how-to-create-global-lock-semaphore-with-multiprocessing-pool-in-python
+# https://hackernoon.com/synchronization-primitives-in-python-564f89fee732
+
+class TimeoutLock(object):
+    ''' taken from https://stackoverflow.com/a/8393033/1668622
+    '''
+    class lock:
+        def __init__(self):
+            self.owner = None
+            self.lock = threading.Lock()
+            self.cond = threading.Condition()
+
+        def _release(self):
+            self.owner = None
+            self.lock.release()
+            with self.cond:
+                self.cond.notify()
+
+    def __init__(self, owner, lock, timeout=1, raise_on_timeout=False):
+        self._owner = owner
+        self._lock = lock
+        self._timeout = timeout
+        self._raise_on_timeout = raise_on_timeout
+
+    # http://effbot.org/zone/python-with-statement.htm
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, type, value, tb):
+        ''' will only be called if __enter__ did not raise '''
+        self.release()
+
+    def acquire(self):
+        if self._raise_on_timeout:
+            if not self._waitLock():
+                raise RuntimeError('"%s" could not aquire lock within %d sec'
+                                   % (self._owner, self._timeout))
+        else:
+            while True:
+                if self._waitLock():
+                    break
+                print('"%s" is waiting for "%s" and is getting bored...'
+                      % (self._owner, self._lock.owner))
+        self._lock.owner = self._owner
+
+    def release(self):
+        self._lock._release()
+
+    def _waitLock(self):
+        with self._lock.cond:
+            _current_t = _start_t = time.time()
+            while _current_t &lt; _start_t + self._timeout:
+                if self._lock.lock.acquire(False):
+                    return True
+                else:
+                    self._lock.cond.wait(self._timeout - _current_t + _start_t)
+                    _current_t = time.time()
+        return False
+</code></pre>
+</div>
+<span class="comment-copy">You might want a <code>threading.Condition</code> object (see <a href="http://docs.python.org/library/threading.html#threading.Condition" rel="nofollow noreferrer">docs.python.org/library/threading.html#threading.Condition</a>).  The Condition object wraps a lock and has a <code>wait</code> method with a timeout.  The wait is interrupted when it times out or when <code>notify</code> is called on the Condition object.</span>
+<span class="comment-copy">I'm not sure if that is a solution to my problem. According to the docs and from a quick glance at the source code, I figured that <code>threading.Condition</code> just wraps a <code>threading.RLock</code> object. Before calling <code>wait</code> you need to <code>acquire</code> the underlying Lock. Apart from that, it seems that <code>wait</code> is implemented using a busy loop. Am I missing something here?</span>
+<span class="comment-copy">Thanks very much, this is okay as polling seems to be the only option. Should have read the documentation more thoroughly, it seems :)</span>
+<span class="comment-copy">You could wrap this all up in a class to implement a <code>TimeoutLock</code>, so you don't rely on callers using both the lock and the condition variable correctly. I'm kind of amused though at using a condition variable (which is implemented with a lock) to implement a lock. :)</span>
+<span class="comment-copy">@Ben: as far as I know, this is not strictly necessary from the perspective of what's available from OS provided locking primitives; nearly all OSes provide a regular mutex with a timeout acquire capability.  Building one from 'scratch' as it were is mostly an artifact of the <code>threading</code> module itself, which has just one timeout capable primitive.  since a condition is not itself anything like a mutex, it instead has to manage access <i>to</i> a mutex.</span>
+<span class="comment-copy">@TokenMacGuy: Oh yes, I didn't mean that as any sort of criticism. It just entertained me.</span>
+<span class="comment-copy">For those who wonder what lock.acquire(False) does?  <a href="https://stackoverflow.com/questions/43466158/lock-acquirefalse-does" title="lock acquirefalse does">stackoverflow.com/questions/43466158/lock-acquirefalse-does</a></span>
+<span class="comment-copy">The solution seems to be correct but Python queue is implemented with two Condition objects (see <a href="https://github.com/python/cpython/blob/master/Lib/queue.py" rel="nofollow noreferrer">github.com/python/cpython/blob/master/Lib/queue.py</a>) so @SingleNegationElimination answer (<a href="https://stackoverflow.com/a/8393033/1763149">stackoverflow.com/a/8393033/1763149</a>) is slightly better.</span>
+<span class="comment-copy">Maybe I need to clarify the progress/bounded waiting thing a bit. I actually meant that if the threads try to acquire the lock non-blocking, it is more or less random which of the threads can execute their critical section next. Your information about the GIL is very useful and makes me confident that a polling-based solution is probably as good as it can get without too much effort. Thanks.</span>
+<span class="comment-copy">I'm accepting Token's answer because I think it might be most interesting for others, although yours was more directly related to the original question.</span>

@@ -1,0 +1,245 @@
+<div class="post-text" itemprop="text">
+<p>Using the new asyncio in python 3.4, how do I acquire the first lock/semaphores that is available from a set of locks/semaphores?</p>
+<p>The approach that I did was using <code>wait(return_when=FIRST_COMPLETED)</code>, then cancel all the <code>acquire()</code>s that are still pending once I manage to acquire one. But I'm concerned that this may cause subtle bugs / race conditions, and I have the feeling that there is a more elegant way of doing it.</p>
+<pre><code>import asyncio as aio
+
+@aio.coroutine
+def run():
+    sem1, sem2 = (aio.Semaphore(), aio.Semaphore())
+    print('initial:', sem1, sem2)
+    a = aio.async(sleep(sem1, 1)) # acquire sem1
+    print('just after sleep:', sem1, sem2)
+    done, pending = yield from aio.wait([sem1.acquire(), sem2.acquire()], return_when=aio.FIRST_COMPLETED)
+    print('done:', done)
+    print('pending:', pending)
+    for task in pending:
+        task.cancel()
+    print('after cancel:', sem1, sem2)
+    yield from aio.wait([a])
+    print('after wait:', sem1, sem2)
+
+@aio.coroutine
+def sleep(sem, i):
+    with (yield from sem):
+        yield from aio.sleep(i)
+
+if __name__ == "__main__":
+    aio.get_event_loop().run_until_complete(run())
+</code></pre>
+<p>The code above gives (memory addresses edited):</p>
+<pre><code>initial: &lt;asyncio.locks.Semaphore object at 0x1 [unlocked,value:1]&gt; &lt;asyncio.locks.Semaphore object at 0x2 [unlocked,value:1]&gt;
+just after sleep: &lt;asyncio.locks.Semaphore object at 0x1 [unlocked,value:1]&gt; &lt;asyncio.locks.Semaphore object at 0x2 [unlocked,value:1]&gt;
+done: {Task(&lt;acquire&gt;)&lt;result=True&gt;}
+pending: {Task(&lt;acquire&gt;)&lt;PENDING&gt;}
+after cancel: &lt;asyncio.locks.Semaphore object at 0x1 [locked,waiters:1]&gt; &lt;asyncio.locks.Semaphore object at 0x2 [locked]&gt;
+after wait: &lt;asyncio.locks.Semaphore object at 0x1 [unlocked,value:1]&gt; &lt;asyncio.locks.Semaphore object at 0x2 [locked]&gt;
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>If I understand your problem correctly, you want to have a two different pools of locks, one that allows X number of connections per-proxy, and another that allows Y number of global connections. A single <code>Semaphore</code> object can actually be used for this <a href="https://docs.python.org/3/library/asyncio-sync.html#semaphores" rel="nofollow">pretty easily</a>:</p>
+<blockquote>
+<p><strong>class asyncio.Semaphore(value=1, *, loop=None)</strong></p>
+<p>A semaphore manages an internal counter which is decremented by each
+  acquire() call and incremented by each release() call. The counter can
+  never go below zero; when acquire() finds that it is zero, it blocks,
+  waiting until some other thread calls release().</p>
+</blockquote>
+<p>So, rather than using a list of <code>Semaphore</code> objects each initialized with the default <code>value</code> of 1 to implement the pool, just initialize the <code>value</code> of a single <code>Semaphore</code> to whatever the maximum number of tasks you want to be able to run concurrently is.</p>
+<pre><code>proxy_sem = Semaphore(value=5) # 5 connections will be able to hold this semaphore concurrently
+global_sem = Semaphore(value=15) # 15 connections will be able to hold this semaphore
+</code></pre>
+<p>Then in your code, just always acquire the proxy semaphore prior to acquiring the global one</p>
+<pre><code>with (yield from proxy_sem):
+     with (yield from global_sem):
+</code></pre>
+<p>That way, you won't hold a global lock while you wait on a proxy-specific lock, which could potentially block a connection from another proxy that would be free to run if it could get a global lock.</p>
+<p><strong>Edit:</strong></p>
+<p>Here's a complete example that demonstrates a way to do this without requiring a proxy-specific lock at all. Instead, you run one coroutine for each proxy, all of which consume from the same queue. The proxy coroutines limit the number of concurrent tasks they run simply by keeping track of the active tasks they've launched, and only starting new tasks when they drop below the limit. When a proxy coroutine launches a task, that task is responsible for acquiring the global semaphore. Here's the code:</p>
+<pre><code>import asyncio
+import random
+
+PROXY_CONN_LIMIT = 5
+GLOBAL_CONN_LIMIT = 20
+PROXIES = ['1.2.3.4', '1.1.1.1', '2.2.2.2', '3.3.3.3', '4.4.4.4']
+
+@asyncio.coroutine
+def do_network_stuff(item, proxy_info):
+    print("Got {}. Handling it with proxy {}".format(item, proxy_info))
+    # Wait a random amount of time to simulate actual work being done.
+    yield from asyncio.sleep(random.randint(1,7))
+
+@asyncio.coroutine
+def handle_item(item, proxy_info, global_sem):
+    with (yield from global_sem):  # Get the global semaphore
+       yield from do_network_stuff(item, proxy_info)
+
+@asyncio.coroutine
+def proxy_pool(proxy_info, queue, global_sem):
+    tasks = []
+    def remove_item(task, *args):
+        tasks.remove(task)
+    while True:  # Loop infinitely. We'll return when we get a sentinel from main()
+        while len(tasks) &lt; PROXY_CONN_LIMIT: # Pull from the queue until we hit our proxy limit
+            item = yield from queue.get()
+            print(len(tasks))
+            if item is None:  # Time to shut down
+                if tasks:
+                    # Make sure all pending tasks are finished first.
+                    yield from asyncio.wait(tasks)
+                print("Shutting down {}".format(proxy_info))
+                return
+            # Create a task for the work item, and add it to our list of
+            # tasks.
+            task = asyncio.async(handle_item(item, proxy_info, global_sem))
+            tasks.append(task)
+        # We've hit our proxy limit. Now we wait for at least one task
+        # to complete, then loop around to pull more from the queue.
+        done, pending = yield from asyncio.wait(tasks,
+                                                return_when=asyncio.FIRST_COMPLETED) 
+        # Remove the completed tasks from the active tasks list.
+        for d in done:
+            tasks.remove(d)
+
+@asyncio.coroutine
+def main():
+    global_sem = asyncio.Semaphore(GLOBAL_CONN_LIMIT)
+    queue = asyncio.Queue()
+    tasks = []
+    # Start the proxy pools.
+    for proxy in PROXIES:
+        tasks.append(asyncio.async(proxy_pool(proxy, queue, global_sem)))
+
+    # Send work to the proxy pools.
+    for i in range(50):
+        yield from queue.put(i)
+
+    # Tell the proxy pools to shut down.
+    for _ in PROXIES:
+        yield from queue.put(None)
+
+    # Wait for them to shut down.
+    yield from asyncio.wait(tasks)
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
+</code></pre>
+<p>Sample output:</p>
+<pre><code>0
+1
+2
+3
+4
+0
+1
+2
+3
+4
+0
+1
+2
+3
+4
+0
+1
+2
+3
+4
+0
+1
+2
+3
+4
+Got 0. Handling it with proxy 1.2.3.4
+Got 1. Handling it with proxy 1.2.3.4
+Got 2. Handling it with proxy 1.2.3.4
+Got 3. Handling it with proxy 1.2.3.4
+Got 4. Handling it with proxy 1.2.3.4
+Got 5. Handling it with proxy 1.1.1.1
+Got 6. Handling it with proxy 1.1.1.1
+Got 7. Handling it with proxy 1.1.1.1
+Got 8. Handling it with proxy 1.1.1.1
+Got 9. Handling it with proxy 1.1.1.1
+Got 10. Handling it with proxy 2.2.2.2
+Got 11. Handling it with proxy 2.2.2.2
+Got 12. Handling it with proxy 2.2.2.2
+Got 13. Handling it with proxy 2.2.2.2
+Got 14. Handling it with proxy 2.2.2.2
+Got 15. Handling it with proxy 3.3.3.3
+Got 16. Handling it with proxy 3.3.3.3
+Got 17. Handling it with proxy 3.3.3.3
+Got 18. Handling it with proxy 3.3.3.3
+Got 19. Handling it with proxy 3.3.3.3
+Got 20. Handling it with proxy 4.4.4.4
+Got 21. Handling it with proxy 4.4.4.4
+Got 22. Handling it with proxy 4.4.4.4
+Got 23. Handling it with proxy 4.4.4.4
+4
+4
+4
+4
+Got 24. Handling it with proxy 4.4.4.4
+Got 25. Handling it with proxy 1.2.3.4
+Got 26. Handling it with proxy 2.2.2.2
+Got 27. Handling it with proxy 1.1.1.1
+Got 28. Handling it with proxy 3.3.3.3
+3
+4
+4
+4
+4
+4
+Got 29. Handling it with proxy 4.4.4.4
+Got 30. Handling it with proxy 4.4.4.4
+Got 31. Handling it with proxy 2.2.2.2
+Got 32. Handling it with proxy 1.1.1.1
+4
+4
+4
+Got 33. Handling it with proxy 1.2.3.4
+Got 34. Handling it with proxy 3.3.3.3
+Got 35. Handling it with proxy 1.1.1.1
+Got 36. Handling it with proxy 2.2.2.2
+Got 37. Handling it with proxy 3.3.3.3
+3
+4
+4
+4
+4
+Got 38. Handling it with proxy 1.2.3.4
+4
+Got 39. Handling it with proxy 1.2.3.4
+Got 40. Handling it with proxy 2.2.2.2
+Got 41. Handling it with proxy 1.1.1.1
+Got 42. Handling it with proxy 3.3.3.3
+Got 43. Handling it with proxy 4.4.4.4
+2
+3
+4
+4
+4
+4
+Got 44. Handling it with proxy 1.2.3.4
+Got 45. Handling it with proxy 1.2.3.4
+Got 46. Handling it with proxy 1.2.3.4
+Got 47. Handling it with proxy 1.1.1.1
+Got 48. Handling it with proxy 4.4.4.4
+Got 49. Handling it with proxy 2.2.2.2
+3
+4
+4
+4
+Shutting down 3.3.3.3
+4
+Shutting down 2.2.2.2
+Shutting down 1.1.1.1
+Shutting down 4.4.4.4
+Shutting down 1.2.3.4
+</code></pre>
+</div>
+<span class="comment-copy">I'm curious, what's your actual use-case for this?</span>
+<span class="comment-copy">I need to make simultaneous connections using proxies. I want to rate-limit the number of outgoing connections per proxy AND the global total number of outgoing connections. So I figured I need to acquire 2 semaphores (one proxy-specific, one global) before each connection.</span>
+<span class="comment-copy">There are more than one proxy_sem (one for each proxy). So the first <code>with</code> need to acquire from a list of proxy_sems.</span>
+<span class="comment-copy">Hmm, I think I need to understand more about what your program is actually trying to do. Are you just trying to connect through whatever proxy is available and then do some network operation, without caring about <i>which</i> proxy you're connecting through? Could you just have X identical functions (where X is the per-proxy pool size)running in a loop for each proxy, which take work items from a <code>asyncio.Queue</code>, and then try to get the global semaphore before actually doing the work?</span>
+<span class="comment-copy">Yes, that's what I would like to do. That's one way to do it, but it means there may be hundreds/thousands of coroutines running around at the same time? Also when everything is done how do you notify all the coroutines to stop?</span>
+<span class="comment-copy">@Leonth You would need to have a coroutine for each Proxy, which would run in an infinite loop. You could have each coroutine pull from a global queue, and manage only spawning <code>PROXY_CONNECTION_LIMIT</code> number of tasks at a time. When we want to shutdown you just send a sentinel to the coroutines via the queue that tells them its time to shut down. I've edited my answer with an example that demonstrates this.</span>

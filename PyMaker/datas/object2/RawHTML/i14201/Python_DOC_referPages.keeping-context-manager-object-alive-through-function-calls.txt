@@ -1,0 +1,168 @@
+<div class="post-text" itemprop="text">
+<p>I am running into a bit of an issue with keeping a context manager open through function calls. Here is what I mean:</p>
+<p>There is a context-manager defined in a module which I use to open SSH connections to network devices. The "setup" code handles opening the SSH sessions and handling any issues, and the teardown code deals with gracefully closing the SSH session. I normally use it as follows:</p>
+<pre><code>from manager import manager
+def do_stuff(device):
+    with manager(device) as conn:
+        output = conn.send_command("show ip route")
+        #process output...
+    return processed_output 
+</code></pre>
+<p>In order to keep the SSH session open and not have to re-establish it across function calls, I would like to do add an argument to "do_stuff" which can optionally return the SSH session along with the data returned from the SSH session, as follows:</p>
+<pre><code>def do_stuff(device, return_handle=False):
+    with manager(device) as conn:
+        output = conn.send_command("show ip route")
+        #process output...
+        if return_handle:
+            return (processed_output, conn)
+        else:
+            return processed_output
+</code></pre>
+<p>I would like to be able to call this function "do_stuff" from another function, as follows, such that it signals to "do_stuff" that the SSH handle should be returned along with the output.</p>
+<pre><code>def do_more_stuff(device):
+    data, conn = do_stuff(device, return_handle=True)
+    output = conn.send_command("show users")
+    #process output...
+    return processed_output
+</code></pre>
+<p>However the issue that I am running into is that the SSH session is closed, due to the do_stuff function "returning" and triggering the teardown code in the context-manager (which gracefully closes the SSH session).</p>
+<p>I have tried converting "do_stuff" into a generator, such that its state is suspended and perhaps causing the context-manager to stay open:</p>
+<pre><code>def do_stuff(device, return_handle=False):
+    with manager(device) as conn:
+        output = conn.send_command("show ip route")
+        #process output...
+        if return_handle:
+            yield (processed_output, conn)
+        else:
+            yield processed_output
+</code></pre>
+<p>And calling it as such:</p>
+<pre><code>def do_more_stuff(device):
+    gen = do_stuff(device, return_handle=True)
+    data, conn = next(gen)
+    output = conn.send_command("show users")
+    #process output...
+    return processed_output
+</code></pre>
+<p>However this approach does not seem to be working in my case, as the context-manager gets closed, and I get back a closed socket.</p>
+<p>Is there a better way to approach this problem? Maybe my generator needs some more work...I think using a generator to hold state is the most "obvious" way that comes to mind, but overall should I be looking into another way of keeping the session open across function calls?</p>
+<p>Thanks</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I found this question because I was looking for a solution to an analogous problem where the object I wanted to keep alive was a pyvirtualdisplay.display.Display instance with selenium.webdriver.Firefox instances in it.</p>
+<p>I also wanted any opened resources to die if an exception were raised during the display/browser instance creations.</p>
+<p>I imagine the same could be applied to your database connection.</p>
+<p>I recognize this probably only a partial solution and contains less-than-best practices. Help is appreciated.</p>
+<p>This answer is the result of an ad lib spike using the following resources to patch together my solution:</p>
+<ul>
+<li><a href="https://docs.python.org/3/library/contextlib.html#contextlib.ContextDecorator" rel="nofollow">https://docs.python.org/3/library/contextlib.html#contextlib.ContextDecorator</a></li>
+<li><a href="http://www.wefearchange.org/2013/05/resource-management-in-python-33-or.html" rel="nofollow">http://www.wefearchange.org/2013/05/resource-management-in-python-33-or.html</a></li>
+</ul>
+<p>(I do not yet fully grok what is described here though I appreciate the potential. The second link above eventually proved to be the most helpful by providing analogous situations.)</p>
+<pre><code>from pyvirtualdisplay.display import Display
+from selenium.webdriver import Firefox
+from contextlib import contextmanager, ExitStack
+
+RFBPORT = 5904
+
+
+def acquire_desktop_display(rfbport=RFBPORT):
+    display_kwargs = {'backend': 'xvnc', 'rfbport': rfbport}
+    display = Display(**display_kwargs)
+    return display
+
+
+def release_desktop_display(self):
+    print("Stopping the display.")
+    # browsers apparently die with the display so no need to call quits on them
+    self.display.stop()
+
+
+def check_desktop_display_ok(desktop_display):
+    print("Some checking going on here.")
+    return True
+
+
+class XvncDesktopManager:
+    max_browser_count = 1
+
+    def __init__(self, check_desktop_display_ok=None, **kwargs):
+        self.rfbport = kwargs.get('rfbport', RFBPORT)
+        self.acquire_desktop_display = acquire_desktop_display
+        self.release_desktop_display = release_desktop_display
+
+        self.check_desktop_display_ok = check_desktop_display_ok \
+            if check_desktop_display_ok is None else check_desktop_display_ok
+
+    @contextmanager
+    def _cleanup_on_error(self):
+        with ExitStack() as stack:
+            """push adds a context manager’s __exit__() method
+            to stack's callback stack."""
+            stack.push(self)
+            yield
+            # The validation check passed and didn't raise an exception
+            # Accordingly, we want to keep the resource, and pass it
+            # back to our caller
+            stack.pop_all()
+
+    def __enter__(self):
+        url = 'http://stackoverflow.com/questions/30905121/'\
+            'keeping-context-manager-object-alive-through-function-calls'
+        self.display = self.acquire_desktop_display(self.rfbport)
+        with ExitStack() as stack:
+            # add XvncDesktopManager instance's exit method to callback stack
+            stack.push(self)
+            self.display.start()
+
+            self.browser_resources = [
+                Firefox() for x in range(self.max_browser_count)
+            ]
+
+            for browser_resource in self.browser_resources:
+                for url in (url, ):
+                    browser_resource.get(url)
+
+            """This is the last bit of magic.
+            ExitStacks have a .close() method which unwinds
+            all the registered context managers and callbacks
+            and invokes their exit functionality."""
+            # capture the function that calls all the exits
+            # will be called later outside the context in which it was captured
+            self.close_all = stack.pop_all().close
+            # if something fails in this context in enter, cleanup
+            with self._cleanup_on_error() as stack:
+                if not self.check_desktop_display_ok(self):
+                    msg = "Failed validation for {!r}"
+                    raise RuntimeError(msg.format(self.display))
+            # self is assigned to variable after "as",
+            # manually call close_all to unwind callback stack
+            return self
+
+    def __exit__(self, *exc_details):
+        # had to comment this out, unable to add this to callback stack
+        # self.release_desktop_display(self)
+        pass
+</code></pre>
+<p>I had a semi-expected result with the following:</p>
+<pre><code>    kwargs = {
+        'rfbport': 5904,
+    }
+    _desktop_manager = XvncDesktopManager(check_desktop_display_ok=check_desktop_display_ok, **kwargs)
+    with ExitStack() as stack:
+        # context entered and what is inside the __enter__ method is executed
+        # desktop_manager will have an attribute "close_all" that can be called explicitly to unwind the callback stack
+        desktop_manager = stack.enter_context(_desktop_manager)
+
+
+    # I was able to manipulate the browsers inside of the display
+    # and outside of the context 
+    # before calling desktop_manager.close_all()
+    browser, = desktop_manager.browser_resources
+    browser.get(url)
+    # close everything down when finished with resource
+    desktop_manager.close_all()  # does nothing, not in callback stack
+    # this functioned as expected
+    desktop_manager.release_desktop_display(desktop_manager)
+</code></pre>
+</div>

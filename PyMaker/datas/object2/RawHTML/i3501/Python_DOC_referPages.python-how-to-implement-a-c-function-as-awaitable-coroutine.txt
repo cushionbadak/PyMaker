@@ -1,0 +1,102 @@
+<div class="post-text" itemprop="text">
+<p>Environment: cooperative RTOS in C and micropython virtual machine is one of the tasks.</p>
+<p>To make the VM not block the other RTOS tasks, I insert <code>RTOS_sleep()</code> in <a href="https://github.com/micropython/micropython/blob/9b158d60e160fd6be2fedc33a7d7327ec755f7b0/py/vm.c#L139" rel="noreferrer"><code>vm.c:DISPATCH()</code></a> so that after every bytecode is executed, the VM relinquishes control to the next RTOS task.</p>
+<p>I created a uPy interface to asynchronously obtain data from a physical data bus - could be CAN, SPI, ethernet - using producer-consumer design pattern.</p>
+<p>Usage in uPy:</p>
+<pre><code>can_q = CANbus.queue()
+message = can_q.get()
+</code></pre>
+<p>The implementation in C is such that <code>can_q.get()</code> does NOT block the RTOS: it polls a C-queue and if message is not received, it calls <code>RTOS_sleep()</code> to give another task the chance to fill the queue. Things are synchronized because the C-queue is only updated by another RTOS task and RTOS tasks only switch when <code>RTOS_sleep()</code> is called i.e. <strong>cooperative</strong></p>
+<p>The C-implementation is basically:</p>
+<pre><code>// gives chance for c-queue to be filled by other RTOS task
+while(c_queue_empty() == true) RTOS_sleep(); 
+return c_queue_get_message();
+</code></pre>
+<p>Although the Python statement <code>can_q.get()</code> does not block the RTOS, it does block the uPy script.
+I'd like to rewrite it so I can use it with <code>async def</code> i.e. <strong>coroutine</strong> and have it not block the uPy script.</p>
+<p>Not sure of <a href="https://docs.python.org/3/library/asyncio-task.html" rel="noreferrer">the syntax</a> but something like this:</p>
+<pre><code>can_q = CANbus.queue()
+message = await can_q.get()
+</code></pre>
+<p><strong>QUESTION</strong></p>
+<p>How do I write a C-function so I can <code>await</code> on it?</p>
+<p>I would prefer a CPython and micropython answer but I would accept a CPython-only answer.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Note: this answer covers CPython and the asyncio framework. The concepts, however, should apply to other Python implementations as well as other async frameworks.</p>
+<blockquote>
+<p>How do I write a C-function so I can <code>await</code> on it?</p>
+</blockquote>
+<p>The simplest way to write a C function whose result can be awaited is by having it return an already made awaitable object, such as an <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.Future" rel="noreferrer"><code>asyncio.Future</code></a>. Before returning the <code>Future</code>, the code must arrange for the future's result to be set by some asynchronous mechanism. All of these coroutine-based approaches assume that your program is running under some event loop that knows how to schedule the coroutines.</p>
+<p>But returning a future isn't always enough - maybe we'd like to define an object with an arbitrary number of suspension points. Returning a future suspends only once (if the returned future is not complete), resumes once the future is completed, and that's it. An awaitable object equivalent to an <code>async def</code> that contains more than one <code>await</code> cannot be implemented by returning a future, it has to implement a protocol that coroutines normally implement. This is somewhat like an iterator implementing a custom <code>__next__</code> and be used instead of a generator.</p>
+<h2>Defining a custom awaitable</h2>
+<p>To define our own awaitable type, we can turn to PEP 492, which <a href="https://www.python.org/dev/peps/pep-0492/#await-expression" rel="noreferrer">specifies</a> exactly which objects can be passed to <code>await</code>. Other than Python functions defined with <code>async def</code>, user-defined types can make objects awaitable by defining the <code>__await__</code> special method, which Python/C maps to the <code>tp_as_async.am_await</code> part of the <code>PyTypeObject</code> struct.</p>
+<p>What this means is that in Python/C, you must do the following:</p>
+<ul>
+<li>specify a non-NULL value for the <a href="https://docs.python.org/3/c-api/typeobj.html#c.tp_as_async" rel="noreferrer"><code>tp_as_async</code></a> field of your extension type.</li>
+<li>have its <a href="https://docs.python.org/3/c-api/typeobj.html#c.PyAsyncMethods.am_await" rel="noreferrer"><code>am_await</code></a> member point to a C function that accepts an instance of your type and returns an instance of another extension type that implements the <a href="https://docs.python.org/3/c-api/iter.html#iterator-protocol" rel="noreferrer">iterator protocol</a>, i.e. defines <a href="https://docs.python.org/3/c-api/typeobj.html#c.PyTypeObject.tp_iter" rel="noreferrer"><code>tp_iter</code></a> (trivially defined as <code>PyIter_Self</code>) and <a href="https://docs.python.org/3/c-api/typeobj.html#c.PyTypeObject.tp_iternext" rel="noreferrer"><code>tp_iternext</code></a>.</li>
+<li>the iterator's <code>tp_iternext</code> must advance the coroutine's state machine. Each non-exceptional return from <code>tp_iternext</code> corresponds to a suspension, and the final <code>StopIteration</code> exception signifies the final return from the coroutine. The return value is stored in the <code>value</code> property of <code>StopIteration</code>.</li>
+</ul>
+<p>For the coroutine to be useful, it must also be able to communicate with the event loop that drives it, so that it can specify when it is to be resumed after it has suspended. Most of coroutines defined by asyncio expect to be running under the asyncio event loop, and internally use <code>asyncio.get_event_loop()</code> (and/or accept an explicit <code>loop</code> argument) to obtain its services.</p>
+<h2>Example coroutine</h2>
+<p>To illustrate what the Python/C code needs to implement, let's consider simple coroutine expressed as a Python <code>async def</code>, such as this equivalent of <code>asyncio.sleep()</code>:</p>
+<pre><code>async def my_sleep(n):
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
+    loop.call_later(n, future.set_result, None)
+    await future
+    # we get back here after the timeout has elapsed, and
+    # immediately return
+</code></pre>
+<p><code>my_sleep</code> creates a <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.Future" rel="noreferrer"><code>Future</code></a>, arranges for it to complete (its result to become set) in <em>n</em> seconds, and suspends itself until the future completes. The last part uses <code>await</code>, where <code>await x</code> means "allow <code>x</code> to decide whether we will now suspend or keep executing". An incomplete future always decides to suspend, and the asyncio <code>Task</code> coroutine driver special-cases yielded futures to suspend them indefinitely and connects their completion to resuming the task. Suspension mechanisms of other event loops (curio etc) can differ in details, but the underlying idea is the same: <code>await</code> is an optional suspension of execution.</p>
+<h2><code>__await__()</code> that returns a generator</h2>
+<p>To translate this to C, we have to get rid of the magic <code>async def</code> function definition, as well as of the <code>await</code> suspension point. Removing the <code>async def</code> is fairly simple: the equivalent ordinary function simply needs to return an object that implements <code>__await__</code>:</p>
+<pre><code>def my_sleep(n):
+    return _MySleep(n)
+
+class _MySleep:
+    def __init__(self, n):
+        self.n = n
+
+    def __await__(self):
+        return _MySleepIter(self.n)
+</code></pre>
+<p>The <code>__await__</code> method of the <code>_MySleep</code> object returned by <code>my_sleep()</code> will be automatically called by the <code>await</code> operator to convert an <em>awaitable</em> object (anything passed to <code>await</code>) to an iterator. This iterator will be used to ask the awaited object whether it chooses to suspend or to provide a value. This is much like how the <code>for o in x</code> statement calls <code>x.__iter__()</code> to convert the <em>iterable</em> <code>x</code> to a concrete <em>iterator</em>.</p>
+<p>When the returned iterator chooses to suspend, it simply needs to produce a value. The meaning of the value, if any, will be interpreted by the coroutine driver, typically part of an event loop. When the iterator chooses to stop executing and return from <code>await</code>, it needs to stop iterating. Using a generator as a convenience iterator implementation, <code>_MySleepIter</code> would look like this:</p>
+<pre><code>def _MySleepIter(n):
+    loop = asyncio.get_event_loop()
+    future = loop.create_future()
+    loop.call_later(n, future.set_result, None)
+    # yield from future.__await__()
+    for x in future.__await__():
+        yield x
+</code></pre>
+<p>As <code>await x</code> maps to <code>yield from x.__await__()</code>, our generator must exhaust the iterator returned by <code>future.__await__()</code>. The iterator returned by <code>Future.__await__</code> will yield if the future is incomplete, and return the future's result (which we here ignore, but <code>yield from</code> actually provides) otherwise.</p>
+<h2><code>__await__()</code> that returns a custom iterator</h2>
+<p>The final obstacle for a C implementation of <code>my_sleep</code> in C is the use of generator for <code>_MySleepIter</code>. Fortunately, any generator can be translated to a stateful iterator whose <code>__next__</code> executes the piece of code up to the next await or return. <code>__next__</code> implements a state machine version of the generator code, where <code>yield</code> is expressed by returning a value, and <code>return</code> by raising <code>StopIteration</code>.  For example:</p>
+<pre><code>class _MySleepIter:
+    def __init__(self, n):
+        self.n = n
+        self.state = 0
+
+    def __iter__(self):  # an iterator has to define __iter__
+        return self
+
+    def __next__(self):
+        if self.state == 0:
+            loop = asyncio.get_event_loop()
+            self.future = loop.create_future()
+            loop.call_later(self.n, self.future.set_result, None)
+            self.state = 1
+        if self.state == 1:
+            if not self.future.done():
+                return next(iter(self.future))
+            self.state = 2
+        if self.state == 2:
+            raise StopIteration
+        raise AssertionError("invalid state")
+</code></pre>
+<h2>Translation to C</h2>
+<p>The above is quite some typing, but it works, and only uses constructs that can be defined with native Python/C functions.</p>
+<p>Actually translating the two classes to C quite straightforward, but beyond the scope of this answer.</p>
+</div>

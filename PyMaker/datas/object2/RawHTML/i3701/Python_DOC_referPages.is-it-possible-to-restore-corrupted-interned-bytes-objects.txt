@@ -1,0 +1,134 @@
+<div class="post-text" itemprop="text">
+<p>It is well known, that small <code>bytes</code>-objects are automatically "interned" by CPython (similar to the <a href="https://docs.python.org/3/library/sys.html#sys.intern" rel="nofollow noreferrer">intern</a>-function for strings). <strong>Correction:</strong> As <a href="https://stackoverflow.com/a/50709066/5769463">explained</a> by @abarnert it is more like the integer-pool than the interned strings.</p>
+<p>Is  it  possible to restore the interned bytes-objects after they have been corrupted by let's say an "experimental" third party library or is the only way to restart the kernel?</p>
+<p>The proof of concept can be done with Cython-functionality (Cython&gt;=0.28):</p>
+<pre><code>%%cython
+def do_bad_things():
+   cdef bytes b=b'a'
+   cdef const unsigned char[:] safe=b  
+   cdef char *unsafe=&lt;char *&gt; &amp;safe[0]   #who needs const and type-safety anyway?
+   unsafe[0]=98                          #replace through `b`
+</code></pre>
+<p>or as suggested by @jfs through <code>ctypes</code>:</p>
+<pre><code>import ctypes
+import sys
+def do_bad_things():
+    b = b'a'; 
+    (ctypes.c_ubyte * sys.getsizeof(b)).from_address(id(b))[-2] = 98
+</code></pre>
+<p>Obviously, by misusing C-functionality, <code>do_bad_things</code> changes immutable (or so the CPython thinks) object <code>b'a'</code> to <code>b'b'</code> and because this <code>bytes</code>-object is interned, we can see bad things happen afterwards:</p>
+<pre><code>&gt;&gt;&gt; do_bad_things() #b'a' means now b'b'
+&gt;&gt;&gt; b'a'==b'b'  #wait for a surprise  
+True
+&gt;&gt;&gt; print(b'a') #another one
+b'b'
+</code></pre>
+<p>It is possible to restore/clear the byte-object-pool, so that <code>b'a'</code> means <code>b'a'</code> once again?</p>
+<hr/>
+<p>A little side note: It seems as if not every <code>bytes</code>-creation process is using this pool. For example:</p>
+<pre><code>&gt;&gt;&gt; do_bad_things()
+&gt;&gt;&gt; print(b'a')
+b'b'
+&gt;&gt;&gt; print((97).to_bytes(1, byteorder='little')) #ord('a')=97
+b'a'
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Python 3 doesn't intern <code>bytes</code> objects the way it does <code>str</code>. Instead, it keeps a static array of them the way it does with <code>int</code>.</p>
+<p>This is very different under the covers. On the down side, it means there's no table (with an API) to be manipulated. On the up side, it means that if you can find the static array, you can fix it, the same way you would for ints, because the array index and the character value of the string are supposed to be identical.</p>
+<p>If you look in <a href="https://github.com/python/cpython/blob/master/Objects/bytesobject.c#L24" rel="nofollow noreferrer"><code>bytesobject.c</code></a>, the array is declared at the top:</p>
+<pre><code>static PyBytesObject *characters[UCHAR_MAX + 1];
+</code></pre>
+<p>… and then, for example, within <code>PyBytes_FromStringAndSize</code>:</p>
+<pre><code>if (size == 1 &amp;&amp; str != NULL &amp;&amp;
+    (op = characters[*str &amp; UCHAR_MAX]) != NULL)
+{
+#ifdef COUNT_ALLOCS
+    one_strings++;
+#endif
+    Py_INCREF(op);
+    return (PyObject *)op;
+}
+</code></pre>
+<p>Notice that the array is <code>static</code>, so it's not accessible from outside this file, and that it's still refcounting the objects, so callers (even internal stuff in the interpreter, much less your C API extension) can't tell that there's anything special going on.</p>
+<p>So, there's no "correct" way to clean this up.</p>
+<p>But if you want to get hacky…</p>
+<p>If you have a reference to any of the single-char bytes, and you know which character it was supposed to be, you can get to the start of the array and then clean up the whole thing.</p>
+<p>Unless you've screwed up even more than you think, you can just construct a one-char <code>bytes</code> and subtract the character it was <em>supposed</em> to be. <code>PyBytes_FromStringAndSize("a", 1)</code> is going to return the object that's <em>supposed</em> to be <code>'a'</code>, even if it happens to <em>actually</em> hold <code>'b'</code>. How do we know that? Because that's exactly the problem that you're trying to fix.</p>
+<p>Actually, there are probably ways you could break things even worse… which all seem very unlikely, but to be safe, let's use a character you're less likely to have broken than <code>a</code>, like <code>\x80</code>:</p>
+<pre><code>PyBytesObject *byte80 = (PyBytesObject *)PyBytes_FromStringAndSize("\x80", 1);
+PyBytesObject *characters = byte80 - 0x80;
+</code></pre>
+<p>The only other caveat is that if you try to do this from Python with <code>ctypes</code> instead of from C code, it would require some extra care,<sup>1</sup> but since you're not using <code>ctypes</code>, let's not worry about that.</p>
+<p>So, now we have a pointer to <code>characters</code>, we can walk it. We can't just delete the objects to "unintern" them, because that will hose anyone who has a reference to any of them, and probably lead to a segfault. But we don't have to. Any object that's in the table, we know what it's supposed to be—<code>characters[i]</code> is supposed to be a one-char <code>bytes</code> whose one character is <code>i</code>. So just set it back to that, with a loop something like this:</p>
+<pre><code>for (size_t char i=0; i!=UCHAR_MAX; i++) {
+    if (characters[i]) {
+        // do the same hacky stuff you did to break the string in the first place
+    }
+}
+</code></pre>
+<p>That's all there is to it.</p>
+<hr/>
+<p>Well, except for compilation.<sup>2</sup></p>
+<p>Fortunately, at the interactive interpreter, each complete top-level statement is its own compilation unit, so… you should be OK with any new line you type after running the fix.</p>
+<p>But a module you've imported, that had to be compiled, while you had the broken strings? You've probably screwed up its constants. And I can't think of a good way to clean this up except to forcibly recompile and reimport every module.</p>
+<hr/>
+<p><sub>1. The compiler might turn your <code>b'\x80'</code> argument into the wrong thing before it even gets to the C call. And you'd be surprised at all the places you think you're passing around a <code>c_char_p</code> and it's actually getting magically converted to and from <code>bytes</code>. Probably better to use a <code>POINTER(c_uint8)</code>.</sub></p>
+<p><sub>2. If you compiled some code with <code>b'a'</code> in it, the consts array should have a reference to <code>b'a'</code>, which will get fixed. But, since <code>bytes</code> are known immutable to the compiler, if it knows that <code>b'a' == b'b'</code>, it may actually store the pointer to the <code>b'b'</code> singleton instead, for the same reason that <code>123456 is 123456</code> is true, in which case fixing <code>b'a'</code> may not actually solve the problem.</sub></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I followed the great explanation of @abarnert and here is my implementation of his idea in Cython. </p>
+<p>Things to consider:</p>
+<ol>
+<li>There is a bytes-pool (like it is the case for integers) and not a dynamically structure (like it is the case for string-interning). So we can just brute-force all bytes-objects in this pool and ensure that they have the right value.</li>
+<li>Only bytes-objects constructed via <a href="https://github.com/python/cpython/blob/master/Objects/bytesobject.c#L101" rel="nofollow noreferrer"><code>PyBytes_FromStringAndSize</code></a> and <a href="https://github.com/python/cpython/blob/master/Objects/bytesobject.c#L135" rel="nofollow noreferrer"><code>PyBytes_FromString</code></a> are using the internal pool, so make sure to use them.</li>
+</ol>
+<p>This leads to the following implementation:</p>
+<pre><code>%%cython
+from libc.limits cimport UCHAR_MAX
+from cpython.bytes cimport PyBytes_FromStringAndSize
+
+cdef replace_first_byte(bytes obj, unsigned char new_value):
+   cdef const unsigned char[:] safe=obj  
+   cdef unsigned char *unsafe=&lt;unsigned char *&gt; &amp;safe[0]   
+   unsafe[0]=new_value
+
+
+def restore_bytes_pool():
+    cdef char[1] ch
+    #create all possible bytes-objects b`\x00` to b`x255`:
+    for i in range(UCHAR_MAX+1):               
+        ch[0]=&lt;unsigned char&gt;(i)
+        obj=PyBytes_FromStringAndSize(ch, 1) #use it so the pool is used
+        replace_first_byte(obj,i)
+</code></pre>
+<p>Slightly differences (and in my opinion advantages to the original proposal):</p>
+<ol>
+<li>this version doesn't need the knowledge, how the byte-object-pool is built and that it is a continuous array. </li>
+<li>no potentially corrupted bytes-objects are used.</li>
+</ol>
+<p>And now:</p>
+<pre><code>&gt;&gt;&gt; do_bad_things()
+&gt;&gt;&gt; print(b'a')
+b'b'
+
+&gt;&gt;&gt; restore_bytes_pool()
+&gt;&gt;&gt; print(b'a')
+b'a'
+</code></pre>
+<hr/>
+<p>For testing purposes, there is function corrupting (almost) all objects in the pool:</p>
+<pre><code>def corrupt_bytes_pool():
+    cdef char[1] ch
+    for i in range(UCHAR_MAX+1):
+        ch[0]=&lt;unsigned char&gt;(i)
+        obj=PyBytes_FromStringAndSize(ch, 1)
+        replace_first_byte(obj,98)           #sets all to b'b'
+</code></pre>
+</div>
+<span class="comment-copy">Use <i>more</i> C, of course.</span>
+<span class="comment-copy">@user2357112 I would if I knew which one is corrupted...</span>
+<span class="comment-copy">Restoring the corrupted strings would require that you somehow know what the pre-corrupted string was.  Clearing a string from the interned string table is impossible if anyone is currently holding a reference to the string.  The only solution I see would be to never send an interned (or otherwise shared) string reference to this crappy library you're using, but I don't know of any way to guarantee that - Python is really aggressive about interning strings that look like valid identifiers.</span>
+<span class="comment-copy">The question is misguided, because Python is not actually interning bytes the same way it does strings. But that means it's actually easier (as in not impossible) to solve here, because you're just dealing with a static array of objects rather than a table, and once you can find that array, you know what each object is supposed to be, so you can fix them all.</span>
+<span class="comment-copy">you  could change <code>b'a' -&gt; b'b'</code> using <code>ctypes</code>: <code>b = b'a'; (ctypes.c_ubyte * sys.getsizeof(b)).from_address(id(b))[-2] = 98</code>. The idea is from <a href="https://lameiro.wordpress.com/2010/07/18/deixando-o-interpretador-python-maluco/" rel="nofollow noreferrer">lameiro.wordpress.com/2010/07/18/…</a></span>
+<span class="comment-copy">Thank you very much for correcting my misunderstandings and explaining how it works. I ended up with a slightly different approach of brute-forcing all 1-character objects, rather than finding the pool-array. This also has the advantage of not using possible corrupted bytes-objects.</span>

@@ -1,0 +1,99 @@
+<div class="post-text" itemprop="text">
+<p>I'm still very confused about how asyncio works, so I was trying to set a simple example but couldn't achieve it.</p>
+<p>The following example is a web server (Quart) that receives a request to generate a large PDF, the server then returns a response before start processing the PDF, then starts processing it and will send the download link to an email later.</p>
+<pre><code>from quart import Quart
+import asyncio
+import time
+
+app = Quart(__name__)
+
+@app.route('/')
+async def pdf():
+    t1 = time.time()
+    await generatePdf()
+    return 'Time to execute : {} seconds'.format(time.time() - t1)
+
+async def generatePdf():
+    await asyncio.sleep(5)
+    #sync generatepdf
+    #send pdf link to email
+
+app.run()
+</code></pre>
+<p>How would I go about this? in the above example I don't want the 5 seconds to be waited before the return.</p>
+<p>I'm not even sure if asyncio is what I need.</p>
+<p>And I'm afraid that blocking the server app after the response has returned is not a thing that should be done, but not sure either.</p>
+<p>Also the pdf library is synchronous, but I guess that's a problem for another day...</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The comment has everything you need to respond to the web request and schedule the pdf generation for later. </p>
+<pre><code>asyncio.create_task(generatePdf())
+</code></pre>
+<p>However it is not a good idea if the pdf processing is slow as it will block the asyncio event thread. i.e. The current request will be responded quickly but the following request will have to wait till the pdf generation is complete.</p>
+<p>The correct way would be run the task in an executor (especially <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ProcessPoolExecutor" rel="nofollow noreferrer">ProcessPoolExecutor</a>).</p>
+<pre><code>from quart import Quart
+import asyncio
+import time
+from concurrent.futures import ProcessPoolExecutor
+
+app = Quart(__name__)
+executor = ProcessPoolExecutor(max_workers=5)
+
+@app.route('/')
+async def pdf():
+    t1 = time.time()
+    asyncio.get_running_loop().run_in_executor(executor, generatePdf)
+    # await generatePdf()
+    return 'Time to execute : {} seconds'.format(time.time() - t1)
+
+def generatePdf():
+    #sync generatepdf
+    #send pdf link to email
+
+app.run()
+</code></pre>
+<p>It is important to note that since, it is running in different process, the <code>generatePdf</code> cannot access any data without synchronization. So pass everything the function needs when calling the function.</p>
+<hr/>
+<p><strong>Update</strong></p>
+<p>If you can refactor the <code>generatePdf</code> function and make it async, it works best.</p>
+<p>Example if the generate pdf looks like</p>
+<pre><code>def generatePdf():
+    image1 = downloadImage(image1Url)
+    image2 = downloadImage(image2Url)
+    data = queryData()
+    pdfFile = makePdf(image1, image2, data)
+    link = upLoadToS3(pdfFile)
+    sendEmail(link)
+</code></pre>
+<p>You can make the function async like:</p>
+<pre><code>async def generatePdf():
+    image1, image2, data = await asyncio.gather(downloadImage(image1Url), downloadImage(image2Url), queryData())
+    pdfFile = makePdf(image1, image2, data)
+    link = await upLoadToS3(pdfFile)
+    await sendEmail(link) 
+</code></pre>
+<p>Note: All the helper functions like <code>downloadImage</code>, <code>queryData</code> need to be rewritten to support <code>async</code>. This way, requests won't be blocked even if the database or image servers are slow. Everything runs in the same asyncio thread.</p>
+<p>If some of them are not yet async, those can be used with <code>run_in_executor</code> and should work good with other async functions.</p>
+</div>
+<div class="post-text" itemprop="text">
+<ol>
+<li>I highly recommend on reviewing this <a href="https://realpython.com/async-io-python/" rel="nofollow noreferrer">explanatory article</a> by  Brad Solomon on parallel programming and asyncio in python.</li>
+<li>For the purpose of asynchronously performing a task, without the need to block the request until the task is complete - I think the best option is to use a <a href="https://docs.python.org/3/library/asyncio-queue.html#queue" rel="nofollow noreferrer">queue</a> that with a "PDFGenerator" class that consumes from the queue pattern(also <a href="https://realpython.com/async-io-python/#using-a-queue" rel="nofollow noreferrer">covered</a> in the article)</li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<p>For your task, generating a large PDF, you can use an asynchronous task/job queue. As an example, you can use <a href="http://www.celeryproject.org/" rel="nofollow noreferrer">Celery</a>. Since you don't want to wait for the task, rather return a reply like - "generating PDF, please wait a minute/second". So when a request comes to the "generate PDF" endpoint, you will create a task in Celery and Celery will process it asynchronously and after completion, you can push to client or client can use the "task lookup" using the task-id (or as you implement). Here is an example answer - <a href="https://stackoverflow.com/questions/9034091/how-to-check-task-status-in-celery">How to check task status in Celery?</a></p>
+<p>The difference between Celery and Asyncio is, Celery can execute a task in a totally separated environment and the communication with the server is done by a distributed message passing like <a href="https://www.rabbitmq.com/" rel="nofollow noreferrer">RabbitMQ</a>. Where Asyncio uses coroutines to utilize the blocking I/O time. It will use the same environment and processors where your server resides.</p>
+</div>
+<span class="comment-copy">Try changing <code>await generatePdf()</code> to <code>asyncio.create_task(generatePdf())</code>.</span>
+<span class="comment-copy">So in the end of the day, a thread is the best solution? Does that mean that asyncio isn't even necessary? That's the only reason I switched from flask to quart</span>
+<span class="comment-copy">@Mojimi asyncio cannot not speed up synchronous blocking tasks. If for example, pdf generation needs to do multiple database queries, and final generation is not too slow, you can use ayncio.</span>
+<span class="comment-copy">Agreed! asyncio is only useful for I/O bound tasks or other non CPU bound tasks. Using asyncio for CPU bound tasks will not achieve any concurrency. As @balki points out, when you use asyncio for your I/O bound tasks, you must ensure that your CPU bound tasks are returning as quickly as possible. In this case, I agree that the CPU heavy task of generating a pdf should be delegated to a separate thread or process</span>
+<span class="comment-copy">@balki I had an issue while implementing this, <code>run_in_executor</code> needs to be awaitng, and by adding an await to it it became blocking again, am I missing something? Just calling <code>run_in_executor</code> did nothing</span>
+<span class="comment-copy">@Mojimi Use <code>asyncio.create_task(...run_in_executor..)</code> ref: <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task" rel="nofollow noreferrer">docs.python.org/3/library/asyncio-task.html#asyncio.create_task</a></span>
+<span class="comment-copy">I understand now what async io is about, is about skipping waiting tasks like server requests right? So I don't think it fits processing a big PDF as that is a CPU and Memory intensive task</span>
+<span class="comment-copy">Well, actually my PDF generation includes downloading some images, I guess I could optimize a loop to gather this images in async io fashion</span>
+<span class="comment-copy">And for number 2, my biggest concern right now isn't block the request, I managed to do that, but block the server app.</span>
+<span class="comment-copy">For CPU intensive tasks you're better off with multiprocessing, using coroutines or threads will not help because of the global interpreter lock(GIL). However if your concern is blocking the server you should probably profile the application to better understand throughput and computation times</span>
+<span class="comment-copy">How is it different than using a ProcessPoolExecutor?</span>
+<span class="comment-copy">Celery can be used in a separate environment when needed and it's mature enough for control and communication, like message passing with RabbitMQ, backend task saving etc. In the ProcessPoolExecutor you have to implement these when scaling or trying to separate the worker from the server. In case of fault intolerance, your server can lose the task if but if you use a backend for task monitoring, you can find the task when the worker/server is online again and it's easy to implement with celery.</span>

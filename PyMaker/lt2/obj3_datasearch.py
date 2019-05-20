@@ -5,7 +5,7 @@ import re
 # datas/object3/ folder should be unzipped like this.
 # [project_root]/PyMaker/datas/object3/1st/i501/Python_DOC_referPages.accept-file-and-pass-arguments-to-function-from-command-line-gives-no-output.txt
 
-_DATAPATH = '../datas/'
+_DATAPATH = 'PyMaker/datas/'
 _OBJ3_DATAPATH = _DATAPATH + 'object3/'
 
 

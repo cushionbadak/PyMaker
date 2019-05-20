@@ -1,0 +1,166 @@
+<div class="post-text" itemprop="text">
+<p>I want to define constraint specification language based on Python. For example:</p>
+<pre><code>x = IntVar()
+c = Constraint(x &lt; 19)
+c.solve()
+</code></pre>
+<p>Here <code>IntVar</code> is a class describing a variable that can assume any integer value, and <code>Constraint</code> is a class to represent constraints. To implement this I can just overload operator <code>&lt;</code> by defining method <code>__lt__</code> for class <code>IntVar</code>.</p>
+<p>Suppose now that I want to state that <code>10 &lt; x &lt; 19</code>. I would like to write something like:</p>
+<pre><code>c = Constraint(x &gt; 10 and x &lt; 19)
+</code></pre>
+<p>Unfortunately, I cannot do this because <code>and</code> cannot be overloaded in Python. Using <code>&amp;</code> instead of <code>and</code> is not an option because of its precedence and because a bit-wise <code>&amp;</code> has its proper meaning in the constraint language, e.g., <code>(x &amp; 0x4) == 1</code>.</p>
+<p>What solution could you suggest?</p>
+<p>As a workaround I am using quoted expressions for constraints:</p>
+<pre><code>c = Constraint("x &lt; 19")
+</code></pre>
+<p>But this requires implementing constraint language parsing that I would prefer to avoid, and, more importantly, the syntactical correctness may be checked only when the parsing is actually done. Thus the user may spend several hours to discover that there is a syntax error in a constraint definition.</p>
+<p>Another option I considered is using kind of a lambda expression for constraint definition:</p>
+<pre><code>c = Constraint(lambda: x &lt; 19)
+</code></pre>
+<p>but I cannot get access to the parse tree of the lambda-object.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Using <code>&amp;</code>, <code>|</code> and <code>~</code> is actually a pretty good option. You simply need to document that parentheses are required because of the different operator precedence.</p>
+<p>SQLAlchemy does it like this for example. For people who do not like this kind of abuse of the bitwise operators, it also provides <code>and_(*args)</code>, <code>or_(*args)</code>, and <code>not_(arg)</code> functions doing the same thing as their operator counterparts. However, you are forced to prefix notation (<code>and_(foo, bar)</code>) which is not as readable as infix notation (<code>foo &amp; bar</code>).</p>
+<hr/>
+<p>The <code>lambda</code> approach is a good idea, too (besides the ugliness introduced by the <code>lambda</code> itself). Unfortunately the AST is indeed not available without source code - but wait, you do have the source code, just not attached to the function object!</p>
+<p>Imagine this code:</p>
+<pre><code>import ast
+import inspect
+
+def evaluate(constraint):
+    print ast.dump(ast.parse(inspect.getsource(constraint)))
+
+evaluate(lambda x: x &lt; 5 and x &gt; -5)
+</code></pre>
+<p>That will give you this AST:</p>
+<pre><code>Module(
+    body=[
+        Expr(
+            value=Call(
+                func=Name(id='evaluate', ctx=Load()), args=[
+                    Lambda(
+                        args=arguments(
+                            args=[
+                                Name(id='x', ctx=Param())
+                            ],
+                            vararg=None,
+                            kwarg=None,
+                            defaults=[]
+                        ),
+                        body=BoolOp(
+                            op=And(),
+                            values=[
+                                Compare(
+                                    left=Name(id='x', ctx=Load()),
+                                    ops=[Lt()],
+                                    comparators=[Num(n=5)]
+                                ),
+                                Compare(
+                                    left=Name(id='x', ctx=Load()),
+                                    ops=[Gt()],
+                                    comparators=[Num(n=-5)]
+                                )
+                            ]
+                        )
+                    )
+                ],
+                keywords=[],
+                starargs=None,
+                kwargs=None
+            )
+        )
+    ]
+)
+</code></pre>
+<p>The disadvantage is that you get the whole source line - but you can easily walk the AST until you reach your lambda expression (the first one inside the call to your evaluation function) and then you can work on just the relevant part.</p>
+<p>To avoid having to evaluate it on your own, you can now simply rewrite the AST to use the bitwise operators instead and then compile the new AST to a function which will then make use of the overloadable operators.</p>
+<p>Let's have a look at the AST of <code>((x &lt; 5) &amp; (x &gt; -5))</code>:</p>
+<pre><code>body=BinOp(
+    left=Compare(
+        left=Name(id='x', ctx=Load()),
+        ops=[Lt()],
+        comparators=[Num(n=5)]
+    ),
+    op=BitAnd(),
+    right=Compare(
+        left=Name(id='x', ctx=Load()),
+        ops=[Gt()],
+        comparators=[Num(n=-5)]
+    )
+)
+</code></pre>
+<p>As you can see, the difference is pretty minor. You just need to rewrite your AST's BoolOp to use a BinOp!</p>
+<p>The AST of <code>and_(x &lt; 5, x &gt; -5)</code> would look like this:</p>
+<pre><code>body=Call(
+    func=Name(id='and_', ctx=Load()),
+    args=[
+        Compare(
+            left=Name(id='x', ctx=Load()),
+            ops=[Lt()],
+            comparators=[Num(n=5)]
+        ),
+        Compare(
+            left=Name(id='x', ctx=Load()),
+            ops=[Gt()],
+            comparators=[Num(n=-5)]
+        )
+    ],
+    keywords=[],
+    starargs=None,
+    kwargs=None
+)
+</code></pre>
+<p>Also not too hard to rewrite to.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Are you familiar with the <a href="http://code.activestate.com/recipes/384122-infix-operators/" rel="nofollow">Infix</a> pattern (hack)?</p>
+<p>Here is how you can apply it:</p>
+<pre><code>class Infix:
+    def __init__(self, function):
+        self.function = function
+    def __ror__(self, other):
+        return Infix(lambda x, self=self, other=other: self.function(other, x))
+    def __or__(self, other):
+        return self.function(other)
+    def __rlshift__(self, other):
+        return Infix(lambda x, self=self, other=other: self.function(other, x))
+    def __rshift__(self, other):
+        return self.function(other)
+    def __call__(self, value1, value2):
+        return self.function(value1, value2)
+
+andalso=Infix(lambda x,y: x.and_impl(y))
+orelse=Infix(lambda x,y: x.or_impl(y))
+
+#and then
+c = Constraint(( (x &gt; 10) |andalso| (x &lt; 19) ) |orelse| (y &lt; 0))
+</code></pre>
+<p>Unfortunately you cannot specify operator precedence when using <code>Infix</code> and, as you can already notice, this leads to excessive bracketing.</p>
+<p>All things considered, I doubt that you will find a solutions that exactly mimics the behavior of <code>and</code> and <code>or</code> and has no drawbacks.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>For what it worth, <code>and</code>, <code>or</code> and <code>not</code> cannot be overloaded in Python as they are not <em>really</em> operators. They are merely control flow operators for "short-circuit" expression evaluation.</p>
+<p>That being said, as a Python developer, I find the use of <code>&amp;</code> to implements a "logical and" quite confusing and probably error prone.</p>
+<p>Is your "constraint language" necessary embedded in Python? If so, maybe you should consider pre-processing you files Python+constraint files.</p>
+<p>Considering "parsing" the constraint language, some option that come to my mind:</p>
+<ul>
+<li>take a look at <a href="http://www.dabeaz.com/ply/" rel="nofollow">PLY</a>. That might allow you to define a complete language with its own grammar. Maybe not the best option for embedded languages.</li>
+<li>An other option would be to use <a href="https://docs.python.org/2/library/ast.html" rel="nofollow">ast</a>. To quote the doc: <em>"The <code>ast</code> module helps Python applications to process trees of the Python abstract syntax grammar."</em> That would allow you to parse a Python-like syntax. But providing your own semantic (take a look at <a href="https://docs.python.org/2/library/ast.html#ast.NodeTransformer" rel="nofollow">ast.NodeTransformer</a>)</li>
+</ul>
+</div>
+<span class="comment-copy">Enter the constraint as a string? <code>Constraint('x &gt; 10 and x &lt; 19')</code></span>
+<span class="comment-copy">This is what I did, actually. The problem is that then I should do parsing which I would like to avoid. More important is that the contents of the string correctness cannot be checked until it is actually parsed. Then the user may run his/her test several hours to discover that the constraint expression has a syntax error.</span>
+<span class="comment-copy">How about subclassing <code>Constraint</code>; <code>AndConstraint(x &gt; 10, x &lt; 19)</code>?</span>
+<span class="comment-copy">This makes the language clumsy in case I have several <code>and</code> and <code>or</code> conditions in my constraint :(</span>
+<span class="comment-copy">Could you edit the question to say what you've tried and/or dismissed so far and why, otherwise this is a waste of both of our time.</span>
+<span class="comment-copy">As I mentioned earlier, I cannot use bit-wise operators <code>&amp;</code>, <code>|</code>, and <code>~</code>, because I need them for their proper meaning. Using '_and', etc. is a better idea.</span>
+<span class="comment-copy">Ah.. in that case the AST rewriting solution would be a bit more tricky since you need to turn the BoolOps into function calls. But still not impossible!</span>
+<span class="comment-copy">As I mentioned earlier, I need bit-wise operators used with their proper meaning. <code>_and</code>, etc. is a better idea.</span>
+<span class="comment-copy">If I have to parse the entire source file, then I don't need lambda, and may internally amend my original example: <code>Constraint(x &gt; 10 and x &lt; 19)</code></span>
+<span class="comment-copy">That way <i>you</i> have to parse the source file and rewrite it. That's far uglier and more work (since you couldn't simply <code>import</code> it anymore without a custom import hook doing your rewriting/amending). By rewriting the AST you can simply do it during runtime.</span>
+<span class="comment-copy">IMHO that's even uglier than using the bitwise operators and parantheses</span>
+<span class="comment-copy">Yes, we have a precedence problem here.</span>
+<span class="comment-copy">To be honest, relying on the fact that <code>and</code> and <code>or</code> do not have random precedence is a horrible idea. IMHO that should actually be a SyntaxError because of the incredibly lack of readability you get when writing <code>foo or bar and foobar or blah</code> (would <i>you</i> know where the implicit parentheses go?)</span>
+<span class="comment-copy">I would prefer to avoid preprocessing. This is a rich source of errors and confusion.</span>
+<span class="comment-copy">@DmitryK. As explained by <i>ThiefMaster</i> in an other comment, using an <a href="https://docs.python.org/3/reference/import.html#import-hooks" rel="nofollow noreferrer">import hook</a> might allow you to "transform" your source transparently to the user. As of myself, I would strongly push toward using <code>ast</code>. But if "code manipulation" is not desirable, then I can't see other solutions beside the one you suggested yourself in the question.</span>

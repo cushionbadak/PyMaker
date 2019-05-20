@@ -1,0 +1,117 @@
+<div class="post-text" itemprop="text">
+<p>I am trying to make a program to make a lot of web-socket connections to the server I've created:</p>
+<pre><code>class WebSocketClient():
+
+    @asyncio.coroutine
+    def run(self):
+        print(self.client_id, 'Connecting')
+        ws = yield from aiohttp.ws_connect(self.url)
+        print(self.client_id, 'Connected')
+        print(self.client_id, 'Sending the message')
+        ws.send_str(self.make_new_message())
+
+        while not ws.closed:
+            msg = yield from ws.receive()
+
+            if msg.tp == aiohttp.MsgType.text:
+                print(self.client_id, 'Received the echo')
+                yield from ws.close()
+                break
+
+        print(self.client_id, 'Closed')
+
+
+@asyncio.coroutine
+def make_clients():
+
+    for client_id in range(args.clients):
+        yield from WebSocketClient(client_id, WS_CHANNEL_URL.format(client_id=client_id)).run()
+
+
+event_loop.run_until_complete(make_clients())
+</code></pre>
+<p>The problem is that all the clients do their jobs one after another:</p>
+<pre><code>0 Connecting
+0 Connected
+0 Sending the message
+0 Received the echo
+0 Closed
+1 Connecting
+1 Connected
+1 Sending the message
+1 Received the echo
+1 Closed
+...
+</code></pre>
+<p>I've tried to use <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.wait" rel="nofollow"><code>asyncio.wait</code></a>, but all the clients start together. I want them to be created gradually and connected to the server immediately once each of them is created. At the same time continuing creating new clients.</p>
+<p>What approach should I apply to accomplish this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Using <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.gather" rel="nofollow">asyncio.wait</a> is a good approach. You can combine it with <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.ensure_future" rel="nofollow">asyncio.ensure_future</a> and <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.sleep" rel="nofollow">asyncio.sleep</a> to create tasks gradually:</p>
+<pre><code>@asyncio.coroutine
+def make_clients(nb_clients, delay):
+    futures = []
+    for client_id in range(nb_clients):
+        url = WS_CHANNEL_URL.format(client_id=client_id)
+        coro = WebSocketClient(client_id, url).run()
+        futures.append(asyncio.ensure_future(coro))
+        yield from asyncio.sleep(delay)
+    yield from asyncio.wait(futures)
+</code></pre>
+<hr/>
+<p>EDIT: I implemented a <code>FutureSet</code> class that should do what you want. This set can be filled with futures and removes them automatically when they're done. It is also possible to wait for all the futures to complete.</p>
+<pre><code>class FutureSet:
+
+    def __init__(self, maxsize, *, loop=None):
+        self._set = set()
+        self._loop = loop
+        self._maxsize = maxsize
+        self._waiters = []
+
+    @asyncio.coroutine
+    def add(self, item):
+        if not asyncio.iscoroutine(item) and \
+           not isinstance(item, asyncio.Future):
+            raise ValueError('Expecting a coroutine or a Future')
+        if item in self._set:
+            return
+        while len(self._set) &gt;= self._maxsize:
+            waiter = asyncio.Future(loop=self._loop)
+            self._waiters.append(waiter)
+            yield from waiter
+        item = asyncio.async(item, loop=self._loop)    
+        self._set.add(item)
+        item.add_done_callback(self._remove)
+
+    def _remove(self, item):
+        if not item.done():
+            raise ValueError('Cannot remove a pending Future')
+        self._set.remove(item)
+        if self._waiters:
+            waiter = self._waiters.pop(0)
+            waiter.set_result(None)
+
+    @asyncio.coroutine
+    def wait(self):
+        return asyncio.wait(self._set)
+</code></pre>
+<p>Example:</p>
+<pre><code>@asyncio.coroutine
+def make_clients(nb_clients, limit=0):
+    futures = FutureSet(maxsize=limit)
+    for client_id in range(nb_clients):
+        url = WS_CHANNEL_URL.format(client_id=client_id)
+        client = WebSocketClient(client_id, url)
+        yield from futures.add(client.run())
+    yield from futures.wait()
+</code></pre>
+</div>
+<span class="comment-copy">you could <a href="http://stackoverflow.com/a/20722204/4279">use a semaphore to limit the number of concurrent connections</a></span>
+<span class="comment-copy">Please decorate WebSocketClient as <code>@coroutine</code></span>
+<span class="comment-copy">@AndrewSvetlov yes, it is decorated -- a copy/paste error</span>
+<span class="comment-copy">@J.F.Sebastian thanks, I will look into it</span>
+<span class="comment-copy"><code>asyncio.Queue</code> is a <i>final</i> class not intended for inheritance. Thus users should never derive own classes from <code>asyncio.Queue</code> even if it's technically possible.</span>
+<span class="comment-copy">@AndrewSvetlov I guess users might want to inherit from <code>asyncio.Queue</code> to create different kind of queues (such as <code>asyncio.PriorityQueue</code> or <code>asyncio.LifoQueue</code>) but in that case I've just been lazy :p I got rid of it anyway.</span>
+<span class="comment-copy">No, user cannot (at least should not). <code>LifoQueue</code> and <code>PriorityQueue</code> are <code>asyncio</code> classes, not intended for inheritance. The only <code>asyncio</code> classes intended for inheritance are <code>Protocol</code> and family. The state was pronounced by Guido van Rossum several times when we designed the library.</span>
+<span class="comment-copy">@AndrewSvetlov All right, that makes sense!</span>
+<span class="comment-copy">I'd just like to add that <code>asyncio.wait</code> returns 2 sets of futures - complete and pending. This wasn't very obviously to me from this example and took me by surprise (until I read the docs).</span>

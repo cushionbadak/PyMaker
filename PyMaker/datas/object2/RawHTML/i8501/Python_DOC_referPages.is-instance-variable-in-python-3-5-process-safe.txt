@@ -1,0 +1,175 @@
+<div class="post-text" itemprop="text">
+<p><strong>Testing Environment:</strong></p>
+<ul>
+<li>Python Version: 3.5.1</li>
+<li>OS Platform: Ubuntu 16.04</li>
+<li>IDE: PyCharm Community Edition 2016.3.2</li>
+</ul>
+<hr/>
+<p>I write a simple program to test process-safe. I find that <code>subprocess2</code> won't run until <code>subprocess1</code> finished. It seems that the instance variable <code>self.count</code> is process-safe.How the process share this variable? Does they share <code>self</code> directly?</p>
+<p>Another question is when I use Queue, I have to use <code>multiprocessing.Manager</code> to guarantees process safety manually, or the program won't run as expected.(If you uncomment <code>self.queue = multiprocessing.Queue()</code>, this program won't run normally, but using <code>self.queue = multiprocessing.Manager().Queue()</code> is OK.)</p>
+<p>The last question is why the final result is <code>900</code>? I think it should be <code>102</code>.</p>
+<p>Sorry for asking so many questions, but I'm indeed curious about these things. Thanks a lot!</p>
+<p><strong>Code:</strong></p>
+<pre><code>import multiprocessing
+import time
+class Test:
+    def __init__(self):
+        self.pool = multiprocessing.Pool(1)
+        self.count = 0
+        #self.queue = multiprocessing.Queue()
+        #self.queue = multiprocessing.Manager().Queue()
+
+    def subprocess1(self):
+        for i in range(3):
+            print("Subprocess 1, count = %d" %self.count)
+            self.count += 1
+            time.sleep(1)
+        print("Subprocess 1 Completed")
+
+    def subprocess2(self):
+        self.count = 100
+        for i in range(3):
+            print("Subprocess 2, count = %d" %self.count)
+            self.count += 1
+            time.sleep(1)
+        print("Subprocess 2 Completed")
+
+    def start(self):
+        self.pool.apply_async(func=self.subprocess1)
+        print("Subprocess 1 has been started")
+        self.count = 900
+        self.pool.apply_async(func=self.subprocess2)
+        print("Subprocess 2 has been started")
+        self.pool.close()
+        self.pool.join()
+
+    def __getstate__(self):
+        self_dict = self.__dict__.copy()
+        del self_dict['pool']
+        return self_dict
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+if __name__ == '__main__':
+    test = Test()
+    test.start()
+    print("Final Result, count = %d" %test.count)
+</code></pre>
+<p><strong>Output:</strong></p>
+<pre><code>Subprocess 1 has been started
+Subprocess 2 has been started
+Subprocess 1, count = 0
+Subprocess 1, count = 1
+Subprocess 1, count = 2
+Subprocess 1 Completed
+Subprocess 2, count = 100
+Subprocess 2, count = 101
+Subprocess 2, count = 102
+Subprocess 2 Completed
+Final Result, count = 900
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The underlying details are rather tricky (see <a href="https://docs.python.org/3/howto/descriptor.html#functions-and-methods" rel="nofollow noreferrer">the Python3 documentation</a> for more, and note that the details are slightly different for Python2), but essentially, when you pass <code>self.subprocess1</code> or <code>self.subprocess2</code> as an argument to <code>self.pool.apply_async</code>, Python ends up calling:</p>
+<pre><code>pickle.dumps(self)
+</code></pre>
+<p>in the main process—the initial one on Linux before <code>fork</code>ing, or the one invoked as <code>__main__</code> on Windows—and then, eventually, <code>pickle.loads()</code> of the resulting byte-string in the pool process.<sup>1</sup>  The <code>pickle.dumps</code> code winds up calling your own <code>__getstate__</code> function; that function's job is to return something that can be <a href="https://stackoverflow.com/q/8968884/1256452">serialized</a> to a byte-string.<sup>2</sup>  The subsequent <code>pickle.loads</code> creates a blank instance of the appropriate type, <em>does not</em> call its <code>__init__</code>, and then uses its <code>__setstate__</code> function to fill in the object (instead of <code>__init__</code>ing it).</p>
+<p>Your <code>__getstate__</code> returns the dictionary holding the state of <code>self</code>, minus the <code>pool</code> object, for good reason:</p>
+<pre><code>&gt;&gt;&gt; import multiprocessing
+&gt;&gt;&gt; x = multiprocessing.Pool(1)
+&gt;&gt;&gt; import pickle
+&gt;&gt;&gt; pickle.dumps(x)
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+  File "/usr/local/lib/python3.5/multiprocessing/pool.py", line 492, in __reduce__
+    'pool objects cannot be passed between processes or pickled'
+NotImplementedError: pool objects cannot be passed between processes or pickled
+</code></pre>
+<p>Since pool objects refuse to be pickled (serialized), we must avoid even attempting to do that.</p>
+<p>In any case, all of this means that the pool process has <em>its own copy</em> of <code>self</code>, which has its own copy of <code>self.count</code> (and is missing <code>self.pool</code> entirely).  These items are not shared in any way so it is safe to modify <code>self.count</code> there.</p>
+<p>I find the simplest mental model of this is to give each worker process a name: Alice, Bob, Carol, and so on, if you like.  You can then think of the main process as "you": you copy something and give the copy to Alice, then copy it and give that one to Bob, and so on.  Function calls, such as <code>apply</code> or <code>apply_async</code>, copy all of their arguments—including the implied <code>self</code> for bound methods.</p>
+<p>When using a <code>multiprocessing.Queue</code>, you get something that knows how to work between the various processes, sharing data as needed, with appropriate synchronization.  This lets you pass copies of data back and forth.  However, like a <code>pool</code> instance, a <code>multiprocessing.Queue</code> instance cannot be copied.  The <code>multiprocessing</code> routines <em>do</em> let you copy a <code>multiprocessing.Manager().Queue()</code> instance, which is good if you want a copied and otherwise private <code>Queue()</code> instance.  (The internal details of this are complicated.<sup>3</sup>)</p>
+<p>The final result you get is just <code>900</code> because you are looking <em>only</em> at the original <code>self</code> object.</p>
+<p>Note that each applied functions (from <code>apply</code> or <code>apply_async</code>) returns a result.  This result is copied <em>back</em>, from the worker process to the main process.  With <code>apply_async</code>, you may choose to get called back as soon as the result is ready.  If you want this result <a href="https://stackoverflow.com/a/8533626/1256452">you should save it somewhere</a>, or use the <code>get</code> function (as shown in that same answer) to wait for it when you need it.</p>
+<hr/>
+<p><sup>1</sup>We can say "the" pool process here without worrying about which one, as you limited yourself to just one.  In any case, though, there is a simple byte-oriented, two-way communications stream, managed by the <code>multiprocessing</code> code, connecting each worker process with the parent process that invoked it.  If you create two such pool processes, each one has its own byte-stream connecting to the main process.  This means it would not matter if there were two or more: the behavior would be the same.</p>
+<p><sup>2</sup>This "something" is often a dictionary, but see <a href="https://stackoverflow.com/q/1939058/1256452">Simple example of use of __setstate__ and __getstate__</a> for details.</p>
+<p><sup>3</sup>The output of <code>pickle.dumps</code> on such an instance is:</p>
+<pre><code>&gt;&gt;&gt; pickle.dumps(y)
+(b'\x80\x03cmultiprocessing.managers\n'
+b'RebuildProxy\n'
+b'q\x00(cmultiprocessing.managers\n'
+b'AutoProxy\n'
+b'q\x01cmultiprocessing.managers\n'
+b'Token\n'
+b'q\x02)\x81q\x03X\x05\x00\x00\x00Queueq\x04X$\x00\x00\x00/tmp/pymp-pog4bhub/listener-0_uwd8c9q\x05X\t\x00\x00\x00801b92400q\x06\x87q\x07bX\x06\x00\x00\x00pickleq\x08}q\tX\x07\x00\x00\x00exposedq\n'
+b'(X\x05\x00\x00\x00emptyq\x0bX\x04\x00\x00\x00fullq\x0cX\x03\x00\x00\x00getq\rX\n'
+b'\x00\x00\x00get_nowaitq\x0eX\x04\x00\x00\x00joinq\x0fX\x03\x00\x00\x00putq\x10X\n'
+b'\x00\x00\x00put_nowaitq\x11X\x05\x00\x00\x00qsizeq\x12X\t\x00\x00\x00task_doneq\x13tq\x14stq\x15Rq\x16.\n')
+</code></pre>
+<p>I did a little trickiness to split this at newlines and then manually added the parentheses, just to keep the long line from being super-long.  The arguments will vary on different systems; this particular one uses a file system object that is a listener socket, that allows cooperating Python processes to establish a <em>new</em> byte stream between themselves.</p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p><strong>Question</strong>: ... why the final result is 900? I think it should be 102.  </p>
+</blockquote>
+<p>The result should be 106, <code>range</code> are <code>0</code> based, you get <strong>3</strong> iterations.</p>
+<p>You can get the expected output, for instance:</p>
+<pre><code>class PoolTasks(object):
+    def __init__(self):
+        self.count = None
+
+    def task(self, n, start):
+        import os
+        pid = os.getpid()
+        count = start
+        print("Task %s in Process %s has been started - start=%s" % (n, pid, count))
+
+        for i in range(3):
+            print("Task %s in Process %s, count = %d " % (n, pid, count))
+            count += 1
+            time.sleep(1)
+
+        print("Task %s in Process %s has been completed - count=%s" % (n, pid, count))
+        return count
+
+    def start(self):
+        with mp.Pool(processes=4) as pool:
+            # launching multiple tasks asynchronously using processes
+            multiple_results = [pool.apply_async(self.task, (p)) for p in [(1, 0), (2, 100)]]
+
+            # sum result from tasks
+            self.count = 0
+            for res in multiple_results:
+                self.count += res.get()
+
+if __name__ == '__main__':
+    pool = PoolTasks()
+    pool.start()
+    print('sum(count) = %s' % pool.count)
+</code></pre>
+<blockquote>
+<p><strong>Output</strong>:<br/>
+  Task 1 in Process 5601 has been started - start=0<br/>
+  Task 1 in Process 5601, count = 0<br/>
+  Task 2 in Process 5602 has been started - start=100<br/>
+  Task 2 in Process 5602, count = 100<br/>
+  Task 1 in Process 5601, count = 1<br/>
+  Task 2 in Process 5602, count = 101<br/>
+  Task 1 in Process 5601, count = 2<br/>
+  Task 2 in Process 5602, count = 102<br/>
+  Task 1 in Process 5601 has been completed - count=3<br/>
+  Task 2 in Process 5602 has been completed - count=103<br/>
+  sum(count) = 106  </p>
+</blockquote>
+<p><strong><em>Tested with Python:3.4.2</em></strong> </p>
+</div>
+<span class="comment-copy">The rules are different for unix-like systems and Windows. What platform are you on?</span>
+<span class="comment-copy">@tdelaney Sorry for lack of these information. Testing Environment has been added. Thanks.</span>
+<span class="comment-copy">Hi, thank you for your detailed answer. It helps me a lot and does indeed give me some tips about how to dig deep into Python programming.</span>
+<span class="comment-copy">This is a much better way to write the code, but it does not explain why the code-as-written behaves the way it does. I had the impression the poster wanted to know how it all works at the bottom level.</span>
+<span class="comment-copy">@torek: Agree with you, I want to show the OP a different view how it could be done.</span>
+<span class="comment-copy">Hi, stovfl, thank you as well for your answer. Thanks!</span>
+<span class="comment-copy">@torek Yes, you are right. I want to know the internal principle of my code.</span>

@@ -1,0 +1,44 @@
+<div class="post-text" itemprop="text">
+<p>I'm writing a Python server for a telnet-like protocol.  Clients connect and authenticate a session, and then issue a series of commands that each have a response.  The sessions have state, in the sense that a user authenticates once and then it's assumed that subsequent commands are performed by that user.  The command/response operations in different sessions are effectively independent, although they do involve reads and occasional writes to a shared IO resource (postgres) that is largely capable of managing its own concurrency.  </p>
+<p>It's a design goal to support a large number of users with a small number of 8 or 16-core servers.  I'm looking for a reasonably efficient way to architect the server implementation.</p>
+<p>Some options I've considered include:</p>
+<ul>
+<li>Using threads for each session; I suspect with the GIL this will make poor use of available cores</li>
+<li>Using multiple processes for each session; I suspect that with a high ratio of sessions to servers (1000-to-1, say) the overhead of 1000 python interpreters may exceed memory limitations.  You also have a "slow start" problem when a user connects.</li>
+<li>Assigning sessions to process pools of 32 or so processes; idle sessions may get assigned to all 32 processes and prevent non-idle sessions from being processed.</li>
+<li>Using some type of "routing" system where all sessions are handled by a single process and then individual commands are farmed out to a process pool.  This still sounds substantially single-threaded to me (as there's a big single-threaded bottleneck), and this system may introduce substantial overhead if some commands are very trivial but must cross an IPC boundary two times and wait for a free process to get a response.</li>
+<li>Use Jython/IronPython and multithreading; lack of C extensions is a concern</li>
+<li>Python isn't a good fit for this problem; use Go/C++/Scala/Java either as a router for Python processes or abandon Python completely.</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>Using threads for each session; I suspect with the GIL this will make poor use of available cores</p>
+</blockquote>
+<p>Is your code actually CPU-bound?* If it spends all its time waiting on I/O, then the GIL doesn't matter at all.** So there's absolutely no reason to use processes, or a GIL-less Python implementation.</p>
+<hr/>
+<p>Of course if your code <em>is</em> CPU-bound, then you should definitely use processes or a GIL-less implementation. But in that case, you're really only going to be able to efficiently handle N clients at a time with N CPUs, which is a very different problem than the one you're describing. Having 10000 users all fighting to run CPU-bound code on 8 cores is just going to frustrate all of them. The only way to solve that is to only handle, say, 8 or 32 at a time, which means the whole "10000 simultaneous connections" problem doesn't even arise.</p>
+<p>So, I'll assume your code I/O-bound and your problem is a sensible and solvable one.</p>
+<hr/>
+<p>There are <em>other</em> reasons threads can be limiting. In particular, if you want to handle 10000 simultaneous clients, your platform probably can't run 10000 simultaneous threads (or can't switch between them efficiently), so this will not work. But in that case, processes usually won't help either (in fact, on some platforms, they'll just make things a lot worse).</p>
+<p>For that, you need to use some kind of asynchronous networking—either a proactor (a small thread pool and I/O completion), or a reactor (a single-threaded event loop around an I/O readiness multiplexer). The <a href="http://docs.python.org/3/howto/sockets.html" rel="nofollow">Socket Programming HOWTO</a> in the Python docs shows how to do this with <code>select</code>; doing it with more powerful mechanisms is a bit more complicated, and a lot more platform-specific, but not that much harder.</p>
+<p>However, there are libraries that make this a lot easier. Python 3.4 comes with <a href="http://docs.python.org/3.4/library/asyncio.html" rel="nofollow"><code>asyncio</code></a>,*** which lets you abstract all the obnoxious details out and just write <em>protocols</em> that talk to <em>transports</em> via coroutines. Under the covers, there's either a reactor or a proactor (and a <em>good</em> one for each platform), without you having to worry about it.</p>
+<p>If you can't wait for 3.4 to be finalized, or want to use something that's less-bleeding-edge, there are popular third-party frameworks like <a href="http://twistedmatrix.com" rel="nofollow">Twisted</a>, which have other advantages as well.****</p>
+<p>Or, if you prefer to think in a threaded paradigm, you can use a library like <a href="http://www.gevent.org" rel="nofollow"><code>gevent</code></a>, while uses greenlets to <em>fake</em> a bunch of threads on a single socket on top of a reactor.</p>
+<hr/>
+<p>From your comments, it sounds like you really have <em>two</em> problems:</p>
+<p>First, you need to handle 10000 connections that are mostly sitting around doing nothing. The actual scheduling and multiplexing of 10000 connections is itself a major I/O bound if you try to do it with something like <code>select</code>, and as I said about, running 10000 threads or processes is not going to work. So, you need a good proactor or reactor for your platform, which is all described above.</p>
+<p>Second, a few of those connections will be alive at a time.</p>
+<p>First, for simplicity, let's assume it's all CPU-bound. So you will want processes. In particular, you want a pool of N processes, where N is the number of cores. Which you do by just creating a <code>concurrent.futures.ProcessPoolExecutor()</code> or <code>multiprocessing.Pool()</code>.</p>
+<p>But you claim they're doing a mix of CPU-bound and I/O-bound work. If all the tasks spend, say, 1/4th of their time burning CPU, use 4N processes instead. There's a bit of wasted overhead in context switching, but you're unlikely to notice it. You can get <code>N</code> as <code>n = multiprocessing.cpu_count()</code>; then use <code>ProcessPoolExecutor(4*n)</code> or <code>Pool(4*n)</code>. If they're not that consistent or predictable, you can still almost always pretend they are—measure average CPU time over a bunch of tasks, and use <code>n/avg</code>. You can fudge this up or down depending on whether you're more concerned with maximizing peak performance or typical performance, but it's just one knob to twiddle, and you can just twiddle it empirically.</p>
+<p>And that's it.*****</p>
+<hr/>
+<p>* … and in Python or in C extensions that don't release the GIL. If you're using, e.g., NumPy, it will do much of its slow work without holding the GIL.</p>
+<p>** Well, it matters before Python 3.2. But hopefully if you're already using 3.x you can upgrade to 3.2+.</p>
+<p>*** There's also <a href="http://docs.python.org/3.4/library/asyncore.html" rel="nofollow"><code>asyncore</code></a> and its friend <code>asynchat</code>, which have been in the stdlib for decades, but you're better off just ignoring them.</p>
+<p>**** For example, frameworks like Twisted are chock full of protocol implementations and wrappers and adaptors and so on to tie all kinds of other functionality in without having to write a mess of complicated code yourself.</p>
+<p>***** What if it really isn't good enough, and the task switching overhead or the idleness when all of your tasks happen to be I/O-waiting at the same time kills performance? Well, those are both very unlikely except in specific kinds of apps. If it happens, you will need to either break your tasks up to separate out the actual CPU-bound subtasks from the I/O-bound, or write some kind of application-specific adaptive load balancer.</p>
+</div>
+<span class="comment-copy">You should try something like twisted, gevent or tornado.</span>
+<span class="comment-copy">The answer to "is your code CPU-bound" is complicated.  The short answer is that commands that a user issues during the session are a heterogeneous mixture of CPU-bound and I-O bound calls.  So both CPU-bound and IO-bound styles need to be considered.  It's worth pointing out that most sessions are idle most of the time.  So supporting 10,000 simultaneous (mostly idle) sessions that can issue CPU-bound commands is a very real possibility.  It's also worth pointing out that <i>most</i> I/O-bound commands are fast (e.g. lock-free reads), although there are exceptions.</span>
+<span class="comment-copy">@Drew: OK, let me edit the answer.</span>

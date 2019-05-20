@@ -1,0 +1,154 @@
+<div class="post-text" itemprop="text">
+<p>I am encountering a picklability problem in this <a href="http://eli.thegreenplace.net/2012/01/24/distributed-computing-in-python-with-multiprocessing/" rel="nofollow noreferrer">code</a> (also attached below). I have read relevant posts <a href="https://stackoverflow.com/questions/7865430/multiprocessing-pool-picklingerror-cant-pickle-type-thread-lock-attribu">[1]</a> <a href="https://stackoverflow.com/questions/1816958/cant-pickle-type-instancemethod-when-using-pythons-multiprocessing-pool-ma">[2]</a> but I can not find usefull correspodences. Could you please give an explanation or solution of this error?</p>
+<p>Below these is the part of the code that returns the error:</p>
+<pre><code>pickle.PicklingError: Can't pickle &lt;class '__main__.JobQueueManager'&gt;: it's not found as __main__.JobQueueManager
+</code></pre>
+<p>Thanks!</p>
+<pre><code>def make_server_manager(port, authkey):
+
+    job_q = Queue.Queue()
+    result_q = Queue.Queue()
+
+    class JobQueueManager(SyncManager):
+        pass
+
+    JobQueueManager.register('get_job_q', callable=lambda: job_q)
+    JobQueueManager.register('get_result_q', callable=lambda: result_q)
+
+    manager = JobQueueManager(address=('', port), authkey=authkey)
+    manager.start()
+    print 'Server started at port %s' % port
+    return manager
+</code></pre>
+<p><sup>PS: Python 2.7.7, Win 7</sup> </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As best as I can tell, to make this pattern work on Windows, you need to create a picklable <code>queue.Queue</code>. You can do that by creating a child class of <code>Queue</code> that defines <a href="https://docs.python.org/3/library/pickle.html#object.__getstate__" rel="nofollow"><code>__setstate__</code> and <code>__getstate__</code></a>, and have it only pickle the pieces of state that we actually need to send between processes, and leave the other stuff (unpicklable internal locks) out.</p>
+<p>The other changes we need to make are to move the custom <code>Manager</code> class definitions to the top-level, and to not use <code>lambda</code> functions as the argument to <code>callable</code>. Instead, we use a <code>partial</code> and a top-level function, because that can be pickled. Here's the final code:</p>
+<pre><code>import sys
+from multiprocessing.managers import SyncManager
+from functools import partial
+import multiprocessing
+from Queue import Queue as _Queue
+
+class Queue(_Queue):
+    """ A picklable queue. """   
+    def __getstate__(self):
+        # Only pickle the state we care about
+        return (self.maxsize, self.queue, self.unfinished_tasks)
+
+    def __setstate__(self, state):
+        # Re-initialize the object, then overwrite the default state with
+        # our pickled state.
+        Queue.__init__(self)
+        self.maxsize = state[0]
+        self.queue = state[1]
+        self.unfinished_tasks = state[2]
+
+
+def get_q(q):
+    return q
+
+class JobQueueManager(SyncManager):
+    pass
+
+
+def make_server_manager(port, authkey):
+    job_q = Queue()
+    result_q = Queue()
+
+    job_q.put("hey")
+    JobQueueManager.register('get_job_q', callable=partial(get_q, job_q))
+    JobQueueManager.register('get_result_q', callable=partial(get_q, result_q))
+
+    manager = JobQueueManager(address=('', port), authkey=authkey)
+    #manager.start()
+    print('Server started at port %s' % port)
+    return manager
+
+def make_client_manager(port, authkey):
+    JobQueueManager.register('get_job_q')
+    JobQueueManager.register('get_result_q')
+    manager = JobQueueManager(address=('localhost', port), authkey=authkey)
+    manager.connect()
+    queue = manager.get_job_q()
+    print("got queue {}".format(queue))
+    print(queue.get_nowait())
+
+if __name__ == "__main__":
+    if len(sys.argv) &gt; 1 and sys.argv[1] == "--client":
+        make_client_manager(50000, 'abcdefg')
+    else:
+        manager = make_server_manager(50000, "abcdefg")
+        server = manager.get_server()
+        server.serve_forever()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You need to have <code>Queue.Queue</code> pickleable, as well as your <code>lambda</code> functions, and your <code>JobQueueManager</code>.</p>
+<p>To do that, I think you can be very lazy about it, and all you need to do is to get the <code>dill</code> package and <code>import dill</code>.</p>
+<p>I didn't test on windows, but it should work as below. <code>dill</code> is available here: <a href="https://github.com/uqfoundation" rel="nofollow">https://github.com/uqfoundation</a>.</p>
+<pre><code>&gt;&gt;&gt; import dill
+&gt;&gt;&gt; import Queue
+&gt;&gt;&gt; from multiprocessing.managers import SyncManager
+&gt;&gt;&gt; 
+&gt;&gt;&gt; def make_server_manager(port, authkey):
+...   job_q = Queue.Queue()
+...   result_q = Queue.Queue()
+...   class JobQueueManager(SyncManager):
+...     pass
+...   JobQueueManager.register('get_job_q', callable=lambda: job_q)
+...   JobQueueManager.register('get_result_q', callable=lambda: result_q)
+...   manager = JobQueueManager(address=('',port), authkey=authkey)
+...   manager.start()
+...   print "server started at port %s" % port
+...   return manager
+... 
+&gt;&gt;&gt; sm = make_server_manager(12345, 'foofoo')
+server started at port 12345
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <code>multiprocessing</code> library gives you a solution out of the box - <a href="https://docs.python.org/3.6/library/multiprocessing.html#pipes-and-queues" rel="nofollow"><code>multiprocessing.Queue</code></a> which should be automatically picklable everywhere, even on Windows (and works as far back as <a href="https://docs.python.org/2.7/library/multiprocessing.html#pipes-and-queues" rel="nofollow">2.7</a>).</p>
+<p>Trying to make <code>Queue.Queue</code> picklable seems like a bad idea to me.  You aren't going to get one queue that you can use from two different processes - you're going to get an independent copy of that queue in the other process.  </p>
+<p>If you wanted to have a copy of the current state of the queue in another process, it'd be much less work to extract all the elements in the queue as a plain old list which pickles for free (if all the elements are picklable), send the list over, and then reconstitute a new <code>Queue.Queue</code> on the other side.</p>
+<p>Also, as I imagine you have discovered by now, you cannot pickle local lambdas - how would that even work?  Instead, create a function global to that namespace, and send that global function over, with the required data.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Try:</p>
+<pre><code>class JobQueueManager(SyncManager):
+        pass
+
+def make_server_manager(port, authkey):
+
+    job_q = Queue.Queue()
+    result_q = Queue.Queue()
+
+    JobQueueManager.register('get_job_q', callable=lambda: job_q)
+    JobQueueManager.register('get_result_q', callable=lambda: result_q)
+
+    manager = JobQueueManager(address=('', port), authkey=authkey)
+    manager.start()
+    print 'Server started at port %s' % port
+    return manager
+</code></pre>
+<p>Moving the definition of the class to where pickle can find it should allow pickling. Pickle will look in the <code>__main__</code> module for the class, but with your code, it cannot find it, as it is inside the function.
+However, as pointed out in the comments, the manager shouldn't need to be pickled, so another object must be dragging it in, such as a function containing the manager in its globals.</p>
+</div>
+<span class="comment-copy">You need to include the full traceback, and the code that's actually being called when the exception is raised.</span>
+<span class="comment-copy">Due to some limitations in Python's multiprocessing module, all objects in the new process must be pickle-able. Only module level classes and functions can be pickled. Ergo, <code>JobQueueManager</code> must be defined at the top level.</span>
+<span class="comment-copy">Thanks for answering, unfortunately with a quick test returns: <code>super().__init__(*args, **kwargs) TypeError: super() takes at least 1 argument (0 given)</code>. Thanks again:)</span>
+<span class="comment-copy">@Thoth Should be fixed now.</span>
+<span class="comment-copy">Just amazed with the quick response but a new <b>EOF</b> error returned with path: <code>runserver() =&gt; manager = make_server_manager(PORTNUM, AUTHKEY) =&gt; manager.start() =&gt; self._address = reader.recv()</code>. Thanks again!</span>
+<span class="comment-copy">@Thoth Sorry, I forgot that <code>Queue</code> is an old-style class in Python 2. I think I've fixed all the issues. Unfortunately I don't have a Windows system available for me to test for myself.</span>
+<span class="comment-copy">@dano: If only one could virtualenv a windows box, then dispose of summarily.  (I know there are VMs for that, but I'm just saying...)</span>
+<span class="comment-copy">I believe SO rules state that you should disclose that you're the author of <code>dill</code>.</span>
+<span class="comment-copy">Ok, that's easy.  I'm the author of <code>dill</code>… and also of the other packages I mentioned.  They've been around for several years.</span>
+<span class="comment-copy">@Mike McKerns, sorry for the delay, I test your code and it seems that it is running but with the <code>class</code> defined just above the function. However, when I am running the whole code returns: <code>pickle.PicklingError: Can't pickle &lt;function &lt;lambda&gt; at 0x000000000298EAC8&gt;: it 's not found as __main__.&lt;lambda&gt;</code>. Thanks for your answer!</span>
+<span class="comment-copy">@Thoth: and if you define <code>job_f = lambda: job_q</code> and <code>result_f = lambda: result_q</code> on the line above registering them to the <code>JobQueueManager</code>, does it find your lambdas?</span>
+<span class="comment-copy">@Mike McKerns, I have done your suggestion: <code>job_f = lambda: job_q JobQueueManager.register('get_job_q', job_f)</code> and <code>result_f = lambda: result_q JobQueueManager.register('get_result_q', result_f)</code> but returna the same erros. Thanks for your response you helpis valuable for making it run.</span>
+<span class="comment-copy">you beat me to it.</span>
+<span class="comment-copy">I'm not sure that <code>JobQueueManager</code> should be getting pickled to begin with, though. Generally you shouldn't be trying to send <code>multiprocessing.Manager</code> objects between processes.</span>
+<span class="comment-copy">@matsjoyce thanks for your response, I have already tested and returns: pickle.PicklingError: Can't pickle &lt;function &lt;lambda&gt; at 0x000000000287B3C8&gt;: it 's not found as <b>main</b>.&lt;lambda&gt;`. :)</span>
+<span class="comment-copy">@matsjoyce There are lambdas being used in the <code>JobQueueManager.register</code> calls. I think that the code he's basing this off of (as well as the section of the <code>multiprocessing</code> docs that covers using remote managers) are not written in a way that make them compatible with Windows.</span>
+<span class="comment-copy">@matsjoyce The lambdas are easy to remove. The problem is that the entire solution is based on passing existing queue objects to the manager process, but you can't do that on Windows.</span>

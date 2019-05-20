@@ -1,0 +1,285 @@
+<div class="post-text" itemprop="text">
+<p>I'm having a hard time wrapping my brain around <a href="http://www.python.org/dev/peps/pep-0380/" rel="noreferrer">PEP 380</a>.</p>
+<ol>
+<li>What are the situations where "yield from" is useful? </li>
+<li>What is the classic use case?</li>
+<li>Why is it compared to micro-threads?</li>
+</ol>
+<p>[ update ]</p>
+<p>Now I understand the cause of my difficulties. I've used generators, but never really used coroutines (introduced by <a href="http://www.python.org/dev/peps/pep-0342/" rel="noreferrer">PEP-342</a>). Despite some similarities, generators and coroutines are basically two different concepts. Understanding coroutines (not only generators) is the key to understanding the new syntax.</p>
+<p>IMHO <strong>coroutines are the most obscure Python feature</strong>, most books make it look useless and uninteresting.</p>
+<p>Thanks for the great answers, but special thanks to <a href="https://stackoverflow.com/users/500584/agf">agf</a> and his comment linking to <a href="http://www.dabeaz.com/coroutines/" rel="noreferrer">David Beazley presentations</a>. David rocks.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Let's get one thing out of the way first. The explanation that <code>yield from g</code> is equivalent to <code>for v in g: yield v</code> <strong>does not even begin to do justice</strong> to what <code>yield from</code> is all about. Because, let's face it, if all <code>yield from</code> does is expand the <code>for</code> loop, then it does not warrant adding <code>yield from</code> to the language and preclude a whole bunch of new features from being implemented in Python 2.x.</p>
+<p>What <code>yield from</code> does is it <strong><em>establishes a transparent bidirectional connection between the caller and the sub-generator</em></strong>:</p>
+<ul>
+<li><p>The connection is "transparent" in the sense that it will propagate everything correctly too, not just the elements being generated (e.g. exceptions are propagated).</p></li>
+<li><p>The connection is "bidirectional" in the sense that data can be both sent <em>from</em> and <em>to</em> a generator.</p></li>
+</ul>
+<p>(<em>If we were talking about TCP, <code>yield from g</code> might mean "now temporarily disconnect my client's socket and reconnect it to this other server socket".</em>)</p>
+<p>BTW, if you are not sure what <em>sending data to a generator</em> even means, you need to drop everything and read about <em>coroutines</em> first—they're very useful (contrast them with <em>subroutines</em>), but unfortunately lesser-known in Python. <a href="http://dabeaz.com/coroutines/" rel="noreferrer">Dave Beazley's Curious Course on Couroutines</a> is an excellent start. <a href="http://dabeaz.com/coroutines/Coroutines.pdf" rel="noreferrer">Read slides 24-33</a> for a quick primer.</p>
+<h2>Reading data from a generator using yield from</h2>
+<pre><code>def reader():
+    """A generator that fakes a read from a file, socket, etc."""
+    for i in range(4):
+        yield '&lt;&lt; %s' % i
+
+def reader_wrapper(g):
+    # Manually iterate over data produced by reader
+    for v in g:
+        yield v
+
+wrap = reader_wrapper(reader())
+for i in wrap:
+    print(i)
+
+# Result
+&lt;&lt; 0
+&lt;&lt; 1
+&lt;&lt; 2
+&lt;&lt; 3
+</code></pre>
+<p>Instead of manually iterating over <code>reader()</code>, we can just <code>yield from</code> it.</p>
+<pre><code>def reader_wrapper(g):
+    yield from g
+</code></pre>
+<p>That works, and we eliminated one line of code. And probably the intent is a little bit clearer (or not). But nothing life changing.</p>
+<h2>Sending data to a generator (coroutine) using yield from - Part 1</h2>
+<p>Now let's do something more interesting. Let's create a coroutine called <code>writer</code> that accepts data sent to it and writes to a socket, fd, etc.</p>
+<pre><code>def writer():
+    """A coroutine that writes data *sent* to it to fd, socket, etc."""
+    while True:
+        w = (yield)
+        print('&gt;&gt; ', w)
+</code></pre>
+<p>Now the question is, how should the wrapper function handle sending data to the writer, so that any data that is sent to the wrapper is <em>transparently</em> sent to the <code>writer()</code>?</p>
+<pre><code>def writer_wrapper(coro):
+    # TBD
+    pass
+
+w = writer()
+wrap = writer_wrapper(w)
+wrap.send(None)  # "prime" the coroutine
+for i in range(4):
+    wrap.send(i)
+
+# Expected result
+&gt;&gt;  0
+&gt;&gt;  1
+&gt;&gt;  2
+&gt;&gt;  3
+</code></pre>
+<p>The wrapper needs to <em>accept</em> the data that is sent to it (obviously) and should also handle the <code>StopIteration</code> when the for loop is exhausted. Evidently just doing <code>for x in coro: yield x</code> won't do. Here is a version that works.</p>
+<pre><code>def writer_wrapper(coro):
+    coro.send(None)  # prime the coro
+    while True:
+        try:
+            x = (yield)  # Capture the value that's sent
+            coro.send(x)  # and pass it to the writer
+        except StopIteration:
+            pass
+</code></pre>
+<p>Or, we could do this.</p>
+<pre><code>def writer_wrapper(coro):
+    yield from coro
+</code></pre>
+<p>That saves 6 lines of code, make it much much more readable and it just works. Magic!</p>
+<h2>Sending data to a generator yield from - Part 2 - Exception handling</h2>
+<p>Let's make it more complicated. What if our writer needs to handle exceptions? Let's say the <code>writer</code> handles a <code>SpamException</code> and it prints <code>***</code> if it encounters one.</p>
+<pre><code>class SpamException(Exception):
+    pass
+
+def writer():
+    while True:
+        try:
+            w = (yield)
+        except SpamException:
+            print('***')
+        else:
+            print('&gt;&gt; ', w)
+</code></pre>
+<p>What if we don't change <code>writer_wrapper</code>? Does it work? Let's try</p>
+<pre><code># writer_wrapper same as above
+
+w = writer()
+wrap = writer_wrapper(w)
+wrap.send(None)  # "prime" the coroutine
+for i in [0, 1, 2, 'spam', 4]:
+    if i == 'spam':
+        wrap.throw(SpamException)
+    else:
+        wrap.send(i)
+
+# Expected Result
+&gt;&gt;  0
+&gt;&gt;  1
+&gt;&gt;  2
+***
+&gt;&gt;  4
+
+# Actual Result
+&gt;&gt;  0
+&gt;&gt;  1
+&gt;&gt;  2
+Traceback (most recent call last):
+  ... redacted ...
+  File ... in writer_wrapper
+    x = (yield)
+__main__.SpamException
+</code></pre>
+<p>Um, it's not working because <code>x = (yield)</code> just raises the exception and everything comes to a crashing halt. Let's make it work, but manually handling exceptions and sending them or throwing them into the sub-generator (<code>writer</code>)</p>
+<pre><code>def writer_wrapper(coro):
+    """Works. Manually catches exceptions and throws them"""
+    coro.send(None)  # prime the coro
+    while True:
+        try:
+            try:
+                x = (yield)
+            except Exception as e:   # This catches the SpamException
+                coro.throw(e)
+            else:
+                coro.send(x)
+        except StopIteration:
+            pass
+</code></pre>
+<p>This works.</p>
+<pre><code># Result
+&gt;&gt;  0
+&gt;&gt;  1
+&gt;&gt;  2
+***
+&gt;&gt;  4
+</code></pre>
+<p>But so does this!</p>
+<pre><code>def writer_wrapper(coro):
+    yield from coro
+</code></pre>
+<p>The <code>yield from</code> transparently handles sending the values or throwing values into the sub-generator.</p>
+<p>This still does not cover all the corner cases though. What happens if the outer generator is closed? What about the case when the sub-generator returns a value (yes, in Python 3.3+, generators can return values), how should the return value be propagated? <a href="https://www.python.org/dev/peps/pep-0380/#formal-semantics" rel="noreferrer">That <code>yield from</code> transparently handles all the corner cases is really impressive</a>. <code>yield from</code> just magically works and handles all those cases.</p>
+<p>I personally feel <code>yield from</code> is a poor keyword choice because it does not make the <em>two-way</em> nature apparent. There were other keywords proposed (like <code>delegate</code> but were rejected because adding a new keyword to the language is much more difficult than combining existing ones.</p>
+<p>In summary, it's best to think of <code>yield from</code> as a <strong><code>transparent two way channel</code></strong> between the caller and the sub-generator.</p>
+<p>References:</p>
+<ol>
+<li><a href="http://www.python.org/dev/peps/pep-0380/" rel="noreferrer">PEP 380</a> - Syntax for delegating to a sub-generator (Ewing) [v3.3, 2009-02-13]</li>
+<li><a href="http://www.python.org/dev/peps/pep-0342/" rel="noreferrer">PEP 342</a> -
+Coroutines via Enhanced Generators (GvR, Eby) [v2.5, 2005-05-10]</li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>What are the situations where "yield from" is useful?</p>
+</blockquote>
+<p>Every situation where you have a loop like this:</p>
+<pre><code>for x in subgenerator:
+  yield x
+</code></pre>
+<p>As the PEP describes, this is a rather naive attempt at using the subgenerator, it's missing several aspects, especially the proper handling of the <code>.throw()</code>/<code>.send()</code>/<code>.close()</code> mechanisms introduced by <a href="http://www.python.org/dev/peps/pep-0342/">PEP 342</a>. To do this properly, <a href="http://www.python.org/dev/peps/pep-0380/#formal-semantics">rather complicated</a> code is necessary.</p>
+<blockquote>
+<p>What is the classic use case?</p>
+</blockquote>
+<p>Consider that you want to extract information from a recursive data structure. Let's say we want to get all leaf nodes in a tree:</p>
+<pre><code>def traverse_tree(node):
+  if not node.children:
+    yield node
+  for child in node.children:
+    yield from traverse_tree(child)
+</code></pre>
+<p>Even more important is the fact that until the <code>yield from</code>, there was no simple method of refactoring the generator code. Suppose you have a (senseless) generator like this:</p>
+<pre><code>def get_list_values(lst):
+  for item in lst:
+    yield int(item)
+  for item in lst:
+    yield str(item)
+  for item in lst:
+    yield float(item)
+</code></pre>
+<p>Now you decide to factor out these loops into separate generators. Without <code>yield from</code>, this is ugly, up to the point where you will think twice whether you actually want to do it. With <code>yield from</code>, it's actually nice to look at:</p>
+<pre><code>def get_list_values(lst):
+  for sub in [get_list_values_as_int, 
+              get_list_values_as_str, 
+              get_list_values_as_float]:
+    yield from sub(lst)
+</code></pre>
+<blockquote>
+<p>Why is it compared to micro-threads?</p>
+</blockquote>
+<p>I think what <a href="http://www.python.org/dev/peps/pep-0380/#generators-as-threads">this section in the PEP</a> is talking about is that every generator does have its own isolated execution context. Together with the fact that execution is switched between the generator-iterator and the caller using <code>yield</code> and <code>__next__()</code>, respectively, this is similar to threads, where the operating system switches the executing thread from time to time, along with the execution context (stack, registers, ...).</p>
+<p>The effect of this is also comparable: Both the generator-iterator and the caller progress in their execution state at the same time, their executions are interleaved. For example, if the generator does some kind of computation and the caller prints out the results, you'll see the results as soon as they're available. This is a form of concurrency.</p>
+<p>That analogy isn't anything specific to <code>yield from</code>, though - it's rather a general property of generators in Python.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Wherever you invoke a generator from within a generator you need a "pump" to re-<code>yield</code> the values:  <code>for v in inner_generator: yield v</code>.  As the PEP points out there are subtle complexities to this which most people ignore.  Non-local flow-control like <code>throw()</code> is one example given in the PEP.  The new syntax <code>yield from inner_generator</code> is used wherever you would have written the explicit <code>for</code> loop before.  It's not merely syntactic sugar, though:  It handles all of the corner cases that are ignored by the <code>for</code> loop.  Being "sugary" encourages people to use it and thus get the right behaviors.</p>
+<p><a href="http://thread.gmane.org/gmane.comp.python.devel/102161/focus=102164" rel="noreferrer">This message in the discussion thread</a> talks about these complexities:</p>
+<blockquote>
+<p>With the additional generator features introduced by PEP 342, that is no
+  longer the case: as described in Greg's PEP, simple iteration doesn't
+  support send() and throw() correctly. The gymnastics needed to support
+  send() and throw() actually aren't that complex when you break them
+  down, but they aren't trivial either.</p>
+</blockquote>
+<p>I can't speak to a <em>comparison</em> with micro-threads, other than to observe that generators are a type of paralellism.  You can consider the suspended generator to be a thread which sends values via <code>yield</code> to a consumer thread.  The actual implementation may be nothing like this (and the actual implementation is obviously of great interest to the Python developers) but this does not concern the users.</p>
+<p>The new <code>yield from</code> syntax does not add any additional capability to the language in terms of threading, it just makes it easier to use existing features correctly.  Or more precisely it makes it easier for a <em>novice</em> consumer of a complex inner generator written by an <em>expert</em> to pass through that generator without breaking any of its complex features.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>A short example will help you understand one of <code>yield from</code>'s use case: get value from another generator</p>
+<pre><code>def flatten(sequence):
+    """flatten a multi level list or something
+    &gt;&gt;&gt; list(flatten([1, [2], 3]))
+    [1, 2, 3]
+    &gt;&gt;&gt; list(flatten([1, [2], [3, [4]]]))
+    [1, 2, 3, 4]
+    """
+    for element in sequence:
+        if hasattr(element, '__iter__'):
+            yield from flatten(element)
+        else:
+            yield element
+
+print(list(flatten([1, [2], [3, [4]]])))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>In applied usage for the <a href="https://docs.python.org/3/library/asyncio-task.html" rel="nofollow noreferrer">Asynchronous IO coroutine</a>, <code>yield from</code> has a similar behavior as <code>await</code> in a <a href="https://docs.python.org/3.7/glossary.html#term-coroutine-function" rel="nofollow noreferrer">coroutine function</a>. Both of which is used to suspend the execution of coroutine. </p>
+<ul>
+<li><p><code>yield from</code> is used by the <a href="https://docs.python.org/3.7/library/asyncio-task.html#asyncio.coroutine" rel="nofollow noreferrer">generator-based coroutine</a>.</p></li>
+<li><p><a href="https://docs.python.org/3.7/reference/expressions.html#await-expression" rel="nofollow noreferrer"><code>await</code></a> is used for <a href="https://docs.python.org/3.7/reference/compound_stmts.html#async-def" rel="nofollow noreferrer"><code>async def</code></a>  coroutine. (since Python 3.5+)</p></li>
+</ul>
+<p>For Asyncio, if there's no need to support an older Python version (i.e. &gt;3.5), <code>async def</code>/<code>await</code> is the recommended syntax to define a coroutine. Thus <code>yield from</code> is no longer needed in a coroutine. </p>
+<p>But in general outside of asyncio, <code>yield from &lt;sub-generator&gt;</code> has still some other usage in iterating the <a href="https://docs.python.org/3.7/reference/expressions.html#yield-expressions" rel="nofollow noreferrer">sub-generator</a> as mentioned in the earlier answer.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>yield from</code> basically chains iterators in a efficient way:</p>
+<pre><code># chain from itertools:
+def chain(*iters):
+    for it in iters:
+        for item in it:
+            yield item
+
+# with the new keyword
+def chain(*iters):
+    for it in iters:
+        yield from it
+</code></pre>
+<p>As you can see it removes one pure Python loop. That's pretty much all it does, but chaining iterators is a pretty common pattern in Python. </p>
+<p>Threads are basically a feature that allow you to jump out of functions at completely random points and jump back into the state of another function. The thread supervisor does this very often, so the program appears to run all these functions at the same time. The problem is that the points are random, so you need to use locking to prevent the supervisor from stopping the function at a problematic point.</p>
+<p>Generators are pretty similar to threads in this sense: They allow you to specify specific points (whenever they <code>yield</code>) where you can jump in and out. When used this way, generators are called coroutines. </p>
+<p><a href="http://www.dabeaz.com/coroutines/" rel="nofollow">Read this excellent tutorials about coroutines in Python for more details</a></p>
+</div>
+<span class="comment-copy"><a href="http://www.dabeaz.com/coroutines/" rel="nofollow noreferrer">dabeaz.com/coroutines</a></span>
+<span class="comment-copy">Video of David Beazley's <a href="http://www.dabeaz.com/coroutines/" rel="nofollow noreferrer">dabeaz.com/coroutines</a> presentation: <a href="https://www.youtube.com/watch?v=Z_OAlIhXziw" rel="nofollow noreferrer">youtube.com/watch?v=Z_OAlIhXziw</a></span>
+<span class="comment-copy">@PraveenGollakota, in the second part of your question, <b>Sending data to a generator (coroutine) using yield from - Part 1</b>, what if you have more than coroutines to forward the received item to? Like a broadcaster or subscriber scenario where you provide multiple coroutines to the wrapper in your example and items should be sent to all or subset of them?</span>
+<span class="comment-copy">@PraveenGollakota, Kudos for the great answer. The small examples let me try things out in repl. Link to the Dave Beazley course was a bonus!</span>
+<span class="comment-copy">doing <code>except StopIteration: pass</code> INSIDE the <code>while True:</code> loop is not an accurate representation of <code>yield from coro</code> - which is not an infinite loop and after <code>coro</code> is exhausted (i.e. raises StopIteration), <code>writer_wrapper</code> will execute the next statement. After the last statement it will itself  auto-raise <code>StopIteration</code> as any exhausted generator...</span>
+<span class="comment-copy">...so if <code>writer</code> contained <code>for _ in range(4)</code> instead of <code>while True</code>, then after printing <code>&gt;&gt; 3</code> it would ALSO auto-raise <code>StopIteration</code> and this would be auto-handled by <code>yield from</code> and then <code>writer_wrapper</code> would auto-raise it's own <code>StopIteration</code> and because <code>wrap.send(i)</code> is not inside <code>try</code> block, it would be actually raised at this point (i.e. traceback will only report the line with <code>wrap.send(i)</code>, not anything from inside the generator)</span>
+<span class="comment-copy">Upon reading "<b>does not even begin to do justice</b>", I know I have come to the right answer. Thank you for the great explanation!</span>
+<span class="comment-copy">Refactoring generators is <i>painful</i> today.</span>
+<span class="comment-copy">@Josh Lee: Thanks, I stretched that point a bit.</span>
+<span class="comment-copy">I tend to use itertools a lot for refactoring generators (stuff like itertools.chain), it's not that a big deal. I like yield from, but I still fail to see how revolutionary it is. It probably is, since Guido is all crazy about it, but I must be missing the big picture. I guess it's great for send() since this is hard to refactor, but I don't use that quite often.</span>
+<span class="comment-copy">I suppose those <code>get_list_values_as_xxx</code> are simple generators with a single line <code>for x in input_param: yield int(x)</code> and the other two respectively with <code>str</code> and <code>float</code></span>
+<span class="comment-copy">@NiklasB. re "extract information from a recursive data structure." I'm just getting into Py for data. Could you take a stab at <a href="https://stackoverflow.com/questions/53991503/map-a-function-by-key-path-in-nested-dict-including-slices-wildcards-and-ragged/54821301#54821301">this Q</a>?</span>
+<span class="comment-copy">Great explanation.  +1 for "Being 'sugary' encourages people to use it and thus get the right behaviors."  Sugary things and intuitive behavior going together is one of the reasons python is so great. :)</span>
+<span class="comment-copy">This answer is misleading because it elides the salient feature of "yield from", as mentioned above: send() and throw() support.</span>
+<span class="comment-copy">@Justin W: I guess whatever you read before is actually misleading, because you didn't get the point that <code>throw()/send()/close()</code> are <code>yield</code> features which <code>yield from</code> obviously has to implement properly as it is supposed to simplify code. Such trivialities have nothing to do with usage.</span>
+<span class="comment-copy">Are you disputing Ben Jackson's answer above?  My reading of your answer is that it is essentially syntactic sugar which follows the code transformation you provided.  Ben Jackson's answer specifically refutes that claim.</span>
+<span class="comment-copy">@JochenRitzel You never need to write your own <code>chain</code> function because <code>itertools.chain</code> already exists. Use <code>yield from itertools.chain(*iters)</code>.</span>

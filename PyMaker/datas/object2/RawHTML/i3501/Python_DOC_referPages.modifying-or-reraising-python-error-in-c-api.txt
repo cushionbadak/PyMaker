@@ -1,0 +1,44 @@
+<div class="post-text" itemprop="text">
+<p>I have a bit of code that tries to parse an object as an integer:</p>
+<pre><code>long val = PyLong_AsLong(obj);
+if(val == -1 &amp;&amp; PyErr_Occurred()) {
+    return -1;
+}
+</code></pre>
+<p>Here <code>obj</code> is a vanilla <code>PyObject *</code>, and <a href="https://docs.python.org/3/c-api/long.html#c.PyLong_AsLong" rel="nofollow noreferrer"><code>PyLong_AsLong</code></a> raises a very generic <code>TypeError</code> if <code>obj</code> is not an integer.</p>
+<p>I would like to transform the error message into something a bit more informative, so I would like to either modify the existing error object, or to reraise it.</p>
+<p>My current solution is to do this:</p>
+<pre><code>long val = PyLong_AsLong(obj);
+if(val == -1 &amp;&amp; PyErr_Occurred()) {
+    PyErr_Clear();
+    PyErr_Format(PyExc_TypeError, "Parameter must be an integer type, but got %s", Py_TYPE(obj)-&gt;tp_name);
+    return -1;
+}
+</code></pre>
+<p>Is this the proper way to reraise an error? Specifically,</p>
+<ol>
+<li>Do I need to call <a href="https://docs.python.org/3/c-api/exceptions.html#c.PyErr_Clear" rel="nofollow noreferrer"><code>PyErr_Clear</code></a> at all? I suspect that it properly decrefs the existing exception object, but I'm not sure.</li>
+<li>Can I modify the message of the error that has already been thrown at that point without re-raising it?</li>
+<li>Is there an option to do the equivalent of <code>raise new_err from old_err</code>?</li>
+</ol>
+<p>I am not sure how to use <a href="https://docs.python.org/3/c-api/exceptions.html#c.PyErr_SetExcInfo" rel="nofollow noreferrer"><code>PyErr_SetExcInfo</code></a> for this situation, although my gut tells me it may be relevant somehow.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your existing code is fine, but if you want to do the equivalent of exception chaining, you can. If you want to skip to how to do that, jump to point 3 near the end of the answer.</p>
+<hr/>
+<p>To explain how to do things like modify a propagating exception or perform the equivalent of <code>raise Something() from existing_exception</code>, first, we'll have to explain how exception state works at C level.</p>
+<p>A propagating exception is represented by a <a href="https://docs.python.org/3/c-api/exceptions.html#exception-handling" rel="nofollow noreferrer">per-thread <em>error indicator</em></a> consisting of a <em>type</em>, <em>value</em>, and <em>traceback</em>. That sounds a lot like <a href="https://docs.python.org/3/library/sys.html#sys.exc_info" rel="nofollow noreferrer"><code>sys.exc_info()</code></a>, but it's not the same. <code>sys.exc_info()</code> is for exceptions that have been <em>caught</em> by Python-level code, not exceptions that are still propagating.</p>
+<p>The error indicator may be <em>unnormalized</em>, which basically means that the work of constructing an exception object hasn't been performed, and the <em>value</em> in the error indicator isn't an instance of the exception <em>type</em>. This state exists for efficiency; if the error indicator is cleared by <code>PyErr_Clear</code> before normalization is needed, Python gets to skip much of the work of raising an exception. Exception normalization is performed by <a href="https://docs.python.org/3/c-api/exceptions.html#c.PyErr_NormalizeException" rel="nofollow noreferrer"><code>PyErr_NormalizeException</code></a>, with a bit of extra work in <a href="https://docs.python.org/3/c-api/exceptions.html#c.PyException_SetTraceback" rel="nofollow noreferrer"><code>PyException_SetTraceback</code></a> to set the exception object's <code>__traceback__</code> attribute.</p>
+<p><code>PyErr_Clear</code> is sort of like the C equivalent of an <code>except</code> block, but it just clears the error indicator, without letting you inspect much of the exception information. To catch an exception and inspect it, you'd want <a href="https://docs.python.org/3/c-api/exceptions.html#c.PyErr_Fetch" rel="nofollow noreferrer"><code>PyErr_Fetch</code></a>. <code>PyErr_Fetch</code> is like catching an exception and examining <code>sys.exc_info()</code>, but it doesn't set <code>sys.exc_info()</code> or normalize the exception. It clears the error indicator and gives you the raw contents of the error indicator directly.</p>
+<p>Explicit exception chaining (<code>raise Something() from existing_exception</code>) works by going through <a href="https://docs.python.org/3/c-api/exceptions.html#c.PyException_SetCause" rel="nofollow noreferrer"><code>PyException_SetCause</code></a> to set the new exception's <code>__cause__</code> to the existing exception. This requires exception objects for both exceptions, so if you want to do the equivalent from C, you'll have to normalize the exceptions and call <code>PyException_SetCause</code> yourself.</p>
+<p>Implicit exception chaining (<code>raise Something()</code> in an <code>except</code> block) works by going through <a href="https://docs.python.org/3/c-api/exceptions.html#c.PyException_SetContext" rel="nofollow noreferrer"><code>PyException_SetContext</code></a> to set the new exception's <code>__context__</code> to the existing exception. Similar to <code>PyException_SetCause</code>, this requires exception objects and exception normalization. <code>raise Something() from existing_exception</code> inside an <code>except</code> block actually sets both <code>__cause__</code> and <code>__context__</code>, and if you want to perform explicit exception chaining at C level, you should usually do the same.</p>
+<hr/>
+<ol>
+<li>Technically not necessary, as far as I can tell, but it's probably a good idea to do it anyway. It looks like <code>PyErr_Format</code> and other functions that set the error indicator will clear the error indicator first if it's already set, but this isn't documented for most of them.</li>
+<li>Sort of, but it's probably a bad idea. You can normalize the error indicator and set the exception object's <code>message</code> attribute, but this won't affect <code>args</code> or anything else the exception class might do with its arguments, and that could lead to weird problems. Alternatively, you could fetch the error indicator with <code>PyErr_Fetch</code> and restore it with a new string for the value with <code>PyErr_Restore</code>, but that will throw away an existing exception object if there is one, and it makes assumptions about the exception class's signature.</li>
+<li><p>Yeah, that's possible, but doing it through public C API functions is pretty awkward and manual. You'd have to manually do a lot of normalization, unraising, and raising exceptions.</p>
+<p><a href="https://bugs.python.org/issue28410" rel="nofollow noreferrer">There</a> are <a href="https://bugs.python.org/issue23188" rel="nofollow noreferrer">efforts</a> to make C-level exception chaining more convenient, but so far, the more convenient functions are all considered internal. For example, <a href="https://github.com/python/cpython/blob/v3.7.0/Python/errors.c#L442" rel="nofollow noreferrer"><code>_PyErr_FormatFromCause</code></a> is like <code>PyErr_Format</code>, but it chains the new exception off of an existing, propagating exception (through both <code>__context__</code> and <code>__cause__</code>.</p>
+<p>I wouldn't recommend calling it directly for now; it's very new (3.6+), and it's very likely to change (specifically, I would be unsurprised to see it lose its leading underscore in a new Python version). Instead, copying the <a href="https://github.com/python/cpython/blob/v3.7.0/Python/errors.c#L415" rel="nofollow noreferrer">implementation</a> of <code>_PyErr_FormatFromCause</code>/<code>_PyErr_FormatVFromCause</code> (and respecting the <a href="https://docs.python.org/3/license.html" rel="nofollow noreferrer">license</a>) is a good way to make sure you have the fiddly bits of normalization and chaining right.</p>
+<p>It's also a useful reference to work from if you want to perform implicit (<code>__context__</code>-only) exception chaining at C level - just remove the part that handles <code>__cause__</code>.</p></li>
+</ol>
+</div>

@@ -1,0 +1,146 @@
+<div class="post-text" itemprop="text">
+<p>I work with a number of json-like dicts. <code>pprint</code> is handy for structuring them. Is there a way to cause all ints in a pprint output to be printed in hex rather than decimal?</p>
+<p>For example, rather than:</p>
+<pre><code>{66: 'far',
+ 99: 'Bottles of the beer on the wall',
+ '12': 4277009102,
+ 'boo': 21,
+ 'pprint': [16, 32, 48, 64, 80, 96, 112, 128]}
+</code></pre>
+<p>I'd rather see:</p>
+<pre><code>{0x42: 'far',
+ 0x63: 'Bottles of the beer on the wall',
+ '12': 0xFEEDFACE,
+ 'boo': 0x15,
+ 'pprint': [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80]}
+</code></pre>
+<p>I have tried customizing <code>PrettyPrinter</code>, but to no avail, was I able to cause the above, having <code>PrettyPrinter.format()</code> handle integers only seems to work for some of the integers:</p>
+<pre><code>class MyPrettyPrinter(PrettyPrinter):
+    def format(self, object, context, maxlevels, level):
+        if isinstance(object, int):
+            return '0x{:X}'.format(object), True, False
+        return super().format(object, context, maxlevels, level)
+</code></pre>
+<p>the above class produces</p>
+<pre><code>{0x42: 'far',
+ 0x63: 'Bottles of the beer on the wall',
+ '12': 0xFEEDFACE,
+ 'boo': 0x15,
+ 'pprint': [16, 32, 48, 64, 80, 96, 112, 128]}
+</code></pre>
+<p>The list contents are not correctly formatted.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You <em>can</em> alter the output of <code>pprint</code>, but you need to re-implement the <a href="https://docs.python.org/3/library/pprint.html#pprint.saferepr" rel="nofollow noreferrer"><code>saferepr()</code> function</a>, not just subclass the <code>pprint.PrettyPrinter()</code> class.</p>
+<p>What happens is that (an internal version of) the <code>saferepr()</code> function is used for all objects, and that function itself then recursively handles turning objects into representations (using only itself, not the <code>PrettyPrinter()</code> instance), so any customisation <em>has</em> to happen <em>there</em>. Only when the result of <code>saferepr()</code> becomes too large (too wide for the configured width) will the <code>PrettyPrinter</code> class start breaking up container output into components to put on separate lines; the process of calling <code>saferepr()</code> is then repeated for the component elements.</p>
+<p>So <a href="https://docs.python.org/3/library/pprint.html#pprint.PrettyPrinter.format" rel="nofollow noreferrer"><code>PrettyPrinter.format()</code></a> is only responsible for handling the <em>top-level</em> object, and every recursive object that is a) inside a supported container type (dict, list, tuple, string and the standard library subclasses of these) and b) where the representation of the parent container produced by <code>.format()</code> exceeded the display width.</p>
+<p>To be able to override the implementation, we need to understand how the <code>.format()</code> method and the <code>saferepr()</code> implementation interact, what arguments they take and what they need to return.</p>
+<p><code>PrettyPrinter.format()</code> is passed additional arguments, <code>context</code>, <code>maxlevels</code> and <code>level</code>:</p>
+<ul>
+<li><code>context</code> is used to detect recursion (the default implementation returns the result of <code>_recursion(object)</code> if <code>id(object) in context</code> is true.</li>
+<li>when <code>maxlevels</code> is set and <code>level &gt;= maxlevels</code> is true, the default implementation returns <code>...</code> as the contents of a container.</li>
+</ul>
+<p>The method is also supposed to return a tuple of 3 values; the representation string and two flags. You can safely <em>ignore</em> the meaning of those flags, they are actually <em>never used in the current implementation</em>. They are meant to signal if the produced representation is 'readable' (uses Python syntax that can be passed to <code>eval()</code>) or was recursive (the object contained circular references). But the  <code>PrettyPrinter.isreadable()</code> and <code>PrettyPrinter.isrecursive()</code> methodsactually completely bypass <code>.format()</code>; these return values seem to be a hold-over from a refactoring that broke the relationship between <code>.format()</code> and those two methods. So just return a representation string and <em>whatever</em> two boolean values you like.</p>
+<p><code>.format()</code> really just delegates to an internal implementation of <code>saferepr()</code> that then does several things</p>
+<ul>
+<li>handle recursion detection with <code>context</code>, and depth handling for <code>maxlevels</code> and <code>level</code></li>
+<li>recurse over dictionaries, lists and tuples (and their subclasses, as long as their <code>__repr__</code> method is still the default implementation)</li>
+<li>for dictionaries, sort the key-value pairs. This is <a href="https://stackoverflow.com/questions/26575183/how-can-i-get-2-x-like-sorting-behaviour-in-python-3-x">trickier than it appears in Python 3</a>, but this is solved with a custom <code>_safe_tuple</code> sorting key that approximates Python 2's <em>sort everything</em> behaviour. We can re-use this.</li>
+</ul>
+<p>To implement a recursive replacement, I prefer to use <a href="https://docs.python.org/3/library/functools.html#functools.singledispatch" rel="nofollow noreferrer"><code>@functools.singledispatch()</code></a> to delegate handling of different types. Ignoring custom <code>__repr__</code> methods, handling depth issues, recursion, and empty objects, can also be handled by a decorator:</p>
+<pre><code>import pprint
+from pprint import PrettyPrinter
+from functools import singledispatch, wraps
+from typing import get_type_hints
+
+def common_container_checks(f):
+    type_ = get_type_hints(f)['object']
+    base_impl = type_.__repr__
+    empty_repr = repr(type_())   # {}, [], ()
+    too_deep_repr = f'{empty_repr[0]}...{empty_repr[-1]}'  # {...}, [...], (...)
+    @wraps(f)
+    def wrapper(object, context, maxlevels, level):
+        if type(object).__repr__ is not base_impl:  # subclassed repr
+            return repr(object)
+        if not object:                              # empty, short-circuit
+            return empty_repr
+        if maxlevels and level &gt;= maxlevels:        # exceeding the max depth
+            return too_deep_repr
+        oid = id(object)
+        if oid in context:                          # self-reference
+            return pprint._recursion(object)
+        context[oid] = 1
+        result = f(object, context, maxlevels, level)
+        del context[oid]
+        return result
+    return wrapper
+
+@singledispatch
+def saferepr(object, context, maxlevels, level):
+    return repr(object)
+
+@saferepr.register(int)
+def _handle_int(object: int, *args):
+    # uppercase hexadecimal representation with 0x prefix
+    return f'0x{object:X}'
+
+@saferepr.register(dict)
+@common_container_checks
+def _handle_dict(object: dict, context, maxlevels, level):
+    level += 1
+    contents = [
+        f'{saferepr(k, context, maxlevels, level)}: '
+        f'{saferepr(v, context, maxlevels, level)}'
+        for k, v in sorted(object.items(), key=pprint._safe_tuple)
+    ]
+    return f'{{{", ".join(contents)}}}'
+
+@saferepr.register(list)
+@common_container_checks
+def _handle_list(object: list, context, maxlevels, level):
+    level += 1
+    contents = [
+        f'{saferepr(v, context, maxlevels, level)}'
+        for v in object
+    ]
+    return f'[{", ".join(contents)}]'
+
+@saferepr.register(tuple)
+@common_container_checks
+def _handle_tuple(object: tuple, context, maxlevels, level):
+    level += 1
+    if len(object) == 1:
+        return f'({saferepr(object[0], context, maxlevels, level)},)'
+    contents = [
+        f'{saferepr(v, context, maxlevels, level)}'
+        for v in object
+    ]
+    return f'({", ".join(contents)})'
+
+class HexIntPrettyPrinter(PrettyPrinter):
+    def format(self, *args):
+        # it doesn't matter what the boolean values are here
+        return saferepr(*args), True, False
+</code></pre>
+<p>This hand-full can handle anything the base <code>pprint</code> implementation can, <em>and</em> it will produce hex integers in any supported container. Just create an instance of the <code>HexIntPrettyPrinter()</code> class and call <code>.pprint()</code> on that:</p>
+<pre><code>&gt;&gt;&gt; sample = {66: 'far',
+...  99: 'Bottles of the beer on the wall',
+...  '12': 4277009102,
+...  'boo': 21,
+...  'pprint': [16, 32, 48, 64, 80, 96, 112, 128]}
+&gt;&gt;&gt; pprinter = HexIntPrettyPrinter()
+&gt;&gt;&gt; pprinter.pprint(sample)
+{0x42: 'far',
+ 0x63: 'Bottles of the beer on the wall',
+ '12': 0xFEEDFACE,
+ 'boo': 0x15,
+ 'pprint': [0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80]}
+</code></pre>
+<p>Side note: as of Python 3.7 you can drop the <code>(&lt;type&gt;)</code> call part of the <code>@saferepr.registation(&lt;type&gt;)</code> decorators; the type is picked up from the annotations instead.</p>
+</div>
+<span class="comment-copy">I give up. Take it from me: Don't try to customize the <code>pprint</code> module. It's <i>much</i> easier and cleaner to reimplement the whole damn thing. They should rewrite the docs to remove any mention of customization.</span>
+<span class="comment-copy">@Aran-Fey: I rewrote just <code>_safe_repr</code>. I'll probably end up suggesting a refactor of the module to Python based on my work below, because using <code>singledispatch</code> would make <code>pprint</code> much more extensible out of the box. I imagine third-party libraries could register their types with <code>pprint</code> by default with this, and for the OPs usecase to be trivial (<i>just register your type-annotated handler directly with the module</i> style instructions).</span>
+<span class="comment-copy">@MartijnPieters You can just wrap <code>_safe_repr</code> to handle your case and then fall the original instead of rewriting the whole thing, which isn’t <i>quite</i> as nasty, but it’s still ugly. But the bigger problem is that you’re hooking all instances this way instead of just the one you create, which defeats the purpose of having a class. If you refactor things, you’d want to make it so you can register types with the instance (although being able to also register with the module would be nice, since nobody actually uses separate instances in practice...).</span>
+<span class="comment-copy">@abarnert: I rather not set a global policy here (which is what monkeypatching <code>_safe_repr()</code> would do). If I refactor, you probably pass in an alternative <code>saferepr()</code> function and are given the opportunity to reuse the standard one to extend, or register with the one used by the module.</span>
+<span class="comment-copy">@MartijnPieters Yes, that’s what I meant by defeating the purpose of having a class. Your answer here gets around that by basically dedicating a separate module to the subclass so it can still do the equivalent of a global call to <code>_safe_repr</code>, but you’d really want the dispatcher to be saved with the instance so that it’s easy to allow people to hook it at whichever level they want.</span>
+<span class="comment-copy">Amazing thorough answer</span>

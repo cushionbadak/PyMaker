@@ -1,0 +1,80 @@
+<div class="post-text" itemprop="text">
+<p>I'm now implementing a data subscriber with Python, which subscribes to a data publisher (actually a ZeroMQ publisher socket) and will get notified once any new messages are fed. In my subscriber, the messages are dumped to a data processor after received. The subscriber will also get notified by the processor when done. Since the data processor is written in C++, I have to extend the Python code with a simple C++ module. </p>
+<p>Below is a simplified runnable code sample of my data subscriber. Code <code>main.py</code>, in which the module proc represents the processor, subscribe to a ZeroMQ socket on <code>localhost:10000</code>, setup the callback, and send the received message to the processor by calling <code>proc.onMsg</code>.</p>
+<pre><code>#!/bin/python
+# main.py
+
+import gevent
+import logging
+import zmq.green as zmq
+
+import pub 
+import proc
+
+logging.basicConfig( format='[%(levelname)s] %(message)s', level=logging.DEBUG )
+
+SUB_ADDR = 'tcp://localhost:10000'
+
+def setupMqAndReceive():
+    '''Setup the message queue and receive messages.
+    '''
+    ctx  = zmq.Context()
+    sock = ctx.socket( zmq.SUB )
+    # add topics
+    sock.setsockopt_string( zmq.SUBSCRIBE, 'Hello' )
+
+    sock.connect( SUB_ADDR )
+
+    while True:
+        msg = sock.recv().decode( 'utf-8' )
+        proc.onMsg( msg )
+
+def callback( a, b ):
+    print( '[callback]',  a, b ) 
+
+def main():
+    '''Entrance of the module.
+    '''
+    pub.start()
+    proc.setCallback( callback )
+    '''A simple on-liner
+    gevent.spawn( setupMqAndReceive ).join()
+    works. However, the received messages will not be
+    processed by the processor.
+    '''
+    gevent.spawn( setupMqAndReceive )
+    proc.start()
+</code></pre>
+<p>Module <code>proc</code> is simplified with three functions exported:</p>
+<ul>
+<li><code>setCallback</code> setup the callback function, so that when the message processed, my subscriber could be notified;</li>
+<li><code>onMsg</code> is invoked by the subscriber;</li>
+<li><code>start</code> setups a new worker thread to handle the messages from subscriber and make the main thread join to wait for the worker thread to exit.</li>
+</ul>
+<p>The full version of source code could be found on <a href="https://github.com/more-more-tea/python_gil" rel="nofollow">github</a> at <a href="https://github.com/more-more-tea/python_gil" rel="nofollow">https://github.com/more-more-tea/python_gil</a>. Nevertheless, it does not run as my expectation. Once the processor thread is added, the subscriber cannot receive data from the publisher in the gevent loop. If I simply drop the data processor module, the subscriber gevent loop could receive the messages from the publisher.</p>
+<p>Is there anything wrong with the code? I suspect the GIL interferes the concurrency of the pthread in the message processor, or the gevent loop is starved. Any hints about the question or about how to debug it will be highly appreciated!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The Global Interpreter Lock, by itself, will not prevent threads from being scheduled.  The Python C API does not run around injecting itself into the pthread library everywhere.  This is both good and bad.</p>
+<p>It is good because you can actually do multiple things at once in a C or C++ extension.</p>
+<p>It is bad because you can violate the GIL rules accidentally.</p>
+<p>The rules of the GIL are (roughly) as follows:</p>
+<ol>
+<li>When your code is called from Python, you may assume your thread has the GIL.  When your code is called from anything that is not Python, you may not make this assumption.</li>
+<li>You must have the GIL before you can call into any part of the Python/C API unless explicitly documented otherwise.  This includes <em>everything</em> owned by the Python/C API, even simple things like the refcounting macros <code>Py_INCREF()</code> and <code>Py_DECREF()</code>.</li>
+<li>The GIL does not release itself automatically while execution is within a C or C++ function.  You need to do that manually if you do not need the GIL.  In particular, it does not automatically release itself when you call a blocking function like <code>pthread_join()</code> or <code>select()</code>, which means you block the whole interpreter.</li>
+</ol>
+<p>The formal version of these rules is specified <a href="https://docs.python.org/3/c-api/init.html#thread-state-and-the-global-interpreter-lock" rel="noreferrer">here</a>.  Pay close attention to the "Non-Python created threads" section; it is about precisely what you are trying to do.</p>
+<p>Reading your code, it looks like you have failed to acquire the GIL in the <code>procThread()</code> function, and also failed to release it before calling <code>pthread_join()</code>.  There may be other problems as well, but these were the most obvious to me.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There is my solution to the question and my understanding to Python thread and pthread native ones.</p>
+<p>Python threads, though protected by GIL, are actually system threads. The only thing makes them different is that when running, the Python thread is protected by GIL. Threads spawned by <code>threading.Thread</code> are Python thread, and all the code running in those threads are protected by GIL automatically. The GIL in Python threads must be released with <code>Py_BEGIN_ALLOW_THREADS</code> and <code>Py_END_ALLOW_THREADS</code> if native threads co-exist with the Python threads and the Python threads are about to run a blocking statement, e.g. I/O, Thread.join, sleep, etc.</p>
+<p>While other threads spawned outside the Python world, e.g. by pthread library, should acquire the GIL explicitly with the Python C API <code>PyGILState_Ensure</code> and <code>PyGILState_Release</code> when executing Python code (for pure C/C++ code, no need to acquire the Python GIL per my experience) as directed in Kevin's answer.</p>
+<p>The updated code could be found on <a href="https://github.com/more-more-tea/python_gil" rel="nofollow">GitHub</a>.</p>
+<p>If any mis-understanding, please give me a comment. Thank you all!</p>
+</div>
+<span class="comment-copy">Hi @Kevin, Thank you very much for your time. I'm really new to this topic and have no direction where to go. The worse thing is that I didn't find any running example about how to manipulating GIL in c extension on the web. Would you mind showing some sample codes/changes about manipulating GIL?</span>
+<span class="comment-copy">@Summer_More_More_Tea: The Python/C API docs I linked has a number of code samples.  Could you explain what you didn't understand in them?</span>
+<span class="comment-copy">Thanks, problem solved. Two cents (procThread, and pthread_join) pointed in the answer matter. Also the gevent.spawn will be blocked once pthread_join is executed. My solution is to schedule the <code>setupMqAndReceive</code> to run in a threading.Thread instead of gevent.Greenlet, with GIL released before pthread_join and ensured in procThread when executing Python callback.</span>
+<span class="comment-copy">This is a great explanation, it explains why my code is blocking. I really don't like to do anything that is not <a href="https://stackoverflow.com/questions/tagged/c">c</a> because of these kind of things. But whatever, now I know what I have to try in order to fix this, more than 12 hours lost.</span>

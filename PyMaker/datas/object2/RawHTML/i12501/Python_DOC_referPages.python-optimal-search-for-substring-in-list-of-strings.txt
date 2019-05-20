@@ -1,0 +1,199 @@
+<div class="post-text" itemprop="text">
+<p>I have a particular problem where I want to search for many substrings in a list of many strings. The following is the gist of what I am trying to do:</p>
+<pre><code>listStrings = [ACDE, CDDE, BPLL, ... ]
+
+listSubstrings = [ACD, BPI, KLJ, ...]
+</code></pre>
+<p>The above entries are just examples. len(listStrings) is ~ 60,000, len(listSubstrings) is ~50,000-300,000, and len(listStrings[i]) is anywhere from 10 to 30,000.</p>
+<p>My current Python attempt is:</p>
+<pre><code>for i in listSubstrings:
+   for j in listStrings:
+       if i in j:
+          w.write(i+j)
+</code></pre>
+<p>Or something along these lines. While this works for my task, it's horribly slow, using one core and taking on the order of 40 minutes to complete the task. Is there a way to speed this up?</p>
+<p>I don't believe that I can make a dict out of listStrings:listSubstrings because there is the possibility of duplicate entries which need to be stored on both ends (although I may try this if I can find a way to append a unique tag to each one, since dicts are so much faster). Similarly, I don't think I can pre-compute possible substrings. I don't even know if searching dict keys is faster than searching a list (since <code>dict.get()</code> is going to give the specific input and not look for sub-inputs). Is searching lists in memory just that slow relatively speaking?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Maybe you can try to chunk one of the two list (the biggest ? although intuitively I would cut <code>listStrings</code>) in smaller ones then use threading to run these search in parallel (the <a href="https://docs.python.org/3/library/multiprocessing.html#module-multiprocessing.pool" rel="nofollow noreferrer"><code>Pool</code> class of <code>multiprocessing</code></a> offers a convenient way to do this) ? I had some significant speed-up using something like :</p>
+<pre><code>from multiprocessing import Pool
+from itertools import chain, islice
+
+# The function to be run in parallel :
+def my_func(strings):
+    return [j+i for i in strings for j in listSubstrings if i.find(j)&gt;-1]
+
+# A small recipe from itertools to chunk an iterable :
+def chunk(it, size):
+    it = iter(it)
+    return iter(lambda: tuple(islice(it, size)), ())
+
+# Generating some fake &amp; random value :
+from random import randint
+listStrings = \
+    [''.join([chr(randint(65, 90)) for i in range(randint(1, 500))]) for j in range(10000)]
+listSubstrings = \
+    [''.join([chr(randint(65, 90)) for i in range(randint(1, 100))]) for j in range(1000)]
+
+# You have to prepare the searches to be performed:
+prep = [strings for strings in chunk(listStrings, round(len(listStrings) / 8))]
+with Pool(4) as mp_pool:
+    # multiprocessing.map is a parallel version of map()
+    res = mp_pool.map(my_func, prep)
+# The `res` variable is a list of list, so now you concatenate them
+# in order to have a flat result list
+result = list(chain.from_iterable(res))
+</code></pre>
+<p>Then you could write the whole <code>result</code> variable (instead of writing it line by lines) :</p>
+<pre><code>with open('result_file', 'w') as f:
+    f.write('\n'.join(result))
+</code></pre>
+<p><em>Edit 01/05/18: flatten the result using <a href="https://docs.python.org/3/library/itertools.html#itertools.chain.from_iterable" rel="nofollow noreferrer"><code>itertools.chain.from_iterable</code></a> instead of a ugly workaround using <code>map</code> side-effects, following ShadowRanger's advice.</em></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>For the sort of thing you're trying (searching for a fixed set of a whole bunch of strings in a whole bunch of other strings), parallelizing and minor tweaks won't help much. You need algorithmic improvements.</p>
+<p>For a start, I'd suggest using the <a href="https://en.wikipedia.org/wiki/Aho-Corasick_string_matching_algorithm" rel="noreferrer">Aho-Corasick string matching algorithm</a>. Basically, in exchange for some precompute work to build a matcher object from your set of fixed strings, you can scan another string for <em>all</em> of those fixed strings at once, in a single pass.</p>
+<p>So instead of scanning 60K strings 50K+ times each (three BILLION scans?!?), you can scan them each once with only slightly higher cost than a normal single scan, and get all the hits.</p>
+<p>Best part is, you're not writing it yourself. PyPI (the Python package index) already has the <a href="https://pypi.python.org/pypi/pyahocorasick" rel="noreferrer"><code>pyahocorasick</code></a> package written for you. So try it out.</p>
+<p>Example of use:</p>
+<pre><code>import ahocorasick
+
+listStrings = [ACDE, CDDE, BPLL, ...]
+listSubstrings = [ACD, BPI, KLJ, ...]
+
+auto = ahocorasick.Automaton()
+for substr in listSubstrings:
+    auto.add_word(substr, substr)
+auto.make_automaton()
+
+...
+
+for astr in listStrings:
+    for end_ind, found in auto.iter(astr):
+        w.write(found+astr)
+</code></pre>
+<p>This will <code>write</code> multiple times if a substring ("needle") is found in string being searched ("haystack") more than once. You could change the loop to make it only <code>write</code> on the first hit for a given needle in a given haystack by using a <code>set</code> to dedup:</p>
+<pre><code>for astr in listStrings:
+    seen = set()
+    for end_ind, found in auto.iter(astr):
+        if found not in seen:
+            seen.add(found)
+            w.write(found+astr)
+</code></pre>
+<p>You can further tweak this to output the needles for a given haystack in the same order they appeared in <code>listSubstrings</code> (and uniquifying while you're at it) by storing the index of the words as or with their values so you can sort hits (presumably small numbers, so sort overhead is trivial):</p>
+<pre><code>from future_builtins import map  # Only on Py2, for more efficient generator based map
+from itertools import groupby
+from operator import itemgetter
+
+auto = ahocorasick.Automaton()
+for i, substr in enumerate(listSubstrings):
+    # Store index and substr so we can recover original ordering
+    auto.add_word(substr, (i, substr))
+auto.make_automaton()
+
+...
+
+for astr in listStrings:
+    # Gets all hits, sorting by the index in listSubstrings, so we output hits
+    # in the same order we theoretically searched for them
+    allfound = sorted(map(itemgetter(1), auto.iter(astr)))
+    # Using groupby dedups already sorted inputs cheaply; the map throws away
+    # the index since we don't need it
+    for found, _ in groupby(map(itemgetter(1), allfound)):
+        w.write(found+astr)
+</code></pre>
+<p>For performance comparisons, I used a variant on mgc's answer that is more likely to contain matches, as well as enlarging the haystacks. First, setup code:</p>
+<pre><code>&gt;&gt;&gt; from random import choice, randint
+&gt;&gt;&gt; from string import ascii_uppercase as uppercase
+&gt;&gt;&gt; # 5000 haystacks, each 1000-5000 characters long
+&gt;&gt;&gt; listStrings = [''.join([choice(uppercase) for i in range(randint(1000, 5000))]) for j in range(5000)]
+&gt;&gt;&gt; # ~1000 needles (might be slightly less for dups), each 3-12 characters long
+&gt;&gt;&gt; listSubstrings = tuple({''.join([choice(uppercase) for i in range(randint(3, 12))]) for j in range(1000)})
+&gt;&gt;&gt; auto = ahocorasick.Automaton()
+&gt;&gt;&gt; for needle in listSubstrings:
+...     auto.add_word(needle, needle)
+...
+&gt;&gt;&gt; auto.make_automaton()
+</code></pre>
+<p>And now to actually test it (using <code>ipython</code> <code>%timeit</code> magic for microbenchmarks):</p>
+<pre><code>&gt;&gt;&gt; sum(needle in haystack for haystack in listStrings for needle in listSubstrings)
+80279  # Will differ depending on random seed
+&gt;&gt;&gt; sum(len(set(map(itemgetter(1), auto.iter(haystack)))) for haystack in listStrings)
+80279  # Same behavior after uniquifying results
+&gt;&gt;&gt; %timeit -r5 sum(needle in haystack for haystack in listStrings for needle in listSubstrings)
+1 loops, best of 5: 9.79 s per loop
+&gt;&gt;&gt; %timeit -r5 sum(len(set(map(itemgetter(1), auto.iter(haystack)))) for haystack in listStrings)
+1 loops, best of 5: 460 ms per loop
+</code></pre>
+<p>So for checking for ~1000 smallish strings in each of 5000 moderate size strings, <code>pyahocorasick</code> beats individual membership tests by a factor of ~21x on my machine. It scales well as the size of <code>listSubstrings</code> increases too; when I initialized it the same way, but with 10,000 smallish strings instead of 1000, the total time required increased from ~460 ms to ~852 ms, a 1.85x time multiplier to perform 10x as many logical searches.</p>
+<p>For the record, the time to build the automatons is trivial in this sort of context. You pay it once up front not once per haystack, and testing shows the ~1000 string automaton took ~1.4 ms to build and occupied ~277 KB of memory (above and beyond the strings themselves); the ~10000 string automaton took ~21 ms to build, and occupied ~2.45 MB of memory.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Are your substrings all the same length?  Your example uses 3-letter substrings.  In that case, you could create a dict with 3-letter substrings as keys to a list of strings:</p>
+<pre><code>index = {}
+for string in listStrings:
+    for i in range(len(string)-2):
+        substring = string[i:i+3]
+        index_strings = index.get(substring, [])
+        index_strings.append(string)
+        index[substring] = index_strings
+
+for substring in listSubstrings:
+    index_strings = index.get(substring, [])
+    for string in index_strings:
+        w.write(substring+string)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can speed up the inner loop significantly by joining listString into one long string (Or read the strings from a file without splitting it on line breaks).</p>
+<pre><code>with open('./testStrings.txt') as f:
+    longString = f.read()               # string with seqs separated by \n
+
+with open('./testSubstrings.txt') as f:
+    listSubstrings = list(f)
+
+def search(longString, listSubstrings):
+    for n, substring in enumerate(listSubstrings):
+        offset = longString.find(substring)
+        while offset &gt;= 0:
+            yield (substring, offset)
+            offset = longString.find(substring, offset + 1)
+
+matches = list(search(longString, listSubstrings))
+</code></pre>
+<p>The offsets can be mapped beck to the string index.</p>
+<pre><code>from bisect import bisect_left
+breaks = [n for n,c in enumerate(longString) if c=='\n']
+
+for substring, offset in matches:
+    stringindex = bisect_left(breaks, offset)
+</code></pre>
+<p>My test shows a 7x speed up versus the nested for loops (11 sec vs 77 sec).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You could get some speed up by using built-in list functions.</p>
+<pre><code>for i in listSubstrings:
+   w.write(list(map(lambda j: i + j, list(lambda j: i in j,listStrings))))
+</code></pre>
+<p>From running time complexity analysis, it seems your worse case will be n^2 comparisons since you need to go through each list given your current problem structure. Another issue that you need to worry about is memory consumption since with larger scales, more memory usually is the bottle-neck.</p>
+<p>As you said, you may want to index the list of strings. Is there any pattern to the list of substrings or list of strings that we can know? For example, in your example, we could index which strings have which characters in the alphabet {"A": ["ABC", "BAW", "CMAI"]...}and thus we wouldn't need to go through the list of strings each time for each list of substring element. </p>
+</div>
+<span class="comment-copy">Stackoverlords :D</span>
+<span class="comment-copy">You are performing possibly over <code>300,000 x 30,000 = 9,000,000,000</code> <code>in</code> tests. It was bound to be quite slow. So yes, this is normal and you need a better <a href="https://stackoverflow.com/questions/3260962/algorithm-to-find-multiple-string-matches">string search algorithm</a></span>
+<span class="comment-copy">There are more efficient algorithms, such as <a href="https://en.wikipedia.org/wiki/Aho%E2%80%93Corasick_algorithm" rel="nofollow noreferrer">Aho-Corasick</a>, but implementing those algorithms in pure Python is going to be really slow. Can you incorporate anything like Cython or SWIG into your project? (Google shows two existing modules on PyPI for Aho-Corasick, though I don't know if either of them are any good.)</span>
+<span class="comment-copy">I could involve something like Cython (with a bit of learning on my part, but that's what I'm here for after all), but I think I want to keep the complexity low in case I need to share this script with coworkers. They're already afraid of Python... but I am assuming Cython will let you implement the Aho-Corasick algorithm a bit better? Might be fun to try out myself</span>
+<span class="comment-copy">It's really not an answer (as it wouldn't replace an efficient search algorithm) but you can try <code>if j.find(i) &gt; -1:</code> instead of <code>if i in j:</code> it can sometimes be a little faster..</span>
+<span class="comment-copy">A little late in replying, but implementing chunking and multiprocessing was a fairly straightforward solution that worked. Now it only takes ~2 minutes to run the script on my data set</span>
+<span class="comment-copy">Side-note: The last two lines of your code should really just be <code>result = list(itertools.chain.from_iterable(res))</code>; <a href="https://docs.python.org/3/library/itertools.html#itertools.chain.from_iterable" rel="nofollow noreferrer"><code>itertools.chain.from_iterable</code></a> is <a href="https://stackoverflow.com/a/953097/364696">the canonical, idiomatic, most efficient way to flatten one level of an existing iterable of iterables</a> (also, using <code>map</code> for side-effects makes Guido van Rossum cry). I believe older Python has a bug when most of iterables are empty; <code>list(filter(None, itertools.chain.from_iterable(res)))</code> fixes that cheaply.</span>
+<span class="comment-copy">@ShadowRanger yeah you are clearly right! I felt that it was not the most idiomatic way (at all!) to produce this result but that's all I had found when answering! I will edit my answer to follow your advice! Thanks!</span>
+<span class="comment-copy">I had some difficulties to achieve what I wanted to do with the <code>pyahocorasick</code> module when i tried it. Do you thing <i>ngram</i> could be a good choice ? (or at least a better choice than scanning lists in two for loops?) (I had not the same volume of data than the OP, nor the same exact search needs but I had pretty good results with the <a href="https://pypi.python.org/pypi/ngram" rel="nofollow noreferrer"><code>ngram</code></a> python module)</span>
+<span class="comment-copy">If the input strings are in files; <code>grep -fF</code> could be used. Another Aho-Corasick Python implementation is <code>noaho</code> package, <a href="http://stackoverflow.com/a/34624747/4279">example</a></span>
+<span class="comment-copy">@shadowRanger yea but pyahocorasick only finds the prefix of a string , if the substring is somewhere in between 2 words in the string , then it will not match it . Or am I wrong ?</span>
+<span class="comment-copy">@RetroCode: If you were using the <code>match</code> or <code>longest_prefix</code> method, then yes, that would happen. But if you're trying to find all matches, you'd be using the <code>iter</code> (or <code>find_all</code>) method, which is scanning the whole haystack" for all "needles" at once (returning each time it finds one).</span>
+<span class="comment-copy">@mgc: Sorry, I didn't notice your comment before. I've added example code for using <code>pyahocorasick</code>. If that doesn't cover it, you'd need to be more explicit about your goals.</span>
+<span class="comment-copy">They are random lengths between ~4-15 or so. My example was vague with regard to that</span>
+<span class="comment-copy">Note: If memory is tight, loading all of the <code>listString</code> into memory at once (as opposed to loading one string at a time) could be a problem. If the strings are pure ASCII, and usually on the longer end of the OP's given range, the cost of storing 60K strings of 30K characters each is ~1.8 GB. If the strings might be non-ASCII, a string of that length with even a single non-BMP character would use closer to 7.2 GB. Even if memory isn't a problem, you'll never benefit from the processor cache while scanning; scaling might behave non-intuitively for various individual vs. combined string sizes.</span>
+<span class="comment-copy">Thanks for the reply - I will give the list function a try when I get home from the office. I also hadn't considered trying to find a pattern to break the list of strings into smaller components... perhaps make a separate entry for "contains 'A'" ... "'contains B'" or something along those lines to form some kind of decision tree. While there isn't any obvious pattern, the possibilities for the string composition are restricted to 20 amino amino acids in my case.</span>
+<span class="comment-copy">Try calculating the probability of a particular amino acid (#occurances/ #total) and then this could help search.</span>
+<span class="comment-copy">One, this is buggy;<code>list(lambda j: i in j, listStrings)</code> is invalid; I suspect you meant <code>filter</code>? Two, If you need a <code>lambda</code> (or any short Python level function) to use <code>map</code> or <code>filter</code>, don't; it will be slower than the equivalent listcomp (on Py2, where <code>map</code>/<code>filter</code> return sequences) or genexpr (on Py3, where they return generator objects). You also can't call <code>write</code> on file-like objects with a <code>list</code>; they take a single <code>unicode</code> (Py2) or <code>str</code> (any version) in text mode, or a <code>bytes</code>-like object in binary mode.</span>
+<span class="comment-copy">Your code could be made legal (and faster) with <code>writelines</code>, which takes an iterator of <code>unicode</code>/<code>str</code>/<code>bytes</code> (as appropriate to mode) and a genexpr (that would avoid numerous unnecessary temporary <code>list</code>s on Py2, and avoid a ton of function call overhead everywhere) getting <code>for i in listSubstrings: w.writelines(i + j for j in listStrings if i in j)</code>. You could even inline the outer loop into the genexpr, making a single, faster genexpr (thanks to <code>i</code> becoming a local variable, not closure scoped): <code>w.writelines(i + j for i in listSubstrings for j in listStrings if i in j)</code></span>

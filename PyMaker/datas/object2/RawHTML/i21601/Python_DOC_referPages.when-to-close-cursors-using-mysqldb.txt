@@ -1,0 +1,200 @@
+<div class="post-text" itemprop="text">
+<p>I'm building a WSGI web app and I have a MySQL database. I'm using MySQLdb, which provides cursors for executing statements and getting results. <strong>What is the standard practice for getting and closing cursors?</strong> In particular, how long should my cursors last? Should I get a new cursor for each transaction?</p>
+<p>I believe you need to close the cursor before committing the connection. Is there any significant advantage to finding sets of transactions that don't require intermediate commits so that you don't have to get new cursors for each transaction? Is there a lot of overhead for getting new cursors, or is it just not a big deal?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Instead of asking what is standard practice, since that's often unclear and subjective, you might try looking to the module itself for guidance. In general, using the <code>with</code> keyword as another user suggested is a great idea, but in this specific circumstance it may not give you quite the functionality you expect.</p>
+<p>As of version 1.2.5 of the module, <code>MySQLdb.Connection</code> implements the <a href="http://docs.python.org/2/library/stdtypes.html#context-manager-types" rel="noreferrer">context manager protocol</a> with the following code (<a href="https://github.com/farcepest/MySQLdb1/blob/2204283605e8c450223965eda8d8f357d5fe4c90/MySQLdb/connections.py" rel="noreferrer">github</a>):</p>
+<pre><code>def __enter__(self):
+    if self.get_autocommit():
+        self.query("BEGIN")
+    return self.cursor()
+
+def __exit__(self, exc, value, tb):
+    if exc:
+        self.rollback()
+    else:
+        self.commit()
+</code></pre>
+<p>There are several existing Q&amp;A about <code>with</code> already, or you can read <a href="http://effbot.org/zone/python-with-statement.htm" rel="noreferrer">Understanding Python's "with" statement</a>, but essentially what happens is that <code>__enter__</code> executes at the start of the <code>with</code> block, and <code>__exit__</code> executes upon leaving the <code>with</code> block. You can use the optional syntax <code>with EXPR as VAR</code> to bind the object returned by  <code>__enter__</code> to a name if you intend to reference that object later. So, given the above implementation, here's a simple way to query your database:</p>
+<pre><code>connection = MySQLdb.connect(...)
+with connection as cursor:            # connection.__enter__ executes at this line
+    cursor.execute('select 1;')
+    result = cursor.fetchall()        # connection.__exit__ executes after this line
+print result                          # prints "((1L,),)"
+</code></pre>
+<p>The question now is, what are the states of the connection and the cursor after exiting the <code>with</code> block? The <code>__exit__</code> method shown above calls only <code>self.rollback()</code> or <code>self.commit()</code>, and neither of those methods go on to call the <code>close()</code> method. The cursor itself has no <code>__exit__</code> method defined – and wouldn't matter if it did, because <code>with</code> is only managing the connection. Therefore, both the connection and the cursor remain open after exiting the <code>with</code> block. This is easily confirmed by adding the following code to the above example:</p>
+<pre><code>try:
+    cursor.execute('select 1;')
+    print 'cursor is open;',
+except MySQLdb.ProgrammingError:
+    print 'cursor is closed;',
+if connection.open:
+    print 'connection is open'
+else:
+    print 'connection is closed'
+</code></pre>
+<p>You should see the output "cursor is open; connection is open" printed to stdout.</p>
+<blockquote>
+<p>I believe you need to close the cursor before committing the connection.</p>
+</blockquote>
+<p>Why? The <a href="https://dev.mysql.com/doc/refman/5.6/en/c-api-function-overview.html" rel="noreferrer">MySQL C API</a>, which is the basis for <code>MySQLdb</code>, does not implement any cursor object, as implied in the module documentation: <a href="http://mysql-python.sourceforge.net/MySQLdb.html#connection-objects" rel="noreferrer">"MySQL does not support cursors; however, cursors are easily emulated."</a> Indeed, the <code>MySQLdb.cursors.BaseCursor</code> class inherits directly from <code>object</code> and imposes no such restriction on cursors with regard to commit/rollback. An Oracle developer <a href="http://forums.mysql.com/read.php?50,578823,578941#msg-578941" rel="noreferrer">had this to say</a>:</p>
+<blockquote>
+<p>cnx.commit() before cur.close() sounds most logical to me.  Maybe you
+  can go by the rule: "Close the cursor if you do not need it  anymore."
+  Thus commit() before closing the cursor. In the end, for
+  Connector/Python,  it does not make much difference, but or other
+  databases it might.</p>
+</blockquote>
+<p>I expect that's as close as you're going to get to "standard practice" on this subject.</p>
+<blockquote>
+<p>Is there any significant advantage to finding sets of transactions that don't require intermediate commits so that you don't have to get new cursors for each transaction?</p>
+</blockquote>
+<p>I very much doubt it, and in trying to do so, you may introduce additional human error. Better to decide on a convention and stick with it.</p>
+<blockquote>
+<p>Is there a lot of overhead for getting new cursors, or is it just not a big deal?</p>
+</blockquote>
+<p>The overhead is negligible, and doesn't touch the database server at all; it's entirely within the implementation of MySQLdb. You can <a href="https://github.com/farcepest/MySQLdb1/blob/master/MySQLdb/cursors.py" rel="noreferrer">look at <code>BaseCursor.__init__</code> on github</a> if you're really curious to know what's happening when you create a new cursor.</p>
+<p>Going back to earlier when we were discussing <code>with</code>, perhaps now you can understand why the <code>MySQLdb.Connection</code> class <code>__enter__</code> and <code>__exit__</code> methods give you a brand new cursor object in every <code>with</code> block and don't bother keeping track of it or closing it at the end of the block. It's fairly lightweight and exists purely for your convenience.</p>
+<p>If it's really that important to you to micromanage the cursor object, you can use <a href="http://docs.python.org/2/library/contextlib.html#contextlib.closing" rel="noreferrer">contextlib.closing</a> to make up for the fact that the cursor object has no defined <code>__exit__</code> method. For that matter, you can also use it to force the connection object to close itself upon exiting a <code>with</code> block. This should output "my_curs is closed; my_conn is closed":</p>
+<pre><code>from contextlib import closing
+import MySQLdb
+
+with closing(MySQLdb.connect(...)) as my_conn:
+    with closing(my_conn.cursor()) as my_curs:
+        my_curs.execute('select 1;')
+        result = my_curs.fetchall()
+try:
+    my_curs.execute('select 1;')
+    print 'my_curs is open;',
+except MySQLdb.ProgrammingError:
+    print 'my_curs is closed;',
+if my_conn.open:
+    print 'my_conn is open'
+else:
+    print 'my_conn is closed'
+</code></pre>
+<p>Note that <code>with closing(arg_obj)</code> will not call the argument object's <code>__enter__</code> and <code>__exit__</code> methods; it will <em>only</em> call the argument object's <code>close</code> method at the end of the <code>with</code> block. (To see this in action, simply define a class <code>Foo</code> with <code>__enter__</code>, <code>__exit__</code>, and <code>close</code> methods containing simple <code>print</code> statements, and compare what happens when you do <code>with Foo(): pass</code> to what happens when you do <code>with closing(Foo()): pass</code>.) This has two significant implications:</p>
+<p>First, if autocommit mode is enabled, MySQLdb will <code>BEGIN</code> an explicit transaction on the server when you use <code>with connection</code> and commit or rollback the transaction at the end of the block. These are default behaviors of MySQLdb, intended to protect you from MySQL's default behavior of immediately committing any and all DML statements. MySQLdb assumes that when you use a context manager, you want a transaction, and uses the explicit <code>BEGIN</code> to bypass the autocommit setting on the server. If you're used to using <code>with connection</code>, you might think autocommit is disabled when actually it was only being bypassed. You might get an unpleasant surprise if you add <code>closing</code> to your code and lose transactional integrity; you won't be able to rollback changes, you may start seeing concurrency bugs and it may not be immediately obvious why.</p>
+<p>Second, <code>with closing(MySQLdb.connect(user, pass)) as VAR</code> binds the <em>connection object</em> to <code>VAR</code>, in contrast to <code>with MySQLdb.connect(user, pass) as VAR</code>, which binds <em>a new cursor object</em> to <code>VAR</code>. In the latter case you would have no direct access to the connection object! Instead, you would have to use the cursor's <code>connection</code> attribute, which provides proxy access to the original connection. When the cursor is closed, its <code>connection</code> attribute is set to <code>None</code>. This results in an abandoned connection that will stick around until one of the following happens:</p>
+<ul>
+<li>All references to the cursor are removed</li>
+<li>The cursor goes out of scope</li>
+<li>The connection times out</li>
+<li>The connection is closed manually via server administration tools</li>
+</ul>
+<p>You can test this by monitoring open connections (in Workbench or by <a href="http://dev.mysql.com/doc/refman/5.6/en/show-processlist.html" rel="noreferrer">using <code>SHOW PROCESSLIST</code></a>) while executing the following lines one by one:</p>
+<pre><code>with MySQLdb.connect(...) as my_curs:
+    pass
+my_curs.close()
+my_curs.connection          # None
+my_curs.connection.close()  # throws AttributeError, but connection still open
+del my_curs                 # connection will close here
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>It's better to rewrite it using 'with' keyword. 'With' will take care about closing cursor (it's important because it's unmanaged resource) automatically. The benefit is it will close cursor in case of exception too. </p>
+<pre><code>from contextlib import closing
+import MySQLdb
+
+''' At the beginning you open a DB connection. Particular moment when
+  you open connection depends from your approach:
+  - it can be inside the same function where you work with cursors
+  - in the class constructor
+  - etc
+'''
+db = MySQLdb.connect("host", "user", "pass", "database")
+with closing(db.cursor()) as cur:
+    cur.execute("somestuff")
+    results = cur.fetchall()
+    # do stuff with results
+
+    cur.execute("insert operation")
+    # call commit if you do INSERT, UPDATE or DELETE operations
+    db.commit()
+
+    cur.execute("someotherstuff")
+    results2 = cur.fetchone()
+    # do stuff with results2
+
+# at some point when you decided that you do not need
+# the open connection anymore you close it
+db.close()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think you'll be better off trying to use one cursor for all of your executions, and close it at the end of your code. It's easier to work with, and it might have efficiency benefits as well (don't quote me on that one).</p>
+<pre><code>conn = MySQLdb.connect("host","user","pass","database")
+cursor = conn.cursor()
+cursor.execute("somestuff")
+results = cursor.fetchall()
+..do stuff with results
+cursor.execute("someotherstuff")
+results2 = cursor.fetchall()
+..do stuff with results2
+cursor.close()
+</code></pre>
+<p>The point is that you can store the results of a cursor's execution in another variable, thereby freeing your cursor to make a second execution. You run into problems this way only if you're using fetchone(), and need to make a second cursor execution before you've iterated through all results from the first query.</p>
+<p>Otherwise, I'd say just close your cursors as soon as you're done getting all of the data out of them. That way you don't have to worry about tying up loose ends later in your code.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><sup>Note: this answer is for <a href="https://github.com/PyMySQL/PyMySQL" rel="nofollow noreferrer">PyMySQL</a>, which is a drop-in replacement for MySQLdb and effectively the latest version of MySQLdb since MySQLdb stopped being maintained. I believe everything here is <em>also</em> true of the legacy MySQLdb, but haven't checked.</sup></p>
+<p>First of all, some facts:</p>
+<ul>
+<li>Python's <a href="https://docs.python.org/library/stdtypes.html#context-manager-types" rel="nofollow noreferrer"><code>with</code></a> syntax calls the context manager's <code>__enter__</code> method before executing the body of the <code>with</code> block, and its <code>__exit__</code> method afterwards.</li>
+<li>Connections have an <a href="https://github.com/PyMySQL/PyMySQL/blob/0.7.10/pymysql/connections.py#L831-L833" rel="nofollow noreferrer"><code>__enter__</code></a> method that does nothing besides create and return a cursor, and an <a href="https://github.com/PyMySQL/PyMySQL/blob/0.7.10/pymysql/connections.py#L835-L840" rel="nofollow noreferrer"><code>__exit__</code></a> method that either commits or rolls back (depending upon whether an exception was thrown). It <em>does not</em> close the connection.</li>
+<li>Cursors in PyMySQL are purely an abstraction implemented in Python; there is no equivalent concept in MySQL itself.<sup>1</sup></li>
+<li>Cursors have an <a href="https://github.com/PyMySQL/PyMySQL/blob/0.7.10/pymysql/cursors.py#L62-L63" rel="nofollow noreferrer"><code>__enter__</code></a> method that doesn't do anything and an <a href="https://github.com/PyMySQL/PyMySQL/blob/0.7.10/pymysql/cursors.py#L65-L67" rel="nofollow noreferrer"><code>__exit__</code></a> method which "closes" the cursor (which just means nulling the cursor's reference to its parent connection and throwing away any data stored on the cursor).</li>
+<li>Cursors hold a reference to the connection that spawned them, but connections don't hold a reference to the cursors that they've created.</li>
+<li>Connections have a <a href="https://github.com/PyMySQL/PyMySQL/blob/0.7.10/pymysql/connections.py#L750" rel="nofollow noreferrer"><code>__del__</code></a> method which closes them</li>
+<li>Per <a href="https://docs.python.org/3/reference/datamodel.html" rel="nofollow noreferrer">https://docs.python.org/3/reference/datamodel.html</a>, CPython (the default Python implementation) uses reference counting and automatically deletes an object once the number of references to it hits zero.</li>
+</ul>
+<p>Putting these things together, we see that naive code like this is <em>in theory</em> problematic:</p>
+<pre><code># Problematic code, at least in theory!
+import pymysql
+with pymysql.connect() as cursor:
+    cursor.execute('SELECT 1')
+
+# ... happily carry on and do something unrelated
+</code></pre>
+<p>The problem is that nothing has closed the connection. Indeed, if you paste the code above into a Python shell and then run <code>SHOW FULL PROCESSLIST</code> at a MySQL shell, you'll be able to see the idle connection that you created. Since MySQL's default number of connections is <a href="https://dev.mysql.com/doc/refman/5.7/en/server-system-variables.html#sysvar_max_connections" rel="nofollow noreferrer">151</a>, which isn't <em>huge</em>, you could theoretically start running into problems if you had many processes keeping these connections open.</p>
+<p>However, in CPython, there is a saving grace that ensures that code like my example above <em>probably</em> won't cause you to leave around loads of open connections. That saving grace is that as soon as <code>cursor</code> goes out of scope (e.g. the function in which it was created finishes, or <code>cursor</code> gets another value assigned to it), its reference count hits zero, which causes it to be deleted, dropping the connection's reference count to zero, causing the connections <code>__del__</code> method to be called which force-closes the connection. If you already pasted the code above into your Python shell, then you can now simulate this by running <code>cursor = 'arbitrary value'</code>; as soon as you do this, the connection you opened will vanish from the <code>SHOW PROCESSLIST</code> output.</p>
+<p>However, relying upon this is inelegant, and theoretically might fail in Python implementations other than CPython. Cleaner, in theory, would be to explicitly <code>.close()</code> the connection (to free up a connection on the database without waiting for Python to destroy the object). This more robust code looks like this:</p>
+<pre><code>import contextlib
+import pymysql
+with contextlib.closing(pymysql.connect()) as conn:
+    with conn as cursor:
+        cursor.execute('SELECT 1')
+</code></pre>
+<p>This is ugly, but doesn't rely upon Python destructing your objects to free up your (finite available number of) database connections.</p>
+<p>Note that closing the <em>cursor</em>, if you're already closing the connection explicitly like this, is entirely pointless.</p>
+<p>Finally, to answer the secondary questions here:</p>
+<blockquote>
+<p>Is there a lot of overhead for getting new cursors, or is it just not a big deal?</p>
+</blockquote>
+<p>Nope, instantiating a cursor doesn't hit MySQL at all and <a href="https://github.com/PyMySQL/PyMySQL/blob/0.7.10/pymysql/cursors.py#L34-L47" rel="nofollow noreferrer">basically does nothing</a>.</p>
+<blockquote>
+<p>Is there any significant advantage to finding sets of transactions that don't require intermediate commits so that you don't have to get new cursors for each transaction?</p>
+</blockquote>
+<p>This is situational and difficult to give a general answer to. As <a href="https://dev.mysql.com/doc/refman/en/optimizing-innodb-transaction-management.html" rel="nofollow noreferrer">https://dev.mysql.com/doc/refman/en/optimizing-innodb-transaction-management.html</a> puts it, <em>"an application might encounter performance issues if it commits thousands of times per second, and different performance issues if it commits only every 2-3 hours"</em>. You pay a performance overhead for every commit, but by leaving transactions open for longer, you increase the chance of other connections having to spend time waiting for lock, increase your risk of deadlocks, and potentially increase the cost of some lookups performed by other connections.</p>
+<hr/>
+<p><sup><sup>1</sup> MySQL <em>does</em> have a construct it calls a <a href="https://dev.mysql.com/doc/refman/en/cursors.html" rel="nofollow noreferrer">cursor</a> but they only exist inside stored procedures; they're completely different to PyMySQL cursors and are not relevant here.</sup></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I suggest to do it like php and mysql. Start i at the beginning of your code before printing of the first data. So if you get a connect error you can display a <code>50x</code>(Don't remember what internal error is) error message. And keep it open for the whole session and close it when you know you wont need it anymore.</p>
+</div>
+<span class="comment-copy">your post was most exhaustive, but even after re-reading it a few times, I find myself still puzzled regarding closing cursors.  Judging from the numerous post on the subject, it seems to be a common point of confusion.  My takeaway is that cursors seemingly DO NOT require .close() to be called -- ever.  So why even have a .close() method?</span>
+<span class="comment-copy">The short answer is that <code>cursor.close()</code> is part of <a href="https://www.python.org/dev/peps/pep-0249/#cursor-methods" rel="nofollow noreferrer">the Python DB API</a>, which was not written specifically with MySQL in mind.</span>
+<span class="comment-copy">Why connection will close after del my_curs?</span>
+<span class="comment-copy">@ChengchengPei <code>my_curs</code> holds the last reference to the <code>connection</code> object. Once that reference no longer exists, the <code>connection</code> object <i>should</i> be garbage collected.</span>
+<span class="comment-copy">This is a fantastic answer, thanks. Excellent explanation of <code>with</code> and <code>MySQLdb.Connection</code>'s <code>__enter__</code> and <code>__exit__</code> functions. Again, thank you @Air.</span>
+<span class="comment-copy">+1 for using <code>with</code></span>
+<span class="comment-copy">I dont think the <code>with</code> is a good option if you want to use it in Flask or other web framework. If the situation is <code>http://flask.pocoo.org/docs/patterns/sqlite3/#sqlite3</code> then there will be problems.</span>
+<span class="comment-copy">@james-king I didn't work with Flask, but in your example Flask will close db connection itself. Actually in my code I use slightly different approach- I use <b>with</b> for close cursors        <code>with closing(self.db.cursor()) as cur:           cur.execute("UPDATE table1 SET status = %s WHERE id = %s",(self.INTEGR_STATUS_PROCESSING, id))           self.db.commit()</code></span>
+<span class="comment-copy">@RomanPodlinov Yeah, If you use it with cursor then things would be fine.</span>
+<span class="comment-copy">Thanks - Considering that you have to close the cursor to commit an update/insert, I guess one easy way to do it for updates/inserts would be to get one cursor for each daemon, close the cursor to commit and immediately get a new cursor so your ready the next time. Does that sound reasonable?</span>
+<span class="comment-copy">Hey, no problem. I didn't actually know about committing the update/insert by closing your cursors, but a quick search online shows this:  conn = MySQLdb.connect(arguments_go_here) cursor = MySQLdb.cursor() cursor.execute(mysql_insert_statement_here) try:     conn.commit() except:     conn.rollback() # undo changes made if error occurs.  This way, the database itself commits the changes, and you don't have to worry about the cursors themselves. Then you can just have 1 cursor open at all times. Have a look here:  <a href="http://www.tutorialspoint.com/python/python_database_access.htm" rel="nofollow noreferrer">tutorialspoint.com/python/python_database_access.htm</a></span>
+<span class="comment-copy">Yeah if that works then I'm just wrong and there was some other reason that caused me to think I had to close the cursor in order to commit the connection.</span>
+<span class="comment-copy">Yea I dunno, that link I posted makes me think that that works. I guess a little more research would tell you if it definitely works or not, but I think you could probably just go with it. Hope I was of help to you!</span>
+<span class="comment-copy">In MySQLdb, there is a difference between a connection and a cursor. I connect once per request (for now) and can detect connection errors early. But what about cursors?</span>
+<span class="comment-copy">IMHO it's not accurate advice.  It dependes. If your code will keep connection for long time (e.g. it takes some data from DB and then for 1-5-10 mins it does something on the server and keep connection) and it's multy thread application it will create a problem pretty soon (you will exceed max allowed connections).</span>

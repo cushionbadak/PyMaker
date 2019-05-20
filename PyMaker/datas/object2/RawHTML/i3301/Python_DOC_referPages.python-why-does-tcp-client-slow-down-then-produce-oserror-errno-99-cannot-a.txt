@@ -1,0 +1,162 @@
+<div class="post-text" itemprop="text">
+<p>I am writing a server for an event-based simulator and am using <code>asyncio</code> TCP server for this purpose.</p>
+<pre><code>#server.py
+import asyncio
+import itertools
+import json
+
+
+class Server:
+    def __init__(self, loop=None):
+        self.loop = loop
+        self.pq = asyncio.PriorityQueue()
+        self.counter = itertools.count()
+
+    async def __call__(self, reader, writer):
+        event = await reader.read(100)
+        message = json.loads(event.decode())
+        self.pq.put_nowait([next(self.counter), message])
+        while self.pq.qsize():
+            t = await self.pq.get()
+            send_data = json.dumps(t).encode("utf-8")
+            writer.write(send_data)
+            await writer.drain()
+
+loop = asyncio.get_event_loop()
+s = Server(loop)
+coro = asyncio.start_server(s, '127.0.0.1', 5000, loop=loop)
+server = loop.run_until_complete(coro)
+
+# Serve requests until Ctrl+C is pressed
+print('Serving on {}'.format(server.sockets[0].getsockname()))
+try:
+    loop.run_forever()
+except KeyboardInterrupt:
+    pass
+
+# Close the server
+server.close()
+loop.run_until_complete(server.wait_closed())
+loop.close()
+</code></pre>
+<p>I want a client to send encoded json events to this server quickly.</p>
+<pre><code>#client.py
+import socket
+import json
+import datetime
+
+host = "127.0.0.1"
+port = 5000
+
+N = 10000
+start = datetime.datetime.utcnow()
+
+
+for i in range(1, N + 1):
+    s = socket.create_connection((host, port))
+    send_message = {"id": i, "value": i * 3}
+    send_json = json.dumps(send_message)
+    send_data = send_json.encode("utf-8")
+    s.sendall(send_data)
+    receive_data = s.recv(1024)
+    receive_json = receive_data.decode("utf-8")
+    _ = json.loads(receive_json)
+    s.close()
+
+stop = datetime.datetime.utcnow()
+print("Tasks per second: {}".format(N / (stop - start).total_seconds()))
+</code></pre>
+<p><strong>Problem</strong>
+The client program has varying performance and error generation, despite having no other user programs open.</p>
+<p>Often, but not always, the first run of <code>client.py</code> runs at about 3,000 tasks per second. Occasionally, the first run goes slower (~500-600 tasks per second).</p>
+<p>Once the performance drops to 500-600 tasks per second, further runs never recover back to 3,000 tasks per second.</p>
+<p>Eventually, running <code>client.py</code> raises the following exception:</p>
+<pre><code>Traceback (most recent call last):
+  File "aioclient.py", line 12, in &lt;module&gt;
+    s = socket.create_connection((host, port))
+  File "/home/randm/Libraries/anaconda3/lib/python3.6/socket.py", line 724, in create_connection
+    raise err
+  File "/home/randm/Libraries/anaconda3/lib/python3.6/socket.py", line 713, in create_connection
+    sock.connect(sa)
+OSError: [Errno 99] Cannot assign requested address
+</code></pre>
+<p><strong>Question</strong></p>
+<p>How should I rewrite <code>client.py</code> (or <code>server.py</code>) to avoid this?</p>
+<p>Having read <a href="https://docs.python.org/3/howto/sockets.html" rel="nofollow noreferrer">https://docs.python.org/3/howto/sockets.html</a>, perhaps a few notes:</p>
+<ol>
+<li>The messages will be variable length.</li>
+<li>I am fine with with either delimiting or sending message length with the messages as opposed to shutting down the connection, which seems to be the underlying source of the problem here.</li>
+<li>I'd rather not add an application-layer protocol like HTTP here as I know messages will always be UTF8-encoded JSON.</li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think using a message delimiter (I've chosen <code>b'\x1e'</code>) allows me to have 1 connection for the entire set of messages instead of establishing a new connection for each message. The <code>StreamReader.readuntil</code> method works fine in this case.</p>
+<pre><code># server.py
+import asyncio
+import itertools
+import json
+
+
+PQ = asyncio.PriorityQueue()
+COUNTER = itertools.count()
+
+
+async def handle_data_provider(reader, writer):
+    try:
+        while True:
+            data = await reader.readuntil(b'\x1e')
+            message = json.loads(data[:-1].decode())
+            n = next(COUNTER)
+            if n % 10000 == 0:
+                print(n, PQ.qsize())
+            PQ.put_nowait([n, message])
+    except asyncio.streams.IncompleteReadError:
+        pass
+
+loop = asyncio.get_event_loop()
+coro = asyncio.start_server(handle_data_provider, '127.0.0.1', 5000, loop=loop)
+server = loop.run_until_complete(coro)
+
+# Serve requests until Ctrl+C is pressed
+print('Serving on {}'.format(server.sockets[0].getsockname()))
+try:
+    loop.run_forever()
+except KeyboardInterrupt:
+    pass
+
+# Close the server
+server.close()
+loop.run_until_complete(server.wait_closed())
+loop.close()
+</code></pre>
+<p>And client...</p>
+<pre><code># client.py
+import socket
+import json
+import datetime
+
+host = "127.0.0.1"
+port = 5000
+
+N = 10000
+start = datetime.datetime.utcnow()
+
+s = socket.create_connection((host, port))
+
+for i in range(1, N + 1):
+    message = {"id": i, "value": i * 3}
+    json_message = json.dumps(message)
+    data = json_message.encode("utf-8") + b'\x1e'
+    s.sendall(data)
+
+s.close()
+
+stop = datetime.datetime.utcnow()
+print("Tasks per second: {}".format(N / (stop - start).total_seconds()))
+</code></pre>
+</div>
+<span class="comment-copy">That is full traceback. <code>aioclient.py</code> is the client in question.</span>
+<span class="comment-copy">From the man page: EADDRNOTAVAIL (Internet domain sockets) The socket referred to by  sockfd  had not  previously been bound to an address and, upon attempting to bind it to an ephemeral port, it was determined that all port numbers in  the ephemeral port range are currently in use. See the discussion of  /proc/sys/net/ipv4/ip_local_port_range in ip(7). ... remember that TCP sockets don't close immediately; the kernel has to keep them alive until the other side acknowledges the close.</span>
+<span class="comment-copy"><i>Also</i>, note that if you are saturating an internet connection with data, many of the "bookkeeping" packets will be lost ... those, for optimal use of an internet connection, you want to deliberately throttle to slightly <i>less</i> than the maximum bandwidth. Individual TCP connections are partly able to self-limit, but multiple TCP connections (or any non-TCP connections) do not.</span>
+<span class="comment-copy">Ok, so given TCP's architecture, would you recommend I rewrite client, server, or use something other than TCP?</span>
+<span class="comment-copy">It depends on what you're aiming for. Remember that the c10k problem doesn't involve that many connections from a single <i>client</i> machine - if you want a single computer to send that many payloads, just keep one TCP connection open. TCP has unavoidable flaws, but reimplementing it with proper fixes them is <i>really</i> hard ... DJB's MinimaLT is probably the closest anyone has come, but it hasn't <i>really</i> been tested in the wild.</span>

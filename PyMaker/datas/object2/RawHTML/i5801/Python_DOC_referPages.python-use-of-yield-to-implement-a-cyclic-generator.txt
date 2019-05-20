@@ -1,0 +1,136 @@
+<div class="post-text" itemprop="text">
+<p>TL;DR is what I'm trying to do too complicated for a yield-based generator?</p>
+<p>I have a python application where I need to repeat an expensive test on a list of objects, one at a time, and then mangle those that pass.  I expect several objects to pass, but I do not want to create a list of all those that pass, as mangle will alter the state of some of the other objects. There is no requirement to test in any particular order. Then rinse and repeat until some stop condition.</p>
+<p>My first simple implementation was this, which runs logically correctly</p>
+<pre><code>while not stop_condition:
+    for object in object_list:
+        if test(object):
+            mangle(object)
+            break
+    else:
+        handle_no_tests_passed()
+</code></pre>
+<p>unfortunately, <code>for object in object_list:</code> always restarts at the beginning of the list, where the objects probably haven't been changed, and there are objects at the end of the list ready to test. Picking them at random would be slightly better, but I would rather carry on where I left off from the previous for/in call. I still want the for/in call to terminate when it's traversed the entire list.</p>
+<p>This sounded like a job for yield, but I tied my brain in knots failing to make it do what I wanted. I can use it in the simple cases, iterating over a range or returning filtered records from some source, but I couldn't find out how to make it save state and restart reading from its source.</p>
+<p>I can often do things the long wordy way with classes, but fail to understand how to use the alleged simplifications like yield. Here is a solution that does exactly what I want.</p>
+<pre><code>class CyclicSource:
+    def __init__(self, source):
+        self.source = source
+        self.pointer = 0
+
+    def __iter__(self):
+        # reset how many we've done, but not where we are
+        self.done_this_call = 0
+        return self
+
+    def __next__(self):
+        ret_val = self.source[self.pointer]
+        if self.done_this_call &gt;= len(self.source):
+            raise StopIteration
+        self.done_this_call += 1
+        self.pointer += 1
+        self.pointer %= len(self.source)
+        return ret_val
+
+source = list(range(5))
+q = CyclicSource(source)
+
+print('calling once, aborted early')
+count = 0
+for i in q:
+    count += 1
+    print(i)
+    if count&gt;=2:
+        break
+else:
+    print('ran off first for/in')
+
+print('calling again')
+for i in q:
+    print(i)
+else:
+    print('ran off second for/in')
+</code></pre>
+<p>which demonstrates the desired behaviour</p>
+<pre><code>calling once, aborted early
+0
+1
+calling again
+2
+3
+4
+0
+1
+ran off second for/in
+</code></pre>
+<p>Finally, the question. Is it possible to do what I want with the simplified generator syntax using yield, or does maintaining state between successive for/in calls require the full class syntax?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Your use of the <code>__iter__</code> method causes your iterator to be reset. This actually goes quite counter to regular behaviour of an iterator; the <a href="https://docs.python.org/3/library/stdtypes.html#iterator-types" rel="nofollow noreferrer"><code>__iter__</code> method should just return <code>self</code>, nothing more</a>. You rely on a <em>side effect</em> of <code>for</code> applying <code>iter()</code> to your iterator each time you create a <code>for i in q:</code> loop. This makes your iterator work, but the behaviour is <em>surprising</em> and will trip up future maintainers. I'd prefer that effect to be split out to a separate <code>.reset()</code> method, for example.</p>
+<p>You <em>can</em> reset a generator too, using <a href="https://docs.python.org/3/reference/expressions.html#generator.send" rel="nofollow noreferrer"><code>generator.send()</code></a> to signal it to reset:</p>
+<pre><code>def cyclic_source(source):
+    pointer = 0
+    done_this_call = 0
+
+    while done_this_call &lt; len(source):
+        ret_val = source[pointer]
+        done_this_call += 1
+        pointer = (pointer + 1) % len(source)
+        reset = yield ret_val
+        if reset is not None:
+            done_this_call = 0
+            yield  # pause again for next iteration sequence
+</code></pre>
+<p>Now you can 'reset' your count back to zero:</p>
+<pre><code>q = cyclic_source(source)
+for count, i in enumerate(q):
+    print(i)
+    if count == 1:
+        break
+else:
+    print('ran off first for/in')
+
+print('explicitly resetting the generator')
+q.send(True)
+for i in q:
+    print(i)
+else:
+    print('ran off second for/in')
+</code></pre>
+<p>This is however, rather.. counter to readability. I'd instead use an <em>infinite generator</em> by using <a href="https://docs.python.org/3/library/itertools.html#itertools.cycle" rel="nofollow noreferrer"><code>itertools.cycle()</code></a> that is limited in the number of iterations with <a href="https://docs.python.org/3/library/itertools.html#itertools.islice" rel="nofollow noreferrer"><code>itertools.islice()</code></a>:</p>
+<pre><code>from itertools import cycle, islice
+
+q = cycle(source)
+for count, i in enumerate(islice(q, len(source))):
+    print(i)
+    if count == 1:
+        break
+else:
+    print('ran off first for/in')
+
+for i in islice(q, len(source)):
+    print(i)
+else:
+    print('ran off second for/in')
+</code></pre>
+<p><code>q</code> will produce values from <code>source</code> in an endless loop. <code>islice()</code> cuts off iteration after <code>len(source)</code> elements. But because <code>q</code> is <em>reused</em>, it is still maintaining the iteration state.</p>
+<p>If you must have a dedicated iterator, stick to a class object and make an <em>iterable</em>, so have it return a new iterator each time <code>__iter__</code> is called:</p>
+<pre><code>from itertools import cycle, islice
+
+class CyclicSource:
+    def __init__(self, source):
+        self.length = len(source)
+        self.source = cycle(source)
+
+    def __iter__(self):
+        return islice(self.source, self.length)
+</code></pre>
+<p>This keeps state in the <code>cycle()</code> iterator still, but simply creates a new <code>islice()</code> object each time you create an iterator for this. It basically encapsulates the <code>islice()</code> approach above.</p>
+</div>
+<span class="comment-copy">I am not sure I follow you. Is there any reason why you can't just do <code>for object in random.shuffle(object_list)</code> to get different ordering of objects every time the loop goes off? <a href="https://stackoverflow.com/questions/976882/shuffling-a-list-of-objects" title="shuffling a list of objects">stackoverflow.com/questions/976882/shuffling-a-list-of-objects</a></span>
+<span class="comment-copy">ie. together with not breaking the loop after mangling.</span>
+<span class="comment-copy">Thx for the reply, more food for thought. I'm working at the very limits of my python_foo here, and I'm not clear why, or even that, my (apparently) misuse of the side effects of for is surprising. The prototype for that generator class was got from 'somewhere on the net' so it might be of low quality. However, I thought that call init on object create, iter on for/in call and next on the next time round the loop was well defined. It sounds like the itertools constructs should be more sanitary. I's still like to make something that can be used in a simple for/in, than do an enumerate round it.</span>
+<span class="comment-copy">@Neil_UK: doing anything else but <code>return self</code> in an iterator <code>__iter__</code> method is surprising, because that's not something any other iterator does. <code>iter(iterator)</code> should produce <code>iterator</code>, nothing else, and certainly not have altered the state of the iterator.</span>
+<span class="comment-copy">@Neil_UK: I'd much rather see an explicit <code>.reset()</code> method on the iterator that you call to set the counter back to 0. That is better than either the side-effect in <code>__iter__</code> or the generator function using sending (which, having to add an extra <code>yield</code> to pause again, is also a bit obscure).</span>
+<span class="comment-copy">@Neil_UK: actually, I've added another option; one that properly creates a new iterator for each <code>iter()</code> invocation, one that starts a new limited loop over <code>cycle</code>.</span>
+<span class="comment-copy">Thx, much tidier, works fine. Handy to get a leg up into itertools.</span>

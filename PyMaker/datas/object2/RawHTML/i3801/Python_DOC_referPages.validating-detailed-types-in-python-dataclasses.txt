@@ -1,0 +1,167 @@
+<div class="post-text" itemprop="text">
+<p><a href="https://www.python.org/dev/peps/pep-0537/#schedule" rel="noreferrer">Python 3.7 is around the corner</a>, and I wanted to test some of the fancy new <code>dataclass</code>+typing features. Getting hints to work right is easy enough, with both native types and those from the <code>typing</code> module:</p>
+<pre><code>&gt;&gt;&gt; import dataclasses
+&gt;&gt;&gt; import typing as ty
+&gt;&gt;&gt; 
+... @dataclasses.dataclass
+... class Structure:
+...     a_str: str
+...     a_str_list: ty.List[str]
+...
+&gt;&gt;&gt; my_struct = Structure(a_str='test', a_str_list=['t', 'e', 's', 't'])
+&gt;&gt;&gt; my_struct.a_str_list[0].  # IDE suggests all the string methods :)
+</code></pre>
+<p>But one other thing that I wanted to try was forcing the type hints as conditions during runtime, i.e. it should not be possible for a <code>dataclass</code> with incorrect types to exist. It can be implemented nicely with <a href="https://www.python.org/dev/peps/pep-0557/#post-init-processing" rel="noreferrer"><code>__post_init__</code></a>:</p>
+<pre><code>&gt;&gt;&gt; @dataclasses.dataclass
+... class Structure:
+...     a_str: str
+...     a_str_list: ty.List[str]
+...     
+...     def validate(self):
+...         ret = True
+...         for field_name, field_def in self.__dataclass_fields__.items():
+...             actual_type = type(getattr(self, field_name))
+...             if actual_type != field_def.type:
+...                 print(f"\t{field_name}: '{actual_type}' instead of '{field_def.type}'")
+...                 ret = False
+...         return ret
+...     
+...     def __post_init__(self):
+...         if not self.validate():
+...             raise ValueError('Wrong types')
+</code></pre>
+<p>This kind of <code>validate</code> function works for native types and custom classes, but not those specified by the <code>typing</code> module:</p>
+<pre><code>&gt;&gt;&gt; my_struct = Structure(a_str='test', a_str_list=['t', 'e', 's', 't'])
+Traceback (most recent call last):
+  a_str_list: '&lt;class 'list'&gt;' instead of 'typing.List[str]'
+  ValueError: Wrong types
+</code></pre>
+<p>Is there a better approach to validate an untyped list with a <code>typing</code>-typed one? Preferably one that doesn't include checking the types of all elements in any <code>list</code>, <code>dict</code>, <code>tuple</code>, or <code>set</code> that is a <code>dataclass</code>' attribute.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Instead of checking for type equality, you should use <code>isinstance</code>. But you cannot use a parametrized generic type (<code>typing.List[int]</code>) to do so, you must use the "generic" version (<code>typing.List</code>). So you will be able to check for the container type but not the contained types. Parametrized generic types define an <code>__origin__</code> attribute that you can use for that.</p>
+<p>Contrary to Python 3.6, in Python 3.7 most type hints have a useful <code>__origin__</code> attribute. Compare:</p>
+<pre><code># Python 3.6
+&gt;&gt;&gt; import typing
+&gt;&gt;&gt; typing.List.__origin__
+&gt;&gt;&gt; typing.List[int].__origin__
+typing.List
+</code></pre>
+<p>and</p>
+<pre><code># Python 3.7
+&gt;&gt;&gt; import typing
+&gt;&gt;&gt; typing.List.__origin__
+&lt;class 'list'&gt;
+&gt;&gt;&gt; typing.List[int].__origin__
+&lt;class 'list'&gt;
+</code></pre>
+<p>Notable exceptions being <code>typing.Any</code>, <code>typing.Union</code> and <code>typing.ClassVar</code>… Well, anything that is a <code>typing._SpecialForm</code> does not define <code>__origin__</code>. Fortunately:</p>
+<pre><code>&gt;&gt;&gt; isinstance(typing.Union, typing._SpecialForm)
+True
+&gt;&gt;&gt; isinstance(typing.Union[int, str], typing._SpecialForm)
+False
+&gt;&gt;&gt; typing.Union[int, str].__origin__
+typing.Union
+</code></pre>
+<p>But parametrized types define an <code>__args__</code> attribute that store their parameters as a tuple:</p>
+<pre><code>&gt;&gt;&gt; typing.Union[int, str].__args__
+(&lt;class 'int'&gt;, &lt;class 'str'&gt;)
+</code></pre>
+<p>So we can improve type checking a bit:</p>
+<pre><code>for field_name, field_def in self.__dataclass_fields__.items():
+    if isinstance(field_def.type, typing._SpecialForm):
+        # No check for typing.Any, typing.Union, typing.ClassVar (without parameters)
+        continue
+    try:
+        actual_type = field_def.type.__origin__
+    except AttributeError:
+        actual_type = field_def.type
+    if isinstance(actual_type, typing._SpecialForm):
+        # case of typing.Union[…] or typing.ClassVar[…]
+        actual_type = field_def.type.__args__
+
+    actual_value = getattr(self, field_name)
+    if not isinstance(actual_value, actual_type):
+        print(f"\t{field_name}: '{type(actual_value)}' instead of '{field_def.type}'")
+        ret = False
+</code></pre>
+<p>This is not perfect as it won't account for <code>typing.ClassVar[typing.Union[int, str]]</code> or <code>typing.Optional[typing.List[int]]</code> for instance, but it should get things started.</p>
+<hr/>
+<p>Next is the way to apply this check.</p>
+<p>Instead of using <code>__post_init__</code>, I would go the decorator route: this could be used on anything with type hints, not only <code>dataclasses</code>:</p>
+<pre><code>import inspect
+import typing
+from contextlib import suppress
+from functools import wraps
+
+
+def enforce_types(callable):
+    spec = inspect.getfullargspec(callable)
+
+    def check_types(*args, **kwargs):
+        parameters = dict(zip(spec.args, args))
+        parameters.update(kwargs)
+        for name, value in parameters.items():
+            with suppress(KeyError):  # Assume un-annotated parameters can be any type
+                type_hint = spec.annotations[name]
+                if isinstance(type_hint, typing._SpecialForm):
+                    # No check for typing.Any, typing.Union, typing.ClassVar (without parameters)
+                    continue
+                try:
+                    actual_type = type_hint.__origin__
+                except AttributeError:
+                    actual_type = type_hint
+                if isinstance(actual_type, typing._SpecialForm):
+                    # case of typing.Union[…] or typing.ClassVar[…]
+                    actual_type = type_hint.__args__
+
+                if not isinstance(value, actual_type):
+                    raise TypeError('Unexpected type for \'{}\' (expected {} but found {})'.format(name, type_hint, type(value)))
+
+    def decorate(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            check_types(*args, **kwargs)
+            return func(*args, **kwargs)
+        return wrapper
+
+    if inspect.isclass(callable):
+        callable.__init__ = decorate(callable.__init__)
+        return callable
+
+    return decorate(callable)
+</code></pre>
+<p>Usage being:</p>
+<pre><code>@enforce_types
+@dataclasses.dataclass
+class Point:
+    x: float
+    y: float
+
+@enforce_types
+def foo(bar: typing.Union[int, str]):
+    pass
+</code></pre>
+<p>Appart from validating some type hints as suggested in the previous section, this approach still have some drawbacks:</p>
+<ul>
+<li>type hints using strings (<code>class Foo: def __init__(self: 'Foo'): pass</code>) are not taken into account by <code>inspect.getfullargspec</code>: you may want to use <a href="https://docs.python.org/3/library/typing.html#typing.get_type_hints" rel="noreferrer"><code>typing.get_type_hints</code></a> and <a href="https://docs.python.org/3/library/inspect.html#inspect.signature" rel="noreferrer"><code>inspect.signature</code></a> instead;</li>
+<li><p>a default value which is not the appropriate type is not validated:</p>
+<pre><code>@enforce_type
+def foo(bar: int = None):
+    pass
+
+foo()
+</code></pre>
+<p>does not raise any <code>TypeError</code>. You may want to use <a href="https://docs.python.org/3/library/inspect.html#inspect.Signature.bind" rel="noreferrer"><code>inspect.Signature.bind</code></a> in conjuction with <a href="https://docs.python.org/3/library/inspect.html#inspect.BoundArguments.apply_defaults" rel="noreferrer"><code>inspect.BoundArguments.apply_defaults</code></a> if you want to account for that (and thus forcing you to define <code>def foo(bar: typing.Optional[int] = None)</code>);</p></li>
+<li>variable number of arguments can't be validated as you would have to define something like <code>def foo(*args: typing.Sequence, **kwargs: typing.Mapping)</code> and, as said at the beginning, we can only validate containers and not contained objects.</li>
+</ul>
+<hr/>
+<p><sub>Thanks to <a href="https://stackoverflow.com/users/1222951/aran-fey">@Aran-Fey</a> that helped me improve this answer.</sub></p>
+</div>
+<span class="comment-copy">The obvious solution would be <code>if not isinstance(actual_type, field_def.type):</code>... but of course the obvious solution doesn't work: <code>TypeError: Parameterized generics cannot be used with class or instance checks</code>.</span>
+<span class="comment-copy">That made me find <code>ty.List.__origin__</code> though, which gives <code>&lt;class 'list'&gt;</code>. That won't let me check the inner type, but at least it won't crash on me any more</span>
+<span class="comment-copy">I found <a href="https://stackoverflow.com/q/42027923/1222951">this</a> similar question, but it doesn't really have a solution. If you're down for checking the type manually, you'll find these two links useful: <a href="//stackoverflow.com/q/49171189">What's the correct way to check if an object is a typing.Generic?</a> and <a href="//stackoverflow.com/q/48572831">How to access the type arguments of typing.Generic?</a></span>
+<span class="comment-copy">@Aran-Fey Those were some really interesting reads!</span>
+<span class="comment-copy">This is a lost cause. Trying to enforce this would encur prohibative runtime costs. What is the list is a million items long? Do you want to iterate over every item checking its type? What if I do <code>struct.a_str_list[24] = 1</code> -- you'd have no way of knowing. You'd have to write a specialised subclass of list  that introspects its items and only allow that class rather than <code>list</code> in your structure. This is a lot fo runtime overhead and more easily prevented by using guards at the API level, and type annotations with linting elsewhere.</span>
+<span class="comment-copy">Let us <a href="https://chat.stackoverflow.com/rooms/172211/discussion-between-mathias-ettinger-and-aran-fey">continue this discussion in chat</a>.</span>
+<span class="comment-copy">Thanks a lot for this great answer! =) I finally got around to understand and test it, and it solved my problems as well as taught me a lot about <code>typing</code>.</span>

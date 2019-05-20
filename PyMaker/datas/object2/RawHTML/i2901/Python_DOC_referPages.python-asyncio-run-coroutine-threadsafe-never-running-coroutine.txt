@@ -1,0 +1,112 @@
+<div class="post-text" itemprop="text">
+<p>I'm not sure what I'm doing wrong here, I'm trying to have a class which contains a queue and uses a coroutine to consume items on that queue.  The wrinkle is that the event loop is being run in a separate thread (in that thread I do <code>loop.run_forever()</code> to get it running).</p>
+<p>What I'm seeing though is that the coroutine for consuming items is never fired:</p>
+<pre><code>import asyncio
+from threading import Thread
+
+import functools
+
+# so print always flushes to stdout
+print = functools.partial(print, flush=True)
+
+
+def start_loop(loop):
+    def run_forever(loop):
+        print("Setting loop to run forever")
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+        print("Leaving run forever")
+
+    asyncio.set_event_loop(loop)
+    print("Spawaning thread")
+    thread = Thread(target=run_forever, args=(loop,))
+    thread.start()
+
+
+class Foo:
+    def __init__(self, loop):
+        print("in foo init")
+        self.queue = asyncio.Queue()
+        asyncio.run_coroutine_threadsafe(self.consumer(self.queue), loop)
+
+    async def consumer(self, queue):
+        print("In consumer")
+        while True:
+            message = await queue.get()
+            print(f"Got message {message}")
+            if message == "END OF QUEUE":
+                print(f"exiting consumer")
+                break
+            print(f"Processing {message}...")
+
+
+def main():
+    loop = asyncio.new_event_loop()
+    start_loop(loop)
+    f = Foo(loop)
+    f.queue.put("this is a message")
+    f.queue.put("END OF QUEUE")
+
+    loop.call_soon_threadsafe(loop.stop)
+
+    # wait for the stop to propagate and complete
+    while loop.is_running():
+        pass
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<p>Output:</p>
+<pre>
+Spawaning thread
+Setting loop to run forever
+in foo init
+Leaving run forever
+</pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>There are several issues with this code.</p>
+<p>First, check the warnings:</p>
+<pre><code>test.py:44: RuntimeWarning: coroutine 'Queue.put' was never awaited
+f.queue.put("this is a message")
+test.py:45: RuntimeWarning: coroutine 'Queue.put' was never awaited
+f.queue.put("END OF QUEUE")
+</code></pre>
+<p>That means <a href="https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue.put" rel="nofollow noreferrer">queue.put</a> is a coroutine, so it has to be run using <a href="https://docs.python.org/3/library/asyncio-task.html#asyncio.run_coroutine_threadsafe" rel="nofollow noreferrer">run_coroutine_threadsafe</a>:</p>
+<pre><code>asyncio.run_coroutine_threadsafe(f.queue.put("this is a message"), loop)
+asyncio.run_coroutine_threadsafe(f.queue.put("END OF QUEUE"), loop)
+</code></pre>
+<p>You could also use <a href="https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue.put_nowait" rel="nofollow noreferrer">queue.put_nowait</a> which is a synchronous method. However, asyncio objects are generally not threadsafe so every synchronous call has to go through <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.AbstractEventLoop.call_soon_threadsafe" rel="nofollow noreferrer">call_soon_threadsafe</a>:</p>
+<pre><code>loop.call_soon_threadsafe(f.queue.put_nowait, "this is a message")
+loop.call_soon_threadsafe(f.queue.put_nowait, "END OF QUEUE")
+</code></pre>
+<p>Another issue is that the loop gets stopped before the consumer task can start processing items. You could add a <code>join</code> method to the <code>Foo</code> class to wait for the consumer to finish:</p>
+<pre><code>class Foo:
+    def __init__(self, loop):
+        [...]
+        self.future = asyncio.run_coroutine_threadsafe(self.consumer(self.queue), loop)
+
+    def join(self):
+        self.future.result()
+</code></pre>
+<p>Then make sure to call this method before stopping the loop:</p>
+<pre><code>f.join()
+loop.call_soon_threadsafe(loop.stop)
+</code></pre>
+<hr/>
+<p>This should be enough to get the program to work as you expect. However, this code is still problematic on several aspects.</p>
+<p>First, the loop should not be set both in the main thread and the extra thread. Asyncio loops are not meant to be shared between threads, so you need to make sure that everything asyncio related happens in the dedicated thread. </p>
+<p>Since <code>Foo</code> is responsible for the communication between those two threads, you'll have to be extra careful to make sure every line of code runs in the right thread. For instance, the instantiation of <code>asyncio.Queue</code> has to happen in the asyncio thread.</p>
+<p>See <a href="https://gist.github.com/vxgmichel/82c3c4a683e75e89c62ae08e2cce7efd" rel="nofollow noreferrer">this gist</a> for a corrected version of your program.</p>
+<hr/>
+<p>Also, I'd like to point out that this is not the typical use case for asyncio. You generally want to have an asyncio loop running in the main thread, especially  if you need <a href="https://docs.python.org/3/library/asyncio-subprocess.html#subprocess-and-threads" rel="nofollow noreferrer">subprocess support</a>:</p>
+<blockquote>
+<p>asyncio supports running subprocesses from different threads, but there are limits:</p>
+<ul>
+<li>An event loop must run in the main thread</li>
+<li>The child watcher must be instantiated in the main thread, before executing subprocesses from other threads. Call the get_child_watcher() function in the main thread to instantiate the child watcher.</li>
+</ul>
+</blockquote>
+<p>I would suggest designing your application the other way, i.e. running asyncio in the main thread and use <a href="https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.AbstractEventLoop.run_in_executor" rel="nofollow noreferrer">run_in_executor</a> for the synchronous blocking code. </p>
+</div>

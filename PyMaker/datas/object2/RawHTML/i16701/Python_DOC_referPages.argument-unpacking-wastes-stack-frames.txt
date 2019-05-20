@@ -1,0 +1,135 @@
+<div class="post-text" itemprop="text">
+<p>When a function is called by unpacking arguments, it seems to increase the recursion depth twice. I would like to know <em>why</em> this happens.</p>
+<p>Normally:</p>
+<pre><code>depth = 0
+
+def f():
+    global depth
+    depth += 1
+    f()
+
+try:
+    f()
+except RuntimeError:
+    print(depth)
+
+#&gt;&gt;&gt; 999
+</code></pre>
+<p>With an unpacking call:</p>
+<pre><code>depth = 0
+
+def f():
+    global depth
+    depth += 1
+    f(*())
+
+try:
+    f()
+except RuntimeError:
+    print(depth)
+
+#&gt;&gt;&gt; 500
+</code></pre>
+<p>In theory both should reach about 1000:</p>
+<pre><code>import sys
+sys.getrecursionlimit()
+#&gt;&gt;&gt; 1000
+</code></pre>
+<p>This happens on CPython 2.7 and CPython 3.3.</p>
+<p>On PyPy 2.7 and PyPy 3.3 there is a difference, but it is much smaller (1480 vs 1395 and 1526 vs 1395).</p>
+<hr/>
+<p>As you can see from the disassembly, there is little difference between the two, other than the type of call (<code>CALL_FUNCTION</code> vs <code>CALL_FUNCTION_VAR</code>):</p>
+<pre><code>import dis
+</code></pre>
+<pre><code>def f():
+    f()
+
+dis.dis(f)
+#&gt;&gt;&gt;  34           0 LOAD_GLOBAL              0 (f)
+#&gt;&gt;&gt;               3 CALL_FUNCTION            0 (0 positional, 0 keyword pair)
+#&gt;&gt;&gt;               6 POP_TOP
+#&gt;&gt;&gt;               7 LOAD_CONST               0 (None)
+#&gt;&gt;&gt;              10 RETURN_VALUE
+</code></pre>
+<pre><code>def f():
+    f(*())
+
+dis.dis(f)
+#&gt;&gt;&gt;  47           0 LOAD_GLOBAL              0 (f)
+#&gt;&gt;&gt;               3 BUILD_TUPLE              0
+#&gt;&gt;&gt;               6 CALL_FUNCTION_VAR        0 (0 positional, 0 keyword pair)
+#&gt;&gt;&gt;               9 POP_TOP
+#&gt;&gt;&gt;              10 LOAD_CONST               0 (None)
+#&gt;&gt;&gt;              13 RETURN_VALUE
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The exception <em>message</em> actually offers you a hint. Compare the non-unpacking option:</p>
+<pre><code>&gt;&gt;&gt; import sys
+&gt;&gt;&gt; sys.setrecursionlimit(4)  # to get there faster
+&gt;&gt;&gt; def f(): f()
+... 
+&gt;&gt;&gt; f()
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+  File "&lt;stdin&gt;", line 1, in f
+  File "&lt;stdin&gt;", line 1, in f
+  File "&lt;stdin&gt;", line 1, in f
+RuntimeError: maximum recursion depth exceeded
+</code></pre>
+<p>with:</p>
+<pre><code>&gt;&gt;&gt; def f(): f(*())
+... 
+&gt;&gt;&gt; f()
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+  File "&lt;stdin&gt;", line 1, in f
+  File "&lt;stdin&gt;", line 1, in f
+RuntimeError: maximum recursion depth exceeded while calling a Python object
+</code></pre>
+<p>Note the addition of the <code>while calling a Python object</code>. This exception is <em>specific</em> to the <a href="https://docs.python.org/3/c-api/object.html#c.PyObject_CallObject" rel="noreferrer"><code>PyObject_CallObject()</code> function</a>. You won't see this exception when you set an <em>odd</em> recursion limit:</p>
+<pre><code>&gt;&gt;&gt; sys.setrecursionlimit(5)
+&gt;&gt;&gt; f()
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+  File "&lt;stdin&gt;", line 1, in f
+  File "&lt;stdin&gt;", line 1, in f
+RuntimeError: maximum recursion depth exceeded
+</code></pre>
+<p>because that is the specific exception raised in the <a href="http://hg.python.org/cpython/file/5a46ebfa5d90/Python/ceval.c#l1119" rel="noreferrer"><code>ceval.c</code> frame evaluation code</a> inside <code>PyEval_EvalFrameEx()</code>:</p>
+<pre class="lang-c prettyprint-override"><code>/* push frame */
+if (Py_EnterRecursiveCall(""))
+    return NULL;
+</code></pre>
+<p>Note the empty message there. This is a crucial difference.</p>
+<p>For your 'regular' function (no variable arguments), what happens is that an <em>optimized path</em> is picked; a <em>Python</em> function that doesn't need tuple or keyword argument unpacking support is handled directly in the <a href="http://hg.python.org/cpython/file/5a46ebfa5d90/Python/ceval.c#l4285" rel="noreferrer"><code>fast_function()</code> function</a> of the evaluation loop. A new frameobject with the Python bytecode object for the function is created, and run. This is <strong>one</strong> recursion check.</p>
+<p>But for a function call with variable arguments (tuple or dictionary or both), the <code>fast_function()</code> call cannot be used. Instead, <a href="http://hg.python.org/cpython/file/5a46ebfa5d90/Python/ceval.c#l4463" rel="noreferrer"><code>ext_do_call()</code> (extended call)</a> is used, which handles the argument unpacking, then uses <a href="http://hg.python.org/cpython/file/5a46ebfa5d90/Python/ceval.c#l4550" rel="noreferrer"><code>PyObject_Call()</code></a> to invoke the function. <code>PyObject_Call()</code> does a recursion limit check, and 'calls' the function object. The function object is invoked via the <a href="http://hg.python.org/cpython/file/5a46ebfa5d90/Objects/funcobject.c#l593" rel="noreferrer"><code>function_call()</code> function</a>, which calls <a href="http://hg.python.org/cpython/file/5a46ebfa5d90/Python/ceval.c#l3380" rel="noreferrer"><code>PyEval_EvalCodeEx()</code></a>, which calls <a href="http://hg.python.org/cpython/file/5a46ebfa5d90/Python/ceval.c#l792" rel="noreferrer"><code>PyEval_EvalFrameEx()</code></a>, which makes the <em>second</em> recursion limit check.</p>
+<h3>TL;DR version</h3>
+<p>Python functions calling Python functions are optimised and bypass the <code>PyObject_Call()</code> C-API function, <em>unless</em> argument unpacking takes place. Both Python frame execution and <code>PyObject_Call()</code> make recursion limit tests, so bypassing <code>PyObject_Call()</code> avoids incrementing the recursion limit check per call.</p>
+<h3>More places with 'extra' recursion depth checks</h3>
+<p>You can grep the Python source code for <code>Py_EnterRecursiveCall</code> for other locations where recursion depth checks are made; various libraries, such as <code>json</code> and <code>pickle</code> use it to avoid parsing structures that are too deeply nested or recursive, for example. Other checks are placed in the <code>list</code> and <code>tuple</code> <code>__repr__</code> implementations, rich comparisons (<code>__gt__</code>, <code>__lt__</code>, <code>__eq__</code>, etc.), handling the <code>__call__</code> callable object hook and handling <code>__str__</code> calls.</p>
+<p>As such, you can hit the recursion limit <em>much faster still</em>:</p>
+<pre><code>&gt;&gt;&gt; class C:
+...     def __str__(self):
+...         global depth
+...         depth += 1
+...         return self()
+...     def __call__(self):
+...         global depth
+...         depth += 1
+...         return str(self)
+... 
+&gt;&gt;&gt; depth = 0
+&gt;&gt;&gt; sys.setrecursionlimit(10)
+&gt;&gt;&gt; C()()
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+  File "&lt;stdin&gt;", line 9, in __call__
+  File "&lt;stdin&gt;", line 5, in __str__
+RuntimeError: maximum recursion depth exceeded while calling a Python object
+&gt;&gt;&gt; depth
+2
+</code></pre>
+</div>
+<span class="comment-copy">By the looks of things, unpacking must call a function, which then calls the target function with unpacked arguments.</span>
+<span class="comment-copy">I think @Blckknght was right: building a tuple doesn't seem right, but as Matt points out tuple unpacking is recursive, not so much the construction necessarily.</span>

@@ -1,0 +1,368 @@
+<div class="post-text" itemprop="text">
+<p>Can anyone suggest a way in python to do logging with:</p>
+<ul>
+<li>log rotation every day</li>
+<li>compression of logs when they're rotated</li>
+<li>optional - delete oldest log file to preserve X MB of free space</li>
+<li>optional - sftp log files to server</li>
+</ul>
+<p>Thanks for any responses,
+Fred</p>
+</div>
+<div class="post-text" itemprop="text">
+<ul>
+<li><strong>log rotation every day:</strong> Use a <a href="http://docs.python.org/library/logging.handlers.html#timedrotatingfilehandler" rel="noreferrer">TimedRotatingFileHandler</a></li>
+<li><strong>compression of logs</strong>: Set the <code>encoding='bz2'</code> parameter. (Note this "trick" will only work for Python2. 'bz2' is no longer considered an encoding in Python3.)</li>
+<li><strong>optional - delete oldest log file to preserve X MB of free space</strong>. 
+You could (indirectly) arrange this using a <a href="http://docs.python.org/library/logging.handlers.html#rotatingfilehandler" rel="noreferrer">RotatingFileHandler</a>. By setting the <code>maxBytes</code> parameter, the log file will rollover when it reaches a certain size. By setting the <code>backupCount</code> parameter, you can control how many rollovers are kept. The two parameters together allow you to control the maximum space consumed by the log files. You could probably subclass the <code>TimeRotatingFileHandler</code> to incorporate this behavior into it as well.</li>
+</ul>
+<hr/>
+<p>Just for fun, here is how you could subclass <code>TimeRotatingFileHandler</code>. When you run the script below, it will write log files to <code>/tmp/log_rotate*</code>. </p>
+<p>With a small value for <code>time.sleep</code> (such as 0.1), the log files fill up quickly, reach the maxBytes limit, and are then rolled over. </p>
+<p>With a large <code>time.sleep</code> (such as 1.0), the log files fill up slowly, the maxBytes limit is not reached, but they roll over anyway when the timed interval (of 10 seconds) is reached.</p>
+<p>All the code below comes from <a href="http://hg.python.org/cpython/file/tip/Lib/logging/handlers.py" rel="noreferrer">logging/handlers.py</a>. I simply meshed TimeRotatingFileHandler with RotatingFileHandler in the most straight-forward way possible.</p>
+<pre><code>import time
+import re
+import os
+import stat
+import logging
+import logging.handlers as handlers
+
+
+class SizedTimedRotatingFileHandler(handlers.TimedRotatingFileHandler):
+    """
+    Handler for logging to a set of files, which switches from one file
+    to the next when the current file reaches a certain size, or at certain
+    timed intervals
+    """
+
+    def __init__(self, filename, maxBytes=0, backupCount=0, encoding=None,
+                 delay=0, when='h', interval=1, utc=False):
+        handlers.TimedRotatingFileHandler.__init__(
+            self, filename, when, interval, backupCount, encoding, delay, utc)
+        self.maxBytes = maxBytes
+
+    def shouldRollover(self, record):
+        """
+        Determine if rollover should occur.
+
+        Basically, see if the supplied record would cause the file to exceed
+        the size limit we have.
+        """
+        if self.stream is None:                 # delay was set...
+            self.stream = self._open()
+        if self.maxBytes &gt; 0:                   # are we rolling over?
+            msg = "%s\n" % self.format(record)
+            # due to non-posix-compliant Windows feature
+            self.stream.seek(0, 2)
+            if self.stream.tell() + len(msg) &gt;= self.maxBytes:
+                return 1
+        t = int(time.time())
+        if t &gt;= self.rolloverAt:
+            return 1
+        return 0
+
+
+def demo_SizedTimedRotatingFileHandler():
+    log_filename = '/tmp/log_rotate'
+    logger = logging.getLogger('MyLogger')
+    logger.setLevel(logging.DEBUG)
+    handler = SizedTimedRotatingFileHandler(
+        log_filename, maxBytes=100, backupCount=5,
+        when='s', interval=10,
+        # encoding='bz2',  # uncomment for bz2 compression
+    )
+    logger.addHandler(handler)
+    for i in range(10000):
+        time.sleep(0.1)
+        logger.debug('i=%d' % i)
+
+demo_SizedTimedRotatingFileHandler()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The other way to compress logfile during rotate (new in python 3.3) is using BaseRotatingHandler (and all inherited) class attribute <em>rotator</em> for example:</p>
+<pre><code>import gzip
+import os
+import logging
+import logging.handlers
+
+class GZipRotator:
+    def __call__(self, source, dest):
+        os.rename(source, dest)
+        f_in = open(dest, 'rb')
+        f_out = gzip.open("%s.gz" % dest, 'wb')
+        f_out.writelines(f_in)
+        f_out.close()
+        f_in.close()
+        os.remove(dest)
+
+logformatter = logging.Formatter('%(asctime)s;%(levelname)s;%(message)s')
+log = logging.handlers.TimedRotatingFileHandler('debug.log', 'midnight', 1, backupCount=5)
+log.setLevel(logging.DEBUG)
+log.setFormatter(logformatter)
+log.rotator = GZipRotator()
+
+logger = logging.getLogger('main')
+logger.addHandler(log)    
+logger.setLevel(logging.DEBUG)
+
+....
+</code></pre>
+<p>More you can see <a href="http://docs.python.org/3.3/library/logging.handlers.html?highlight=logging.handler#logging.handlers.BaseRotatingHandler" rel="noreferrer">here</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>In addition to unutbu's answer: here's how to modify the TimedRotatingFileHandler to compress using zip files.</p>
+<pre><code>import logging
+import logging.handlers
+import zipfile
+import codecs
+import sys
+import os
+import time
+import glob
+
+
+class TimedCompressedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+    """
+    Extended version of TimedRotatingFileHandler that compress logs on rollover.
+    """
+    def doRollover(self):
+        """
+        do a rollover; in this case, a date/time stamp is appended to the filename
+        when the rollover happens.  However, you want the file to be named for the
+        start of the interval, not the current time.  If there is a backup count,
+        then we have to get a list of matching filenames, sort them and remove
+        the one with the oldest suffix.
+        """
+
+        self.stream.close()
+        # get the time that this sequence started at and make it a TimeTuple
+        t = self.rolloverAt - self.interval
+        timeTuple = time.localtime(t)
+        dfn = self.baseFilename + "." + time.strftime(self.suffix, timeTuple)
+        if os.path.exists(dfn):
+            os.remove(dfn)
+        os.rename(self.baseFilename, dfn)
+        if self.backupCount &gt; 0:
+            # find the oldest log file and delete it
+            s = glob.glob(self.baseFilename + ".20*")
+            if len(s) &gt; self.backupCount:
+                s.sort()
+                os.remove(s[0])
+        #print "%s -&gt; %s" % (self.baseFilename, dfn)
+        if self.encoding:
+            self.stream = codecs.open(self.baseFilename, 'w', self.encoding)
+        else:
+            self.stream = open(self.baseFilename, 'w')
+        self.rolloverAt = self.rolloverAt + self.interval
+        if os.path.exists(dfn + ".zip"):
+            os.remove(dfn + ".zip")
+        file = zipfile.ZipFile(dfn + ".zip", "w")
+        file.write(dfn, os.path.basename(dfn), zipfile.ZIP_DEFLATED)
+        file.close()
+        os.remove(dfn)
+
+if __name__=='__main__':
+    ## Demo of using TimedCompressedRotatingFileHandler() to log every 5 seconds,
+    ##     to one uncompressed file and five rotated and compressed files
+
+    os.nice(19)   # I always nice test code
+
+    logHandler = TimedCompressedRotatingFileHandler("mylog", when="S",
+        interval=5, backupCount=5) # Total of six rotated log files, rotating every 5 secs
+    logFormatter = logging.Formatter(
+        fmt='%(asctime)s.%(msecs)03d %(message)s', 
+        datefmt='%Y-%m-%d %H:%M:%S'
+        )
+    logHandler.setFormatter(logFormatter)
+    mylogger = logging.getLogger('MyLogRef')
+    mylogger.addHandler(logHandler)
+    mylogger.setLevel(logging.DEBUG)
+
+    # Write lines non-stop into the logger and rotate every 5 seconds
+    ii = 0
+    while True:
+        mylogger.debug("Test {0}".format(ii))
+        ii += 1
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I guess it's too late to join the party, but here is what I did. I created a new class inheriting <code>logging.handlers.RotatingFileHandler</code> class and added a couple of lines to gzip the file before moving it. </p>
+<p><a href="https://github.com/rkreddy46/python_code_reference/blob/master/compressed_log_rotator.py" rel="nofollow noreferrer">https://github.com/rkreddy46/python_code_reference/blob/master/compressed_log_rotator.py</a></p>
+<pre><code>#!/usr/bin/env python
+
+# Import all the needed modules
+import logging.handlers
+import sys
+import time
+import gzip
+import os
+import shutil
+import random
+import string
+
+__version__ = 1.0
+__descr__ = "This logic is written keeping in mind UNIX/LINUX/OSX platforms only"
+
+
+# Create a new class that inherits from RotatingFileHandler. This is where we add the new feature to compress the logs
+class CompressedRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    def doRollover(self):
+        """
+        Do a rollover, as described in __init__().
+        """
+        if self.stream:
+            self.stream.close()
+        if self.backupCount &gt; 0:
+            for i in range(self.backupCount - 1, 0, -1):
+                sfn = "%s.%d.gz" % (self.baseFilename, i)
+                dfn = "%s.%d.gz" % (self.baseFilename, i + 1)
+                if os.path.exists(sfn):
+                    # print "%s -&gt; %s" % (sfn, dfn)
+                    if os.path.exists(dfn):
+                        os.remove(dfn)
+                    os.rename(sfn, dfn)
+            dfn = self.baseFilename + ".1.gz"
+            if os.path.exists(dfn):
+                os.remove(dfn)
+            # These two lines below are the only new lines. I commented out the os.rename(self.baseFilename, dfn) and
+            #  replaced it with these two lines.
+            with open(self.baseFilename, 'rb') as f_in, gzip.open(dfn, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            # os.rename(self.baseFilename, dfn)
+            # print "%s -&gt; %s" % (self.baseFilename, dfn)
+        self.mode = 'w'
+        self.stream = self._open()
+
+# Specify which file will be used for our logs
+log_filename = "/Users/myname/Downloads/test_logs/sample_log.txt"
+
+# Create a logger instance and set the facility level
+my_logger = logging.getLogger()
+my_logger.setLevel(logging.DEBUG)
+
+# Create a handler using our new class that rotates and compresses
+file_handler = CompressedRotatingFileHandler(filename=log_filename, maxBytes=1000000, backupCount=10)
+
+# Create a stream handler that shows the same log on the terminal (just for debug purposes)
+view_handler = logging.StreamHandler(stream=sys.stdout)
+
+# Add all the handlers to the logging instance
+my_logger.addHandler(file_handler)
+my_logger.addHandler(view_handler)
+
+# This is optional to beef up the logs
+random_huge_data = "".join(random.choice(string.ascii_letters) for _ in xrange(10000))
+
+# All this code is user-specific, write your own code if you want to play around
+count = 0
+while True:
+    my_logger.debug("This is the message number %s" % str(count))
+    my_logger.debug(random_huge_data)
+    count += 1
+    if count % 100 == 0:
+        count = 0
+        time.sleep(2)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Be warned: The class signatures have changed in python 3. Here is my working example for python 3.6</p>
+<pre><code>import logging.handlers
+import os
+import zlib
+
+
+def namer(name):
+    return name + ".gz"
+
+
+def rotator(source, dest):
+    print(f'compressing {source} -&gt; {dest}')
+    with open(source, "rb") as sf:
+        data = sf.read()
+        compressed = zlib.compress(data, 9)
+        with open(dest, "wb") as df:
+            df.write(compressed)
+    os.remove(source)
+
+
+err_handler = logging.handlers.TimedRotatingFileHandler('/data/errors.log', when="M", interval=1,
+                                                        encoding='utf-8', backupCount=30, utc=True)
+err_handler.rotator = rotator
+err_handler.namer = namer
+
+logger = logging.getLogger("Rotating Log")
+logger.setLevel(logging.ERROR)
+
+logger.addHandler(err_handler)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>To copy the file, gzip the copied file (using epoch time), and then clearing out the existing file in a way that won't upset the logging module:</p>
+<pre><code>import gzip
+import logging
+import os
+from shutil import copy2
+from time import time
+
+def logRoll(logfile_name):
+    log_backup_name = logfile_name + '.' + str(int(time()))
+    try:
+        copy2(logfile_name, log_backup_name)   
+    except IOError, err:
+        logging.debug(' No logfile to roll')
+        return
+    f_in = open(log_backup_name, 'rb')
+    f_out = gzip.open(log_backup_name + '.gz', 'wb')
+    f_out.writelines(f_in)
+    f_out.close()
+    f_in.close()
+    os.remove(log_backup_name)
+    f=open(logfile_name, 'w')
+    f.close()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think that the best option will be to use current implementation of <code>TimedRotatingFileHandler</code> and after renaming log file to the rotated version just compress it:</p>
+<pre><code>import zipfile
+import os
+from logging.handlers import TimedRotatingFileHandler
+
+
+class TimedCompressedRotatingFileHandler(TimedRotatingFileHandler):
+    """
+    Extended version of TimedRotatingFileHandler that compress logs on rollover.
+    """
+    def find_last_rotated_file(self):
+        dir_name, base_name = os.path.split(self.baseFilename)
+        file_names = os.listdir(dir_name)
+        result = []
+        prefix = '{}.20'.format(base_name)  # we want to find a rotated file with eg filename.2017-12-12... name
+        for file_name in file_names:
+            if file_name.startswith(prefix) and not file_name.endswith('.zip'):
+                result.append(file_name)
+        result.sort()
+        return result[0]
+
+    def doRollover(self):
+        super(TimedCompressedRotatingFileHandler, self).doRollover()
+
+        dfn = self.find_last_rotated_file()
+        dfn_zipped = '{}.zip'.format(dfn)
+        if os.path.exists(dfn_zipped):
+            os.remove(dfn_zipped)
+        with zipfile.ZipFile(dfn_zipped, 'w') as f:
+            f.write(dfn, dfn_zipped, zipfile.ZIP_DEFLATED)
+        os.remove(dfn)
+</code></pre>
+</div>
+<span class="comment-copy">Rotation? Do you mean running the script every day? If so, I'd suggest using a cron job.</span>
+<span class="comment-copy">My app will be running and logging continuously, so I want the system to start a new log file each day</span>
+<span class="comment-copy">related <a href="http://bugs.python.org/issue13516" rel="nofollow noreferrer">Python issue 13516: Gzip old log files in rotating handlers</a> mentions <a href="http://code.activestate.com/recipes/502265-timedcompressedrotatingfilehandler/" rel="nofollow noreferrer">TimedCompressedRotatingFileHandler example</a></span>
+<span class="comment-copy">Thanks, great answer</span>
+<span class="comment-copy">The best things is done just for fun! Thanks</span>
+<span class="comment-copy">The <code>mode</code> parameter in the <code>__init__()</code> is assigned but never used.</span>
+<span class="comment-copy">@mshsayem: Thanks for the correction.</span>
+<span class="comment-copy">The sample from the <a href="https://docs.python.org/3/howto/logging-cookbook.html#using-a-rotator-and-namer-to-customize-log-rotation-processing" rel="nofollow noreferrer">logging cookbook</a> is IMHO a bit cleaner, separating the rename from the compression (but +1 for the pointer)</span>
+<span class="comment-copy">tested this work if the process is running. if 'when' is set to midnight and this script is not running before, on and after might, the log file will not rotate, logging stay at the current log.</span>

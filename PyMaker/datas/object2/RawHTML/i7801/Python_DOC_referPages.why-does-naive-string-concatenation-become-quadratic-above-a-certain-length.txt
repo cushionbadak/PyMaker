@@ -1,0 +1,141 @@
+<div class="post-text" itemprop="text">
+<p>Building a string through repeated string concatenation is an anti-pattern, but I'm still curious why its performance switches from linear to quadratic after string length exceeds approximately 10 ** 6:</p>
+<pre><code># this will take time linear in n with the optimization
+# and quadratic time without the optimization
+import time
+start = time.perf_counter()
+s = ''
+for i in range(n):
+    s += 'a'
+total_time = time.perf_counter() - start
+time_per_iteration = total_time / n
+</code></pre>
+<p>For example, on my machine (Windows 10, python 3.6.1):</p>
+<ul>
+<li>for <code>10 ** 4 &lt; n &lt; 10 ** 6</code>, the <code>time_per_iteration</code> is almost perfectly constant at 170±10 µs</li>
+<li>for <code>10 ** 6 &lt; n</code>, the <code>time_per_iteration</code> is almost perfectly linear, reaching 520 µs at <code>n == 10 ** 7</code>. </li>
+</ul>
+<p>Linear growth in <code>time_per_iteration</code> is equivalent to quadratic growth in <code>total_time</code>.</p>
+<p>The linear complexity results from the <a href="https://docs.python.org/2/whatsnew/2.4.html#optimizations" rel="noreferrer">optimization</a> in the more recent CPython versions (2.4+) that <a href="http://blog.mclemon.io/python-efficient-string-concatenation-in-python-2016-edition" rel="noreferrer">reuse the original storage</a> if no references remain to the original object. But I expected the linear performance to continue indefinitely rather than switch to quadratic at some point.</p>
+<p>My question is based made on <a href="https://stackoverflow.com/questions/4435169/good-way-to-append-to-a-string#comment65441380_4435752">this comment</a>. For some odd reason running </p>
+<pre><code>python -m timeit -s"s=''" "for i in range(10**7):s+='a'"
+</code></pre>
+<p>takes incredibly long time (much longer than quadratic), so I never got the actual timing results from <code>timeit</code>. So instead, I used a simple loop as above to obtain performance numbers.</p>
+<p>Update:</p>
+<p>My question might as well have been titled "How can a list-like <code>append</code> have <code>O(1)</code> performance without over-allocation?". From observing constant <code>time_per_iteration</code> on small-size strings, I assumed the string optimization must be over-allocating. But <code>realloc</code> is (unexpectedly to me) quite successful at avoiding memory copy when extending small memory blocks.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>In the end, the platform C allocators (like <code>malloc()</code>) are the ultimate source of memory.  When CPython tries to reallocate string space to extend its size, it's really the system C <code>realloc()</code> that determines the details of what happens.  If the string is "short" to begin with, chances are decent the system allocator finds unused memory adjacent to it, so extending the size is just a matter of the C library's allocator updating some pointers.  But after repeating this some number of times (depending again on details of the platform C allocator), it <em>will</em> run out of space.  At that point, <code>realloc()</code> will need to copy the entire string so far to a brand new larger block of free memory.  That's the source of quadratic-time behavior.</p>
+<p>Note, e.g., that growing a Python list faces the same tradeoffs.  However, lists are <em>designed</em> to be grown, so CPython deliberately asks for more memory than is actually needed at the time.  The amount of this overallocation scales up as the list grows, enough to make it rare that <code>realloc()</code> needs to copy the whole list-so-far.  But the string optimizations do not overallocate, making cases where <code>realloc()</code> needs to copy far more frequent.</p>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>[XXXXXXXXXXXXXXXXXX............]
+ \________________/\__________/
+     used space      reserved
+                      space
+</code></pre>
+<p>When growing a contiguous array data structure (illustrated above) through appending to it, linear performance  can be achieved if the extra space reserved while reallocating the array is proportional to the current size of the array. Obviously, for large strings this strategy is not followed, most probably with the purpose of not wasting too much memory. Instead a fixed amount of extra space is reserved during each reallocation, resulting in quadratic time complexity. To understand where the quadratic performance comes from in the latter case, imagine that no overallocation is performed at all (which is the boundary case of that strategy). Then at each iteration a reallocation (requiring linear time) must be performed, and the full runtime is quadratic.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>TL;DR: Just because string concatenation is optimized under certain circumstances doesn't mean it's necessarily <code>O(1)</code>, it's just not always <code>O(n)</code>. What determines the performance is ultimatly your system and it could be smart (beware!). Lists that "garantuee" amortized <code>O(1)</code> append operations are still much faster and better at avoiding reallocations.</p>
+<hr/>
+<p>This is an extremly complicated problem, because it's hard to "measure quantitativly". If you read the announcement:</p>
+<blockquote>
+<p>String concatenations in statements of the form <code>s = s + "abc"</code> and <code>s += "abc"</code> are now performed more efficiently in certain circumstances.</p>
+</blockquote>
+<p>If you take a closer look at it then you'll note that it mentions "certain circumstances". The tricky thing is to find out what these certain cirumstances are. One is immediatly obvious:</p>
+<ul>
+<li>If something else holds a reference to the original string.</li>
+</ul>
+<p>Otherwise it wouldn't be safe to change <code>s</code>.</p>
+<p>But another condition is:</p>
+<ul>
+<li>If the system can do the reallocation in <code>O(1)</code> - that means without needing to copy the contents of the string to a new location.</li>
+</ul>
+<p>That's were it get's tricky. Because the system is responsible for doing a reallocation. That's nothing you can control from within python. However your system is smart. That means in many cases you can actually do the reallocation without needing to copy the contents. <a href="https://stackoverflow.com/a/44487738/5393381">You might want to take a look at @TimPeters answer, that explains some of it in more details</a>.</p>
+<p>I'll approach this problem from an experimentalists point of view.</p>
+<p>You can easily check how many reallocations actually need a copy by checking how often the ID changes (because the <a href="https://docs.python.org/3/library/functions.html#id" rel="nofollow noreferrer"><code>id</code></a> function in CPython returns the memory adress):</p>
+<pre><code>changes = []
+s = ''
+changes.append((0, id(s)))
+for i in range(10000):
+    s += 'a'
+    if id(s) != changes[-1][1]:
+        changes.append((len(s), id(s)))
+
+print(len(changes))
+</code></pre>
+<p>This gives a different number each run (or almost each run). It's somewhere around 500 on my computer. Even for <code>range(10000000)</code> it's just 5000 on my computer.</p>
+<p>But if you think that's really good at "avoiding" copies you're wrong. If you compare it to the number of resizes a <code>list</code> needs (<code>list</code>s over-allocate intentionally so <code>append</code> is amortized <code>O(1)</code>):</p>
+<pre><code>import sys
+
+changes = []
+s = []
+changes.append((0, sys.getsizeof(s)))
+for i in range(10000000):
+    s.append(1)
+    if sys.getsizeof(s) != changes[-1][1]:
+        changes.append((len(s), sys.getsizeof(s)))
+
+len(changes)
+</code></pre>
+<p>That only needs 105 reallocations (always).</p>
+<hr/>
+<p>I mentioned that <code>realloc</code> could be smart and I intentionally kept the "sizes" when the reallocs happened in a list. Many C allocators try to avoid memory fragmentation and at least on my computer the allocator does something different depending on the current size:</p>
+<pre><code># changes is the one from the 10 million character run
+
+%matplotlib notebook   # requires IPython!
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+fig = plt.figure(1)
+ax = plt.subplot(111)
+
+#ax.plot(sizes, num_changes, label='str')
+ax.scatter(np.arange(len(changes)-1), 
+           np.diff([i[0] for i in changes]),   # plotting the difference!
+           s=5, c='red',
+           label='measured')
+ax.plot(np.arange(len(changes)-1), 
+        [8]*(len(changes)-1),
+        ls='dashed', c='black',
+        label='8 bytes')
+ax.plot(np.arange(len(changes)-1), 
+        [4096]*(len(changes)-1),
+        ls='dotted', c='black',
+        label='4096 bytes')
+ax.set_xscale('log')
+ax.set_yscale('log')
+ax.set_xlabel('x-th copy')
+ax.set_ylabel('characters added before a copy is needed')
+ax.legend()
+plt.tight_layout()
+</code></pre>
+<p><a href="https://i.stack.imgur.com/wdp4y.png" rel="nofollow noreferrer"><img alt="enter image description here" src="https://i.stack.imgur.com/wdp4y.png"/></a></p>
+<p>Note that the x-axis represents the number of "copies done" not the size of the string!</p>
+<p>That's graph was actually very interesting for me, because it shows clear patterns: For small arrays (up to 465 elements) the steps are constant. It needs to reallocate for every 8 elements added. Then it needs to actually allocate a new array for every character added and then at roughly 940 all bets are off until (roughly) one million elements. Then it seems it allocates in blocks of 4096 bytes.</p>
+<p>My guess is that the C allocator uses different allocation schemes for differently sized objects. Small objects are allocated in blocks of 8 bytes, then for bigger-than-small-but-still-small arrays it stops to overallocate and then for medium sized arrays it probably positions them where they "may fit". Then for huge (comparativly speaking) arrays it allocates in blocks of 4096 bytes.</p>
+<p>I guess the 8byte and 4096 bytes aren't random. 8 bytes is the size of an <code>int64</code> (or <code>float64</code> aka <code>double</code>) and I'm on a 64bit computer with python compiled for 64bits. And 4096 is the page size of my computer. I assume there are lots of "objects" that need have these sizes so it makes sense that the compiler uses these sizes because it could avoid memory fragmentation.</p>
+<p>You probably know but just to make sure: For <code>O(1)</code> (amortized) append behaviour the overallocation must depend on the size. If the overallocation is constant it will be <code>O(n**2)</code> (the greater the overallocation the smaller the constant factor but it's still quadratic). </p>
+<p>So on my computer the runtime behaviour will be always <code>O(n**2)</code> except for lengths (roughly) 1 000 to 1 000 000 - there it really seems to undefined. In my test run it was able to add many (ten-)thousand elements without ever needing a copy so it would probably "look like <code>O(1)</code>" when timed.</p>
+<p>Note that this is just my system. It could look totally different on another computer or even with another compiler on my computer. Don't take these too seriously. I provided the code to do the plots yourself, so you can analyze your system yourself.</p>
+<hr/>
+<p>You also asked the question (in the comments) if there would be downsides if you over-allocate strings. That's really easy: Strings are immutable. So any overallocated byte is wasting ressources. There are only a few limited cases where it really does grow and these are considered implementation details. The developers probably don't throw away space to make implementation details perform better, <a href="https://stackoverflow.com/a/1350289/5393381">some python developers also think that adding this optimization was a bad idea</a>.</p>
+</div>
+<span class="comment-copy">Use the full timiet module so you can control the <code>number</code> of times the code is executed:  <code>timeit.timeit('for i in range(10**7): s += "a"', 's=""', number=1)</code> I believe the default number is 1e6, so that is why it's not terminating</span>
+<span class="comment-copy">Also, for what it's worth, that took about 1.1 seconds on my machine, and switching to 10**8 took about 12 seconds, so it seems that on my Python 3.5.2 the optimization still holds for big numbers.</span>
+<span class="comment-copy">@juanpa.arrivillaga the default when called from command line (which is what I did) should be auto-determined based on how long each execution takes. And I'm running python 3.6.1, so something is weird. Can you try my loop with <code>time.perf_counter()</code> instead of <code>timeit</code>? And what's your platform?</span>
+<span class="comment-copy">Yep, I tried it. I'm getting linear performance. Given the answers below, perhaps the total memory available on the machine affects the probability of the system allocator finding unused memory adjacent to the string? I'm running with about 8 gigabytes of free memory...</span>
+<span class="comment-copy">@juanpa.arrivillaga I doubt it's the amount of free memory, since I have 20 GB free out of 32 GB total. Which OS do you use? And how high can you go before it hits quadratic? :)</span>
+<span class="comment-copy">Ahhh it doesn't over-allocate! I somehow assumed it does; but it makes sense: this is just an optimization that's not guaranteed by the language anyway, so it's not as sophisticated as <code>list.append()</code>. Out of curiosity though, apart from memory usage, is there any downside to over-allocating in string optimizations?</span>
+<span class="comment-copy">Strings are immutable so it's a total waste of space if you overallocate. It's just an "implementation detail" that this (quite uncommon) way of string concatenation <i>could be</i> optimized.</span>
+<span class="comment-copy">Don't you still have to copy the memory? Allocation hardly seems like the issue here.</span>
+<span class="comment-copy">@Mehrdad <a href="https://github.com/python/cpython/blob/master/Objects/unicodeobject.c#L996" rel="nofollow noreferrer">Yes</a> and <a href="https://github.com/python/cpython/blob/master/Objects/unicodeobject.c#L932" rel="nofollow noreferrer">yes</a> (at least for CPython and the question is tagged CPython). There are lots of safety checks that make sure it doesn't happen in case <i>it could go wrong</i>. But the example in the question is specifically designed to "go into the realloc path".</span>
+<span class="comment-copy">@Mehrdad, note that all the references supplied in these answers emphasize that this optimization is specific to CPython, and is very limited.  That's key to understanding your objection wrt threads:  in CPython, the GIL (Global Interpreter Lock) guarantees only one thread is running CPython internals during the bits of the C implementation that decide whether resizing is safe (and, if so, go on to do the realloc).  That's all a single atomic operation so far as threads in CPython are concerned.</span>
+<span class="comment-copy"><code>most probably with the purpose of not wasting too much memory</code>: I guess overallocating is only good if there's a high probability the growth will continue in the future (to justify the use of extra memory). And while the growth will very often continue after <code>list.append()</code>, it was probably deemed to be unlikely that string concatenation will repeat many times, this being an anti-pattern?</span>
+<span class="comment-copy">@max, CPython never <i>intended</i> to resize strings in-place.  That optimization was added more than a dozen years after Python was first released.  Some core developers were opposed to it even then.  Note that the <i>ability</i> to overallocate costs memory even if it's never used(!):  then the object needs to store not only the current size, but also the amount currently allocated.   Blowing an extra 8 bytes to store the character <code>"k"</code> just in case someone wants to extend it later is not attractive ;-)  Multiply that by millions (programs slinging millions of strings are pretty common).</span>
+<span class="comment-copy">Alex's speech is amazing :) As for the number of reallocations, I still think it's really impressively small. 105 vs 5000 is not a big deal because it still manages to avoid materially impacting the time to incrementally build up a string character by character: it's still linear rather than quadratic as it "should" be. But either way, I agree it's an absolutely horrible practice to rely on it, so I was interested merely for education purposes. Re: intelligent realloc that adjusts to memory request patterns: cool! Though I suppose it's not done yet in any mainstream OS (win/linux)?</span>
+<span class="comment-copy">@MSeifert, just to drive home how system-dependent this is, on my Win10 box just now under Python 3.6.1, your string loop reallocated about 180 times for 10 thousand iterations, and about 2400 for 10 million iterations.(versus about 50 and 105 times for the list loop).</span>
+<span class="comment-copy">@max I updated the post. After some looking around "smart memory allocation based on past allocation history" is more a theoretical concept than actual implementation. :( I also included a graph that shows why it's quadratic for strings greater than 1 million elements on my computer (and it's pretty to look at I think xD).</span>
+<span class="comment-copy">@MSeifert, FYI, if you're running a current version of Python 3, "almost all" memory allocations are given to CPython's own "small block allocator" (obmalloc.c) first.  If the request doesn't exceed 512 bytes, obmalloc handles it itself.  And obmalloc then rounds the size up to the nearest multiple of 8 bytes.  That's why you see "jump at every 8" so long as the string remains short.  Above 512 bytes, you're seeing what your platform C library does (malloc() and realloc()).</span>

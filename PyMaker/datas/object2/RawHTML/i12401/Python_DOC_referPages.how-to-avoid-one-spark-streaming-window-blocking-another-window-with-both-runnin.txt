@@ -1,0 +1,126 @@
+<div class="post-text" itemprop="text">
+<p>I'm running Spark Streaming with two different windows (on window for training a model with SKLearn and the other for predicting values based on that model) and I'm wondering how I can avoid one window (the "slow" training window) to train a model, without "blocking" the "fast" prediction window.<br/>
+My simplified code looks as follows:</p>
+<pre><code>conf = SparkConf()
+conf.setMaster("local[4]")
+sc = SparkContext(conf=conf)
+ssc = StreamingContext(sc, 1)
+
+stream = ssc.socketTextStream("localhost", 7000)
+
+
+import Custom_ModelContainer
+
+### Window 1 ###
+### predict data based on model computed in window 2 ###
+
+def predict(time, rdd):
+    try:
+       # ... rdd conversion to df, feature extraction etc...
+
+       # regular python code 
+       X = np.array(df.map(lambda lp: lp.features.toArray()).collect())
+       pred = Custom_ModelContainer.getmodel().predict(X)
+
+       # send prediction to GUI
+
+    except Exception, e: print e
+
+predictionStream = stream.window(60,60)
+predictionStream.foreachRDD(predict)
+
+
+### Window 2 ###
+### fit new model ###
+
+def trainModel(time, rdd):
+try:
+    # ... rdd conversion to df, feature extraction etc...
+
+    X = np.array(df.map(lambda lp: lp.features.toArray()).collect())
+    y = np.array(df.map(lambda lp: lp.label).collect())
+
+    # train test split etc...
+
+    model = SVR().fit(X_train, y_train)
+    Custom_ModelContainer.setModel(model)
+
+except Exception, e: print e
+
+modelTrainingStream = stream.window(600,600)
+modelTrainingStream.foreachRDD(trainModel)
+</code></pre>
+<p>(Note: The Custom_ModelContainer is a class I wrote to save and retrieve the trained model)</p>
+<p>My setup generally works fine, with the exception that every time a new model is trained in the second window (which takes about a minute), the first windows does not compute predictions until model training is finished. Actually, I guess that this makes sense, since model fitting and predictions are both computed on the master node (in a non-distributed setting - due to SKLearn).</p>
+<p>So my question is the following: Would it be possible to train the model on a single worker node (instead of the master node)? If so, how could I achieve the latter and would that actually resolve my issue?</p>
+<p>If not, any other suggestion on how I could make such a setup work without delaying computations in window 1?</p>
+<p>Any help is greatly appreciated.</p>
+<p>EDIT: I guess the more general question would be:
+How can I run two different task on two different workers in parallel?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Disclaimer: This is only a set of ideas. None of these has been tested in practice.</p>
+<hr/>
+<p>A couple of things you can try:</p>
+<ol>
+<li><p>Don't <code>collect</code> to <code>predict</code>. <code>scikit-learn</code> models are typically serializable so prediction process can be easily handled on the cluster:</p>
+<pre><code>def predict(time, rdd):
+    ... 
+
+    model = Custom_ModelContainer.getmodel()
+    pred = (df.rdd.map(lambda lp: lp.features.toArray())
+        .mapPartitions(lambda iter: model.predict(np.array(list(iter)))))
+    ...
+</code></pre>
+<p>It should not only parallelize predictions but also, if raw data is not passed to GUI, reduce amount of data that has to be collected.</p></li>
+<li><p>Try to <code>collect</code> and send data asynchronously. PySpark doesn't provide <code>collectAsync</code> method but you can try to achieve something similar with <a href="https://docs.python.org/3/library/concurrent.futures.html#module-concurrent.futures" rel="nofollow"><code>concurrent.futures</code></a>:</p>
+<pre><code>from pyspark.rdd import RDD
+from concurrent.futures import ThreadPoolExecutor
+
+executor = ThreadPoolExecutor(max_workers=4)
+
+def submit_to_gui(*args): ...
+
+def submit_if_success(f):
+    if not f.exception():
+        executor.submit(submit_to_gui, f.result())
+</code></pre>
+<p>continue from 1.</p>
+<pre><code>def predict(time, rdd):
+    ...
+    f = executor.submit(RDD.collect, pred)
+    f.add_done_callback(submit_if_success)
+    ...
+</code></pre></li>
+<li><p>If you really want to use local <code>scikit-learn</code> model try to <code>collect</code> and <code>fit</code> using futures as above. You can also try to collect only once, especially if data is not cached:</p>
+<pre><code>def collect_and_train(df):
+    y, X = zip(*((p.label, p.features.toArray()) for p in df.collect()))
+    ...
+    return SVR().fit(X_train, y_train)
+
+def set_if_success(f):
+    if not f.exception():
+        Custom_ModelContainer.setModel(f.result())  
+
+def trainModel(time, rdd): 
+   ...
+    f = excutor.submit(collect_and_train, df)
+    f.add_done_callback(set_if_success) 
+   ...
+</code></pre></li>
+<li><p>Move training process to the cluster either using already existing solutions like <a href="https://github.com/databricks/spark-sklearn" rel="nofollow"><code>spark-sklearn</code></a> or custom approach:</p>
+<ul>
+<li>naive solution - prepare your data, <code>coalesce(1)</code> and train a single model using <code>mapPartitions</code>.</li>
+<li>distributed solution - create and validate a separate model per partition using <code>mapPartitions</code>, collect models and use as an ensemble for example by taking an average or median prediction.</li>
+</ul></li>
+<li><p>Throw away <code>scikit-learn</code> and use a model which can be trained and maintained in a distributed, streaming environment (for example <a href="https://github.com/apache/spark/blob/27c910f7f29087d1ac216d4933d641d6515fd6ad/python/pyspark/mllib/regression.py#L735" rel="nofollow"><code>StreamingLinearRegressionWithSGD</code></a>). </p>
+<p>Your current approach makes Spark obsolete. If you can train model locally there is a good chance that you can perform all other tasks much faster on the local machine. Otherwise your program will simply fail on <code>collect</code>.</p></li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think what you're looking for is the property: "spark.streaming.concurrentJobs" which defaults to 1. Increasing this should allow you to run multiple foreachRDD functions in parallel.</p>
+<p><a href="https://github.com/apache/spark/blob/v1.6.0/streaming/src/main/scala/org/apache/spark/streaming/scheduler/JobScheduler.scala#L47" rel="nofollow">In JobScheduler.scala:</a></p>
+<pre><code>private val numConcurrentJobs = ssc.conf.getInt("spark.streaming.concurrentJobs", 1)
+</code></pre>
+<p>Just a reminder to also be aware of thread safety on your custom model container if you're going to be mutating and reading in parallel. :)</p>
+</div>

@@ -1,0 +1,232 @@
+<div class="post-text" itemprop="text">
+<p>Pytest's output for failed asserts is much more informative and useful than the default in Python. I would like to leverage this when normally running my Python program, not just when executing tests. Is there a way to, from within my script, overwrite Python's <code>assert</code> behavior to use pytest to print the stacktrace instead while still running my program as <code>python script/pytest_assert.py</code>?</p>
+<h2>Example program</h2>
+<pre><code>def test_foo():
+  foo = 12
+  bar = 42
+  assert foo == bar
+
+if __name__ == '__main__':
+  test_foo()
+</code></pre>
+<p></p>
+<pre><code>$ python script/pytest_assert.py
+
+Traceback (most recent call last):
+  File "script/pytest_assert.py", line 8, in &lt;module&gt;
+    test_foo()
+  File "script/pytest_assert.py", line 4, in test_foo
+    assert foo == bar
+AssertionError
+</code></pre>
+<p></p>
+<pre><code>$ pytest script/pytest_assert.py
+
+======================== test session starts ========================
+platform linux -- Python 3.5.3, pytest-3.3.2, py-1.5.2, pluggy-0.6.0
+rootdir: /usr/local/google/home/danijar, inifile:
+collected 1 item                                                    
+
+script/pytest_assert.py F                                     [100%]
+
+============================= FAILURES ==============================
+_____________________________ test_foo ______________________________
+
+    def test_foo():
+      foo = 12
+      bar = 42
+&gt;     assert foo == bar
+E     assert 12 == 42
+
+script/pytest_assert.py:4: AssertionError
+===================== 1 failed in 0.02 seconds =====================
+</code></pre>
+<h2>Desired result</h2>
+<pre><code>$ python script/pytest_assert.py
+
+Traceback (most recent call last):
+  File "script/pytest_assert.py", line 8, in &lt;module&gt;
+    test_foo()
+
+    def test_foo():
+      foo = 12
+      bar = 42
+&gt;     assert foo == bar
+E     assert 12 == 42
+
+script/pytest_assert.py:4: AssertionError
+</code></pre>
+<h2>Progress update</h2>
+<p>The closest I've got is this but it only works for asserts within that one function and spams the trace:</p>
+<pre><code>import ast
+import inspect
+
+from _pytest import assertion
+
+
+def test_foo():
+  foo = []
+  foo.append(13)
+  foo = foo[-1]
+  bar = 42
+  assert foo == bar, 'message'
+
+
+if __name__ == '__main__':
+  tree = ast.parse(inspect.getsource(test_foo))
+  assertion.rewrite.rewrite_asserts(tree)
+  code = compile(tree, '&lt;name&gt;', 'exec')
+  ns = {}
+  exec(code, ns)
+  ns[test_foo.__name__]()
+</code></pre>
+<p></p>
+<pre><code>$ python script/pytest_assert.py
+Traceback (most recent call last):
+  File "script/pytest_assert.py", line 21, in &lt;module&gt;
+    ns[test_foo.__name__]()
+  File "&lt;name&gt;", line 6, in test_foo
+AssertionError: message
+assert 13 == 42
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<h2>Disclaimer</h2>
+<p>Although there is surely a way to reuse <code>pytest</code> code to print the traceback in the desired format, stuff you need to use is not part of public API, so the resulting solution will be too fragile, require invocation of non-related <code>pytest</code> code (for initialization purposes) and likely break on package updates. Best bet would be rewriting crucial parts, using <code>pytest</code> code as an example.</p>
+<h2>Notes</h2>
+<p>Basically, the proof-of-concept code below does three things:</p>
+<ol>
+<li><p>Replace the default <a href="https://docs.python.org/3/library/sys.html#sys.excepthook" rel="nofollow noreferrer"><code>sys.excepthook</code></a> with the custom one: this is necessary to alter the default traceback formatting. Example:</p>
+<pre><code>import sys
+
+orig_hook = sys.excepthook
+
+def myhook(*args):
+    orig_hook(*args)
+    print('hello world')
+
+if __name__ == '__main__':
+    sys.excepthook = myhook
+    raise ValueError()
+</code></pre>
+<p>will output:</p>
+<pre><code>Traceback (most recent call last):
+  File "example.py", line 11, in &lt;module&gt;
+    raise ValueError()
+ValueError
+hello world
+</code></pre></li>
+<li><p>Instead of <code>hello world</code>, the formatted exception info will be printed. We use <a href="https://docs.pytest.org/en/latest/reference.html#_pytest._code.ExceptionInfo.getrepr" rel="nofollow noreferrer"><code>ExceptionInfo.getrepr()</code></a> for that.</p></li>
+<li><p>To access the additional info in asserts, <code>pytest</code> rewrites the <code>assert</code> statements (you can get some rough info about how they look like after rewrite in <a href="http://pybites.blogspot.com/2011/07/behind-scenes-of-pytests-new-assertion.html" rel="nofollow noreferrer">this old article</a>). To achieve that, <code>pytest</code> registers a custom import hook as specified in <a href="https://www.python.org/dev/peps/pep-0302/" rel="nofollow noreferrer"><strong>PEP 302</strong></a>. The hook is the most problematic part as it is tightly coupled to <a href="https://docs.pytest.org/en/latest/reference.html#config" rel="nofollow noreferrer"><code>Config</code></a> object, also I noticed some module imports to cause problems (I guess it doesn't fail with <code>pytest</code> only because the modules are already imported when the hook is registered; will try to write a test that reproduces the issue on a <code>pytest</code> run and create a new issue). I would thus suggest to write a custom import hook that invokes the <a href="https://github.com/pytest-dev/pytest/blob/master/src/_pytest/assertion/rewrite.py#L526" rel="nofollow noreferrer"><code>AssertionRewriter</code></a>. This AST tree walker class is the essential part in assertion rewriting, while the <code>AssertionRewritingHook</code> is not that important.</p></li>
+</ol>
+<h2>Code</h2>
+<pre><code>so-51839452
+├── hooks.py
+├── main.py
+└── pytest_assert.py
+</code></pre>
+<h3><code>hooks.py</code></h3>
+<pre><code>import sys
+
+from pluggy import PluginManager
+import _pytest.assertion.rewrite
+from _pytest._code.code import ExceptionInfo
+from _pytest.config import Config, PytestPluginManager
+
+
+orig_excepthook = sys.excepthook
+
+def _custom_excepthook(type, value, tb):
+    orig_excepthook(type, value, tb)  # this is the original traceback printed
+    # preparations for creation of pytest's exception info
+    tb = tb.tb_next  # Skip *this* frame
+    sys.last_type = type
+    sys.last_value = value
+    sys.last_traceback = tb
+
+    info = ExceptionInfo(tup=(type, value, tb, ))
+
+    # some of these params are configurable via pytest.ini
+    # different params combination generates different output
+    # e.g. style can be one of long|short|no|native
+    params = {'funcargs': True, 'abspath': False, 'showlocals': False,
+              'style': 'long', 'tbfilter': False, 'truncate_locals': True}
+    print('------------------------------------')
+    print(info.getrepr(**params))  # this is the exception info formatted
+    del type, value, tb  # get rid of these in this frame
+
+
+def _install_excepthook():
+    sys.excepthook = _custom_excepthook
+
+
+def _install_pytest_assertion_rewrite():
+    # create minimal config stub so AssertionRewritingHook is happy
+    pluginmanager = PytestPluginManager()
+    config = Config(pluginmanager)
+    config._parser._inidict['python_files'] = ('', '', [''])
+    config._inicache = {'python_files': None, 'python_functions': None}
+    config.inicfg = {}
+
+    # these modules _have_ to be imported, or AssertionRewritingHook will complain
+    import py._builtin
+    import py._path.local
+    import py._io.saferepr
+
+    # call hook registration
+    _pytest.assertion.install_importhook(config)
+
+# convenience function
+def install_hooks():
+    _install_excepthook()
+    _install_pytest_assertion_rewrite()
+</code></pre>
+<h3><code>main.py</code></h3>
+<p>After calling <code>hooks.install_hooks()</code>, <code>main.py</code> will have modified traceback printing. Every module imported after <code>install_hooks()</code> call will have asserts rewritten on import.</p>
+<pre><code>from hooks import install_hooks
+
+install_hooks()
+
+import pytest_assert
+
+
+if __name__ == '__main__':
+    pytest_assert.test_foo()
+</code></pre>
+<h3><code>pytest_assert.py</code></h3>
+<pre><code>def test_foo():
+    foo = 12
+    bar = 42
+    assert foo == bar
+</code></pre>
+<h2>Example output</h2>
+<pre><code>$ python main.py
+Traceback (most recent call last):
+  File "main.py", line 9, in &lt;module&gt;
+    pytest_assert.test_foo()
+  File "/Users/hoefling/projects/private/stackoverflow/so-51839452/pytest_assert.py", line 4, in test_foo
+    assert foo == bar
+AssertionError
+------------------------------------
+def test_foo():
+        foo = 12
+        bar = 42
+&gt;       assert foo == bar
+E       AssertionError
+
+pytest_assert.py:4: AssertionError
+</code></pre>
+<h2>Summarizing</h2>
+<p>I would go with writing an own version of <code>AssertionRewritingHook</code>, without the whole non-related <code>pytest</code> stuff. The <code>AssertionRewriter</code> however looks pretty much reusable; although it requires a <code>Config</code> instance, it is only used for warning printing and can be left to <code>None</code>.</p>
+<p>Once you have that, write your own function that formats the exception properly, replace <code>sys.excepthook</code> and you're done.</p>
+</div>
+<span class="comment-copy">With <code>assert</code> being a keyword the answer would be "no, not without recompiling the interpreter". A question that must be asked is: if you like pytest's output, why not use pytest?</span>
+<span class="comment-copy">pytest does nothing else than handling the <code>AssertionError</code>. You should try the same.</span>
+<span class="comment-copy">@KlausD. Thanks, that's a good idea. Do you know how to call into pytest to print these details? If implemented manually, I'd have to programmatically get access to the source code above the assertion and to the values of the variables.</span>
+<span class="comment-copy">@DeepSpace I cannot freely decide on the executable that runs my script in the environment where it is being deployed. Since pytest is just a Python module that is executed using the normal Python interpreter, it must be possible to do without recompiling. See the other comment above for that :)</span>
+<span class="comment-copy">You might find some of the pytest magic in <a href="https://github.com/pytest-dev/pytest/blob/master/src/_pytest/assertion/rewrite.py" rel="nofollow noreferrer">github.com/pytest-dev/pytest/blob/master/src/_pytest/assertion/…</a></span>
+<span class="comment-copy">Hey, thanks a lot! I had to add <code>config.getini = lambda _: []</code> to the config stub to run with the newest pytest release. The output I get is not quite the right one though, it reads <code>&gt; assert foo == bar\nE AssertionError</code> instead of <code>&gt; assert foo=bar\nE assert 13 == 42</code> so it doesn't resolve the variable values.</span>
+<span class="comment-copy">I managed to get the right output with a different script that calls <code>_pytest.assertion.rewrite.rewrite_asserts(tree)</code> on the AST of a function I want to run. I've included this example in my question above. However, it doesn't use the importhooks (that I haven't completely understood yet) so it only works for asserts within that one function.</span>
+<span class="comment-copy">If you don't register the import hook, you won't rewrite the asserts in the imported modules, so the rewrite will only work for the bytecode of the current module. The hook rewrites the bytecode of the imported modules (check out the <code>__pycache__</code> dir, it should contain <code>module_..._PYTEST.pyc</code> files with the rewritten asserts) and uses this modified bytecode instead of what the interpreter compiles by default.</span>
+<span class="comment-copy">Yeah, that makes sense. Do you know how to write a custom import hook to apply <code>AssertionRewriter</code> instead of calling pytest's <code>install_importhook</code>? I'm also still not quite sure why the line starting with <code>E </code> is printed differently by your code example.</span>
+<span class="comment-copy">Import hooks are actually quite simple per se; it's a combination of module finder and module loader. Here are some examples: <a href="https://gist.github.com/jezdez/3103339" rel="nofollow noreferrer">one</a>, <a href="https://gist.github.com/aliles/9bb375a9f889c2e584b5" rel="nofollow noreferrer">two</a>, <a href="https://pymotw.com/2/sys/imports.html#custom-importers" rel="nofollow noreferrer">three</a>. The <code>AssertionRewritingHook</code> combines both by implementing <code>find_module</code> and <code>load_module</code> in one class; these contain the most important logic you will need to reproduce in your own impl.</span>

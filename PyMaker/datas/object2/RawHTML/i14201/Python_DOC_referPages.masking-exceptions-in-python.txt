@@ -1,0 +1,87 @@
+<div class="post-text" itemprop="text">
+<p>It is typical to use the <code>with</code> statement to open a file so that the file handle cannot be leaked:</p>
+<pre><code>with open("myfile") as f:
+    …
+</code></pre>
+<p>But what if the exception occurs somewhere <em>within</em> the <code>open</code> call?  The <code>open</code> function is very likely not an atomic instruction in the Python interpreter, so it's entirely possible that an asynchronous exception such as <code>KeyboardInterrupt</code> would be thrown* at some moment before the <code>open</code> call has finished, but after the system call has already completed.</p>
+<p>The conventional way of handle this (in, for example, POSIX signals) to use the <em>masking mechanism</em>: while masked, the delivery of exceptions is suspended until they are later unmasked.  This allows operations such as <code>open</code> to be implemented in an atomic way.  Does such a primitive exist in Python?</p>
+<hr/>
+<p>[*] One might say it's doesn't matter for <code>KeyboardInterrupt</code> since the program is about to die anyway, but that is not true of all programs.  It's conceivable that a program might choose to catch <code>KeyboardInterrupt</code> on the top level and continue execution, in which case the leaked file handle can add up over time.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I do not think its possible to mask <code>exceptions</code> , you can mask <code>signals</code> but not <code>exceptions</code> . In your case <code>KeyboardInterrupt</code> is the exception that is raised when the <code>signal.SIGINT</code> is raised (which is the Ctrl + C) .</p>
+<p>It is not possible to mask <code>Exceptions</code> because well it does not make sense, right? Let's say you are doing open('file','r') , but <code>file</code> does not exist, this causes the <code>open</code> function to throw <code>IOError</code> Exception, we should not be able to <code>mask</code> these kinds of exceptions. It does not make sense to mask it, because open would never be able to complete in the above case.</p>
+<blockquote>
+<p><strong>exceptions</strong> – anomalous or exceptional conditions requiring special processing</p>
+</blockquote>
+<p>For <code>KeyboardInterrupt</code> exception , its different because like I said, its actually a <code>signal</code> that causes the <code>KeyboardInterrupt</code> exception to be raised.</p>
+<p>You can only <code>mask</code> signals in Unix starting from Python 3.3 using the function <code>signal.pthread_sigmask</code><a href="https://docs.python.org/3/library/signal.html#signal.pthread_sigmask" rel="nofollow"> [Reference]</a></p>
+<p>For that you will have to move the the <code>context expression</code> to a different block so that we can so something like <code>mask</code> the signal, run the context expression to get the context manager and then <code>unmask</code> the signal , a sample code would look like (please note I have not personally tested this code) -</p>
+<pre><code>import signal
+signal.pthread_sigmask(signal.SIG_BLOCK,[signal.SIGINT])
+with &lt;context expression&gt; as variable:  # in your case ,open('filename','r')
+
+    signal.pthread_sigmask(signal.SIG_UNBLOCK,[signal.SIGINT])
+...
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Some clarification: it seems that asynchronous exceptions are not commonly used in Python.  The standard library only documents <code>KeyboardInterrupt</code> AFAIK.  Other libraries can implement their own via signal handlers, but I don't think (or hope?) this is a common practice, as asynchronous exceptions are notoriously tricky to work with.</p>
+<p>Here is a naive solution that <em>won't</em> work:</p>
+<pre><code>try:
+    handle = acquire_resource(…)
+except BaseException as e:
+    handle.release()
+    raise e
+else:
+    with handle:
+        …
+</code></pre>
+<ul>
+<li><p>The exception-handling part is still vulnerable to exceptions: a <code>KeyboardInterrupt</code> could occur a second time after the exception is caught but before <code>release</code> is complete.</p></li>
+<li><p>There is also a "gap" between the end of the <code>try</code> statement and the beginning of the <code>with</code> statement where it is vulnerable to exceptions.</p></li>
+</ul>
+<p>I don't think there's anyway to make it work this way.</p>
+<p>Thinking from a different perspective, it seems that the <em>only</em> way in which asynchronous exceptions can arise is from signals.  If this is true, one could mask them as <a href="https://stackoverflow.com/a/30929913">@AnandSKumar suggested</a>.  However, masking is not portable as it requires pthreads.</p>
+<p>Nonetheless, we can fake masking with a little trickery:</p>
+<pre><code>def masking_handler(queue, prev_handler):
+    def handler(*args):
+        queue.append(lambda: prev_handler[0](*args))
+    return handler
+
+mask_stack = []
+
+def mask():
+    queue = []
+    prev_handler = []
+    new_handler = masking_handler(queue, prev_handler)
+    # swap out the signal handler with our own
+    prev_handler[0] = signal.signal(signal.SIGINT, new_handler)
+    mask_stack.append((prev_handler[0], queue))
+
+def unmask():
+    prev_handler, queue = mask_stack.pop()
+    # restore the original signal handler
+    signal.signal(signal.SIGINT, prev_handler)
+    # the remaining part may never occur if a signal happens right now
+    # but that's fine
+    for event in queue:
+        event()
+
+mask()
+with acquire_resource(…) as handle:
+    unmask()
+    …
+</code></pre>
+<p>This will work if SIGINT is the only source that we care about.  Unfortunately it breaks down for multiple signals, not just because we don't know which ones are being handled, but also because we can't swap out multiple signals atomically!</p>
+</div>
+<span class="comment-copy">Is this about exceptions or signals ?</span>
+<span class="comment-copy">@Paul: Exceptions.</span>
+<span class="comment-copy">The onus lies with <code>open</code> to succeed, or fail and tidy up. You've got nothing to worry about.</span>
+<span class="comment-copy">@DavidHeffernan: that may well be fine for <code>open</code>, but that doesn't really answer the question of how one implements similar operations in an exception-safe way.</span>
+<span class="comment-copy">You are imagining a problem that does not exist.</span>
+<span class="comment-copy">While masking synchronous exceptions is not very useful, masking asynchronous ones is perfectly sensible since they can occur <i>anywhere</i> in the code.  Masking provides a mechanism for suspending them in critical parts where atomicity is required.  (Masking signals is of course always an option, but that's not portable.)  Also, your example is incorrect: the unmasking needs to take place <i>after</i> <code>with</code> otherwise the signal will be delivered before the context manager reaches <code>with</code>.</span>
+<span class="comment-copy">Do you mean unmasking needs to happen after complete with block? I thought the requirement was to unmask the signal during <code>context manager</code> creation portion, for that my example is correct, but if the masking if for complete <code>with</code> block, then the unmasking needs to happen after with block.</span>
+<span class="comment-copy">Also, can you please give one example of asynchronous exception?</span>
+<span class="comment-copy">The unmasking needs to happen just as the block <i>begins</i>.  If it happens before the block begins then the signal gets delivered and therefore the context_manager's <code>__exit__</code> will never be executed.</span>
+<span class="comment-copy">That being said, it seems <code>KeyboardInterrupt</code> is the oddball here.  Python by default does not seem to use exceptions asynchronously except for this one case (unless the user or some library invents their own), so perhaps there is a workaround to this …</span>

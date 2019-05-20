@@ -1,0 +1,105 @@
+<div class="post-text" itemprop="text">
+<p>I need to call a Python function from my C code.
+It works perfectly, but when I want to do parallelization, it breaks down.
+Please see the following minimal C code:</p>
+<pre><code>#include &lt;Python.h&gt;
+#include &lt;stdio.h&gt;
+
+int main(void)
+{
+  double Z = 1.;
+  double k = 1.;
+  double l = 1.;
+  double eta = -Z/k;
+
+  Py_Initialize();
+
+  PyObject* pName = PyString_FromString("mpmath");
+  PyObject* pModule = PyImport_Import(pName);
+  PyObject* pFunc = PyObject_GetAttrString(pModule, "coulombf");
+
+  PyObject* pl = PyFloat_FromDouble(l);
+  PyObject* peta = PyFloat_FromDouble(eta);
+
+  int i;
+#pragma omp parallel for private(i)
+  for(i=0; i&lt;10000; i++)
+  {
+    double r = 0.01*i;
+    PyObject* prho = PyFloat_FromDouble(k*r);
+    PyObject* pArgs = PyTuple_Pack(3, pl, peta, prho);
+    PyObject* pValue = PyObject_CallObject(pFunc, pArgs);
+    double value = PyFloat_AsDouble(pValue);
+    printf("r=%.2f\tf=%.6f\n",r,value);
+  }
+
+  Py_Finalize();
+  return 0;
+}
+</code></pre>
+<p>Let's name this file as <code>testPython.c</code>, you can compile it with <code>gcc -fopenmp testPython.c -o testPython -I/usr/include/python2.7 -L/usr/lib64/python2.7/config -lpython2.7</code>.</p>
+<p>Now run it with <code>./testPython</code>, you with see such error: <code>Fatal Python error: GC object already tracked</code>. (Sometimes, the error info differs.)</p>
+<p>But if you compile it leaving <code>-fopenmp</code> out, the program works perfectly.</p>
+<p>How can I overcome this problem? Thanks!</p>
+<p><strong>Edit:</strong></p>
+<p>As answered by Natecat, John Bollinger, and Olaf, multithreading is unlikely to speed up the process much, but multiprocessing can really speed up the computation. The pure python script is as simple as following:</p>
+<pre><code>import numpy
+from mpmath import coulombf
+from multiprocessing import Pool
+
+Z = 1.
+k = 1.
+l = 1.
+eta = -Z/k
+
+def coulombF(r):
+    return coulombf(l,eta,k*r)
+
+pool = Pool(12)
+result = pool.map_async(coulombF, numpy.arange(0.,100.,0.01))
+print(result.get())
+</code></pre>
+<p>But how do I do it in C? I haven't found the way yet.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>@Natecat's answer is basically right, if a bit lacking in detail and nuance.  <a href="https://docs.python.org/3/c-api/init.html" rel="nofollow">The docs of Python's C API</a> give a more complete picture.  Supposing that this is the Python implementation you are using, you need to be aware of the following:</p>
+<blockquote>
+<p>The Python interpreter is not fully thread-safe. In order to support multi-threaded Python programs, there’s a global lock, called the global interpreter lock or GIL, that must be held by the current thread before it can safely access Python objects. Without the lock, even the simplest operations could cause problems in a multi-threaded program [...].</p>
+<p>Therefore, the rule exists that only the thread that has acquired the GIL may operate on Python objects or call Python/C API functions. In order to emulate concurrency of execution, the interpreter regularly tries to switch threads (see sys.setswitchinterval()). The lock is also released around potentially blocking I/O operations like reading or writing a file, so that other Python threads can run in the meantime.</p>
+</blockquote>
+<p>and</p>
+<blockquote>
+<p>when threads are created from C (for example by a third-party library with its own thread management), they don’t hold the GIL, nor is there a thread state structure for them.</p>
+</blockquote>
+<p>Note: this is exactly the case with OpenMP.</p>
+<blockquote>
+<p>If you need to call Python code from these threads [...] you must first register these threads with the interpreter by creating a thread state data structure, then acquiring the GIL, and finally storing their thread state pointer, before you can start using the Python/C API. When you are done, you should reset the thread state pointer, release the GIL, and finally free the thread state data structure.</p>
+<p>The PyGILState_Ensure() and PyGILState_Release() functions do all of the above automatically. The typical idiom for calling into Python from a C thread is:</p>
+<pre><code>PyGILState_STATE gstate;
+gstate = PyGILState_Ensure();
+
+/* Perform Python actions here. */
+result = CallSomeFunction();
+/* evaluate result or handle exception */
+
+/* Release the thread. No Python API allowed beyond this point. */
+PyGILState_Release(gstate);
+</code></pre>
+</blockquote>
+<p>You <em>must</em> implement that pattern to allow multiple OpenMP threads safely to make concurrent calls into the same CPython interpreter, but you are unlikely to get much benefit from the parallelization, as the various OpenMP threads will largely be prevented from running concurrently.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Any type of true multithreading (E.G. using multiple system threads in one process) in python is not possible, at least in the most common python implementations. You can either not use any type of paralellization or you can switch to an implementation without a GIL. Here is an article with more information on the subject: <a href="https://wiki.python.org/moin/GlobalInterpreterLock" rel="nofollow">https://wiki.python.org/moin/GlobalInterpreterLock</a></p>
+</div>
+<span class="comment-copy">Just to clarify, this is trying to make separate threads, not processes, correct?</span>
+<span class="comment-copy">Yes, I use OpenMP to create separate threads, and each thread call the Python function.</span>
+<span class="comment-copy">Actually your answer shows that it is very well possible. The actual question is if an application benefits from it. For I/O-heavy applications or if using one/few processing and multiple IO threads this can be a good application.</span>
+<span class="comment-copy">Wouldn't this restrict the python code to 1 thread at a time, defeating the purpose of parallelization?</span>
+<span class="comment-copy">@Natecat, as I wrote in the answer, "you are unlikely to get much benefit from the parallelization, as the various OpenMP threads will largely be prevented from running concurrently."  That's not quite the same thing as having only one Python thread at a time, however.  The interpreter will switch among threads, and you can have concurrency during I/O and certain other operations.  If such operations are few, as I'm guessing is the case here, then the effective concurrency is low.  If such operations are many or long, however, then effective concurrency may be high.</span>
+<span class="comment-copy">Ahh sorry, I missed that part of your answer</span>
+<span class="comment-copy">@Olaf How to actually implement the multiprocessing in C?</span>
+<span class="comment-copy">This is wrong. See the <code>threading</code> and <code>multiprocessing</code> modules. The GIL actually exists to allow multiprocessing without internal contention in the interpreter.</span>
+<span class="comment-copy">Threading only allows simulated concurrency, no true multithreading is happening. Multiprocessing is NOT multithreading and has much more significant overhead. I'll change my answer to clarify this</span>
+<span class="comment-copy">It very well is some kind of multithreading. A thread need not be not a seperate process.</span>
+<span class="comment-copy">I would not say this is "multithreading in python", because the parallelization is done in C, each thread creates a new Python object. Is this impossible as well?</span>
+<span class="comment-copy">It isn't guaranteed that the system will run all of the processes on different cores but by having 12 processes you make it possible that it might utilize all 12 cores. You can in fact use the multiprocessing module like that, and in order to not have the overhead of creating a new process each time, simply include in the code of the new process some way for it to move on to the next set of data instead of terminating after finishing with it's initial data set. Also, if my answer is satisfactory, can you click the check mark under the voting symbols to accept my answer?</span>

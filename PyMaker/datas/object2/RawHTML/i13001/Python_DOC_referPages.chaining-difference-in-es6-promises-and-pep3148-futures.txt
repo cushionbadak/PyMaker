@@ -1,0 +1,180 @@
+<div class="post-text" itemprop="text">
+<p>I am somewhat puzzled about reasoning in difference in implementation of ES6 Promises and PEP3148 Futures. In Javascript, when Promise is resolved with another Promise, "outer" promise inherits the value of "inner" promise once it's resolved or rejected. In Python, "outer" future is instead immediately resolved with "inner" future itself, not with it's eventual value, and that is the problem.</p>
+<p>To illustrate this, I had provided two code snippets for both platforms. In Python, code looks like this:</p>
+<pre><code>import asyncio
+
+async def foo():
+    return asyncio.sleep(delay=2, result=42)
+
+async def bar():
+    return foo()
+
+async def main():
+    print(await bar())
+
+asyncio.get_event_loop().run_until_complete(main())
+</code></pre>
+<p>In Javascript, fully equivalent code is this:</p>
+<pre><code>function sleep(delay, result) {
+    return new Promise((resolve, reject) =&gt; {
+        setTimeout(() =&gt; {
+            resolve(result);
+        }, delay * 1000);
+    });
+}
+
+async function foo() {
+    return sleep(2, 42);
+}
+
+async function bar() {
+    return foo();
+}
+
+(async function main() {
+    console.log(await bar());
+})();
+</code></pre>
+<p><code>sleep</code> function provided for the sake of completeness.</p>
+<p>Javascript code prints <code>42</code>, as expected. Python code prints <code>&lt;coroutine object foo at 0x102a05678&gt;</code> and complaints about "coroutine 'foo' was never awaited".</p>
+<p>This way, JS allows you to choose the point when the control will be passed away of your current context of execution, by immediately <code>await</code>ing promises, or letting caller to await them. Python literally leaves you no other option than always <code>await</code> the Future/coroutine, because otherwise you will have to unwind the Future chain in a loop yourself with an ugly wrapper function like this:</p>
+<pre><code>async def unwind(value):
+    while hasattr(value, '__await__'):
+        value = await value
+
+    return value
+</code></pre>
+<p>So, the question: <strong>Is there any reasoning behind this decision? Why Python disallows chained Futures? Were there any discussions about it? Is there anything that can be done to make behavior match Promises closer?</strong></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Let me show a quick comparison of <em>JavaScript's Promises</em>, and <em>Python's futures</em>, where I can point out the main usecases and reveal the 
+reasons behind decisions.</p>
+<p>I will use the following dummy example to demonstrate the use of async functions:</p>
+<pre class="lang-js prettyprint-override"><code>async function concatNamesById(id1, id2) {
+  return (await getNameById(id1)) + ', ' + (await getNameById(id2));
+}
+</code></pre>
+<h1>Asynchronous JavaScript</h1>
+<p>Back in the day, before the concept of Promises emerged, people wrote their code using <em>callbacks</em>. There are still various conventions about
+which argument should be the callback, how errors should be handled, etc... At the end, our function looks something like this:</p>
+<pre class="lang-js prettyprint-override"><code>// using callbacks
+function concatNamesById(id1, id2, callback) {
+    getNameById(id1, function(err, name1) {
+        if (err) {
+            callback(err);
+        } else {
+            getNameById(id2, function(err, name2) {
+                if (err) {
+                    callback(err);
+                } else {
+                    callback(null, name1 + ', ' + name2);
+                }
+            });
+        }
+    });
+}
+</code></pre>
+<p>This does the same as the example, and yes, I used 4 indentation spaces intentionally to magnify the problem with the so called <em>callback hell</em> or
+<a href="http://calculist.org/blog/2011/12/14/why-coroutines-wont-work-on-the-web/" rel="nofollow"><em>pyramid of doom</em></a>. People using JavaScript were writing code like this for many years! </p>
+<p>Then <a href="https://github.com/kriskowal/q" rel="nofollow">Kris Kowal came with his flaming Q library</a> and saved the disappointed JavaScript community by introducing the concept of <em>Promises</em>.
+The name is intentionally not "future" or "task". The main goal of the Promise concept is to get rid of the pyramid. To achieve this promises
+have a <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise/then" rel="nofollow"><code>then</code></a> method which not only allows you to subscribe to the event that is fired when the promised value is obtained, but will also 
+return another promise, allowing <em>chaining</em>. That is what make Promises and futures a different concept. Promises are a bit more.</p>
+<pre class="lang-js prettyprint-override"><code>// using chained promises
+function concatNamesById(id1, id2) {
+  var name1;
+  return getNameById(id1).then(function(temp) {
+    name1 = temp;
+    return getNameById(id2); // Here we return a promise from 'then'
+  }) // this then returns a new promise, resolving to 'getNameById(id2)', allows chaining
+  .then(function(name2) {    
+    return name1 + ', ' + name2; // Here we return an immediate value from then
+  }); // the final then also returns a promise, which is ultimately returned
+}
+</code></pre>
+<p>See? It is essential to unwrap promises returned from <code>then</code> callbacks to build a clean, transparent chain. (I myself wrote this kind of asynchronouos
+code for over a year.)
+However, things get complicated when you need some control flow like conditional branching or loops.
+When the first compilers/transpilers (like 6to5) for ES6 appeared, people slowly started to use generators. ES6 generators are two directional, meaning
+the generator <strong>not only produces values, but can receive supplied values on each iteration</strong>. This allowed us to write the following code:</p>
+<pre class="lang-js prettyprint-override"><code>// using generators and promises
+const concatNamesById = Q.async(function*(id1, id2) {
+  return (yield getNameById(id1)) + ', ' + (yield getNameById(id2));
+});
+</code></pre>
+<p>Still using promises, <a href="https://github.com/kriskowal/q/blob/v1/q.js#L1260" rel="nofollow"><code>Q.async</code></a> makes an async function from a generator. There is no black magic there, this wrapper function is implemented using
+nothing but <code>promise.then</code> (more or less). We are nearly there.</p>
+<p>Today, since <a href="http://tc39.github.io/ecmascript-asyncawait/" rel="nofollow">the ES7 specification for async-await</a> is pretty mature, anyone can compile asynchronous ES7 code to ES5 using <a href="http://babeljs.io/repl/#?experimental=false&amp;evaluate=false&amp;loose=false&amp;spec=false&amp;code=async%20function%20foo()%20%7B%0A%20%20await%20bar()%3B%0A%7D" rel="nofollow">BabelJS</a>.</p>
+<pre class="lang-js prettyprint-override"><code>// using real async-await
+async function concatNamesById(id1, id2) {
+  return (await getNameById(id1)) + ', ' + (await getNameById(id2));
+}
+</code></pre>
+<h3>Returning promise from an async function</h3>
+<p>So this works:</p>
+<pre class="lang-js prettyprint-override"><code>async foo() {
+  return /* await */ sleep('bar', 1000);
+  // No await is needed!
+}
+</code></pre>
+<p>and so does this:</p>
+<pre class="lang-js prettyprint-override"><code>async foo() {
+  return await await await 'bar';
+  // You can write await pretty much everywhere you want!
+}
+</code></pre>
+<p>This kind of weak/dynamic/duck typing fits well in JavaScript's view of the world.</p>
+<p>You are right that you can return a promise from an async function without await, and it gets unwinded.
+It is not really a decision, but is a direct consequence of how <code>promise.then</code> works, as it unwinds the 
+promises to make chaining comfortable. Still, I think it is a good practice to <strong>write await before every
+async call to make it clear you are aware of the call being asynchronous</strong>. We do have multiple bugs
+every day because of missing await keywords, as they will not cause instantaneous errors, just a bunch
+of random tasks running in parallel. I love debugging them. Seriously.</p>
+<h1>Asynchronous Python</h1>
+<p>Let's see what Python people did before async-await coroutines were introduced in python:</p>
+<pre class="lang-python prettyprint-override"><code>def concatNamesById(id1, id2):
+  return getNameById(id1) + ', ' + getNameById(id2);
+</code></pre>
+<p><em>Wait what? Where are the futures? Where is the callback pyramid?</em> The point is that Python people
+do not have any of the problems JavaScript people had. They just use blocking calls.</p>
+<h1>The big difference between JavaScript and Python</h1>
+<p>So why didn't JavaScript people use blocking calls? Because they couldn't! Well, they wanted to. Believe me.
+Before they introduced <a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Using_web_workers" rel="nofollow">WebWorkers</a> all JavaScript code ran on the gui thread, and any blocking call caused
+the ui to freeze! That is undesireable, so people writing the specifications did everything to prevent such things.
+As of today, the only ways to block the UI thread in a browser I am aware of:</p>
+<ul>
+<li>Using XMLHttpRequest with the deprecated <code>async = false</code> option</li>
+<li>Using a spin-wait</li>
+<li>(Or do actual heavy computation)</li>
+</ul>
+<p>Currently you cannot implement spin-locks and similar things in JavaScript, there is just no way.
+(Until browser vendors start to implement things like <a href="https://www.chromestatus.com/feature/4570991992766464" rel="nofollow">Shared Array Buffers</a>, which I am afraid of will bring
+a special kind of hell upon us as soon as enthusiast amateurs will start to use them)</p>
+<p>On the other hand there is nothing wrong with blocking calls in Python as usually there is no such thing as a 
+'gui thread'. If you still need some parallelism, you can start a new thread, and work on that. This is useful when
+you want to run multiple SOAP requests at once, but not as useful when you want to utilize the computational power
+of all the cpu cores in your laptop, as the <a href="https://wiki.python.org/moin/GlobalInterpreterLock" rel="nofollow">Global Interpreter Lock</a> will prevent you to do so. (This was
+worked around by the <a href="https://docs.python.org/2/library/multiprocessing.html" rel="nofollow">multiprocessing</a> module, but that's another story)</p>
+<p>So, why do Python people need coroutines? The main answer is that reactive programming got really popular nowadays.
+There are of course other aspects, like not wanting to start a new thread for every restful query you make, (some 
+Python libraries are known to leak thread ids until they eventually crash) or just wanting to get rid of all the
+unnecessary multithreading primitives like mutexes and semaphores. (I mean those primitives can be omitted if your
+code can be rewritten to coroutines. Sure they are needed when you do <em>real</em> multithreading.) And that is why futures
+were developed.</p>
+<p>Python's futures do not allow chaining in any form. They are not intended to be used that way. Remember, JavaScript's 
+promises were to change the pyramid scheme to a nice chain scheme, so unwinding was necessary. <strong>But automatic
+unwinding needs specific code to be written, and needs the future resolution to make distinction between supplied
+values by their types or properties.</strong> That is, it would be more complex (=== harder to debug), and would be a
+little step towards weak typing, which is against the main principles of python. Python's futures are lightweight,
+clean and easy to understand. They just don't need automatic unwinding.</p>
+</div>
+<span class="comment-copy"><code>asyncio</code> does allow <a href="https://docs.python.org/3/library/asyncio-task.html#example-chain-coroutines" rel="nofollow noreferrer">chained coroutines</a>, but you just have to <code>await</code> on them before returning. Are you asking, why you must <code>await</code> on every coroutine/future before returning it?</span>
+<span class="comment-copy">You probably should just make it <code>def bar(): return foo()</code> without the <code>async</code> if you're not <code>await</code>ing anything.</span>
+<span class="comment-copy">So this is a Python question, right?</span>
+<span class="comment-copy">@Bergi, this is both JS and Python question, because it makes little sense without ES6 <code>Promise</code> background.</span>
+<span class="comment-copy">@JashandeepSohi it's "explicit" chaining, because I have to <code>await</code> the future before resolving another future. Promises make it easier and more flexible by automatically resolving the promise with chained promise, so you don't need to <code>await</code> it explicitly — instead, when "root promise" settles, all dependent promises are settled immediately along with it.</span>
+<span class="comment-copy">Your example "<i>using chained promises</i>" is <a href="http://stackoverflow.com/a/28250700/1048572">particularly ugly</a>. While there are better answers in general (<code>async/await</code> being one of them, see the whole question), I think your example would benefit from using a <a href="http://stackoverflow.com/a/28250687/1048572">nesting approach</a>. It would still show how promises ease error handling and decrease the indentation pyramid height; also it would show nicely how <a href="http://stackoverflow.com/a/22562045/1048572">they are monadic</a> (because the result is flattened), and would be closer to the async/await desugaring.</span>
+<span class="comment-copy">hi @Bergi, I see you pretty much enumerated all the possibilities around handling state around promises. Please note that that example is not the main conclusion of the answer, just an example how promises make our everyday life easier. We both agree on the <code>async-await</code> solution being the best, Chaining or nesting promises in this case is a matter of taste. I must agree with @jib in his comment, I am willing to use mutability (only once for every variable) in my closure to eliminate pyramids and passed state objects between <code>.then</code>s.</span>
+<span class="comment-copy">In fact I think it is more close to the <code>async-await</code> version, as you can access the value of an uninitialized variable resulting undefined in both cases. Of course, you loose the chance to use <code>const</code>s. That is the price of not using generators or <code>async-await</code>.</span>
+<span class="comment-copy">Yeah, it might be a matter of taste, but I have a strong opionion on nesting being purer and cleaner :-) And of course, uninitialised variables should always throw on access, with <code>let</code> semantics. Regardless, the control flow (not syntax or variable scope) of <code>async-await</code> is much more close to nesting than to chaining, especially when you consider loops, conditions, exception handling or other blocks.</span>
+<span class="comment-copy">Yes, that is need to be said, when <code>let</code>, <code>const</code>, exception handling, conditions or loops are involved, then the nested approach does definitely mimic the <code>async-await</code> approach better. In fact, conditions, exception handling, and loops would require indentation anyway (in a well-formed code). It is only that poor old <code>var</code> keyword which is reflected better with chaining.</span>

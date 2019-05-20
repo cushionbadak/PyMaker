@@ -1,0 +1,147 @@
+<div class="post-text" itemprop="text">
+<p>Suppose I have a class that will spawn a thread and implements <code>.__enter__</code> and <code>.__exit__</code> so I can use it as such:</p>
+<pre><code>with SomeAsyncTask(params) as t:
+    # do stuff with `t`
+    t.thread.start()
+    t.thread.join()
+</code></pre>
+<p><code>.__exit__</code> might perform certain actions for clean-up purposes (ie. removing temp files, etc.)</p>
+<p>That works all fine until I have a list of <code>SomeAsyncTask</code>s that I would like to start all at once.</p>
+<pre><code>list_of_async_task_params = [params1, params2, ...]
+</code></pre>
+<p>How should I use <code>with</code> on the list? I'm hoping for something like this:</p>
+<pre><code>with [SomeAsyncTask(params) for params in list_of_async_task_params] as tasks:
+    # do stuff with `tasks`
+    for task in tasks:
+        task.thread.start()
+    for task in tasks:
+        task.thread.join()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think <a href="https://docs.python.org/3/library/contextlib.html#contextlib.ExitStack" rel="nofollow noreferrer"><code>contextlib.ExitStack</code></a> is exactly what you're looking for. It's a way of combining an indeterminate number of context managers into a single one safely (so that an exception while entering one context manager won't cause it to skip exiting the ones it's already entered successfully).</p>
+<p>The example from the docs is pretty instructive:</p>
+<pre><code>with ExitStack() as stack:
+    files = [stack.enter_context(open(fname)) for fname in filenames]
+    # All opened files will automatically be closed at the end of
+    # the with statement, even if attempts to open files later
+    # in the list raise an exception
+</code></pre>
+<p>This can adapted to your "hoped for" code pretty easily:</p>
+<pre><code>import contextlib
+
+with contextlib.ExitStack() as stack:
+    tasks = [stack.enter_context(SomeAsyncTask(params))
+             for params in list_of_async_task_params]
+    for task in tasks:
+        task.thread.start()
+    for task in tasks:
+        task.thread.join()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><em>Note</em>: Somehow I missed the fact that your <code>Thread</code> subclass was also a context manager itself—so the code below doesn't make that assumption. Nevertheless, it might be helpful when using more "generic" kinds of threads (where using something like <code>contextlib.ExitStack</code> wouldn't be an option).</p>
+<p>Your question is a little light on details—so I made some up—however this might be close to what you want. It defines a <code>AsyncTaskListContextManager</code> class that has the necessary <code>__enter__()</code> and <code>__exit__()</code> methods required to support the context manager protocol (and associated <code>with</code> statements).</p>
+<pre><code>import threading
+from time import sleep
+
+class SomeAsyncTask(threading.Thread):
+    def __init__(self, name, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.name = name
+        self.status_lock = threading.Lock()
+        self.running = False
+
+    def run(self):
+        with self.status_lock:
+            self.running = True
+
+        while True:
+            with self.status_lock:
+                if not self.running:
+                    break
+            print('task {!r} running'.format(self.name))
+            sleep(.1)
+
+        print('task {!r} stopped'.format(self.name))
+
+    def stop(self):
+        with self.status_lock:
+            self.running = False
+
+
+class AsyncTaskListContextManager:
+    def __init__(self, params_list):
+        self.threads = [SomeAsyncTask(params) for params in params_list]
+
+    def __enter__(self):
+        for thread in self.threads:
+            thread.start()
+        return self
+
+    def __exit__(self, *args):
+        for thread in self.threads:
+            if thread.is_alive():
+                thread.stop()
+                thread.join()  # wait for it to terminate
+        return None  # allows exceptions to be processed normally
+
+params = ['Fee', 'Fie', 'Foe']
+with AsyncTaskListContextManager(params) as task_list:
+    for _ in range(5):
+        sleep(1)
+    print('leaving task list context')
+
+print('end-of-script')
+</code></pre>
+<p>Output:</p>
+<pre class="lang-none prettyprint-override"><code>task 'Fee' running
+task 'Fie' running
+task 'Foe' running
+task 'Foe' running
+task 'Fee' running
+task 'Fie' running
+... etc
+task 'Fie' running
+task 'Fee' running
+task 'Foe' running
+leaving task list context
+task 'Foe' stopped
+task 'Fie' stopped
+task 'Fee' stopped
+end-of-script
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>@martineau answer should work. Here's a more generic method that should work for other cases. Note that exceptions are not handled in <code>__exit__()</code>. If one <code>__exit__()</code> function fails, the rest won't be called. A generic solution would probably throw an aggregate exception and allow you to handle it. Another corner case is when you your second manager's <code>__enter__()</code> method throws an exception. The first manager's <code>__exit__()</code> will not be called in that case.</p>
+<pre><code>class list_context_manager:
+  def __init__(self, managers):
+    this.managers = managers
+
+  def __enter__(self):
+    for m in self.managers:
+      m.__enter__()
+    return self.managers
+
+  def __exit__(self):
+    for m in self.managers:
+      m.__exit__()
+</code></pre>
+<p>It can then be used like in your question:</p>
+<pre><code>with list_context_manager([SomeAsyncTask(params) for params in list_of_async_task_params]) as tasks:
+    # do stuff with `tasks`
+    for task in tasks:
+        task.thread.start()
+    for task in tasks:
+        task.thread.join()
+</code></pre>
+</div>
+<span class="comment-copy">@Carcigenicate I want the tasks to be started "concurrently", meaning it shouldn't wait for the previous task to be complete before starting. If I map it to a function, it would get stuck at <code>t.thread.join()</code>.</span>
+<span class="comment-copy"><code>with param1 as task1, param2 as task2, ....:</code> I don't think the <code>with</code> machinery supports arbitrary lists yet.</span>
+<span class="comment-copy">With a for loop, they can't start concurrently, just one after the other in the loop.  You will need to use a <a href="https://docs.python.org/3/library/multiprocessing.html" rel="nofollow noreferrer">multiprocessing</a> library.</span>
+<span class="comment-copy">The threads don't need to be exactly executed concurrently. I just need them to be interleaving.</span>
+<span class="comment-copy">Is <code>class SomeAsyncTask</code> a subclass of <code>threading.Thread</code>?</span>
+<span class="comment-copy">Awesome, but is there an equivalent method for Python2.7? It seems it was introduced in 3.3.</span>
+<span class="comment-copy">According to <a href="https://stackoverflow.com/questions/34630393/python2-7-contextlib-exitstack-equivalent">the answer to question</a>, there's a backport of the Python 3.5 version of the <code>contextlib</code> module for Python 2 named <a href="https://contextlib2.readthedocs.io/en/stable/" rel="nofollow noreferrer"><code>contextlib2</code></a>. @kichik's answer presents a rough start at a version you could create for yourself, though you might want to be more careful about <code>__enter__</code> methods throwing exceptions.</span>
+<span class="comment-copy"><code>AsyncTaskListContextManager.__enter__()</code> seems to be missing <code>return self.threads</code>.</span>
+<span class="comment-copy">@kichik: Nice catch...fixed (but using a different return value). Thanks for pointing the potential issue out, although it wasn't really affecting the sample usage shown.</span>

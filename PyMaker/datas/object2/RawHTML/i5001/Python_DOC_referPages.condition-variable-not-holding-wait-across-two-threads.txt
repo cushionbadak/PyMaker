@@ -1,0 +1,140 @@
+<div class="post-text" itemprop="text">
+<p>Stumped on this thread sync I'm encountering.
+Basically, I'm writing to a out buffer, and waiting on a condition variable until the read buffer is populated with a response from a socket. It's an incredibly simple thread sync.</p>
+<pre><code>def write_wait_response(self, buffer, timeout=30):
+        '''
+            Write and wait for response
+            Params:
+                Buffer BYTE encoded data
+                Timeout timeout to wait for response
+            Returns: 
+                response str if successful
+        '''
+        self.buffer = buffer
+
+        if self.waitLock(timeout):
+            # condition var was signaled, we can return a response
+            readbuf = bytes(self.readbuffer)
+            self.readbuffer = b''
+            return readbuf
+        else:
+            print("AsyncClientSocket: No response recieved from {} in {} seconds, dumping buffer".format(
+                    self.sa, timeout))
+            self.buffer = ''
+            raise TimeoutError("AsyncClientSocket Timed Out")
+
+def handle_read(self):
+        self.readbuffer, address = self.recvfrom(2048)
+        print(self.readbuffer)
+        print("notifying")
+        self.cond.notifyAll() 
+</code></pre>
+<p>Seems straightforward enough, right? There's 1 thread waiting on the condition variable, and 1 thread (asyncore async callback loop) that will populate self.readbuffer and notify on the condition variable. Even more curious : if I do a time.sleep() instead of using a condition variable, I get a perfectly populated self.readbuffer on the calling thread of write_wait_response(). Obviously this is not a solution I can accept.</p>
+<p>Here's what I'm expecting is happening:</p>
+<ol>
+<li>Call to write_wait_response(buffer), this writes to buffer and waits
+on self.cond </li>
+<li>asyncore callback loop calls handle_write, writes bytes to socket.</li>
+<li>Server receives bytes, writes response.</li>
+<li>asyncore callback loop sees bytes on the socket, reads into
+self.readbuffer, notifies cv</li>
+<li>?????????? write_wait_response should unblock?</li>
+</ol>
+<p>Console output:</p>
+<pre><code>waiting &lt;- thread 1 waiting on CV
+AsyncClientSocket: writing 5 bytes &lt;- thread 2: handle_write
+b'200,2' &lt;- thread 2: that's the server response
+notifying &lt;- thread 2: that's handle_read attempting to notify the held CV
+
+error: uncaptured python exception, closing channel &lt;my_socket_stuff.AsyncClientSocket connected 127.0.0.1:50000 at 0x1051bf438&gt; (&lt;class 'RuntimeError'&gt;:cannot notify on un-acquired lock
+</code></pre>
+<p>Note: at the end of this log, thread 1 is STILL waiting on self.cond. What's going on?</p>
+<p>Full class:</p>
+<pre><code>class AsyncClientSocket(asyncore.dispatcher):
+    def __init__(self, socketargs):
+        asyncore.dispatcher.__init__(self)
+        family, type, proto, canonname, sa = socketargs
+        self.sa = sa
+        self.create_socket(family, type)
+
+        if type == socket.SOCK_STREAM:
+            self.connect( sa )
+        elif type == socket.SOCK_DGRAM:
+            pass
+
+        self.buffer = b''
+        self.lock = threading.Lock()
+        self.cond = threading.Condition(self.lock)
+        self.readbuffer = b''
+
+    def write_wait_response(self, buffer, timeout=30):
+        '''
+            Write and wait for response
+            Params:
+                Buffer BYTE encoded data
+                Timeout timeout to wait for response
+            Returns: 
+                response str if successful
+        '''
+        self.buffer = buffer
+
+        if self.waitLock(timeout):
+            # condition var was signaled, we can return a response
+            readbuf = bytes(self.readbuffer)
+            self.readbuffer = b''
+            return readbuf
+        else:
+            print("AsyncClientSocket: No response recieved from {} in {} seconds, dumping buffer".format(
+                    self.sa, timeout))
+            self.buffer = ''
+            raise TimeoutError("AsyncClientSocket Timed Out")
+
+    def waitLock(self, timeout):
+        '''
+            Wait for timeout seconds on CV
+        '''
+        try:
+            self.cond.acquire()
+            print("waiting")
+            return self.cond.wait(timeout)
+        finally:
+            self.cond.release()
+
+
+    def handle_connect(self):
+        pass
+
+    def handle_close(self):
+        self.close()
+
+    def handle_read(self):
+        self.readbuffer, address = self.recvfrom(2048)
+        print(self.readbuffer)
+        print("notifying")
+        self.cond.notifyAll() 
+
+    def writable(self):
+        return (len(self.buffer) &gt; 0)
+
+    def handle_write(self):
+        print("AsyncClientSocket: writing {} bytes".format(len(self.buffer)))
+        self.readbuffer = b''
+        sent = self.sendto(self.buffer, self.sa)
+        self.buffer = self.buffer[sent:]
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Figured it out. This isn't related to asyncore. I was just signaling the condition variable incorrectly. <a href="https://docs.python.org/3/library/threading.html#threading.Condition.notify" rel="nofollow noreferrer">The python3 threading api doc says the calling thread of notify() must acquire the underlying lock</a> which makes sense, wouldn't want two producers to notify on the same condition variable. Would want one to block on the critical section while the other performs its task.</p>
+<pre><code>def handle_read(self):
+    try:
+        self.cond.acquire()
+        self.readbuffer, address = self.recvfrom(2048)
+        print(self.readbuffer)
+        self.cond.notify() 
+    finally:
+        self.cond.release()
+</code></pre>
+</div>
+<span class="comment-copy">Try a self-contained complete example, <a href="http://sscce.org/" rel="nofollow noreferrer">sscce.org</a></span>
+<span class="comment-copy">@Jean-PaulCalderone well a concise example for this (didn't) exist. Now that I know that I was notifying the condition variable incorrectly, I can put together a SSCCE but prior to this I was under the impression the problem was tangled with asyncore somehow changing the thread context so the condition variable wasn't seen as held in the handle_read() function.</span>
+<span class="comment-copy">Many people have constructed many concise examples prior to understanding the problem.  It is possible.</span>

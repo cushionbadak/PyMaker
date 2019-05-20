@@ -1,0 +1,125 @@
+<div class="post-text" itemprop="text">
+<p>I have the following python3 code:</p>
+<pre><code>class BaseTypeClass(type):
+    def __new__(cls, name, bases, namespace, **kwd):
+        result = type.__new__(cls, name, bases, namespace)
+        print("creating class '{}'".format(name))
+        return result
+
+    def __instancecheck__(self, other):
+        print("doing instance check")
+        print(self)
+        print(other)
+        return False
+
+
+class A(metaclass=BaseTypeClass):
+    pass
+
+print(type(A))
+print(isinstance(A(), A))
+</code></pre>
+<p>and when I run it on <code>Python 3.6.3 (v3.6.3:2c5fed8, Oct  3 2017, 18:11:49) [MSC v.1900 64 bit (AMD64)] on win32</code> I get the following output</p>
+<pre><code>creating class 'A'
+&lt;class '__main__.BaseTypeClass'&gt;
+True
+</code></pre>
+<p>Why isn't it outputting <code>doing instance check</code>? The <a href="https://docs.python.org/3/reference/datamodel.html#customizing-instance-and-subclass-checks" rel="nofollow noreferrer">documentation</a> says the <code>__instancecheck__</code> method needs to be defined on the metaclass and not the class itself, which I have done here. I even verify the metaclass is being used since <code>creating class 'A'</code> is printed. However, when I call <code>isinstance</code> it appears to be using the default implementation and not the one I defined in the metaclass.</p>
+<p>I'm probably not using metaclasses correctly, but I can't figure out where I made my mistake.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <code>isinstance</code> function makes a quick check to see if the type of the instance supplied as an argument is the same as that of the class. If so, it returns early and doesn't invoke your custom <code>__instancecheck__</code>. </p>
+<p>This is an optimization used in order to avoid an expensive call to <code>__instancecheck__</code> (it's Pythonland code) when it isn't required. </p>
+<p>You can see the <a href="https://github.com/python/cpython/blob/0ccc0f6c7495be9043300e22d8f38e6d65e8884f/Objects/abstract.c#L2376" rel="nofollow noreferrer">specific test in <code>PyObject_IsInstance</code></a>, the function that handles the <code>isinstance</code> call in the CPython implementation:</p>
+<pre><code>/* Quick test for an exact match */
+if (Py_TYPE(inst) == (PyTypeObject *)cls)
+    return 1;
+</code></pre>
+<p>Of course, your <code>__instancecheck__</code> fires correctly when that test isn't <code>True</code>:</p>
+<pre><code>&gt;&gt;&gt; isinstance(2, A)
+doing instance check
+&lt;class '__main__.A'&gt;
+2
+False
+</code></pre>
+<p>I am not certain if this is implementation specific, I would of thought so, though, since there's no reference to this in <a href="https://www.python.org/dev/peps/pep-3119/#overloading-isinstance-and-issubclass" rel="nofollow noreferrer">the corresponding PEP section</a> nor in the documentation on <code>isinstance</code>.</p>
+<hr/>
+<p>Interesting aside: <code>issubclass</code> actually doesn't behave this way. Due to its implementation it always calls <code>__subclasscheck__</code>. I had opened <a href="https://bugs.python.org/issue30230" rel="nofollow noreferrer">an issue</a> on this a while back which is still pending. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Jim's answer seems to nail it.</p>
+<p>But for whoever <em>needs</em> for some weid reason a fully customized
+instancheck (ok, now that I am writing this, there seems to be
+no correct reason for one to want that, let s hope I am wrong), a metaclass can get
+away with it, but it is tricky. </p>
+<p>This one dynamically replaces the actual class 
+of the object being instantiated by a "shadow class", that
+is a clone of the original. This way, the native "instancheck" always
+fail, and the metaclass one is called.</p>
+<pre><code>def sub__new__(cls, *args, **kw):
+    metacls = cls.__class__
+    new_cls = metacls(cls.__name__, cls.__bases__, dict(cls.__dict__), clonning=cls)
+    return new_cls(*args, **kw)
+
+class M(type):
+    shadows = {}
+    rev_shadows = {}
+    def __new__(metacls, name, bases, namespace, **kwd):
+        clonning = kwd.pop("clonning", None)
+        if not clonning:
+            cls = super().__new__(metacls, name, bases, namespace)
+            # Assumes classes don't have  a `__new__` of them own.
+            # if they do, it is needed to wrap it.
+            cls.__new__ = sub__new__
+        else:
+            cls = clonning
+            if cls not in metacls.shadows:
+                clone = super().__new__(metacls, name, bases, namespace)
+                # The same - replace for unwrapped new.
+                del clone.__new__
+                metacls.shadows[cls] = clone
+                metacls.rev_shadows[clone] = cls
+            return metacls.shadows[cls]
+
+        return cls
+
+    def __setattr__(cls, attr, value):
+
+        # Keep class attributes in sync with shadoclass
+        # This could be done with 'super', but we'd need a thread lock
+        # and check for re-entering.
+        type.__setattr__(cls, attr, value)
+        metacls = type(cls)
+        if cls in metacls.shadows:
+            type.__setattr__(metacls.shadows[cls], attr, value)
+        elif cls in metacls.rev_shadows:
+            type.__setattr__(metacls.rev_shadows[cls], attr, value)    
+
+    def call(cls, *args, **kw):
+        # When __new__ don't return an instance of its class,
+        # __init__ is not called by type's __call__
+        instance = cls.__new__(*args, **kw)
+        instance.__init__(*args, **kw)
+        return instance
+
+    def __instancecheck__(cls, other):
+        print("doing instance check")
+        print(cls)
+        print(other)
+        return False
+
+
+class A(metaclass=M):
+    pass
+
+print(type(A))
+print(isinstance(A(), A))
+</code></pre>
+<p>It even has a mechanism do sync attributes in the shadow class and actual class. The one thing it does not support is if classes handled in this way do implement a custom <code>__new__</code>. If such a <code>__new__</code>  makes use of parameterless <code>super</code>, it starts to become tricky, as the parameter to super would not be the shadow class. </p>
+</div>
+<span class="comment-copy">let's try to workaround this "implementation detail"...</span>
+<span class="comment-copy">just as an odd side note, if you define <code>__instancecheck__</code> as a method on a normal class, instances of the class can be used as the second argument of <code>isinstance</code></span>
+<span class="comment-copy">Shoot, I should have figured this was the case and tried testing it with a few other cases. Thanks!</span>
+<span class="comment-copy">Huh. That does seem to contradict the documentation. The <a href="https://docs.python.org/3/reference/datamodel.html#customizing-instance-and-subclass-checks" rel="nofollow noreferrer">data model docs</a> on <code>__instancecheck__</code> and <code>__subclasscheck__</code> don't mention this case either. I feel like the <code>if (Py_TYPE(inst) == (PyTypeObject *)cls)</code> check should be moved into the <code>if (PyType_CheckExact(cls))</code> block; it'd match the docs better, and it probably wouldn't slow things down significantly, though I haven't benchmarked it.</span>
+<span class="comment-copy">It's a weird situation because there's also a discrepancy between <code>__instancecheck__</code> and <code>__subclasscheck__</code> @user2357112 . I had opened an <a href="https://bugs.python.org/issue30230" rel="nofollow noreferrer">issue</a> a while back where I talked about their difference (which I haven't gotten around to post on python-dev yet).</span>
+<span class="comment-copy">wow, this is above and beyond! thanks for this hack!</span>

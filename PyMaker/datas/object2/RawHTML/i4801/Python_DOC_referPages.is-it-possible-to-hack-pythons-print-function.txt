@@ -1,0 +1,303 @@
+<div class="post-text" itemprop="text">
+<p>Note: This question is for informational purposes only. I am interested to see how deep into Python's internals it is possible to go with this.</p>
+<p>Not very long ago, a discussion began inside a certain <a href="https://stackoverflow.com/q/49271187/4909087">question</a> regarding whether the strings passed to print statements could be modified after/during the call to <code>print</code> has been made. For example, consider the function:</p>
+<pre><code>def print_something():
+    print('This cat was scared.')
+</code></pre>
+<p>Now, when <code>print</code> is run, then the output to the terminal should display:</p>
+<pre><code>This dog was scared.
+</code></pre>
+<p>Notice the word "cat" has been replaced by the word "dog". Something somewhere somehow was able to modify those internal buffers to change what was printed. Assume this is done without the original code author's explicit permission (hence, hacking/hijacking).</p>
+<p>This <a href="https://stackoverflow.com/questions/49271187/how-to-change-a-string-in-a-function-when-calling-a-function/49271219?noredirect=1#comment85545706_49271219">comment</a> from the wise @abarnert, in particular, got me thinking:</p>
+<blockquote>
+<p>There are a couple of ways to do that, but they're all very ugly, and
+  should never be done. The least ugly way is to probably replace the
+  <code>code</code> object inside the function with one with a different <code>co_consts</code>
+  list. Next is probably reaching into the C API to access the str's
+  internal buffer. [...]</p>
+</blockquote>
+<p>So, it looks like this is actually possible.</p>
+<p>Here's my naive way of approaching this problem:</p>
+<pre><code>&gt;&gt;&gt; import inspect
+&gt;&gt;&gt; exec(inspect.getsource(print_something).replace('cat', 'dog'))
+&gt;&gt;&gt; print_something()
+This dog was scared.
+</code></pre>
+<p>Of course, <code>exec</code> is bad, but that doesn't really answer the question, because it does not actually modify anything <em>during when/after</em> <code>print</code> is called.</p>
+<p>How would it be done as @abarnert has explained it?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>First, there's actually a much less hacky way. All we want to do is change what <code>print</code> prints, right?</p>
+<pre><code>_print = print
+def print(*args, **kw):
+    args = (arg.replace('cat', 'dog') if isinstance(arg, str) else arg
+            for arg in args)
+    _print(*args, **kw)
+</code></pre>
+<p>Or, similarly, you can monkeypatch <code>sys.stdout</code> instead of <code>print</code>.</p>
+<hr/>
+<p>Also, nothing wrong with the <code>exec … getsource …</code> idea. Well, of course there's <em>plenty</em> wrong with it, but less than what follows here…</p>
+<hr/>
+<p>But if you do want to modify the function object's code constants, we can do that.</p>
+<p>If you really want to play around with code objects for real, you should use a library like <a href="https://github.com/vstinner/bytecode" rel="noreferrer"><code>bytecode</code></a> (when it's finished) or <a href="https://github.com/serprex/byteplay" rel="noreferrer"><code>byteplay</code></a> (until then, or for older Python versions) instead of doing it manually. Even for something this trivial, the <code>CodeType</code> initializer is a pain; if you actually need to do stuff like fixing up <code>lnotab</code>, only a lunatic would do that manually. </p>
+<p>Also, it goes without saying that not all Python implementations use CPython-style code objects. This code will work in CPython 3.7, and probably all versions back to at least 2.2 with a few minor changes (and not the code-hacking stuff, but things like generator expressions), but it won't work with any version of IronPython.</p>
+<pre><code>import types
+
+def print_function():
+    print ("This cat was scared.")
+
+def main():
+    # A function object is a wrapper around a code object, with
+    # a bit of extra stuff like default values and closure cells.
+    # See inspect module docs for more details.
+    co = print_function.__code__
+    # A code object is a wrapper around a string of bytecode, with a
+    # whole bunch of extra stuff, including a list of constants used
+    # by that bytecode. Again see inspect module docs. Anyway, inside
+    # the bytecode for string (which you can read by typing
+    # dis.dis(string) in your REPL), there's going to be an
+    # instruction like LOAD_CONST 1 to load the string literal onto
+    # the stack to pass to the print function, and that works by just
+    # reading co.co_consts[1]. So, that's what we want to change.
+    consts = tuple(c.replace("cat", "dog") if isinstance(c, str) else c
+                   for c in co.co_consts)
+    # Unfortunately, code objects are immutable, so we have to create
+    # a new one, copying over everything except for co_consts, which
+    # we'll replace. And the initializer has a zillion parameters.
+    # Try help(types.CodeType) at the REPL to see the whole list.
+    co = types.CodeType(
+        co.co_argcount, co.co_kwonlyargcount, co.co_nlocals,
+        co.co_stacksize, co.co_flags, co.co_code,
+        consts, co.co_names, co.co_varnames, co.co_filename,
+        co.co_name, co.co_firstlineno, co.co_lnotab,
+        co.co_freevars, co.co_cellvars)
+    print_function.__code__ = co
+    print_function()
+
+main()
+</code></pre>
+<p>What could go wrong with hacking up code objects? Mostly just segfaults, <code>RuntimeError</code>s that eat up the whole stack, more normal <code>RuntimeError</code>s that can be handled, or garbage values that will probably just raise a <code>TypeError</code> or <code>AttributeError</code> when you try to use them. For examples, try creating a code object with just a <code>RETURN_VALUE</code> with nothing on the stack (bytecode <code>b'S\0'</code> for 3.6+, <code>b'S'</code> before), or with an empty tuple for <code>co_consts</code> when there's a <code>LOAD_CONST 0</code> in the bytecode, or with <code>varnames</code> decremented by 1 so the highest <code>LOAD_FAST</code> actually loads a freevar/cellvar cell. For some real fun, if you get the <code>lnotab</code> wrong enough, your code will only segfault when run in the debugger.</p>
+<p>Using <code>bytecode</code> or <code>byteplay</code> won't protect you from all of those problems, but they do have some basic sanity checks, and nice helpers that let you do things like insert a chunk of code and let it worry about updating all offsets and labels so you can't get it wrong, and so on. (Plus, they keep you from having to type in that ridiculous 6-line constructor, and having to debug the silly typos that come from doing so.)</p>
+<hr/>
+<p>Now on to #2.</p>
+<p>I mentioned that code objects are immutable. And of course the consts are a tuple, so we can't change that directly. And the thing in the const tuple is a string, which we also can't change directly. That's why I had to build a new string to build a new tuple to build a new code object.</p>
+<p>But what if you could change a string directly?</p>
+<p>Well, deep enough under the covers, everything is just a pointer to some C data, right? If you're using CPython, there's <a href="https://docs.python.org/3/c-api/unicode.html#creating-and-accessing-unicode-strings" rel="noreferrer">a C API to access the objects</a>, and <a href="https://docs.python.org/3/library/ctypes.html#accessing-values-exported-from-dlls" rel="noreferrer">you can use <code>ctypes</code> to access that API from within Python itself, which is such a terrible idea that they put a <code>pythonapi</code> right there in the stdlib's <code>ctypes</code> module</a>. :) The most important trick you need to know is that <code>id(x)</code> is the actual pointer to <code>x</code> in memory (as an <code>int</code>).</p>
+<p>Unfortunately, the C API for strings won't let us safely get at the internal storage of an already-frozen string. So screw safely, let's just <a href="https://github.com/python/cpython/blob/master/Include/unicodeobject.h" rel="noreferrer">read the header files</a> and find that storage ourselves.</p>
+<p>If you're using CPython 3.4 - 3.7 (it's different for older versions, and who knows for the future), a string literal from a module that's made of pure ASCII is going to be stored using the compact ASCII format, which means the struct ends early and the buffer of ASCII bytes follows immediately in memory. This will break (as in probably segfault) if you put a non-ASCII character in the string, or certain kinds of non-literal strings, but you can read up on the other 4 ways to access the buffer for different kinds of strings.</p>
+<p>To make things slightly easier, I'm using the <a href="https://github.com/abarnert/superhackyinternals" rel="noreferrer"><code>superhackyinternals</code></a> project off my GitHub. (It's intentionally not pip-installable because you really shouldn't be using this except to experiment with your local build of the interpreter and the like.)</p>
+<pre><code>import ctypes
+import internals # https://github.com/abarnert/superhackyinternals/blob/master/internals.py
+
+def print_function():
+    print ("This cat was scared.")
+
+def main():
+    for c in print_function.__code__.co_consts:
+        if isinstance(c, str):
+            idx = c.find('cat')
+            if idx != -1:
+                # Too much to explain here; just guess and learn to
+                # love the segfaults...
+                p = internals.PyUnicodeObject.from_address(id(c))
+                assert p.compact and p.ascii
+                addr = id(c) + internals.PyUnicodeObject.utf8_length.offset
+                buf = (ctypes.c_int8 * 3).from_address(addr + idx)
+                buf[:3] = b'dog'
+
+    print_function()
+
+main()
+</code></pre>
+<p>If you want to play with this stuff, <code>int</code> is a whole lot simpler under the covers than <code>str</code>. And it's a lot easier to guess what you can break by changing the value of <code>2</code> to <code>1</code>, right? Actually, forget imagining, let's just do it (using the types from <code>superhackyinternals</code> again):</p>
+<pre><code>&gt;&gt;&gt; n = 2
+&gt;&gt;&gt; pn = PyLongObject.from_address(id(n))
+&gt;&gt;&gt; pn.ob_digit[0]
+2
+&gt;&gt;&gt; pn.ob_digit[0] = 1
+&gt;&gt;&gt; 2
+1
+&gt;&gt;&gt; n * 3
+3
+&gt;&gt;&gt; i = 10
+&gt;&gt;&gt; while i &lt; 40:
+...     i *= 2
+...     print(i)
+10
+10
+10
+</code></pre>
+<p>… pretend that code box has an infinite-length scrollbar.</p>
+<p>I tried the same thing in IPython, and the first time I tried to evaluate <code>2</code> at the prompt, it went into some kind of uninterruptable infinite loop. Presumably it's using the number <code>2</code> for something in its REPL loop, while the stock interpreter isn't?</p>
+</div>
+<div class="post-text" itemprop="text">
+<h2>Monkey-patch <code>print</code></h2>
+<p><code>print</code> is a builtin function so it will use the <code>print</code> function defined in the <code>builtins</code> module (or <code>__builtin__</code> in Python 2). So whenever you want to modify or change the behavior of a builtin function you can simply reassign the name in that module. </p>
+<p>This process is called <code>monkey-patching</code>.</p>
+<pre><code># Store the real print function in another variable otherwise
+# it will be inaccessible after being modified.
+_print = print  
+
+# Actual implementation of the new print
+def custom_print(*args, **options):
+    _print('custom print called')
+    _print(*args, **options)
+
+# Change the print function globally
+import builtins
+builtins.print = custom_print
+</code></pre>
+<p>After that every <code>print</code> call will go through <code>custom_print</code>, even if the <code>print</code> is in an external module.</p>
+<p>However you don't really want to print additional text, you want to change the text that is printed. One way to go about that is to replace it in the string that would be printed:</p>
+<pre><code>_print = print  
+
+def custom_print(*args, **options):
+    # Get the desired seperator or the default whitspace
+    sep = options.pop('sep', ' ')
+    # Create the final string
+    printed_string = sep.join(args)
+    # Modify the final string
+    printed_string = printed_string.replace('cat', 'dog')
+    # Call the default print function
+    _print(printed_string, **options)
+
+import builtins
+builtins.print = custom_print
+</code></pre>
+<p>And indeed if you run:</p>
+<pre><code>&gt;&gt;&gt; def print_something():
+...     print('This cat was scared.')
+&gt;&gt;&gt; print_something()
+This dog was scared.
+</code></pre>
+<p>Or if you write that to a file:</p>
+<h3>test_file.py</h3>
+<pre><code>def print_something():
+    print('This cat was scared.')
+
+print_something()
+</code></pre>
+<p>and import it:</p>
+<pre><code>&gt;&gt;&gt; import test_file
+This dog was scared.
+&gt;&gt;&gt; test_file.print_something()
+This dog was scared.
+</code></pre>
+<p>So it really works as intended.</p>
+<p>However, in case you only temporarily want to monkey-patch print you could wrap this in a context-manager:</p>
+<pre><code>import builtins
+
+class ChangePrint(object):
+    def __init__(self):
+        self.old_print = print
+
+    def __enter__(self):
+        def custom_print(*args, **options):
+            # Get the desired seperator or the default whitspace
+            sep = options.pop('sep', ' ')
+            # Create the final string
+            printed_string = sep.join(args)
+            # Modify the final string
+            printed_string = printed_string.replace('cat', 'dog')
+            # Call the default print function
+            self.old_print(printed_string, **options)
+
+        builtins.print = custom_print
+
+    def __exit__(self, *args, **kwargs):
+        builtins.print = self.old_print
+</code></pre>
+<p>So when you run that it depends on the context what is printed:</p>
+<pre><code>&gt;&gt;&gt; with ChangePrint() as x:
+...     test_file.print_something()
+... 
+This dog was scared.
+&gt;&gt;&gt; test_file.print_something()
+This cat was scared.
+</code></pre>
+<p>So that's how you could "hack" <code>print</code> by monkey-patching.</p>
+<h2>Modify the target instead of the <code>print</code></h2>
+<p>If you look at the signature of <a href="https://docs.python.org/library/functions.html#print" rel="noreferrer"><code>print</code></a> you'll notice a <code>file</code> argument which is <code>sys.stdout</code> by default. Note that this is a dynamic default argument (it <strong>really</strong> looks up <code>sys.stdout</code> every time you call <code>print</code>) and not like normal default arguments in Python. So if you change <code>sys.stdout</code> <code>print</code> will actually print to the different target even more convenient that Python also provides a <a href="https://docs.python.org/library/contextlib.html#contextlib.redirect_stdout" rel="noreferrer"><code>redirect_stdout</code></a> function (from Python 3.4 on, but it's easy to create an equivalent function for earlier Python versions).</p>
+<p>The downside is that it won't work for <code>print</code> statements that don't print to <code>sys.stdout</code> and that creating your own <code>stdout</code> isn't really straightforward.</p>
+<pre><code>import io
+import sys
+
+class CustomStdout(object):
+    def __init__(self, *args, **kwargs):
+        self.current_stdout = sys.stdout
+
+    def write(self, string):
+        self.current_stdout.write(string.replace('cat', 'dog'))
+</code></pre>
+<p>However this also works:</p>
+<pre><code>&gt;&gt;&gt; import contextlib
+&gt;&gt;&gt; with contextlib.redirect_stdout(CustomStdout()):
+...     test_file.print_something()
+... 
+This dog was scared.
+&gt;&gt;&gt; test_file.print_something()
+This cat was scared.
+</code></pre>
+<h2>Summary</h2>
+<p>Some of these points have already be mentioned by @abarnet but I wanted to explore these options in more detail. Especially how to modify it across modules (using <code>builtins</code>/<code>__builtin__</code>) and how to make that change only temporary (using contextmanagers).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>A simple way to capture all output from a <code>print</code> function and then process it, is to change the output stream to something else, e.g. a file.</p>
+<p>I'll use a <code>PHP</code> naming conventions (<a href="http://php.net/manual/en/function.ob-start.php" rel="noreferrer">ob_start</a>, <a href="http://php.net/manual/en/function.ob-get-contents.php" rel="noreferrer">ob_get_contents</a>,...)</p>
+<pre><code>from functools import partial
+output_buffer = None
+print_orig = print
+def ob_start(fname="print.txt"):
+    global print
+    global output_buffer
+    print = partial(print_orig, file=output_buffer)
+    output_buffer = open(fname, 'w')
+def ob_end():
+    global output_buffer
+    close(output_buffer)
+    print = print_orig
+def ob_get_contents(fname="print.txt"):
+    return open(fname, 'r').read()
+</code></pre>
+<p>Usage:</p>
+<pre><code>print ("Hi John")
+ob_start()
+print ("Hi John")
+ob_end()
+print (ob_get_contents().replace("Hi", "Bye"))
+</code></pre>
+<p>Would print</p>
+<blockquote>
+<p>Hi John
+  Bye John</p>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<p>Let's combine this with frame introspection!</p>
+<pre><code>import sys
+
+_print = print
+
+def print(*args, **kw):
+    frame = sys._getframe(1)
+    _print(frame.f_code.co_name)
+    _print(*args, **kw)
+
+def greetly(name, greeting = "Hi")
+    print(f"{greeting}, {name}!")
+
+class Greeter:
+    def __init__(self, greeting = "Hi"):
+        self.greeting = greeting
+    def greet(self, name):
+        print(f"{self.greeting}, {name}!")
+</code></pre>
+<p>You'll find this trick prefaces every greeting with the calling function or method. This might be very useful for logging or debugging; especially as it lets you "hijack" print statements in third party code.</p>
+</div>
+<span class="comment-copy">By the way, the internal storage for ints is a lot simpler than strings, and floats even more so. And, as a bonus, it's a lot more obvious why it's a bad idea to change the value of <code>42</code> to <code>23</code> than why it's a bad idea to change the value of <code>"My name is Y"</code> to <code>"My name is X"</code>.</span>
+<span class="comment-copy">@cᴏʟᴅsᴘᴇᴇᴅ The code-munging is <i>arguably</i> reasonable Python, although you generally only want to touch code objects for much better reasons (e.g., running the bytecode through a custom optimizer). Accessing the internal storage of a <code>PyUnicodeObject</code>, on the other hand, that's probably really only Python in the sense that a Python interpreter will run it…</span>
+<span class="comment-copy">Your first code snippet raises <code>NameError: name 'arg' is not defined</code>.  Did you mean: <code>args = [arg.replace('cat', 'dog') if isinstance(arg, str) else arg for arg in args]</code>?  An arguably better way to write this would be: <code>args = [str(arg).replace('cat', 'dog') for arg in args]</code>.  Another, even shorter, option: <code>args = map(lambda a: str(a).replace('cat', 'dog'), args)</code>. This has the added benefit that <code>args</code> is lazy (which could also be accomplished by replacing the above list comprehension with a generator one—<code>*args</code> works either way).</span>
+<span class="comment-copy">@cᴏʟᴅsᴘᴇᴇᴅ Yeah, IIRC I'm only using the <code>PyUnicodeObject</code> struct definition, but copying that into the answer would I think just get in the way, and I think the readme and/or source comments to <code>superhackyinternals</code> actually explain how to access the buffer (at least well enough to remind me next time I care; not sure if it'll be enough for anyone else…), which I didn't want to get into here. The relevant part is how to get from a live Python object to its <code>PyObject *</code> via <code>ctypes</code>. (And maybe simulating pointer arithmetic, avoiding automatic <code>char_p</code> conversions, etc.)</span>
+<span class="comment-copy">@jpmc26 I don't think you need to do it <i>before</i> importing modules, as long as you do it before they print. Modules will do the name lookup every time, unless they explicitly bind <code>print</code> to a name. You can also bind the name <code>print</code> for them: <code>import yourmodule; yourmodule.print = badprint</code>.</span>
+<span class="comment-copy">@abarnert: I've noticed you've warned often about doing this (eg. <a href="https://stackoverflow.com/questions/49271187/how-to-change-a-string-in-a-function-when-calling-a-function/49271219?noredirect=1#comment85545706_49271219">"you never want to actually do this"</a>, <a href="https://stackoverflow.com/questions/49271750/is-it-possible-to-hack-pythons-print-function#comment85547327_49271750">"why it's a bad idea to change the value"</a>, etc.). It's not exactly clear what could possibly go wrong (sarcasm), would you be willing to elaborate a bit on that? It could possibly help for those tempted to blindly try it.</span>
+<span class="comment-copy">Yeah, the closest thing to this question anyone should ever actually want to do is <code>redirect_stdout</code>, so it’s nice to have a clear answer that leads to that.</span>

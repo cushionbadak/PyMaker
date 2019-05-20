@@ -1,0 +1,326 @@
+<div class="post-text" itemprop="text">
+<p>It seems that when an exception is raised from a multiprocessing.Pool process, there is no stack trace or any other indication that it has failed. Example: </p>
+<pre><code>from multiprocessing import Pool 
+
+def go():
+    print(1)
+    raise Exception()
+    print(2)
+
+p = Pool()
+p.apply_async(go)
+p.close()
+p.join()
+</code></pre>
+<p>prints 1 and stops silently. Interestingly, raising a BaseException instead works. Is there any way to make the behavior for all exceptions the same as BaseException?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I have a reasonable solution for the problem, at least for debugging purposes. I do not currently have a solution that will raise the exception back in the main processes. My first thought was to use a decorator, but you can only pickle <a href="http://docs.python.org/library/pickle.html#what-can-be-pickled-and-unpickled" rel="noreferrer">functions defined at the top level of a module</a>, so that's right out.</p>
+<p>Instead, a simple wrapping class and a Pool subclass that uses this for <code>apply_async</code> (and hence <code>apply</code>). I'll leave <code>map_async</code> as an exercise for the reader.</p>
+<pre><code>import traceback
+from multiprocessing.pool import Pool
+import multiprocessing
+
+# Shortcut to multiprocessing's logger
+def error(msg, *args):
+    return multiprocessing.get_logger().error(msg, *args)
+
+class LogExceptions(object):
+    def __init__(self, callable):
+        self.__callable = callable
+
+    def __call__(self, *args, **kwargs):
+        try:
+            result = self.__callable(*args, **kwargs)
+
+        except Exception as e:
+            # Here we add some debugging help. If multiprocessing's
+            # debugging is on, it will arrange to log the traceback
+            error(traceback.format_exc())
+            # Re-raise the original exception so the Pool worker can
+            # clean up
+            raise
+
+        # It was fine, give a normal answer
+        return result
+
+class LoggingPool(Pool):
+    def apply_async(self, func, args=(), kwds={}, callback=None):
+        return Pool.apply_async(self, LogExceptions(func), args, kwds, callback)
+
+def go():
+    print(1)
+    raise Exception()
+    print(2)
+
+multiprocessing.log_to_stderr()
+p = LoggingPool(processes=1)
+
+p.apply_async(go)
+p.close()
+p.join()
+</code></pre>
+<p>This gives me:</p>
+<pre><code>1
+[ERROR/PoolWorker-1] Traceback (most recent call last):
+  File "mpdebug.py", line 24, in __call__
+    result = self.__callable(*args, **kwargs)
+  File "mpdebug.py", line 44, in go
+    raise Exception()
+Exception
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Maybe I'm missing something, but isn't that what the <code>get</code> method of the Result object returns? See <a href="http://docs.python.org/library/multiprocessing.html#module-multiprocessing.pool" rel="noreferrer">Process Pools</a>.</p>
+<blockquote>
+<p>class multiprocessing.pool.AsyncResult</p>
+<p>The class of the result returned by Pool.apply_async() and Pool.map_async().get([timeout])<br/>
+  Return the result when it arrives. If timeout is not None and the result does not arrive within
+  timeout seconds then multiprocessing.TimeoutError is raised. If the remote
+  call raised an exception then that exception will be reraised by get().</p>
+</blockquote>
+<p>So, slightly modifying your example, one can do</p>
+<pre><code>from multiprocessing import Pool
+
+def go():
+    print(1)
+    raise Exception("foobar")
+    print(2)
+
+p = Pool()
+x = p.apply_async(go)
+x.get()
+p.close()
+p.join()
+</code></pre>
+<p>Which gives as result</p>
+<pre><code>1
+Traceback (most recent call last):
+  File "rob.py", line 10, in &lt;module&gt;
+    x.get()
+  File "/usr/lib/python2.6/multiprocessing/pool.py", line 422, in get
+    raise self._value
+Exception: foobar
+</code></pre>
+<p>This is not completely satisfactory, since it does not print the traceback, but is better than nothing.</p>
+<p>UPDATE: This bug has been fixed in Python 3.4, courtesy of Richard Oudkerk. See the issue <a href="http://bugs.python.org/issue13831Ups" rel="noreferrer">get method of multiprocessing.pool.Async should return full traceback</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The solution with the most votes at the time of writing has a problem:</p>
+<pre><code>from multiprocessing import Pool
+
+def go():
+    print(1)
+    raise Exception("foobar")
+    print(2)
+
+p = Pool()
+x = p.apply_async(go)
+x.get()  ## waiting here for go() to complete...
+p.close()
+p.join()
+</code></pre>
+<p>As @dfrankow noted, it will wait on <code>x.get()</code>, which ruins the point of running a task asynchronously. So, for better efficiency (in particular if your worker function <code>go</code> takes a long time) I would change it to:</p>
+<pre><code>from multiprocessing import Pool
+
+def go(x):
+    print(1)
+    # task_that_takes_a_long_time()
+    raise Exception("Can't go anywhere.")
+    print(2)
+    return x**2
+
+p = Pool()
+results = []
+for x in range(1000):
+    results.append( p.apply_async(go, [x]) )
+
+p.close()
+
+for r in results:
+     r.get()
+</code></pre>
+<p><strong>Advantages</strong>: the worker function is run asynchronously, so if for example you are running many tasks on several cores, it will be a lot more efficient than the original solution.</p>
+<p><s><strong>Disadvantages</strong>: if there is an exception in the worker function, it will only be raised <strong>after</strong> the pool has completed all the tasks. This may or may not be the desirable behaviour.</s> EDITED according to @colinfang's comment, which fixed this. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I've had success logging exceptions with this decorator:</p>
+<pre><code>import traceback, functools, multiprocessing
+
+def trace_unhandled_exceptions(func):
+    @functools.wraps(func)
+    def wrapped_func(*args, **kwargs):
+        try:
+            func(*args, **kwargs)
+        except:
+            print 'Exception in '+func.__name__
+            traceback.print_exc()
+    return wrapped_func
+</code></pre>
+<p>with the code in the question, it's</p>
+<pre><code>@trace_unhandled_exceptions
+def go():
+    print(1)
+    raise Exception()
+    print(2)
+
+p = multiprocessing.Pool(1)
+
+p.apply_async(go)
+p.close()
+p.join()
+</code></pre>
+<p>Simply decorate the function you pass to your process pool. The key to this working is <code>@functools.wraps(func)</code> otherwise multiprocessing throws a <code>PicklingError</code>.</p>
+<p>code above gives</p>
+<pre><code>1
+Exception in go
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 5, in wrapped_func
+  File "&lt;stdin&gt;", line 4, in go
+Exception
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>import logging
+from multiprocessing import Pool
+
+def proc_wrapper(func, *args, **kwargs):
+    """Print exception because multiprocessing lib doesn't return them right."""
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        logging.exception(e)
+        raise
+
+def go(x):
+    print x
+    raise Exception("foobar")
+
+p = Pool()
+p.apply_async(proc_wrapper, (go, 5))
+p.join()
+p.close()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I created a module <a href="https://gist.github.com/niccokunzmann/5763860" rel="nofollow">RemoteException.py</a> that shows the full traceback of a exception in a process. Python2. <a href="https://gist.github.com/niccokunzmann/5763860" rel="nofollow">Download it</a> and add this to your code:</p>
+<pre><code>import RemoteException
+
+@RemoteException.showError
+def go():
+    raise Exception('Error!')
+
+if __name__ == '__main__':
+    import multiprocessing
+    p = multiprocessing.Pool(processes = 1)
+    r = p.apply(go) # full traceback is shown here
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'd try using pdb:</p>
+<pre><code>import pdb
+import sys
+def handler(type, value, tb):
+  pdb.pm()
+sys.excepthook = handler
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since you have used <code>apply_sync</code>, I guess the use case is want to do some synchronize tasks. Use callback for handling is another option. Please note this option is available only for python3.2 and above and not available on python2.7.</p>
+<pre><code>from multiprocessing import Pool
+
+def callback(result):
+    print('success', result)
+
+def callback_error(result):
+    print('error', result)
+
+def go():
+    print(1)
+    raise Exception()
+    print(2)
+
+p = Pool()
+p.apply_async(go, callback=callback, error_callback=callback_error)
+
+# You can do another things
+
+p.close()
+p.join()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since there are already decent answers for <code>multiprocessing.Pool</code> available, I will provide a solution using a different approach for completeness.</p>
+<p>For <code>python &gt;= 3.2</code> the following solution seems to be the simplest:</p>
+<pre><code>from concurrent.futures import ProcessPoolExecutor, wait
+
+def go():
+    print(1)
+    raise Exception()
+    print(2)
+
+
+futures = []
+with ProcessPoolExecutor() as p:
+    for i in range(10):
+        futures.append(p.submit(go))
+
+results = [f.result() for f in futures]
+</code></pre>
+<p>Advantages:</p>
+<ul>
+<li>very little code</li>
+<li>raises an exception in the main process</li>
+<li>provides a stack trace</li>
+<li>no external dependencies</li>
+</ul>
+<p>For more info about the API please check: <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ProcessPoolExecutor" rel="nofollow noreferrer">https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ProcessPoolExecutor</a></p>
+<p>Additionally, if you are submitting a large number of tasks and you would like your main process to fail as soon as one of your tasks fail, you can use the following snippet:</p>
+<pre><code>from concurrent.futures import ProcessPoolExecutor, wait, FIRST_EXCEPTION, as_completed
+import time
+
+
+def go():
+    print(1)
+    time.sleep(0.3)
+    raise Exception()
+    print(2)
+
+
+futures = []
+with ProcessPoolExecutor(1) as p:
+    for i in range(10):
+        futures.append(p.submit(go))
+
+    for f in as_completed(futures):
+        if f.exception() is not None:
+            for f in futures:
+                f.cancel()
+            break
+
+[f.result() for f in futures]
+</code></pre>
+<p>All of the other answers fail only once all tasks have been executed.</p>
+</div>
+<span class="comment-copy">I had the same problem. The cause is as follows: the worker process catches Exception and puts a failure code and the exception on the results queue. Back in the main process, the Pool's result handler thread gets the failure code and just ignores it. Some sort of monkey-patch debug mode might be possible. An alternative would be to ensure your worker function catches any exception, returns it and an error code for your handler to print.</span>
+<span class="comment-copy">This has been answered here: <a href="http://stackoverflow.com/a/26096355/512111">stackoverflow.com/a/26096355/512111</a></span>
+<span class="comment-copy">It's too bad there isn't a simpler solution (or a mistake on my part) but this will get the job done- thanks!</span>
+<span class="comment-copy">I've realised that decorators CAN be used, if you use <code>@functools.wraps(func)</code> to decorate your wrapper. This makes your decorated function look like a function defined at the top level of a module.</span>
+<span class="comment-copy">The solution in <a href="http://stackoverflow.com/a/26096355/512111">this answer</a> is simpler <b>and</b> supports re-raising the error in the main process!</span>
+<span class="comment-copy">@j08lue - that answer is nice but comes with 3 downsides: 1) extra dependency 2) have to wrap your worker function with a try/except and the logic to return a wrapper object 3) have to sniff the return type and re-raise. On the plus side, getting the actual traceback in your main thread is nicer, I agree.</span>
+<span class="comment-copy">@RupertNash I actually meant a usage more like in <a href="http://stackoverflow.com/a/42000305/512111">this new answer</a>. That resolves downside 3.</span>
+<span class="comment-copy">Let me know if you figure out why it doesn't return the traceback. Since it is able to return the error value, it should be able to return the traceback too. I may ask on some suitable forum - perhaps some Python development list. BTW, as you may have guessed, I came across your question while trying to find out the same thing. :-)</span>
+<span class="comment-copy">Note: to do this for a bunch of simultaneously running tasks, you should save all the results on a list, then iterate through each result with get(), possibly surrounded by try/catch if you don't want to crap out on the first error.</span>
+<span class="comment-copy">@dfrankow That's a great suggestion. Would you care to suggest a possible implementation in a new answer? I'm betting it would be very useful. ;)</span>
+<span class="comment-copy">Sadly after over a year, I've completely forgotten all of this.</span>
+<span class="comment-copy">The code as it is in the answer will wait on the <code>x.get()</code>, which ruins the point of applying a task asynchronously. The comment by @dfrankow about saving the results to a list and then <code>get</code>ting them at the end is a better solution.</span>
+<span class="comment-copy">Good effort. However, since your example is predicated on the assumption that there are multiple results, maybe expand it a bit so that there are, in fact, multiple results? Also, you write: "in particular if you worker function". That should be "your".</span>
+<span class="comment-copy">You are right, thanks. I've expanded the example a bit.</span>
+<span class="comment-copy">Cool. Also, you might want to try/except, depending on how you want to tolerate errors in the fetch.</span>
+<span class="comment-copy">@gozzilli can you put <code>for r in ... r.get()</code> between <code>p.close()</code> and <code>p.join()</code>, so you exit as soon as you hit an exception</span>
+<span class="comment-copy">@colinfang I believe that would <code>return null</code> because the computation hasn't occurred yet--it doesn't wait on it unless you <code>join()</code>.</span>
+<span class="comment-copy">This doesn't work if the function being run in parallel -- go() in this case -- returns a value. The decorator doesn't pass the return value through. Other than that I like this solution.</span>
+<span class="comment-copy">For passing return values just modify the wrapper_func like this: `    def wrapped_func(*args, **kwargs):         result = None         try:             result = func(*args, **kwargs)         except:             print ('Exception in '+func.__name__)             traceback.print_exc()         return result ` Works like charm ;)</span>
+<span class="comment-copy">It never reaches handler in that case, strange</span>
+<span class="comment-copy">there is no such <code>error_callbak</code> for <code>apply_async</code> method ,refer <a href="https://docs.python.org/3.1/library/multiprocessing.html#multiprocessing.pool.multiprocessing.Pool.apply_async" rel="nofollow noreferrer">docs.python.org/3.1/library/…</a></span>
+<span class="comment-copy">for the later version: <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.Pool.apply_async" rel="nofollow noreferrer">docs.python.org/3/library/…</a></span>

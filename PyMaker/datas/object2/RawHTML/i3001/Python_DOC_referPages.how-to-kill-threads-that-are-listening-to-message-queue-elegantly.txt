@@ -1,0 +1,86 @@
+<div class="post-text" itemprop="text">
+<p>In my Python application, I have a function that consumes message from Amazon SQS FIFO queue.</p>
+<pre><code>def consume_msgs():
+    sqs = boto3.client('sqs',
+                   region_name='us-east-1',
+                   aws_access_key_id=AWS_ACCESS_KEY_ID,
+                   aws_secret_access_key=AWS_SECRET_ACCESS_KEY)
+    print('STARTING WORKER listening on {}'.format(QUEUE_URL))
+    while 1:
+        response = sqs.receive_message(
+            QueueUrl=QUEUE_URL,
+            MaxNumberOfMessages=1,
+            WaitTimeSeconds=10,
+        )
+        messages = response.get('Messages', [])
+        for message in messages:
+            try:
+                print('{} &gt; {}'.format(threading.currentThread().getName(), message.get('Body')))
+                body = json.loads(message.get('Body'))
+                sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=message.get('ReceiptHandle'))
+
+            except Exception as e:
+                print('Exception in worker &gt; ', e)
+                sqs.delete_message(QueueUrl=QUEUE_URL, ReceiptHandle=message.get('ReceiptHandle'))
+
+    time.sleep(10)
+</code></pre>
+<p>In order to scale up, I am using multi threading to process messages. </p>
+<pre><code>if __name__ == '__main__:
+
+    for i in range(3):
+        t = threading.Thread(target=consume_msgs, name='worker-%s' % i)
+        t.setDaemon(True)
+        t.start()
+    while True:
+        print('Waiting')
+        time.sleep(5)
+</code></pre>
+<p>The application runs as service. If I need to deploy new release, it has to be restarted. Is there a way have the threads exist gracefully when main process is being terminated? In stead of killing the threads abruptly, they finish with current message first and stop receiving the next messages. </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since your threads keep looping, you cannot just <code>join</code> them, but you need to signal them it's time to break out of the loop too in order to be able to do that. This <a href="https://docs.python.org/3/library/threading.html#thread-objects" rel="nofollow noreferrer">docs</a> hint might be useful:</p>
+<blockquote>
+<p>Daemon threads are abruptly stopped at shutdown. Their resources (such as open files, database transactions, etc.) may not be released properly. If you want your threads to stop gracefully, make them non-daemonic and use a suitable signalling mechanism such as an <a href="https://docs.python.org/3/library/threading.html#threading.Event" rel="nofollow noreferrer">Event</a>.</p>
+</blockquote>
+<p>With that, I've put the following example together, which can hopefully help a bit:</p>
+<pre><code>from threading import Thread, Event
+from time import sleep
+
+def fce(ident, wrap_up_event):
+    cnt = 0
+    while True:
+        print(f"{ident}: {cnt}", wrap_up_event.is_set())
+        sleep(3)
+        cnt += 1
+        if wrap_up_event.is_set():
+            break
+    print(f"{ident}: Wrapped up")
+
+if __name__ == '__main__':
+    wanna_exit = Event()
+    for i in range(3):
+        t = Thread(target=fce, args=(i, wanna_exit))
+        t.start()
+    sleep(5)
+    wanna_exit.set()
+</code></pre>
+<p>A single event instance is passed to <code>fce</code> which would just keep running endlessly, but when done with each iteration, before going back to the top check, if the event has been set to <code>True</code>. And before exiting from the script, we set this event to <code>True</code> from the controlling thread. Since the threads are no longer marked as daemon threads, we do not have to explicitly <code>join</code> them.</p>
+<p>Depending on how exactly you want to shutdown your script, you will need to handle the incoming signal (<code>SIGTERM</code> perhaps) or <code>KeyboardInterrupt</code> exception for <code>SIGINT</code>. And perform your clean-up before exiting, the mechanics of which remain the same. Apart from not letting python just stop execution right away, you need to let your threads know they should not re-enter the loop and wait for them to be joined.</p>
+<hr/>
+<p>The <code>SIGINT</code> is a bit simpler, because it's exposed as a python exception and you could do for instance this for the "main" bit:</p>
+<pre><code>if __name__ == '__main__':
+    wanna_exit = Event()
+    for i in range(3):
+        t = Thread(target=fce, args=(i, wanna_exit))
+        t.start()
+    try:
+        while True:
+            sleep(5)
+            print('Waiting')
+    except KeyboardInterrupt:
+        pass
+    wanna_exit.set()
+</code></pre>
+<p>You can of course send <code>SIGINT</code> to a process with <code>kill</code> and not only from the controlling terminal.</p>
+</div>

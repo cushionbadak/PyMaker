@@ -1,0 +1,149 @@
+<div class="post-text" itemprop="text">
+<p>I'm working on a dataset from a MOOC.  I have a lot of python3 code snippets that I need to run and get the results from.  To do this I've written a python script that loops over each snippet.  For each snippet I:</p>
+<ol>
+<li>Create new StringIO objects</li>
+<li>Set <code>sys.stdout</code> and <code>sys.stderr</code> to my stringIO buffers</li>
+<li>Execute the code snippet in a <code>threading.thread</code> object</li>
+<li>Join the thread</li>
+<li>Log the results in the stringIO buffers</li>
+<li>Restore stdout and stderr </li>
+</ol>
+<p>This works fine for "correct" code, but this has issues in other cases:</p>
+<ul>
+<li>When the code has an infinite loop, thread.join doesn't kill the thread.  The thread is a daemon thread, so it runs quietly in the background until my loop finishes.</li>
+<li>When the code has an infinite loop with a <code>print()</code>, the thread starts overwriting my actual stdout when I set it back to the default (away from the StringIO buffer).  This pollutes my reporting.</li>
+</ul>
+<p>Here is my current code:</p>
+<pre><code>def execCode(code, testScript=None):
+    # create file-like string to capture output
+    codeOut = io.StringIO()
+    codeErr = io.StringIO()
+
+    # capture output and errors
+    sys.stdout = codeOut
+    sys.stderr = codeErr
+
+    def worker():
+        exec(code, globals())
+
+        if testScript:
+            # flush stdout/stderror
+            sys.stdout.truncate(0)
+            sys.stdout.seek(0)
+            # sys.stderr.truncate(0)
+            # sys.stderr.seek(0)
+            exec(testScript)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    # thread = Process(target=worker) #, stdout=codeOut, stderr=codeErr)
+    thread.start()
+    thread.join(0.5)  # 500ms
+
+    execError = codeErr.getvalue().strip()
+    execOutput = codeOut.getvalue().strip()
+
+    if thread.is_alive():
+        thread.terminate()
+        execError = "TimeError: run time exceeded"
+
+    codeOut.close()
+    codeErr.close()
+
+    # restore stdout and stderr
+    sys.stdout = sys.__stdout__
+    sys.stderr = sys.__stderr__
+
+    # restore any overridden functions
+    restoreBuiltinFunctions()
+
+    if execError:
+        return False, stripOuterException(execError)
+    else:
+        return True, execOutput
+</code></pre>
+<p>To handle this case, I've been trying to use <code>multithreading.Process</code> and/or <code>contextlib.redirect_stdout</code> to run the code in a process (then I can call <code>process.terminate()</code>), but I'm not having any success capturing stdout/stderr.</p>
+<p>So my question is:  How can I redirect or capture stdout/stderr from a process?  Alternatively, is there some other way I could go about trying to run and capture the output of arbitrary code?</p>
+<p>(And yes, I know this is a bad idea in general; I'm running it in a virtual machine just in case there is malicious code in there somewhere)</p>
+<p>Python version is 3.5.3</p>
+<hr/>
+<h1>Update</h1>
+<p>It occurs to me that there is a little more flexibility in this situation.  I have a function, <code>preprocess(code)</code> that accepts a the code submission as a string and alters it.  Mostly I've been using it to swap out the value of some variables using regular expressions.</p>
+<p>Here is an example implementation:</p>
+<pre><code>def preprocess(code):
+    import re
+    rx = re.compile('earlier_date\s*=\s*.+')
+    code = re.sub(rx, "earlier_date = date(2016, 5, 3)", code)
+    rx = re.compile('later_date\s*=\s*.+')
+    code = re.sub(rx, "later_date = date(2016, 5, 24)", code)
+    return code
+</code></pre>
+<p>I could use the preprocess function to help redirect STDOUT</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Communicating with running process is not straightforward in Python. For some reason you can only do it once in subprocess life cycle. From my experience, it is best to run a thread that starts a process and after timeout gets its output and terminates the subprocess.</p>
+<p>Something like:</p>
+<pre><code>def subprocess_with_timeout(cmd, timeout_sec, stdin_data=None):
+    """Execute `cmd` in a subprocess and enforce timeout `timeout_sec` seconds.
+
+    Send `stdin_data` to the subprocess.
+
+    Return subprocess exit code and outputs on natural completion of the subprocess.
+    Raise an exception if timeout expires before subprocess completes."""
+    proc = os.subprocess.Popen(cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE)
+    timer = threading.Timer(timeout_sec, proc.kill)
+    # this will terminate subprocess after timeout
+    timer.start()
+
+    # you will be blocked here until process terminates (by itself or by timeout death switch)
+    stdoutdata, stderrdata = proc.communicate(stdin_data) 
+
+    if timer.is_alive():
+        # Process completed naturally - cancel timer and return exit code
+        timer.cancel()
+        return proc.returncode, stdoutdata, stderrdata
+    # Process killed by timer - raise exception
+    raise TimeoutError('Process #%d killed after %f seconds' % (proc.pid, timeout_sec))
+</code></pre>
+<p>So, run a threaded executioner that calls for <code>subprocess_with_timeout</code>. It should handle the inputs and save the results.</p>
+<p>Another idea is using a webserver to do the IPC. See <a href="https://eli.thegreenplace.net/2017/interacting-with-a-long-running-child-process-in-python/" rel="nofollow noreferrer">this link</a> </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>What about <a href="https://docs.python.org/3/library/subprocess.html#subprocess.check_output" rel="nofollow noreferrer"><code>subprocess.check_output</code></a>? You could call <code>python -c {snippet}</code> with it, or if it is longer, just write the snippet to a temporary <code>.py</code> file. <code>check_output</code> (and indeed, all the other functions in <code>subprocess</code>) has a <code>timeout</code> parameter.</p>
+<p>The general idea is then:</p>
+<pre><code>import subprocess
+import sys
+
+def execCode(code):
+    try:
+        output = subprocess.check_output([sys.executable, '-c', code],
+                                         stdin=subprocess.PIPE,
+                                         stderr=subprocess.PIPE,
+                                         timeout=0.5)
+        return True, output
+    except subprocess.TimeoutExpired as te:
+        return False, 'run time exceeded'
+    except subprocess.CalledProcessError as cpe:
+        return False, cpe.stderr
+</code></pre>
+<p>Example runs in IPython:</p>
+<pre><code>In [18]: execCode('import os\nprint(" ".join(os.listdir()))')
+Out[18]:
+(True,
+ b'contents of directory\n')
+
+In [19]: execCode('import time\ntime.sleep(1)')
+Out[19]: (False, 'run time exceeded')
+
+In [20]: execCode('import os\nprint("\t".join(os.listdi))')
+Out[20]: 
+(False,
+ b'Traceback (most recent call last):\n  File "&lt;string&gt;", line 2, in &lt;module&gt;\nAttributeError: module \'os\' has no attribute \'listdi\'\n')
+</code></pre>
+<p>Note that <code>check_output</code> returns a <code>bytes</code> sequence, so you will have to convert it into <code>str</code>. Or you can use the <code>encoding</code> parameter of <code>check_output</code>.</p>
+</div>
+<span class="comment-copy">Have you considered <code>logging</code>?</span>
+<span class="comment-copy">I have some logging.  My current work around is to turn on logging when I encounter an infinite loop.  I use the logging to track down and delete the offending snippet, but this is a manual process that can't really be automated (If I could automate it, I wouldn't need to log anything, I could just abort, delete the record, and continue)</span>
+<span class="comment-copy">What about <a href="https://docs.python.org/3/library/subprocess.html#subprocess.check_output" rel="nofollow noreferrer"><code>subprocess.check_output</code></a>? You could call <code>python -c {snippet}</code> with it, or if it is longer, just write the snippet to a temporary <code>.py</code> file. <code>check_output</code> (and indeed, all the other functions in <code>subprocess</code>) has a <code>timeout</code> parameter.</span>

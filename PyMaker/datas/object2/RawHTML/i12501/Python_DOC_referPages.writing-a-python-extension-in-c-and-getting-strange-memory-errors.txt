@@ -1,0 +1,206 @@
+<div class="post-text" itemprop="text">
+<p>I have a Python class I've written in C called <code>pyquat.Quat</code>, and it includes methods for multiplying by another Quat, returning a NumPy array (<code>Quat#to_matrix()</code>) and for printing the representation.</p>
+<p>Sometimes when I call these methods, I get a <code>SIGSEGV</code>. However, the segmentation fault never occurs when I'm running the program in GDB.</p>
+<p>Although I can't seem to trace the problem, I <em>am</em> seeing some weird cases of memory being overwritten (apparently). For example, here's my script and output:</p>
+<pre><code>&gt;&gt;&gt; from pyquat import Quat
+&gt;&gt;&gt; z = Quat(4,3,2,1) * Quat(1,2,3,4)
+&gt;&gt;&gt; z
+Quat{{-12, 6, 24, 12}}
+&gt;&gt;&gt; z.normalize()
+Quat{{-0.40000000000000002, 0.20000000000000001, 0.80000000000000004, 0.40000000000000002}}
+&gt;&gt;&gt; m = z.to_matrix()
+&gt;&gt;&gt; m
+array([[-0.6 ,  0.  ,  0.8 ],
+       [ 0.64,  0.6 ,  0.48],
+       [-0.48,  0.8 , -0.36]])
+&gt;&gt;&gt; z
+'exc_traceback'
+</code></pre>
+<p>I've been doing a lot of searching, but I have no clue why it would be overwriting the caller with a string here.</p>
+<p>The function in question is:</p>
+<pre><code>static PyObject* pyquat_Quat_to_matrix(PyObject* self) {
+  npy_intp dims[2] = {3,3};
+
+  pyquat_Quat* q = (pyquat_Quat*)(self);
+
+  PyArrayObject* ary  = (PyArrayObject*)PyArray_SimpleNew(2, dims, NPY_DOUBLE);
+  double* T = (double*)ary-&gt;data;
+
+  T[0] = 1.0 - 2.0 * (q-&gt;v[2] * q-&gt;v[2] + q-&gt;v[1] * q-&gt;v[1]); 
+  T[1] =       2.0 * (q-&gt;v[1] * q-&gt;v[0] +    q-&gt;s * q-&gt;v[2]);
+  T[2] =       2.0 * (q-&gt;v[2] * q-&gt;v[0] -    q-&gt;s * q-&gt;v[1]);
+  T[3] =       2.0 * (q-&gt;v[1] * q-&gt;v[0] -    q-&gt;s * q-&gt;v[2]);
+  T[4] = 1.0 - 2.0 * (q-&gt;v[2] * q-&gt;v[2] + q-&gt;v[0] * q-&gt;v[0]);
+  T[5] =       2.0 * (q-&gt;v[2] * q-&gt;v[1] +    q-&gt;s * q-&gt;v[0]);
+  T[6] =       2.0 * (q-&gt;v[2] * q-&gt;v[0] +    q-&gt;s * q-&gt;v[1]);
+  T[7] =       2.0 * (q-&gt;v[2] * q-&gt;v[1] -    q-&gt;s * q-&gt;v[0]);
+  T[8] = 1.0 - 2.0 * (q-&gt;v[1] * q-&gt;v[1] + q-&gt;v[0] * q-&gt;v[0]);
+
+  return PyArray_Return(ary);
+}
+</code></pre>
+<p>and my type looks like</p>
+<pre><code>typedef struct {
+  PyObject_HEAD
+
+  /* Type-specific fields go here */
+  double s;     // scalar component
+  double v[3];  // vector components
+} pyquat_Quat;
+</code></pre>
+<p>I'm fairly certain I'm correctly including numpy, and creating both my module and my class:</p>
+<pre><code>/* Initialize the pyquat module and add pyquat.Quat to it.  */
+PyMODINIT_FUNC initpyquat(void) {
+  PyObject* m;
+
+  pyquat_QuatType.tp_new = PyType_GenericNew;
+  if (PyType_Ready(&amp;pyquat_QuatType) &lt; 0)
+    return;
+
+  // Define the pyquat module.
+  m = Py_InitModule3("pyquat", pyquat_methods,
+         "Quaternion module with fast unit (right) quaternion math written in C.");
+
+  // Import NumPy to prevent a segfault when we call a function that uses NumPy API.
+  import_array();
+
+  // Create the Quat class in the pyquat module.
+  Py_INCREF(&amp;pyquat_QuatType);
+  PyModule_AddObject(m, "Quat", (PyObject *)&amp;pyquat_QuatType);
+}
+
+
+static int pyquat_Quat_init(pyquat_Quat* self, PyObject* args) {
+
+  double scalar, vx, vy, vz;
+
+  if (!PyArg_ParseTuple(args, "dddd", &amp;scalar, &amp;vx, &amp;vy, &amp;vz))
+    return -1;
+
+  // Read the scalar and vector components of the quaternion.
+  self-&gt;s = scalar;
+  self-&gt;v[0] = vx;
+  self-&gt;v[1] = vy;
+  self-&gt;v[2] = vz;
+
+  return 0;
+}
+</code></pre>
+<p>My repr method seems pretty typical, too, but I notice that this method also occasionally causes <code>obj</code> to be overwritten.</p>
+<pre><code>static PyObject* pyquat_Quat_repr(PyObject* obj) {
+  pyquat_Quat* self = (pyquat_Quat*)(obj);
+  return PyString_FromFormat("Quat{{\%s, \%s, \%s, \%s}}", 
+                             PyOS_double_to_string(self-&gt;s, 'g', 17, 0, NULL),
+                             PyOS_double_to_string(self-&gt;v[0], 'g', 17, 0, NULL),
+                             PyOS_double_to_string(self-&gt;v[1], 'g', 17, 0, NULL),
+                             PyOS_double_to_string(self-&gt;v[2], 'g', 17, 0, NULL));
+}
+
+
+static PyObject * pyquat_Quat_mul(PyObject* self, PyObject* arg) {
+
+  // Expects the one argument to be a pyquat_Quat
+  if (!PyObject_IsInstance(arg, (PyObject*)&amp;pyquat_QuatType)) {
+    Py_DECREF(arg);
+    PyErr_SetString(PyExc_IOError, "expected quaternion");
+    return NULL;
+  }
+
+  pyquat_Quat* rhs    = (pyquat_Quat*)(arg);
+  pyquat_Quat* lhs    = (pyquat_Quat*)(self);
+  pyquat_Quat* result = (pyquat_Quat *)Py_TYPE(self)-&gt;tp_alloc(Py_TYPE(self), 0);
+
+  result-&gt;s    = lhs-&gt;s * rhs-&gt;s - (lhs-&gt;v[0] * rhs-&gt;v[0] + lhs-&gt;v[1] * rhs-&gt;v[1] + lhs-&gt;v[2] * rhs-&gt;v[2]);
+  result-&gt;v[0] = lhs-&gt;s * rhs-&gt;v[0] + rhs-&gt;s * lhs-&gt;v[0] - (lhs-&gt;v[1] * rhs-&gt;v[2] - lhs-&gt;v[2] * rhs-&gt;v[1]);
+  result-&gt;v[1] = lhs-&gt;s * rhs-&gt;v[1] + rhs-&gt;s * lhs-&gt;v[1] - (lhs-&gt;v[2] * rhs-&gt;v[0] - lhs-&gt;v[0] * rhs-&gt;v[2]);
+  result-&gt;v[2] = lhs-&gt;s * rhs-&gt;v[2] + rhs-&gt;s * lhs-&gt;v[2] - (lhs-&gt;v[0] * rhs-&gt;v[1] - lhs-&gt;v[1] * rhs-&gt;v[0]);
+
+  return (PyObject*)(result);
+}
+</code></pre>
+<p>This is one I have some concern about. It's returning <code>self</code> — but why does the multiplication function, which also returns an object, not also cause Python to echo the repr for the object?</p>
+<p><strong>Edit:</strong> After some investigation, it looks like the problem only happens when I call the in-place normalization routine. Do I need to increment or decrement some reference counter here?</p>
+<pre><code>static PyObject* pyquat_Quat_inplace_normalize(PyObject* self) {
+
+  pyquat_Quat* q = (pyquat_Quat*)(self);
+
+  double q_mag = sqrt(q-&gt;s * q-&gt;s + q-&gt;v[0] * q-&gt;v[0] + q-&gt;v[1] * q-&gt;v[1] + q-&gt;v[2] * q-&gt;v[2]);
+  if (q_mag &gt; PYQUAT_QUAT_SMALL) q_mag = 1.0 / q_mag;
+  else                           q_mag = 0.0;
+
+  q-&gt;s    *= q_mag;
+  q-&gt;v[0] *= q_mag;
+  q-&gt;v[1] *= q_mag;
+  q-&gt;v[2] *= q_mag;
+
+  return self;
+}
+</code></pre>
+<p>Here is the multiplication function:</p>
+<pre><code>static PyObject * pyquat_Quat_mul(PyObject* self, PyObject* arg) {
+
+  // Expects the one argument to be a pyquat_Quat
+  if (!PyObject_IsInstance(arg, (PyObject*)&amp;pyquat_QuatType)) {
+    Py_DECREF(arg);
+    PyErr_SetString(PyExc_IOError, "expected quaternion");
+    return NULL;
+  }
+
+  pyquat_Quat* rhs    = (pyquat_Quat*)(arg);
+  pyquat_Quat* lhs    = (pyquat_Quat*)(self);
+  pyquat_Quat* result = (pyquat_Quat *)Py_TYPE(self)-&gt;tp_alloc(Py_TYPE(self), 0);
+
+  result-&gt;s    = lhs-&gt;s * rhs-&gt;s - (lhs-&gt;v[0] * rhs-&gt;v[0] + lhs-&gt;v[1] * rhs-&gt;v[1] + lhs-&gt;v[2] * rhs-&gt;v[2]);
+  result-&gt;v[0] = lhs-&gt;s * rhs-&gt;v[0] + rhs-&gt;s * lhs-&gt;v[0] - (lhs-&gt;v[1] * rhs-&gt;v[2] - lhs-&gt;v[2] * rhs-&gt;v[1]);
+  result-&gt;v[1] = lhs-&gt;s * rhs-&gt;v[1] + rhs-&gt;s * lhs-&gt;v[1] - (lhs-&gt;v[2] * rhs-&gt;v[0] - lhs-&gt;v[0] * rhs-&gt;v[2]);
+  result-&gt;v[2] = lhs-&gt;s * rhs-&gt;v[2] + rhs-&gt;s * lhs-&gt;v[2] - (lhs-&gt;v[0] * rhs-&gt;v[1] - lhs-&gt;v[1] * rhs-&gt;v[0]);
+
+  return (PyObject*)(result);
+}
+</code></pre>
+<p>Does anyone have any suggestions on how I might debug this more effectively, or see what the problem could be?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You said that by <code>Py_INCREF</code> some values before returning them from your methods, the problem seems to disappear.</p>
+<p>Inspired by your discovery, I found the problem:</p>
+<pre><code>static PyObject * pyquat_Quat_mul(PyObject* self, PyObject* arg) {
+  // Expects the one argument to be a pyquat_Quat
+  if (!PyObject_IsInstance(arg, (PyObject*)&amp;pyquat_QuatType)) {
+    Py_DECREF(arg);
+</code></pre>
+<p>You are <code>Py_DECREF</code>ing arguments. You should not do that! Refcounts should be increased and decreased only when objects are stored somewhere.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Okay, I think I found a solution.</p>
+<p>The problem is in my in-place functions, which also return <code>self</code>.</p>
+<p>For example,</p>
+<pre><code>static PyObject* pyquat_Quat_inplace_normalize(PyObject* self) {
+
+  pyquat_Quat* q = (pyquat_Quat*)(self);
+
+  double q_mag = sqrt(q-&gt;s * q-&gt;s + q-&gt;v[0] * q-&gt;v[0] + q-&gt;v[1] * q-&gt;v[1] + q-&gt;v[2] * q-&gt;v[2]);
+  if (q_mag &gt; PYQUAT_QUAT_SMALL) q_mag = 1.0 / q_mag;
+  else                           q_mag = 0.0;
+
+  q-&gt;s    *= q_mag;
+  q-&gt;v[0] *= q_mag;
+  q-&gt;v[1] *= q_mag;
+  q-&gt;v[2] *= q_mag;
+
+  Py_INCREF(self); # THIS
+
+  return self;
+}
+</code></pre>
+<p>I had to add a <code>Py_INCREF(self)</code> since <code>self</code> is both an argument and the return value.</p>
+<p>This appears to fix the problem.</p>
+</div>
+<span class="comment-copy">Can you reproduce the problem if you compile without ASLR (or if you enable ASLR under gdb)? I'm assuming that you are using ASLR, of course</span>
+<span class="comment-copy">No. It does make it more sensitive. For example, this time I get <code>&lt;refcnt -1222254038 at 0xb725e200&gt;</code>, but it doesn't actually segfault.</span>
+<span class="comment-copy">If you see <code>&lt;refcnt -1222254038 at 0xb725e200&gt;</code> you are still experiencing an erratic behavior. That memory region is readable, so you don't get a segfault, but still that is not a valid Python object. This can be a good starting point for debugging. By the way, I guess that to obtain such result you have disable ASLR, which is why you have more chances of getting a readable memory address. Am I right?</span>
+<span class="comment-copy">Yes, I did have to disable ASLR, as you suggested — and also compiled with <code>-g -O0</code> flags.</span>
+<span class="comment-copy">Ohhh. Okay. That's the clearest most concise answer I've seen so far. Do you want to incorporate my answer into yours and I'll mark yours as accepted? (Thanks!!)</span>
+<span class="comment-copy">@Dr.JohnnyMohawk: did I incorporate your answer into mine?</span>
+<span class="comment-copy">@Dr.JohnnyMohawk: actually what I wrote is not accurate. Your <code>Py_INCREF</code> from your answer is indeed required, because you are in fact returning a new reference to it. However, still, you should not <code>Py_DECREF</code> arguments. Tomorrow I'm writing a clearer and more detailed answer, time to sleep now! :)</span>
+<span class="comment-copy">in the meantime, be sure to read <a href="https://docs.python.org/3/extending/extending.html?highlight=py_incref#reference-counting-in-python" rel="nofollow noreferrer">docs.python.org/3/extending/…</a></span>
+<span class="comment-copy">...no, I'm saying if you would combine your answer with mine, I would upvote it and mark it as correct. It seems that both answers are correct. I wanted to give you credit for your assistance.</span>

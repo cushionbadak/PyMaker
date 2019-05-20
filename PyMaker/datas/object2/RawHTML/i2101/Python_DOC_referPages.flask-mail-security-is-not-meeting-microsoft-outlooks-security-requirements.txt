@@ -1,0 +1,75 @@
+<div class="post-text" itemprop="text">
+<p>We have a web application that sends emails to clients and the web application is using Flask mail framework to handle that. About 2 weeks ago, our web application failed to send emails to clients and our own group of people. We use Office 365's Outlook as our sender.</p>
+<blockquote>
+<p>Remote Server returned '554 5.6.0 Corrupt message content; STOREDRV.Deliver.Exception:ConversionFailedException; Failed to process message due to a permanent exception with message Content conversion: Corrupt summary TNEF content. ConversionFailedException: Content conversion: Corrupt summary TNEF content. [Stage: PromoteCreateReplay]' 
+  Original message headers: </p>
+</blockquote>
+<p>This is the error message that the sender receives after being instructed to send email out. We contacted our Office 365 admin and Microsoft told him that the security that our web application has does not meet Microsoft's requirement / protocol. </p>
+<p>The question is is Flask mail using the older security protocol or configuration that is not working well with Microsoft Outlook? </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The Outlook.com / Office365 error message is less than helpful, as it can indicate any number of problems. It indicates that the Microsoft mail servers were unhappy about some aspect of the email packaging (headers, attachments, etc) and their parsers errorred out somewhere. Their error message is otherwise next to useless in what detail it provides. I find the assertion that this is a <em>security problem</em> to be nonsense; Flask-Mail uses the well-tested Python standard library <code>email</code> and <code>smtplib</code> packages to send email over a TLS encrypted connection. </p>
+<p>For Flask-Mail on Heroku, I instead traced the issue to the Message-ID header that is generated on Heroku Dyno machines. The problem is not limited to Heroku, however, you'd see this on any host with a <em>long hostname</em>. Your typical Heroku dyno hostname starts with a full UUID, plus another 5 components or so, e.g. <code>aaf39fce-569e-473a-9453-6862595bd8da.prvt.dyno.rt.heroku.com</code>.</p>
+<p>This hostname is used in the Message-ID header that is generated for each email. The Flask-Mail package uses the standard <a href="https://docs.python.org/3/library/email.utils.html#email.utils.make_msgid" rel="nofollow noreferrer"><code>email.utils.make_msgid()</code> function</a> to generate the header, and that uses the current hostname by default. This then results in a Message-ID header like:</p>
+<pre><code>Message-ID: &lt;154810422972.4.16142961424846318784@aaf39fce-569e-473a-9453-6862595bd8da.prvt.dyno.rt.heroku.com&gt;
+</code></pre>
+<p>That's a string 110 characters long. That's a slight problem for email headers, because the email RFCs state that headers <em>should</em> be limited to <em>78</em> characters. There are ways around this, however; for header values longer than 77 characters you can use the provisions in <a href="https://tools.ietf.org/html/rfc5322" rel="nofollow noreferrer">RFC 5322</a> to <em>fold</em> headers. Folding can use multiple <a href="https://tools.ietf.org/html/rfc2047" rel="nofollow noreferrer">RFC 2047</a> <em>encoded words</em> on multiple lines. This is is what happens here, the email header above becomes</p>
+<pre><code>Message-ID: =?utf-8?q?=3C154810422972=2E4=2E16142961424846318784=40aaf39fce-?=
+ =?utf-8?q?569e-473a-9453-6862595bd8da=2Eprvt=2Edyno=2Ert=2Eheroku=2Ecom=3E?=
+</code></pre>
+<p>which, being 78 and 77 characters, now fit the email MIME standard.</p>
+<p>All of this is appears to me to be <em>standards compliant</em> and valid method of handling mail headers. Or at least something that other mail providers tolerate and process properly, but Microsoft's mail servers are not having this. They really don't like the above RFC2047 encoded Message-ID header, and try to wrap the body in a TNEF winmail.dat attachment. That doesn't always work, so you end up with the very cryptic <em>554 5.6.0 Corrupt message content</em> error message. I consider this a Microsoft bug; I am not 100% certain that the email RFCs allow the Message-ID header to be folded using encoded words, but MS’s handling of the error by sending the recipient a meaningless error rather than reject the message when receiving is just terrible.  </p>
+<p>You could set an alternative <a href="https://docs.python.org/3/library/email.policy.html" rel="nofollow noreferrer">email policy</a> for Flask-Mail to use by setting the <code>flask_mail.message_policy</code> module global, or we can generate a different message-ID.</p>
+<p>Email policies are only available if you are using Python 3.3 or up, but it is the policy object that handles folding and so allows us to alter how Message-ID and other RFC 5322 identifier headers are handled. Here is a subclass that won't fold the Message-ID header; the standard actually allows up to 998 characters on a single line, and this subclass uses that limit just for this header:</p>
+<pre><code>import flask_mail
+from email.policy import EmailPolicy, SMTP
+
+# Headers that contain msg-id values, RFC5322
+MSG_ID_HEADERS = {'message-id', 'in-reply-to', 'references', 'resent-msg-id'}
+
+class MsgIdExcemptPolicy(EmailPolicy):
+    def _fold(self, name, value, *args, **kwargs):
+        if (name.lower() in MSG_ID_HEADERS and
+            self.max_line_length &lt; 998 and
+            self.max_line_length - len(name) - 2 &lt; len(value)
+        ):
+            # RFC 5322, section 2.1.1: "Each line of characters MUST be no
+            # more than 998 characters, and SHOULD be no more than 78
+            # characters, excluding the CRLF.". To avoid msg-id tokens from being folded
+            # by means of RFC2047, fold identifier lines to the max length instead.
+            return self.clone(max_line_length=998)._fold(name, value, *args, **kwargs)
+        return super()._fold(name, value, *args, **kwargs)
+
+flask_mail.message_policy = MsgIdExcemptPolicy() + SMTP
+</code></pre>
+<p>On Python 2.7 or Python 3.2 or older, you'll have to resort to replacing the Message-Id header, just re-generate the header with a hard-coded domain name:</p>
+<pre><code>from flask import current_app
+from flask_mail import Message as _Message
+
+# set this to your actual domain name
+DOMAIN_NAME = 'example.com'
+
+class Message(_Message):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # work around issues with Microsoft Office365 / Outlook.com email servers
+        # and their inability to handle RFC2047 encoded Message-Id headers. The
+        # Python email package only uses RFC2047 when encoding *long* message ids,
+        # and those happen all the time on Heroku, where the hostname includes a
+        # full UUID as well as 5 more components, e.g.
+        # aaf39fce-569e-473a-9453-6862595bd8da.prvt.dyno.rt.heroku.com
+        # The work-around is to just use our own domain name, hard-coded, but only
+        # when the message-id length exceeds 77 characters (MIME allows 78, but one
+        # is used for a leading space)
+        if len(self.msgId) &gt; 77:
+            domain = current_app.config.get('MESSAGE_ID_DOMAIN', DOMAIN_NAME)
+            self.msgId = make_msgid(domain=domain)
+</code></pre>
+<p>You'd then use the above <code>Message</code> class instead of the <code>flask_mail.Message()</code> class, and it'll generate a shorter Message-ID header that won't clash with Microsoft's problematic header parsers.</p>
+<p>I filed <a href="https://bugs.python.org/issue35805" rel="nofollow noreferrer">a bug report with the Python project</a> to track the handling of msg-id tokens, as I suspect this should really be solved there.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Flask mail using the older security protocol or configuration can work well with Microsoft Outlook.</p>
+<p>As for “554” error, you could reference this link:</p>
+<p><a href="https://answers.microsoft.com/en-us/msoffice/forum/msoffice_outlook/e-mail-ndr/6ca8cddc-869d-4c8c-897d-0878fe5cd817" rel="nofollow noreferrer">E-mail NDR</a></p>
+</div>

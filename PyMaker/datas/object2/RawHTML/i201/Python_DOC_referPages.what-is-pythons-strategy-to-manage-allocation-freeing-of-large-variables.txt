@@ -1,0 +1,78 @@
+<div class="post-text" itemprop="text">
+<p>As a follow-up to <a href="https://stackoverflow.com/questions/18310668/is-freeing-handled-differently-for-small-large-numpy-arrays:">this question</a>, it appears that there are different allocation/deallocation strategies for little and big variables in (C)Python.<br/>
+More precisely, there seems to be a boundary in the object size above which the memory used by the allocated object can be given back to the OS. Below this size, the memory is not given back to the OS.</p>
+<p>To quote the answer taken from the Numpy policy for releasing memory:</p>
+<blockquote>
+<p>The exception is that for large single allocations (e.g. if you create a multi-megabyte array), a different mechanism is used. Such large memory allocations can be released back to the OS. So it might specifically be the non-numpy parts of your program that are producing the issues you see.</p>
+</blockquote>
+<p>Indeed, these two allocations strategies are easy to show. For example:</p>
+<ul>
+<li>1st strategy: no memory is given back to the OS</li>
+</ul>
+<pre class="lang-py prettyprint-override"><code>import numpy as np
+import psutil
+import gc
+
+# Allocate  array
+x = np.random.uniform(0,1, size=(10**4))
+
+# gc
+del x
+gc.collect()
+# We go from 41295.872 KB to 41295.872 KB
+# using psutil.Process().memory_info().rss / 10**3; same behavior for VMS
+</code></pre>
+<p>=&gt; No memory given back to the OS</p>
+<ul>
+<li>2nd strategy: freed memory is given back to the OS</li>
+</ul>
+<p>When doing the same experiment, but with a bigger array:</p>
+<pre class="lang-py prettyprint-override"><code>x = np.random.uniform(0,1, size=(10**5))
+
+del x
+gc.collect()
+# We go from 41582.592 KB to 41017.344 KB
+</code></pre>
+<p>=&gt; Memory is released to the OS</p>
+<p>It seems that objects approximately bigger than <code>8*10**4</code> bytes get allocated using the 2nd strategy. </p>
+<p>So:</p>
+<ul>
+<li>Is this behavior documented? (And what is the exact boundary at which the allocation strategy changes?)</li>
+<li>What are the internals of these strategies (more than assuming the use of an <code>mmap</code>/<code>munmap</code> to release the memory back to the OS)</li>
+<li>Is this 100% done by the Python runtime or does Numpy have a specific way of handling this? (The <a href="https://docs.scipy.org/doc/numpy/reference/c-api.array.html#c.PyArray_realloc" rel="nofollow noreferrer">numpy doc</a> mentions the <code>NPY_USE_PYMEM</code> that switches between the memory allocator)</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>What you observe isn't CPython's strategy, but the strategy of the memory allocator which comes with the C-runtime your CPython-version is using.</p>
+<p>When CPython allocates/deallocates memory via <code>malloc/free</code>, it doesn't not communicate directly with the underlying OS, but with a concrete implementation of memory allocator. In my case on Linux, it is <a href="https://www.gnu.org/software/libc/manual/html_node/The-GNU-Allocator.html" rel="nofollow noreferrer">the GNU Allocator</a>.</p>
+<p>The GNU Allocator has different so called arenas, where the memory isn't returned to OS, but kept so it can be reused without the need to comunicate with OS. However, if a large amout of memory is requested (whatever the definition of "large"), the allocator doesn't use the memory from arenas but requests the memory from OS and as consequence can give it directly back to OS, once <code>free</code> is called.</p>
+<hr/>
+<p>CPython has its own memory allocator - <a href="https://docs.python.org/3/c-api/memory.html#the-pymalloc-allocator" rel="nofollow noreferrer">pymalloc</a>, which is built atop of the C-runtime-allocator. It is optimized for small objects, which live in a special arena; there is less overhead when creating/freeing these objects as compared to the underlying C-runtime-allocator. However, objects bigger than 512 bytes don't use this arena, but are managed directly by the C-runtime-allocator.</p>
+<p>The situation is even more complex with numpy's array, because different memory-allocators are used for the meta-data (like shape, datatype and other flags) and for the the actual data itself:</p>
+<ol>
+<li>For meta-data <a href="https://github.com/numpy/numpy/blob/dea85807c258ded3f75528cce2a444468de93bc1/numpy/core/include/numpy/ndarraytypes.h#L356-L375" rel="nofollow noreferrer"><code>PyArray_malloc</code></a>, the CPython's memory allocator (i.e. pymalloc)  is used.</li>
+<li>For data itself, <a href="https://github.com/numpy/numpy/blob/dea85807c258ded3f75528cce2a444468de93bc1/numpy/core/src/multiarray/alloc.c#L216-L233" rel="nofollow noreferrer"><code>PyDataMem_NEW</code></a> is used, which utilzes the underlying C-runtimme-functionality directly:</li>
+</ol>
+<pre class="lang-c prettyprint-override"><code>NPY_NO_EXPORT void *
+PyDataMem_NEW(size_t size)
+{
+    void *result;
+
+    result = malloc(size);
+    ...
+    return result;
+}
+</code></pre>
+<p>I'm not sure, what was the exact idea behind this design: obviously one would like to prifit from small object optimization of pymalloc, and for data this optimization would never work, but then one could use <a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Objects/obmalloc.c#L90-L100" rel="nofollow noreferrer"><code>PyMem_RawMalloc</code></a> instead of <code>malloc</code>. Maybe the goal was to be able to wrap numpy arrays around memory allocated by C-routines and take over the ownership of memory (but this will not work in some circumstances, see my comment at the end of this post).</p>
+<p>This explains the behavior you are observing: For data (whose size is changing depending on the passed size-argument in) <code>PyDataMem_NEW</code> is used, which bypasses CPython's memory allocator and you see the original behavior of C-runtime's allocators.</p>
+<hr/>
+<p>One should try to avoid to mix different allocations/deallocations routines <code>PyArray_malloc</code>/<code>PyDataMem_NEW'/</code>malloc<code>and</code>PyArray_free<code>/</code>PyDataMem_FREE<code>/</code>free`: even if it works at OS+Python version at hand, it might fail for another combinations.</p>
+<p>For example on Windows, when an extension is built with a different compiler version, one executable might have different memory allocators from different C-run-times and <code>malloc/free</code> might communicate with different C-memory-allocators, which could lead to hard to track down errors.</p>
+</div>
+<span class="comment-copy"><i>Python</i> has no strategy; it's an implementation detail.</span>
+<span class="comment-copy">Please understand that <code>gc.collect()</code> is a total red-herring here. The <code>gc</code> module <i>only applies to the cyclic garbage collection mechanism in CPython</i>. You haven't created any reference cycles, so it isn't expected to do anything</span>
+<span class="comment-copy">Wether memory is given back to the operating system depends on memory manager which comes with the runtime (in my case on Linux it is glibc). Those managers usually will not bother to return small chunks of memory to OS and will reuse this memory latter on for allocations of similar sizes.</span>
+<span class="comment-copy">pymalloc can rely on different allocation functions, <code>mmap</code>/<code>munmap</code> or <code>malloc</code>/<code>free</code> (<a href="https://docs.python.org/3/c-api/memory.html#the-pymalloc-allocator" rel="nofollow noreferrer">doc</a>): while malloc is a C-runtime allocator (that can itself call the <code>brk</code> and <code>mmap</code> syscalls), <code>mmap</code> is just a syscall</span>
+<span class="comment-copy">For numpy arrays, are the different allocators used by <code>PyArray_malloc</code> and <code>PyDatamem_New</code> by design, or just because the metadata is under 512 bytes / the data itself is bigger 512 bytes, as stated in the 2nd paragraph?</span>
+<span class="comment-copy">The part of the doc you are referencing is about arena allocation, for allocation of objects only malloc is used <a href="https://github.com/python/cpython/blob/8905fcc85a6fc3ac394bc89b0bbf40897e9497a6/Objects/obmalloc.c#L99" rel="nofollow noreferrer">github.com/python/cpython/blob/…</a> @Phylliade</span>
+<span class="comment-copy">@Phylliade it is a design decision by Numpy's makers, but I don't know about reasons.</span>

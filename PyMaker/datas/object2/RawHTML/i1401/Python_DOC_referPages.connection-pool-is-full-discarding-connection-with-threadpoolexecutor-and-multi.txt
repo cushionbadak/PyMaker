@@ -1,0 +1,160 @@
+<div class="post-text" itemprop="text">
+<p>I'm writing some automation software using <code>selenium==3.141.0</code>, <code>python 3.6.7</code>, <code>chromedriver 2.44</code>.</p>
+<p>Most of the the logic is ok to be executed by the single browser instance, but for some part i have to launch 10-20 instances to have a decent execution speed.</p>
+<p>Once it comes to the part which is executed by <code>ThreadPoolExecutor</code>, browser interactions start throwing this error:</p>
+<pre><code>WARNING|05/Dec/2018 17:33:11|connectionpool|_put_conn|274|Connection pool is full, discarding connection: 127.0.0.1
+WARNING|05/Dec/2018 17:33:11|connectionpool|urlopen|662|Retrying (Retry(total=2, connect=None, read=None, redirect=None, status=None)) after connection broken by 'ProtocolError('Connection aborted.', RemoteDisconnected('Remote end closed connection without response',))': /session/119df5b95710793a0421c13ec3a83847/url
+WARNING|05/Dec/2018 17:33:11|connectionpool|urlopen|662|Retrying (Retry(total=1, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('&lt;urllib3.connection.HTTPConnection object at 0x7fcee7ada048&gt;: Failed to establish a new connection: [Errno 111] Connection refused',)': /session/119df5b95710793a0421c13ec3a83847/url
+</code></pre>
+<p><strong>browser setup:</strong></p>
+<pre><code>def init_chromedriver(cls):
+    try:
+        chrome_options = webdriver.ChromeOptions()
+        chrome_options.add_argument('--headless')
+        chrome_options.add_argument(f"user-agent={Utils.get_random_browser_agent()}")
+        prefs = {"profile.managed_default_content_settings.images": 2}
+        chrome_options.add_experimental_option("prefs", prefs)
+
+        driver = webdriver.Chrome(driver_paths['chrome'],
+                                       chrome_options=chrome_options,
+                                       service_args=['--verbose', f'--log-path={bundle_dir}/selenium/chromedriver.log'])
+        driver.implicitly_wait(10)
+
+        return driver
+    except Exception as e:
+        logger.error(e)
+</code></pre>
+<p><strong>relevant code:</strong></p>
+<p><code>ProfileParser</code> instantiates a webdriver and execute a few page interactions. I suppose the interactions themselves are not relevant because everything works without <code>ThreadPoolExecutor</code>.
+However, in short:</p>
+<pre><code>class ProfileParser(object):
+    def __init__(self, acc):
+        self.driver = Utils.init_chromedriver()
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        Utils.shutdown_chromedriver(self.driver)
+        self.driver = None
+
+    collect_user_info(post_url)
+           self.driver.get(post_url)
+           profile_url = self.driver.find_element_by_xpath('xpath_here')]').get_attribute('href')
+</code></pre>
+<p>While runs in <code>ThreadPoolExecutor</code>, the error above appears at this point <code>self.driver.find_element_by_xpath</code> or at <code>self.driver.get</code></p>
+<p><strong>this is working:</strong></p>
+<pre><code>with ProfileParser(acc) as pparser:
+        pparser.collect_user_info(posts[0])
+</code></pre>
+<p><strong>these options are not working:</strong> (<code>connectionpool errors</code>)</p>
+<pre><code>futures = []
+#one worker, one future
+with ThreadPoolExecutor(max_workers=1) as executor:
+        with ProfileParser(acc) as pparser:
+            futures.append(executor.submit(pparser.collect_user_info, posts[0]))
+
+#10 workers, multiple futures
+with ThreadPoolExecutor(max_workers=10) as executor:
+    for p in posts:
+        with ProfileParser(acc) as pparser:
+            futures.append(executor.submit(pparser.collect_user_info, p))
+</code></pre>
+<p><strong>UPDATE:</strong></p>
+<p>I found a temporal solution (which does not invalidate this initial question) - to instantiate a <code>webdriver</code> outside of <code>ProfileParser</code> class. Don't know why it works but the initial does not. I suppose the cause in some language specifics?
+Thanks for answers, however it doesn't seem like the problem is with the <code>ThreadPoolExecutor</code> <code>max_workers</code> limit - as you see in one of the options i tried to submit a single instance and it is still didn't work.</p>
+<p>current workaround:</p>
+<pre><code>futures = []
+with ThreadPoolExecutor(max_workers=10) as executor:
+    for p in posts:
+        driver = Utils.init_chromedriver()
+        futures.append({
+            'future': executor.submit(collect_user_info, driver, acc, p),
+            'driver': driver
+        })
+
+for f in futures:
+    f['future'].done()
+    Utils.shutdown_chromedriver(f['driver'])
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This error message...</p>
+<pre><code>WARNING|05/Dec/2018 17:33:11|connectionpool|_put_conn|274|Connection pool is full, discarding connection: 127.0.0.1
+WARNING|05/Dec/2018 17:33:11|connectionpool|urlopen|662|Retrying (Retry(total=2, connect=None, read=None, redirect=None, status=None)) after connection broken by 'ProtocolError('Connection aborted.', RemoteDisconnected('Remote end closed connection without response',))': /session/119df5b95710793a0421c13ec3a83847/url
+WARNING|05/Dec/2018 17:33:11|connectionpool|urlopen|662|Retrying (Retry(total=1, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('&lt;urllib3.connection.HTTPConnection object at 0x7fcee7ada048&gt;: Failed to establish a new connection: [Errno 111] Connection refused',)': /session/119df5b95710793a0421c13ec3a83847/url
+</code></pre>
+<p>...seems to be an issue in <code>urllib3</code>'s connection pooling which raised these <strong>WARNING</strong> while executing the <code>def _put_conn(self, conn)</code> method in <strong>connectionpool.py</strong>.</p>
+<pre><code>def _put_conn(self, conn):
+    """
+    Put a connection back into the pool.
+
+    :param conn:
+        Connection object for the current host and port as returned by
+        :meth:`._new_conn` or :meth:`._get_conn`.
+
+    If the pool is already full, the connection is closed and discarded
+    because we exceeded maxsize. If connections are discarded frequently,
+    then maxsize should be increased.
+
+    If the pool is closed, then the connection will be closed and discarded.
+    """
+    try:
+        self.pool.put(conn, block=False)
+        return  # Everything is dandy, done.
+    except AttributeError:
+        # self.pool is None.
+        pass
+    except queue.Full:
+        # This should never happen if self.block == True
+        log.warning(
+            "Connection pool is full, discarding connection: %s",
+            self.host)
+
+    # Connection never got put back into the pool, close it.
+    if conn:
+        conn.close()
+</code></pre>
+<hr/>
+<h2><a href="https://docs.python.org/3/library/concurrent.futures.html" rel="nofollow noreferrer">ThreadPoolExecutor</a></h2>
+<p><a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ThreadPoolExecutor" rel="nofollow noreferrer">ThreadPoolExecutor</a> is an <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Executor" rel="nofollow noreferrer">Executor</a> subclass that uses a pool of threads to execute calls asynchronously. Deadlocks can occur when the callable associated with a Future waits on the results of another Future.</p>
+<pre><code>class concurrent.futures.ThreadPoolExecutor(max_workers=None, thread_name_prefix='', initializer=None, initargs=())
+</code></pre>
+<ul>
+<li>An Executor subclass that uses a pool of at most max_workers threads to execute calls asynchronously.</li>
+<li>initializer is an optional callable that is called at the start of each worker thread; initargs is a tuple of arguments passed to the initializer. Should initializer raise an exception, all currently pending jobs will raise a BrokenThreadPool, as well as any attempt to submit more jobs to the pool.</li>
+<li>From version 3.5 onwards: If max_workers is None or not given, it will default to the number of processors on the machine, multiplied by 5, assuming that ThreadPoolExecutor is often used to overlap I/O instead of CPU work and the number of workers should be higher than the number of workers for ProcessPoolExecutor.</li>
+<li>From version 3.6 onwards: The thread_name_prefix argument was added to allow users to control the threading.Thread names for worker threads created by the pool for easier debugging.</li>
+<li>From version 3.7: Added the initializer and initargs arguments.</li>
+</ul>
+<p>As per your question as you are trying to launch 10-20 instances the <em>default connection pool size</em> of <strong>10</strong> seems not to be enough in your case which is hardcoded in <a href="https://github.com/requests/requests/blob/master/requests/adapters.py" rel="nofollow noreferrer"><strong>adapters.py</strong></a>. </p>
+<p>Moreover, @EdLeafe in the discussion <a href="https://github.com/pycontribs/pyrax/issues/378#issuecomment-44694033" rel="nofollow noreferrer">Getting error: Connection pool is full, discarding connection</a> mentions:</p>
+<blockquote>
+<p>It looks like within the requests code, None objects are normal. If <code>_get_conn()</code> gets <strong>None</strong> from the pool, it simply creates a new connection. It seems odd, though, that it should start with all those None objects, and that _put_conn() isn't smart enough to replace None with the connection.</p>
+</blockquote>
+<p>However the merge <a href="https://github.com/influxdata/influxdb-python/pull/534" rel="nofollow noreferrer">Add pool size parameter to client constructor</a> have fixed this issue. </p>
+<h2>Solution</h2>
+<p>Increasing the <em>default connection pool size</em> of <strong>10</strong> which was earlier hardcoded in <a href="https://github.com/requests/requests/blob/master/requests/adapters.py" rel="nofollow noreferrer"><strong>adapters.py</strong></a> and now configurable will solve your issue.</p>
+<hr/>
+<h2>Update</h2>
+<p>As per your comment update <em>...submit a single instance and the outcome is the same...</em>. as per @meferguson84 within the discussion <a href="https://github.com/pycontribs/pyrax/issues/378#issuecomment-44678896" rel="nofollow noreferrer">Getting error: Connection pool is full, discarding connection</a>:</p>
+<blockquote>
+<p>I stepped into the code to the point where it mounts the adapter just to play with the pool size and see if it made a difference. What I found was that the queue is full of NoneType objects with the actual upload connection being the last item in the list. The list is 10 items long (which makes sense). What doesn't make sense is that the unfinished_tasks parameter for the pool is 11. How can this be when the queue itself is only 11 items? Also, is it normal for the queue to be full of NoneType objects with the connection we are using being the last item on the list?</p>
+</blockquote>
+<p>That sounds like a possible cause in your <em>usecase</em> as well. It may sound redundant but you may still perform a couple of ad-hoc steps as follows:</p>
+<ul>
+<li><em>Clean</em> your <em>Project Workspace</em> through your <em>IDE</em> and <em>Rebuild</em> your project with required dependencies only.</li>
+<li>(<em>WindowsOS only</em>) Use <a href="https://www.ccleaner.com/ccleaner" rel="nofollow noreferrer"><em>CCleaner</em></a> tool to wipe off all the OS chores before and after the execution of your <em>Test Suite</em>.</li>
+<li>(<em>LinuxOS only</em>) <a href="http://www.yourownlinux.com/2013/10/how-to-free-up-release-unused-cached-memory-in-linux.html" rel="nofollow noreferrer">Free Up and Release the Unused/Cached Memory in Ubuntu/Linux Mint</a> before and after the execution of your <em>Test Suite</em>.</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>please see your error</p>
+<pre><code>ProtocolError('Connection aborted.', 
+  RemoteDisconnected('Remote end closed connection without response',))
+
+'NewConnectionError('&lt;urllib3.connection.HTTPConnection object at &gt;: 
+   Failed to establish a new connection: [Errno 111] Connection refused',)':
+</code></pre>
+<p>The error come because you are doing multiple connection too fast, it can be server down or server block your request. </p>
+</div>
+<span class="comment-copy">Hi! Thanks for a detailed response. However if look at my post again - i tried to submit a single instance and the outcome is the same. In addition - even if i submit more instances than <code>max_workers</code> parameter limit, <code>ThreadPoolExecutor</code> suppose to process it is as a queue with the <code>max_workers</code> number of instances executing simultaneously.</span>
+<span class="comment-copy">Updated the question</span>
+<span class="comment-copy">@user1935987 I have added an answer update. Let me know the status.</span>
+<span class="comment-copy">I don't really think the problem here is with the executor itself. Reason - i've just tried another approach with instantiating a <code>webdriver</code> in the same class as <code>ThreadPoolExecutor</code> and it is working.</span>

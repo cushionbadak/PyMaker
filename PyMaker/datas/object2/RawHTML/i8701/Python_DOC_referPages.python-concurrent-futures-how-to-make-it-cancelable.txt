@@ -1,0 +1,159 @@
+<div class="post-text" itemprop="text">
+<p>Python concurrent.futures and ProcessPoolExecutor provide a neat interface to schedule and monitor tasks. Futures even <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.Future" rel="nofollow noreferrer">provide</a> a .cancel() method:</p>
+<blockquote>
+<p><strong>cancel()</strong>:    Attempt to cancel the call. If the call is <strong>currently being executed and cannot be cancelled</strong> then the method will return False, otherwise the call will be cancelled and the method will return True.</p>
+</blockquote>
+<p>Unfortunately in a simmilar <a href="https://stackoverflow.com/questions/26413613/asyncio-is-it-possible-to-cancel-a-future-been-run-by-an-executor">question</a> (concerning asyncio) the answer claims running tasks are uncancelable using this snipped of the documentation, but the docs dont say that, only if they are running AND uncancelable.</p>
+<p>Submitting multiprocessing.Events to the processes is also not trivially possible (doing so via parameters as in multiprocess.Process returns a RuntimeError) </p>
+<p>What am I trying to do? I would like to partition a search space and run a task for every partition. But it is enough to have ONE solution and the process is CPU intensive. So is there an actual comfortable way to accomplish this that does not offset the gains by using ProcessPool to begin with?</p>
+<p>Example:</p>
+<pre><code>from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
+
+# function that profits from partitioned search space
+def m_run(partition):
+    for elem in partition:
+        if elem == 135135515:
+            return elem
+    return False
+
+futures = []
+# used to create the partitions
+steps = 100000000
+with ProcessPoolExecutor(max_workers=4) as pool:
+    for i in range(4):
+        # run 4 tasks with a partition, but only *one* solution is needed
+        partition = range(i*steps,(i+1)*steps)
+        futures.append(pool.submit(m_run, partition))
+
+    done, not_done = wait(futures, return_when=FIRST_COMPLETED)
+    for d in done:
+        print(d.result())
+
+    print("---")
+    for d in not_done:
+        # will return false for Cancel and Result for all futures
+        print("Cancel: "+str(d.cancel()))
+        print("Result: "+str(d.result()))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Unfortunately, running <code>Futures</code> cannot be cancelled. I believe the core reason is to ensure the same API over different implementations (it's not possible to interrupt running threads or coroutines).</p>
+<p>The <a href="https://pypi.python.org/pypi/Pebble" rel="nofollow noreferrer">Pebble</a> library was designed to overcome this and other limitations.</p>
+<pre><code>from pebble import ProcessPool
+
+def function(foo, bar=0):
+    return foo + bar
+
+with ProcessPool() as pool:
+    future = pool.schedule(function, args=[1])
+
+    # if running, the container process will be terminated 
+    # a new process will be started consuming the next task
+    future.cancel()  
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I found your question interesting so here's my finding.</p>
+<p>I found the behaviour of <code>.cancel()</code> method is as stated in python documentation. As for your running concurrent functions, unfortunately they could not be cancelled even after they were told to do so. If my finding is correct, then I reason that Python does require a more effective .cancel() method.</p>
+<p>Run the code below to check my finding.</p>
+<pre><code>from concurrent.futures import ProcessPoolExecutor, as_completed
+from time import time 
+
+# function that profits from partitioned search space
+def m_run(partition):
+    for elem in partition:
+        if elem == 3351355150:
+            return elem
+            break #Added to terminate loop once found
+    return False
+
+start = time()
+futures = []
+# used to create the partitions
+steps = 1000000000
+with ProcessPoolExecutor(max_workers=4) as pool:
+    for i in range(4):
+        # run 4 tasks with a partition, but only *one* solution is needed
+        partition = range(i*steps,(i+1)*steps)
+        futures.append(pool.submit(m_run, partition))
+
+    ### New Code: Start ### 
+    for f in as_completed(futures):
+        print(f.result())
+        if f.result():
+            print('break')
+            break
+
+    for f in futures:
+        print(f, 'running?',f.running())
+        if f.running():
+            f.cancel()
+            print('Cancelled? ',f.cancelled())
+
+    print('New Instruction Ended at = ', time()-start )
+print('Total Compute Time = ', time()-start )
+</code></pre>
+<p><strong>Update:</strong>
+It is possible to forcefully terminate the concurrent processes via bash, but the consequence is that the main python program will terminate too. If this isn't an issue with you, then try the below code.  </p>
+<p>You have to add the below codes between the last 2 print statements to see this for yourself. Note: This code works only if you aren't running any other python3 program.</p>
+<pre><code>import subprocess, os, signal 
+result = subprocess.run(['ps', '-C', 'python3', '-o', 'pid='],
+                        stdout=subprocess.PIPE).stdout.decode('utf-8').split()
+print ('result =', result)
+for i in result:
+    print('PID = ', i)
+    if i != result[0]:
+        os.kill(int(i), signal.SIGKILL)
+        try: 
+           os.kill(int(i), 0)
+           raise Exception("""wasn't able to kill the process 
+                              HINT:use signal.SIGKILL or signal.SIGABORT""")
+        except OSError as ex:
+           continue
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I don't know why <code>concurrent.futures.Future</code> does not have a <code>.kill()</code> method, but you can accomplish what you want by shutting down the process pool with <code>pool.shutdown(wait=False)</code>, and killing the remaining child processes by hand.</p>
+<p>Create a function for killing child processes:</p>
+<pre><code>import signal, psutil
+
+def kill_child_processes(parent_pid, sig=signal.SIGTERM):
+    try:
+        parent = psutil.Process(parent_pid)
+    except psutil.NoSuchProcess:
+        return
+    children = parent.children(recursive=True)
+    for process in children:
+        process.send_signal(sig)
+</code></pre>
+<p>Run your code until you get the first result, then kill all remaining child processes:</p>
+<pre><code>from concurrent.futures import ProcessPoolExecutor, FIRST_COMPLETED, wait
+
+# function that profits from partitioned search space
+def m_run(partition):
+    for elem in partition:
+        if elem == 135135515:
+            return elem
+    return False
+
+futures = []
+# used to create the partitions
+steps = 100000000
+pool = ProcessPoolExecutor(max_workers=4)
+for i in range(4):
+    # run 4 tasks with a partition, but only *one* solution is needed
+    partition = range(i*steps,(i+1)*steps)
+    futures.append(pool.submit(m_run, partition))
+
+done, not_done = wait(futures, timeout=3600, return_when=FIRST_COMPLETED)
+
+# Shut down pool
+pool.shutdown(wait=False)
+
+# Kill remaining child processes
+kill_child_processes(os.getpid())
+</code></pre>
+</div>
+<span class="comment-copy">You can try to set the <code>Event</code> to global variable instead of passing it as a param, see <a href="http://stackoverflow.com/questions/1675766/how-to-combine-pool-map-with-array-shared-memory-in-python-multiprocessing" title="how to combine pool map with array shared memory in python multiprocessing">stackoverflow.com/questions/1675766/…</a></span>
+<span class="comment-copy">@niemmi thank you for the tipp. I'll probably try this as a workaround, as it doesnt feel well designed with calls to different modules.</span>
+<span class="comment-copy">Maybe this is all linked to the fact that there is no immediate cancel POSIX API either: <a href="https://stackoverflow.com/questions/2084830/kill-thread-in-pthread-library" title="kill thread in pthread library">stackoverflow.com/questions/2084830/…</a></span>

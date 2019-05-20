@@ -1,0 +1,244 @@
+<div class="post-text" itemprop="text">
+<p>Here's the scenario. I have a Python script that will launch another program (let's call it <code>P</code>) before running its main code. Multiple Python scripts can be ran at the same time, however if the program <code>P</code> has already been started, it should not be started again:</p>
+<pre><code>pid 100 starts up
+pid 100 starts program P with pid n and detaches it
+pid 100 runs main
+pid 101 starts up
+pid 101 does not start program P because it's already started
+pid 101 runs main
+pid 100 main finishes
+pid 100 does not terminate program P because pid 101 needs it
+pid 100 terminates
+pid 101 main finishes
+pid 101 terminates program P with pid n
+pid 101 terminates
+</code></pre>
+<p>In C I can probably create a shared memory by <code>mmap</code>ing a file and putting a semaphore in it to track that. Once the semaphore reaches 0 I can also terminate the program <code>P</code>. But I have no idea how to do that in Python <em>and</em> on Windows.</p>
+<p>How should I approach this problem, i.e. is there an already established method of solving this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I've created an example of how you can achieve this behavior on Windows using sockets rather than a shared memory semaphore. This achieves the same thing; the c++ program will keep running so long as at least one of the Python scripts is running. Once all the scripts have finished, the c++ program will finish so long as no more Python scripts are started within a certain timeout period.</p>
+<p>Most of the code here goes into the c++ program, which runs a thread that monitors TCP connections from the Python script(s).</p>
+<p>The Python script just checks/starts the Windows program, then opens a socket which is left open until the script ends.</p>
+<p>The Windows program detects the socket connections and disconnections, thus keeping track of when the Python scripts are running.</p>
+<p>In these examples, the Windows program happens to be called "ConsoleApplication11.exe". I've used port 1234 and a timeout of 15 seconds, you can change these in lines 19-21 of the c++ program. Also, if you want to make the termination of the c++ program more immediate, call exit() instead of return at the end of client_monitor_thread().</p>
+<p>Hope this may be useful.</p>
+<p>Python script:</p>
+<pre><code>import socket
+import time
+import psutil
+import os
+
+# check if the C++ program is running, start it if not
+cppProgramName = "ConsoleApplication11.exe"
+progRunning = False
+for pid in psutil.pids():
+    p = psutil.Process(pid)
+    if (cppProgramName in p.name()):
+        progRunning = True
+
+if not progRunning:
+    os.startfile(cppProgramName)
+    time.sleep(5) # wait for c++ program to start
+
+# open a socket to the C++ program to tell it we need it to keep running
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect(("127.0.0.1", 1234))
+
+# (MAIN PROGRAM)
+time.sleep(3)
+# (END OF MAIN PROGRAM)
+
+# close the socket to the C++ program
+s.close()
+</code></pre>
+<p>C++ program:</p>
+<pre class="lang-cpp prettyprint-override"><code>// ConsoleApplication11.cpp : Defines the entry point for the console application.
+//
+
+#include "stdafx.h"
+
+#include &lt;iostream&gt;
+#include &lt;set&gt;
+#include &lt;chrono&gt;
+#include &lt;thread&gt;
+
+#include &lt;winsock2.h&gt;
+#include &lt;Ws2tcpip.h&gt;
+
+#pragma comment(lib, "ws2_32.lib")              // link with Ws2_32.lib
+
+
+namespace
+{
+    const unsigned int commonPort            = 1234;   // must match Python app
+    const unsigned int noClientsTimeoutLimit = 15;     // quit when no clients connected for this many seconds
+    bool               clientMonitorRunning  = true;   // flag to show client monitor is running
+
+
+    void client_monitor_thread()
+    {
+        // start up winsock service version 2.2
+        WSADATA wsaData;
+        int iResult = WSAStartup(MAKEWORD(2, 2), &amp;wsaData);
+        if (iResult != NO_ERROR)
+        {
+            std::cout &lt;&lt; "WSAStartup() failed with error: " &lt;&lt; iResult &lt;&lt; std::endl;
+            clientMonitorRunning = false;
+            return;
+        }
+
+        // create a socket for listening for incoming connection requests.
+        SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (listenSocket == INVALID_SOCKET)
+        {
+            std::cout &lt;&lt; "socket() function failed with error: " &lt;&lt; WSAGetLastError() &lt;&lt; std::endl;
+            closesocket(listenSocket);
+            clientMonitorRunning = false;
+            return;
+        }
+
+        // sockaddr_in structure specifies the address family, IP address, and port for the socket 
+        sockaddr_in service;
+        service.sin_family = AF_INET;
+        inet_pton(AF_INET, (PCSTR)"127.0.0.1", &amp;(service.sin_addr));
+        service.sin_port = htons(commonPort);
+        if (SOCKET_ERROR == bind(listenSocket, (SOCKADDR *)&amp; service, sizeof(service)))
+        {
+            std::cout &lt;&lt; "bind function failed with error " &lt;&lt; WSAGetLastError() &lt;&lt; std::endl;
+            closesocket(listenSocket);
+            clientMonitorRunning = false;
+            return;
+        }
+
+        // Listen for incoming connection requests on the created socket
+        if (SOCKET_ERROR == listen(listenSocket, SOMAXCONN))
+        {
+            wprintf(L"listen function failed with error: %d\n", WSAGetLastError());
+            closesocket(listenSocket);
+            clientMonitorRunning = false;
+            return;
+        }
+
+        std::cout &lt;&lt; "Listening on port " &lt;&lt; commonPort &lt;&lt; std::endl;
+
+        // mow monitor client connections
+        std::set&lt;unsigned int&gt; activefds;
+        int timeoutCounter = 0;
+
+        while (clientMonitorRunning)
+        {
+            // check for existing clients disconnected
+            if (0 != activefds.size())
+            {
+                std::set&lt;unsigned int&gt; disconnectedfds;
+                for (auto fd : activefds)
+                {
+                    int flags = 0;
+                    char buf[10];
+                    int rv = recv(fd, buf, 10, flags);
+                    if (0 == rv)
+                    {
+                        disconnectedfds.insert(fd);
+                    }
+                }
+                for (auto fd : disconnectedfds)
+                {
+                    activefds.erase(fd);
+                }
+            }
+
+            // are any clients connected? do we need to quit?
+            if (0 == activefds.size())
+            {
+                std::cout &lt;&lt; "No clients - will exit in " &lt;&lt; noClientsTimeoutLimit - timeoutCounter &lt;&lt; " seconds" &lt;&lt; std::endl;
+                ++timeoutCounter;
+                if (timeoutCounter == noClientsTimeoutLimit)
+                {
+                    for (auto fd : activefds)
+                    {
+                        closesocket(fd);
+                    }
+                    closesocket(listenSocket);
+                    clientMonitorRunning = false;
+                    return;
+                }
+            }
+            else
+            {
+                timeoutCounter = 0;
+            }
+
+            // check for activity on the listening socket
+            fd_set readfds;
+            struct timeval timeout;
+            timeout.tv_sec = 1;
+            timeout.tv_usec = 0;
+            FD_ZERO(&amp;readfds);
+            FD_SET(listenSocket, &amp;readfds);
+            switch (select(sizeof(readfds), &amp;readfds, NULL, NULL, &amp;timeout))
+            {
+            case 0: // timeout
+            {
+                break;
+            }
+            case SOCKET_ERROR:
+            {
+                std::cout &lt;&lt; "listen failed with error: " &lt;&lt; WSAGetLastError() &lt;&lt; std::endl;
+                closesocket(listenSocket);
+                clientMonitorRunning = false;
+                return;
+            }
+            default:
+            {
+                if (FD_ISSET(listenSocket, &amp;readfds))
+                {
+                    // accept the connection.
+                    SOCKET fd = accept(listenSocket, NULL, NULL);
+                    if (fd == INVALID_SOCKET)
+                    {
+                        std::cout &lt;&lt; "accept failed with error: " &lt;&lt; WSAGetLastError() &lt;&lt; std::endl;
+                        closesocket(listenSocket);
+                        clientMonitorRunning = false;
+                        return;
+                    }
+                    else
+                    {
+                        unsigned long nonBlock = 1;
+                        ioctlsocket(fd, FIONBIO, &amp;nonBlock);
+                        activefds.insert(fd);
+                    }
+                }
+                break;
+            }
+            }
+        }
+
+        return;
+    }
+}
+
+
+int main()
+{
+    // start the client monitor thread, which will run until no clients are connected
+    std::thread clientMonitor(client_monitor_thread);
+
+    // placeholder for doing the actual work in this program
+    // loop until the client monitor thread exits
+    while (clientMonitorRunning)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    // clean up
+    clientMonitor.join();
+    WSACleanup();
+    return 0;
+}
+</code></pre>
+</div>
+<span class="comment-copy">You can use the <a href="https://docs.python.org/3/library/mmap.html" rel="nofollow noreferrer"><code>mmap</code></a> module with a <code>tagname</code>. Shared memory in Windows is a Section object, which like several other kernel object types (e.g. Devices, Events) can be named in the object namespace. A name such as "share1234" is local to the current Windows session. To have the name be accessible across all sessions, use "Global\share1234". The latter has to use backslash as the separator since forward slash is just a name character in the kernel.</span>
+<span class="comment-copy">Creating a global name uses a path separator because of how this is implemented. The Windows API uses <code>\BaseNamedObjects</code> for its global names (all sessions) and <code>\Sessions\[session number]\BaseNamedObjects</code> for names local to a session. There's a "Global" symbolic link in the local BNO, so it's really resolving this as, for example, <code>\Sessions\1\BaseNamedObjects\Global\share1234</code> =&gt; <code>\BaseNamedObjects\share1234</code>.</span>
+<span class="comment-copy">This is an interesting idea, but it is not safe for parallel programming. (Another instance might start before <code>if not progRunning</code> and it would launch the program twice.) I actually managed to solve the problem by creating a <a href="https://gist.github.com/derek1906/fab1773852362d45e024bacc239dcaf7" rel="nofollow noreferrer">"mutex"</a> that can be used across different processes using Windows file locks.</span>
+<span class="comment-copy">I though of that and it is safe for parallel programming. By design, 2 instances of the c++ program cannot run as both cannot listen on the same port, and one will fail and exit. However, well done on your mutex solution.</span>

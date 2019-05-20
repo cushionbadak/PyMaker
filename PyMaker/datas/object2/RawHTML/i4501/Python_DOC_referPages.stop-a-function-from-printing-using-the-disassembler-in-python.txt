@@ -1,0 +1,104 @@
+<div class="post-text" itemprop="text">
+<p>I have this function here and it looks like this when disassembled:</p>
+<pre><code>def game_on():    
+    def other_function():
+        print('Statement within a another function')
+    print("Hello World")
+    sys.exit()
+    print("Statement after sys.exit")
+
+8           0 LOAD_CONST               1 (&lt;code object easter_egg at 0x0000000005609C90, file "filename", line 8&gt;)
+              3 LOAD_CONST               2 ('game_on.&lt;locals&gt;.other_function')
+              6 MAKE_FUNCTION            0
+              9 STORE_FAST               0 (other_function)
+
+10          12 LOAD_GLOBAL              0 (print)
+             15 LOAD_CONST               3 ('Hello World')
+             18 CALL_FUNCTION            1 (1 positional, 0 keyword pair)
+             21 POP_TOP
+
+11          22 LOAD_GLOBAL              1 (sys)
+             25 LOAD_ATTR                2 (exit)
+             28 CALL_FUNCTION            0 (0 positional, 0 keyword pair)
+             31 POP_TOP
+
+12          32 LOAD_GLOBAL              0 (print)
+             35 LOAD_CONST               4 ('second print statement')
+             38 CALL_FUNCTION            1 (1 positional, 0 keyword pair)
+             41 POP_TOP
+             42 LOAD_CONST               5 (None)
+             45 RETURN_VALUE
+</code></pre>
+<p>Is there a way to modify the bytecode so it doesn't print "Hello world." It's like I want to skip line 10 and continue to 11. </p>
+<p>There's a lot of material like inspectors and <code>settrace</code> but it's not very direct. does anyone have any info on this or can someone point me to what I could do? </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The best way to modify the bytecode of a function (well, assuming anything can be called a good way in the first place…) is with a third-party library. At present, <a href="https://github.com/vstinner/bytecode" rel="nofollow noreferrer"><code>bytecode</code></a> seems to be the best one, but for older versions of Python, you probably want <code>byteplay</code>—for 3.4 (which you seem to be using), specifically <a href="https://github.com/serprex/byteplay" rel="nofollow noreferrer">Seprex's version of the 3.x port</a>.</p>
+<p>But you can do everything manually. It's worth doing that at least once, just to make sure you understand everything (and to learn why <code>bytecode</code> is such a cool library).</p>
+<p>As you can see from the <a href="https://docs.python.org/3/library/inspect.html#types-and-members" rel="nofollow noreferrer"><code>inspect</code></a> documentation, a function is basically a wrapper around a <code>__code__</code> object with extra stuff (closure cells, default values, and reflection stuff like the name and type annotations), and a code object is a wrapper around a <code>co_code</code> bytestring full of bytecode with a whole bunch of extra stuff. </p>
+<p>So, you'd think chopping out some bytecode would just be a matter of:</p>
+<pre><code>del func.__code__.co_code[12:22]
+</code></pre>
+<p>But sadly, bytecode does everything in terms of offsets, from jump instructions to the line-number table used for generating tracebacks. You can fix everything up, but it's painful. So you can instead replace the instructions you wanted to kill with <a href="https://docs.python.org/3/library/dis.html#opcode-NOP" rel="nofollow noreferrer"><code>NOP</code></a>. (Under the covers, the compiler and the peephole optimizer drop NOPs in all over the place and then do one big fixup at the end. But the code to do that fixup isn't exposed to Python.)</p>
+<p>Also, bytecode is stored in immutable <code>bytes</code>, not a mutable <code>bytearray</code>, and <code>code</code> objects are themselves immutable (and trying to change them behind the interpreter's back via C API hacks is a very bad idea). So, you have to build a new <code>code</code> object around the modified bytecode. But functions are mutable, so you can hack up your function to point at that new code object.</p>
+<hr/>
+<p>So, here's a function to NOP out a range of instructions by offset:</p>
+<pre><code>import dis
+import sys
+import types
+
+NOP = bytes([dis.opmap['NOP']])
+
+def noprange(func, start, end):
+    c = func.__code__
+    cc = c.co_code
+    if sys.version_info &gt;= (3,6):
+        if (end - start) % 2:
+            raise ValueError('Cannot nop out partial wordcodes')
+        nops = (NOP + b'\0') * ((end-start)//2)
+    else:
+        nops = NOP * (end-start)
+    newcc = cc[:start] + nops + cc[end:]
+    newc = types.CodeType(
+        c.co_argcount, c.co_kwonlyargcount, c.co_nlocals, c.co_stacksize,
+        c.co_flags, newcc, c.co_consts, c.co_names, c.co_varnames,
+        c.co_filename, c.co_name, c.co_firstlineno, c.co_lnotab,
+        c.co_freevars, c.co_cellvars)
+    func.__code__ = newc
+</code></pre>
+<p>If you're wondering about that version check: In Python 2.x and 3.0-3.5, each instruction is either 1 or 3 bytes long, depending on whether it needs any arguments, so NOP is 1 byte; in 3.6+, each instruction is 2 bytes long, including NOP.</p>
+<p>Anyway, I only actually tested on 3.6, not 3.4 or 3.5, so hopefully I didn't get that part wrong. And hopefully I didn't add any functions added to <code>dis</code> after 3.4. So, cross your fingers, then:</p>
+<pre><code>noprange(game_on, 12, 22)
+</code></pre>
+<p>… will do exactly what you wanted. Or it'll modify your function to raise a <code>RuntimeError</code> or crash when you try to call it, but segfaults are part of learning, right? Anyway, if you <code>dis.dis(noprange)</code> you should see the four instructions from line 10 replaced by a string of <code>NOP</code> lines, and then the rest of the function unchanged, so try that before you call it.</p>
+<hr/>
+<p>Once you're confident you've got this working properly, if you want to knock out all of the instructions from one source line without having to <code>dis</code> the function and read them manually, you can use <a href="https://docs.python.org/3/library/dis.html#dis.findlinestarts" rel="nofollow noreferrer"><code>findlinestarts</code></a> to do it programmatically:</p>
+<pre><code>def nopline(func, line):
+    linestarts = dis.findlinestarts(func.__code__)
+    for offset, lineno in linestarts:
+        if lineno &gt; line:
+            raise ValueError('No code found for line')
+        if lineno == line:
+            try:
+                nextoffset, _ = next(linestarts)
+            except StopIteration:
+                raise ValueError('Do not nop out the last return')
+            noprange(func, offset, nextoffset)
+            return
+    raise ValueError('No line found')
+</code></pre>
+<p>And now it's just:</p>
+<pre><code>nopline(game_on, 10)
+</code></pre>
+<p>This has the nice advantage that you can use it in code will work (or crash) the same way in 3.4 and 3.8, because offsets may change between Python versions, but the way line numbers are counted obviously won't.</p>
+</div>
+<span class="comment-copy">If you want to hack up the bytecode, you probably want <a href="https://github.com/vstinner/bytecode" rel="nofollow noreferrer">the <code>bytecode</code> library</a>. Although you seem to be still on 3.4, so you may want the older <code>byteplay</code> library, probably <a href="https://github.com/serprex/byteplay" rel="nofollow noreferrer">Serprex's version of the 3.x port</a>.</span>
+<span class="comment-copy">Anyway, what you want to skip is the <code>CALL_FUNCTION</code> to <code>print</code>. Since that <code>print</code> happens to be on a line all by itself, it's pretty obvious that offsets <code>[12, 22)</code> are the relevant ones. As a doublecheck, if you understand enough about bytecode, you can see that offset 12 pushes the function, offset 15 pushes the only arg, offset 18 calls, and offset 21 throws away the return value. So, you just want to replace all of the bytes in that range with <code>dis.opmap['NOP']</code>. Then rebuild the code object, and replace the function object's <code>__code__</code> with the result, and you're done.</span>
+<span class="comment-copy">(Just NOPing out a bunch of bytes is simple enough to do by hand, it's just that the constructor for <code>types.CodeType</code> is such a pain to call that I don't like to recommend it to anyone I don't hate.)</span>
+<span class="comment-copy">@abarnert is there any links with any reference code on how to do that? I'm trying some out but no luck on finding info.</span>
+<span class="comment-copy">There's no examples in the reference docs; you're not expected to be doing this unless you've already been grubbing through the C source code… But the <code>byteplay</code> and <code>bytecode</code> docs may have examples and links to other resources. And I'm pretty sure there are some blog posts that help out—I've probably even written one or two; I'll check when I get a chance.</span>
+<span class="comment-copy">This is a great answer. I love the advise that "segfaults are part of learning". Reminds me of when a friend and I as freshman CS students went back and forth trying to make the smallest Hello World program that would run on our Linux systems. I think we managed to get it down to something like 30 bytes by embedding the code and the string inside an incomplete ELF header (which of course ended up with lots of bogus values, that amazingly didn't cause it to crash). You know you're having fun when you're hand-writing machine code with a hex editor.</span>
+<span class="comment-copy">@Blckknght Couldn't you use an a.out executable instead of an ELF one to get a smaller header? Or did linux stop supporting those a lot earlier than other *nixes? I can't remember.</span>
+<span class="comment-copy">I don't remember all the details, as it was more than 15 years ago. Maybe we tried an a.out but found the ELF could be made smaller by cheating on the specification (leaving out certain header values or letting them be nonsense)? I do recall the end result was smaller than a normal ELF header should be (we just truncated it and it still worked). We didn't know much assembly or machine code at the start of that effort, we started with a Hello World program compiled from C and gradually made the binary smaller and smaller, reading the ELF spec and an x86 instruction set manual as we went.</span>
+<span class="comment-copy">Wow, that was amazing. It works and it NOPS the given range. I wanna keep messing with it and I have another question, is it possible to NOP a single bytecode without using the function? I know that might mess things up and crash but I'm curious about that.</span>
+<span class="comment-copy">@DartFeld You have to do the same work the function is doing, but you don't have to use the function. And for pre-3.6, you have to be careful about whether the bytecode is 1 or 3 bytes. For example, if you NOP just the first byte f <code>LOAD_CONST 1</code>, you'll end up with <code>NOP</code>, then <code>POP_TOP</code>, then invalid opcode <code>&lt;0&gt;</code>. (In theory, you could end up with something interesting a la HP41c synthetic programming, but in practice there's nothing useful you can do that way…)</span>

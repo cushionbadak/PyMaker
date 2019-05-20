@@ -1,0 +1,100 @@
+<div class="post-text" itemprop="text">
+<p>I am trying to build a parser with <a href="https://github.com/alex/rply" rel="nofollow noreferrer">RPLY</a> and am failing at making if - else if -else statements work.</p>
+<p>It seems to me as if the parser desperately tries to follow one path and when it fails, instead of looking for another, it just stops.</p>
+<p>Here is my current productions/rules:</p>
+<pre class="lang-py prettyprint-override"><code>@self.pg.production('file : ')
+@self.pg.production('file : expression_seq')
+
+@self.pg.production('block : INDENT expression_seq DEDENT')
+
+@self.pg.production('expression_seq : expression')
+@self.pg.production('expression_seq : expression NEWLINE expression_seq')
+
+@self.pg.production('else_clause : else NEWLINE block')
+
+@self.pg.production('else_if_clause : else_if expression NEWLINE block')
+
+@self.pg.production('else_if_clause_seq : else_if_clause')
+@self.pg.production('else_if_clause_seq : else_if_clause NEWLINE else_if_clause_seq')
+
+@self.pg.production('expression : if expression NEWLINE block')
+@self.pg.production('expression : if expression NEWLINE block NEWLINE else_if_clause_seq')
+@self.pg.production('expression : if expression NEWLINE block NEWLINE else_clause')
+@self.pg.production('expression : if expression NEWLINE block NEWLINE else_if_clause_seq NEWLINE else_clause')
+
+@self.pg.production('expression : INTEGER')
+
+@self.pg.production('expression : false')
+@self.pg.production('expression : true')
+</code></pre>
+<p>And here is the grammar in EBNF:</p>
+<pre><code>file = [ expression_seq ] ;
+expression_seq = expression , { NEWLINE , expression } ;
+block = INDENT , expression_seq , DEDENT ;
+expression = if | INTEGER | 'false' | 'true' ;
+if = 'if' , expression , NEWLINE , block , { NEWLINE , else_if_clause_seq } , [ NEWLINE , else_clause ] ;
+else_clause = 'else' , block ;
+else_if_clause = 'else if' , expression , NEWLINE , block ;
+else_if_clause_seq = else_if_clause , { NEWLINE , else_if_clause } ;
+</code></pre>
+<p>So as of now, the parser parses:</p>
+<pre><code>if true
+  1
+else
+  1
+
+true
+</code></pre>
+<p>but not:</p>
+<pre><code>if true
+  1
+
+true
+=&gt; rply.errors.ParsingError: (None, SourcePosition(idx=13, lineno=4, colno=1))
+</code></pre>
+<p>or</p>
+<pre><code>if true
+  1
+else if true
+  1
+else
+  1
+
+true
+=&gt; rply.errors.ParsingError: (None, SourcePosition(idx=29, lineno=5, colno=1))
+</code></pre>
+<p>Is there something wrong with my rules? How would you implement such a (common) grammar?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem lies in your handling of <code>NEWLINE</code> tokens. This creates shift/reduce conflict, which are resolved in favour of the shift action. The consequence is that the conflict reduce action can never be taken, which makes certain grammatical constructions impossible to parse.</p>
+<p>Here's one example:</p>
+<pre><code>else_if_clause_seq: else_if_clause .  [$end, NEWLINE, DEDENT]
+                  | else_if_clause . NEWLINE else_if_clause_seq
+</code></pre>
+<p>That's taken from bison's state machine dump for the same grammar. A parser state is a collection of "items"; each item is a production with a marked position. (The mark is the <code>.</code> in the two productions.) The mark basically shows how far the parser has gotten when it reaches that state; if the <code>.</code> is at the end of a production (as in the first line), then a reduction action is possible because the parser has reached the end of the production. If the <code>.</code> has some following symbol, then the parser could shift the next token if the next token could possibly be (or be the first token in some expansion of) the following symbol. In the case of the second production above, a <code>NEWLINE</code> could be shifted if it happened to be the next token.</p>
+<p>Productions in the state are also annotated with a lookahead set, although bison only shows the lookahead set for productions which could be reduced. The annotation <code>[$end, NEWLINE, DEDENT]</code> at the end of the first production is that production's lookahead set. In other words, it is the set of possible next tokens in a context in which the production could be reduced.</p>
+<p>This state is a shift/reduce conflict because <code>NEWLINE</code> could either trigger a reduction of <code>else_if_clause_seq: else_if_clause</code>, or it could be shifted on the assumption that <code>NEWLINE else_if_clause_seq</code> will be parsed. Since the default resolution of a shift/reduce conflict is to prefer the shift (in bison, ply, rply and most other LR parser generators), the reduction will never take place, forcing the parser to always chose to try to extend <code>else_if_clause_seq</code>. In effect, that means that an <code>else_if_clause</code> not at the end of a block must always be followed by another <code>else_if_clause</code>, making it impossible to parse <code>else_if true 1 else 1</code> in which the <code>else_if_clause</code> is followed by an <code>else</code> clause.</p>
+<p>A parser which could look ahead two tokens wouldn't have any problems with this grammar. The second next token, the one which comes after the <code>NEWLINE</code>, must be either <code>else</code> or <code>else_if</code>; in the first case, a reduction is needed, while in the second case the shift is the correct action. In fact, the <code>NEWLINE</code> really serves no purpose there, since both <code>else</code> and <code>else_if</code> must always be preceded by <code>NEWLINE</code> tokens. Also, since <code>else_if_clause</code> can only end with <code>block</code> and <code>block</code> can only end with <code>DEDENT</code>, we can conclude that the <code>NEWLINE</code> must be preceded by a <code>DEDENT</code>. </p>
+<p>It appears that you choose to send <code>NEWLINE</code> after the <code>DEDENT</code>, since your grammar seems to indicate that you send a <code>NEWLINE</code> <em>before</em> an <code>INDENT</code>. That's probably workable in theory but it definitely leads to the shift/reduce conflicts you're experiencing.</p>
+<p>The more common implementation of whitespace-aware lexical scanning uses the algorithm <a href="https://docs.python.org/3/reference/lexical_analysis.html#indentation" rel="nofollow noreferrer">outlined in the Python manual</a>: a <code>NEWLINE</code> token is generated when the newline is encountered, unless the surrounding lines are explicitly or implicitly joined, and then the decision is made to issue either one <code>INDENT</code>, one or more <code>DEDENT</code>s, or nothing. Careful examination of the <a href="https://docs.python.org/3/reference/grammar.html" rel="nofollow noreferrer">Python grammar</a> shows how this fits together. Here's a simplified extract, in EBNF:</p>
+<pre><code>stmt: simple_stmt | compound_stmt
+simple_stmt: small_stmt (';' small_stmt)* [';'] NEWLINE
+small_stmt: expr_stmt …
+compound_stmt: if_stmt …
+if_stmt: 'if' test ':' suite ('elif' test ':' suite)* ['else' ':' suite]
+suite: simple_stmt | NEWLINE INDENT stmt+ DEDENT
+</code></pre>
+<p><code>suite</code> more or less corresponds to your <code>block</code> but allows unindented single statements on the same line, but note that it starts with a <code>NEWLINE</code>. Simple (non-compound) statements end with a <code>NEWLINE</code>; compound statements are treated as being self-delimiting.</p>
+<p>An alternative approach is to only issue <code>NEWLINE</code> tokens in the case where two consecutive lines have exactly the same indentation. As noted above, <code>NEWLINE</code> tokens in lines which are indented or dedented are strictly redundant, since there presence can be deduced; leaving them out entirely reduces the number of tokens which need to be handled by the parser. But if you do that, you can no longer use the simple principle that simple statements are always terminated with a <code>NEWLINE</code> since the last simple statement in a <code>block</code> is directly followed by a <code>DEDENT</code>. That makes it necessary to use a slightly more complicated (and right-recursive) definition of <code>expression_seq</code>:</p>
+<pre><code>block              : INDENT statement_sequence DEDENT
+statement          : simple_statement | compound_statement
+statement_sequence : statement
+                   | simple_statement NEWLINE statement_sequence
+                   | compound_statement statement_sequence
+</code></pre>
+</div>
+<span class="comment-copy">Doesn't RPLY report that you have shift/reduce conflicts in that grammar?</span>
+<span class="comment-copy">@rici Yes it does. I guess it has to do with the dangling else poblem. But shouldn't this work without nesting?</span>
+<span class="comment-copy">when <code>if</code> statements must be nested, there is no dangling else issue. Thete shouldn't be any conflicts.  So the fact that there are conflicts is important.</span>
+<span class="comment-copy">@rici Do you have an idea as to what might be the reason for them? RPLY doesn't give any indication, just this: <code>ParserGeneratorWarning: 3 shift/reduce conflicts</code></span>
+<span class="comment-copy">Thank you for this thorough explanation!</span>

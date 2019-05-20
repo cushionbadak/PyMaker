@@ -1,0 +1,150 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to create a Python-based CLI that communicates with a web service via websockets. One issue that I'm encountering is that requests made by the CLI to the web service intermittently fail to get processed. Looking at the logs from the web service, I can see that the problem is caused by the fact that frequently these requests are being made at the same time (or even after) the socket has closed:</p>
+<pre class="lang-none prettyprint-override"><code>2016-09-13 13:28:10,930 [22 ] INFO  DeviceBridge - Device bridge has opened
+2016-09-13 13:28:11,936 [21 ] DEBUG DeviceBridge - Device bridge has received message
+2016-09-13 13:28:11,937 [21 ] DEBUG DeviceBridge - Device bridge has received valid message
+2016-09-13 13:28:11,937 [21 ] WARN  DeviceBridge - Unable to process request: {"value": false, "path": "testcube.pwms[0].enabled", "op": "replace"}
+2016-09-13 13:28:11,936 [5  ] DEBUG DeviceBridge - Device bridge has closed
+</code></pre>
+<p>In my CLI I define a class <code>CommunicationService</code> that is responsible for handling all direct communication with the web service. Internally, it uses the <a href="https://websockets.readthedocs.io/en/stable/" rel="nofollow"><code>websockets</code></a> package to handle communication, which itself is built on top of <code>asyncio</code>.</p>
+<p><code>CommunicationService</code> contains the following method for sending requests:</p>
+<pre><code>def send_request(self, request: str) -&gt; None:
+    logger.debug('Sending request: {}'.format(request))
+    asyncio.ensure_future(self._ws.send(request))
+</code></pre>
+<p>...where <code>ws</code> is a websocket opened earlier in another method:</p>
+<pre><code>self._ws = await websockets.connect(websocket_address)
+</code></pre>
+<p>What I want is to be able to await the future returned by <code>asyncio.ensure_future</code> and, if necessary, sleep for a short while after in order to give the web service time to process the request before the websocket is closed.</p>
+<p>However, since <code>send_request</code> is a synchronous method, it can't simply <code>await</code> these futures. Making it asynchronous would be pointless as there would be nothing to await the coroutine object it returned. I also can't use <code>loop.run_until_complete</code> as the loop is already running by the time it is invoked.</p>
+<p>I found someone describing a problem very similar to the one I have at <a href="https://mail.python.org/pipermail/python-list/2016-April/707139.html" rel="nofollow">mail.python.org</a>. The solution that was posted in that thread was to make the function return the coroutine object in the case the loop was already running:</p>
+<pre><code>def aio_map(coro, iterable, loop=None):
+    if loop is None:
+        loop = asyncio.get_event_loop()
+
+    coroutines = map(coro, iterable)
+    coros = asyncio.gather(*coroutines, return_exceptions=True, loop=loop)
+
+    if loop.is_running():
+        return coros
+    else:
+        return loop.run_until_complete(coros)
+</code></pre>
+<p>This is not possible for me, as I'm working with PyRx (Python implementation of the reactive framework) and <code>send_request</code> is only called as a subscriber of an Rx observable, which means the return value gets discarded and is not available to my code:</p>
+<pre><code>class AnonymousObserver(ObserverBase):
+    ...
+    def _on_next_core(self, value):
+        self._next(value)
+</code></pre>
+<p>On a side note, I'm not sure if this is some sort of problem with <code>asyncio</code> that's commonly come across or whether I'm just not getting it, but I'm finding it pretty frustrating to use. In C# (for instance), all I would need to do is probably something like the following:</p>
+<pre class="lang-cs prettyprint-override"><code>void SendRequest(string request)
+{
+    this.ws.Send(request).Wait();
+    // Task.Delay(500).Wait();  // Uncomment If necessary
+}
+</code></pre>
+<p>Meanwhile, <code>asyncio</code>'s version of "wait" unhelpfully just returns another coroutine that I'm forced to discard.</p>
+<p><strong>Update</strong></p>
+<p>I've found a way around this issue that seems to work. I have an asynchronous callback that gets executed after the command has executed and before the CLI terminates, so I just changed it from this...</p>
+<pre><code>async def after_command():
+    await comms.stop()
+</code></pre>
+<p>...to this:</p>
+<pre><code>async def after_command():
+    await asyncio.sleep(0.25)  # Allow time for communication
+    await comms.stop()
+</code></pre>
+<p>I'd still be happy to receive any answers to this problem for future reference, though. I might not be able to rely on workarounds like this in other situations, and I still think it would be better practice to have the delay executed inside <code>send_request</code> so that clients of <code>CommunicationService</code> do not have to concern themselves with timing issues.</p>
+<p>In regards to Vincent's question:</p>
+<blockquote>
+<p>Does your loop run in a different thread, or is send_request called by some callback?</p>
+</blockquote>
+<p>Everything runs in the same thread - it's called by a callback. What happens is that I define all my commands to use asynchronous callbacks, and when executed some of them will try to send a request to the web service. Since they're asynchronous, they don't do this until they're executed via a call to <code>loop.run_until_complete</code> at the top level of the CLI - which means the loop is running by the time they're mid-way through execution and making this request (via an indirect call to <code>send_request</code>).</p>
+<p><strong>Update 2</strong></p>
+<p>Here's a solution based on Vincent's proposal of adding a "done" callback.</p>
+<p>A new boolean field <code>_busy</code> is added to <code>CommunicationService</code> to represent if comms activity is occurring or not.</p>
+<p><code>CommunicationService.send_request</code> is modified to set <code>_busy</code> true before sending the request, and then provides a callback to <code>_ws.send</code> to reset <code>_busy</code> once done:</p>
+<pre><code>def send_request(self, request: str) -&gt; None:
+    logger.debug('Sending request: {}'.format(request))
+
+    def callback(_):
+        self._busy = False
+
+    self._busy = True
+    asyncio.ensure_future(self._ws.send(request)).add_done_callback(callback)
+</code></pre>
+<p><code>CommunicationService.stop</code> is now implemented to wait for this flag to be set false before progressing:</p>
+<pre><code>async def stop(self) -&gt; None:
+    """
+    Terminate communications with TestCube Web Service.
+    """
+    if self._listen_task is None or self._ws is None:
+        return
+
+    # Wait for comms activity to stop.
+    while self._busy:
+        await asyncio.sleep(0.1)
+
+    # Allow short delay after final request is processed.
+    await asyncio.sleep(0.1)
+
+    self._listen_task.cancel()
+    await asyncio.wait([self._listen_task, self._ws.close()])
+
+    self._listen_task = None
+    self._ws = None
+    logger.info('Terminated connection to TestCube Web Service')
+</code></pre>
+<p>This seems to work too, and at least this way all communication timing logic is encapsulated within the <code>CommunicationService</code> class as it should be.</p>
+<p><strong>Update 3</strong></p>
+<p>Nicer solution based on Vincent's proposal.</p>
+<p>Instead of <code>self._busy</code> we have <code>self._send_request_tasks = []</code>.</p>
+<p>New <code>send_request</code> implementation:</p>
+<pre><code>def send_request(self, request: str) -&gt; None:
+    logger.debug('Sending request: {}'.format(request))
+
+    task = asyncio.ensure_future(self._ws.send(request))
+    self._send_request_tasks.append(task)
+</code></pre>
+<p>New <code>stop</code> implementation:</p>
+<pre><code>async def stop(self) -&gt; None:
+    if self._listen_task is None or self._ws is None:
+        return
+
+    # Wait for comms activity to stop.
+    if self._send_request_tasks:
+        await asyncio.wait(self._send_request_tasks)
+    ...
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You could use a <code>set</code> of tasks:</p>
+<pre><code>self._send_request_tasks = set()
+</code></pre>
+<p>Schedule the tasks using <code>ensure_future</code> and clean up using <code>add_done_callback</code>:</p>
+<pre><code>def send_request(self, request: str) -&gt; None:
+    task = asyncio.ensure_future(self._ws.send(request))
+    self._send_request_tasks.add(task)
+    task.add_done_callback(self._send_request_tasks.remove)
+</code></pre>
+<p>And wait for the <code>set</code> of tasks to complete:</p>
+<pre><code>async def stop(self):
+    if self._send_request_tasks:
+        await asyncio.wait(self._send_request_tasks)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Given that you're not inside an asynchronous function you can use the <code>yield from</code> keyword to effectively implement <code>await</code> yourself. The following code will block until the future returns:</p>
+<pre><code>def send_request(self, request: str) -&gt; None:
+    logger.debug('Sending request: {}'.format(request))
+    future = asyncio.ensure_future(self._ws.send(request))
+    yield from future.__await__()
+</code></pre>
+</div>
+<span class="comment-copy"><code>"I also can't use loop.run_until_complete as the loop is already running by the time it is invoked."</code> Does your loop run in a different thread, or is <code>send_request</code> called by some callback?</span>
+<span class="comment-copy">It's all single-threaded, so called by some callback. I've updated the post.</span>
+<span class="comment-copy">What about using <code>asyncio.ensure_future(self._ws.send(request)).add_done_callback(...)</code> to schedule a callback to run once the request is sent?</span>
+<span class="comment-copy">Yeah, that seems to work. The solution I've got isn't as elegant as C#'s <code>Task.Wait()</code> would have been, but it seems to work. Elegant or not, it hides the timing logic from client code which is the important thing. If you'd like to submit that as an answer, I would accept it.</span>
+<span class="comment-copy">Wait, why not save <code>asyncio.ensure_future(self._ws.send(request))</code> as <code>self._send_request_task</code>, and await it in the <code>stop</code> coroutine if it exists?</span>
+<span class="comment-copy">One minor caveat with <code>asyncio.wait</code> according to the <a href="https://docs.python.org/3/library/asyncio-task.html" rel="nofollow noreferrer">documentation</a> is that "The sequence <i>futures</i> must not be empty", so I would just nest <code>asyncio.wait</code> inside an if statement checking that the set is non-empty (as I've done in my post). Otherwise this looks great and it seems to work.</span>
+<span class="comment-copy">@Tagc You're right, see my edit.</span>

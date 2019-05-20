@@ -1,0 +1,639 @@
+<div class="post-text" itemprop="text">
+<p>I have an expression/formula like this</p>
+<pre><code> std::string expr="((A&gt;0) &amp;&amp; (B&gt;5 || C &gt; 10))";
+</code></pre>
+<p>I have done some research and it seems that if A,B,C values are known, by embedding Lua or Python in a C++ program, there are <code>eval</code> functions that can substitute A,B and C and return <code>true</code> or <code>false</code>.</p>
+<p>But what happens when I don't know all the values? Let's say that A is known and it is -1. If A is -1 then the formula will evaluate to "false" irrespective of the values of B or C. </p>
+<p>Can I evaluate a formula without knowing all the variables in advance? For example if A is 10, it makes sense to lookup for the value of B and re-evaluate again. How can we solve these problems? Ideas?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It sounds like you have two challenges: </p>
+<ol>
+<li>It is expensive to calculate some variable values, so you want to avoid calculating values that aren't needed to evaluate the expression; and</li>
+<li>Your expression exists as a string, composed at runtime, so you can't use C++'s built-in short-circuiting logic.</li>
+</ol>
+<p>This means you need some way to evaluate an expression at runtime, and you would like to take advantage of short-circuit logic if possible. Python could be a good choice for this, as shown in the example below.</p>
+<p>There is a short Python script (<code>evaluate.py</code>), which defines an <code>evaluate()</code> function which can be called from your C or C++ program. The <code>evaluate()</code> function will attempt to evaluate the expression you give it (translating "&amp;&amp;" and "||" to "and" and "or" if needed). If it requires a variable which hasn't been defined yet, it will retrieve a value for that variable by calling a <code>get_var_value()</code> function defined in the C/C++ program (and then cache the value for later use). </p>
+<p>This approach will use normal short-circuit behavior, so it will only request the variable values needed to finish evaluating the expression. Note that this won't rearrange the expression to choose the minimal set of variables needed to evaluate it; it just uses the standard short-circuiting behavior.</p>
+<p>UPDATE: I've added an example at the end that defines the Python script using a multiline string literal in the .cpp file. This could be useful if you don't want to install a separate evaluate.py file along with your executable. It also simplifies the Python initialization a little bit.</p>
+<p>The C/Python interaction in the scripts below is based on code in <a href="https://docs.python.org/2/extending/embedding.html" rel="nofollow noreferrer">https://docs.python.org/2/extending/embedding.html</a> and <a href="https://docs.python.org/2/c-api/arg.html" rel="nofollow noreferrer">https://docs.python.org/2/c-api/arg.html</a>. </p>
+<p>Here are the files:</p>
+<p><strong>evaluate.py</strong> (Python script)</p>
+<pre><code># load embedded_methods module defined by the parent C program
+from embedded_methods import get_var_value
+
+# define a custom dictionary class that calls get_var_value(key) for any missing keys.
+class var_dict(dict):
+    def __missing__(self, var):
+        self[var] = val = get_var_value(var)
+        return val
+
+# define a function which can be called by the parent C program
+def evaluate(expr):
+    # Create a dictionary to use as a namespace for the evaluation (this version 
+    # will automatically request missing variables).
+    # Move this line up to the module level to retain values between calls.
+    namespace = var_dict()
+
+    # convert C-style Boolean operators to Python-style
+    py_expr = expr.replace("||", " or ").replace("&amp;&amp;", " and ").replace("  ", " ")
+
+    print('evaluating expression "{}" as "{}"'.format(expr, py_expr))
+
+    # evaluate the expression, retrieving variable values as needed
+    return eval(py_expr, namespace)
+</code></pre>
+<p><strong>evaluate.c</strong> (your main program; could also be evaluate.cpp, compiled with g++)</p>
+<pre><code>// on Mac, compile with gcc -o evaluate evaluate.c -framework Python
+#include &lt;Python/Python.h&gt;  // Mac
+// #include &lt;Python.h&gt; // non-Mac?
+
+// retain values of argc and argv for equation evaluation
+int argc;
+char **argv;
+
+/* 
+   Calculate the value of a named variable; this is called from the Python 
+   script to obtain any values needed to evaluate the expression. 
+*/
+static PyObject* c_get_var_value(PyObject *self, PyObject *args)
+{
+    int var_num;
+    char *var_name;
+    char err_string[100];
+    long var_value;
+    if(!PyArg_ParseTuple(args, "s:get_var_value", &amp;var_name)) {
+        PyErr_SetString(PyExc_ValueError, "Invalid arguments passed to get_var_value()");
+        return NULL;
+    }
+    // change the code below to define your variable values
+    // This version just assumes A, B, C are given by argv[2], argv[3], argv[4], etc.
+    printf("looking up value of %s: ", var_name);
+    var_num = var_name[0]-'A';
+    if (strlen(var_name) != 1 || var_num &lt; 0 || var_num &gt;= argc-2) {
+        printf("%s\n", "unknown");
+        snprintf(
+            err_string, sizeof(err_string), 
+            "Value requested for unknown variable \"%s\"", var_name
+        );
+        PyErr_SetString(PyExc_ValueError, err_string);
+        return NULL;  // will raise exception in Python
+    } else {
+        var_value = atoi(argv[2+var_num]);
+        printf("%ld\n", var_value);
+        return Py_BuildValue("l", var_value);
+    }
+}
+
+// list of methods to be added to the "embedded_methods" module
+static PyMethodDef c_methods[] = {
+    {"get_var_value", c_get_var_value, METH_VARARGS, // could use METH_O
+     "Retrieve the value for the specified variable."},
+    {NULL, NULL, 0, NULL} // sentinel for end of list
+};
+
+int main(int ac, char *av[])
+{
+    PyObject *p_module, *p_evaluate, *p_args, *p_result;
+    long result;
+    const char* expr;
+
+    // cache and evaluate arguments
+    argc = ac;
+    argv = av;
+    if (argc &lt; 2) {
+        fprintf(
+            stderr, 
+            "Usage: %s \"expr\" A B C ...\n"
+            "e.g.,  %s \"((A&gt;0) &amp;&amp; (B&gt;5 || C &gt; 10))\" 10 9 -1\n", 
+            argv[0], argv[0]
+        );
+        return 1;
+    }
+    expr = argv[1];
+
+    // initialize Python
+    Py_SetProgramName(argv[0]);
+    Py_Initialize();
+    // Set system path to include the directory where this executable is stored
+    // (to find evaluate.py later)
+    PySys_SetArgv(argc, argv);
+
+    // attach custom module with get_var_value() function
+    Py_InitModule("embedded_methods", c_methods);
+
+    // Load evaluate.py
+    p_module = PyImport_ImportModule("evaluate");
+    if (PyErr_Occurred()) { PyErr_Print(); }
+    if (p_module == NULL) {
+        fprintf(stderr, "unable to load evaluate.py\n");
+        return 1;
+    }
+
+    // get a reference to the evaluate() function
+    p_evaluate = PyObject_GetAttrString(p_module, "evaluate");
+    if (!(p_evaluate &amp;&amp; PyCallable_Check(p_evaluate))) {
+        fprintf(stderr, "Cannot retrieve evaluate() function from evaluate.py module\n");
+        return 1;
+    }
+
+     /*
+        Call the Python evaluate() function with the expression to be evaluated.
+        The evaluate() function will call c_get_var_value() to obtain any
+        variable values needed to evaluate the expression. It will use 
+        caching and normal logical short-circuiting to reduce the number 
+        of requests.
+     */
+    p_args = Py_BuildValue("(s)", expr);
+    p_result = PyObject_CallObject(p_evaluate, p_args);
+    Py_DECREF(p_args);
+    if (PyErr_Occurred()) {
+        PyErr_Print();
+        return 1;
+    }
+    result = PyInt_AsLong(p_result);
+    Py_DECREF(p_result);
+
+    printf("result was %ld\n", result);
+
+    Py_DECREF(p_evaluate);
+    Py_DECREF(p_module);
+    return 0;
+}
+</code></pre>
+<p>Results:</p>
+<pre><code>$ evaluate "((A&gt;0) &amp;&amp; (B&gt;5 || C &gt; 10))" -1 9 -1
+evaluating expression "((A&gt;0) &amp;&amp; (B&gt;5 || C &gt; 10))" as "((A&gt;0) and (B&gt;5 or C &gt; 10))"
+looking up value of A: -1
+result was 0
+
+$ evaluate "((A&gt;0) &amp;&amp; (B&gt;5 || C &gt; 10))" 10 9 -1
+evaluating expression "((A&gt;0) &amp;&amp; (B&gt;5 || C &gt; 10))" as "((A&gt;0) and (B&gt;5 or C &gt; 10))"
+looking up value of A: 10
+looking up value of B: 9
+result was 1
+
+$ evaluate "((A&gt;0) &amp;&amp; (B&gt;5 || C &gt; 10))" 10 3 -1
+evaluating expression "((A&gt;0) &amp;&amp; (B&gt;5 || C &gt; 10))" as "((A&gt;0) and (B&gt;5 or C &gt; 10))"
+looking up value of A: 10
+looking up value of B: 3
+looking up value of C: -1
+result was 0
+</code></pre>
+<p>As an alternative, you can combine all this code into a single .cpp file, as shown below. This uses the multi-line string literal capability in C++11.</p>
+<p>Self-contained <strong>evaluate.cpp</strong></p>
+<pre><code>// on Mac, compile with g++ evaluate.cpp -o evaluate -std=c++11 -framework Python
+#include &lt;Python/Python.h&gt;  // Mac
+//#include &lt;Python.h&gt; // non-Mac?
+
+/* 
+   Python script to be run in embedded interpreter.
+   This defines an evaluate(expr) function which will interpret an expression
+   and return the result. If any variable values are needed, it will call the
+   get_var_values(var) function defined in the parent C++ program
+*/
+const char* py_script = R"(
+# load embedded_methods module defined by the parent C program
+from embedded_methods import get_var_value
+
+# define a custom dictionary class that calls get_var_value(key) for any missing keys.
+class var_dict(dict):
+    def __missing__(self, var):
+        self[var] = val = get_var_value(var)
+        return val
+
+# define a function which can be called by the parent C program
+def evaluate(expr):
+    # Create a dictionary to use as a namespace for the evaluation (this version 
+    # will automatically request missing variables).
+    # Move this line up to the module level to retain values between calls.
+    namespace = var_dict()
+
+    # convert C-style Boolean operators to Python-style
+    py_expr = expr.replace("||", " or ").replace("&amp;&amp;", " and ").replace("  ", " ")
+
+    print('evaluating expression "{}" as "{}"'.format(expr, py_expr))
+
+    # evaluate the expression, retrieving variable values as needed
+    return eval(py_expr, namespace)
+)";
+
+// retain values of argc and argv for equation evaluation
+int argc;
+char **argv;
+
+/* 
+   Calculate the value of a named variable; this is called from the Python 
+   script to obtain any values needed to evaluate the expression. 
+*/
+static PyObject* c_get_var_value(PyObject *self, PyObject *args)
+{
+    int var_num;
+    char *var_name;
+    char err_string[100];
+    long var_value;
+    if(!PyArg_ParseTuple(args, "s:get_var_value", &amp;var_name)) {
+        PyErr_SetString(PyExc_ValueError, "Invalid arguments passed to get_var_value()");
+        return NULL;
+    }
+    // change the code below to define your variable values
+    // This version just assumes A, B, C are given by argv[2], argv[3], argv[4], etc.
+    printf("looking up value of %s: ", var_name);
+    var_num = var_name[0]-'A';
+    if (strlen(var_name) != 1 || var_num &lt; 0 || var_num &gt;= argc-2) {
+        printf("%s\n", "unknown");
+        snprintf(
+            err_string, sizeof(err_string), 
+            "Value requested for unknown variable \"%s\"", var_name
+        );
+        PyErr_SetString(PyExc_ValueError, err_string);
+        return NULL;  // will raise exception in Python
+    } else {
+        var_value = atoi(argv[2+var_num]);
+        printf("%ld\n", var_value);
+        return Py_BuildValue("l", var_value);
+    }
+}
+
+// list of methods to be added to the "embedded_methods" module
+static PyMethodDef c_methods[] = {
+    {"get_var_value", c_get_var_value, METH_VARARGS, // could use METH_O
+     "Retrieve the value for the specified variable."},
+    {NULL, NULL, 0, NULL} // sentinel for end of list
+};
+
+int main(int ac, char *av[])
+{
+    PyObject *p_module, *p_evaluate, *p_args, *p_result;
+    long result;
+    const char* expr;
+
+    // cache and evaluate arguments
+    argc = ac;
+    argv = av;
+    if (argc &lt; 2) {
+        fprintf(
+            stderr, 
+            "Usage: %s \"expr\" A B C ...\n"
+            "e.g.,  %s \"((A&gt;0) &amp;&amp; (B&gt;5 || C &gt; 10))\" 10 9 -1\n", 
+            argv[0], argv[0]
+        );
+        return 1;
+    }
+    expr = argv[1];
+
+    // initialize Python
+    Py_SetProgramName(argv[0]);
+    Py_Initialize();
+
+    // attach custom module with get_var_value() function
+    Py_InitModule("embedded_methods", c_methods);
+
+    // run script to define evalute() function
+    PyRun_SimpleString(py_script);
+    if (PyErr_Occurred()) {
+        PyErr_Print(); 
+        fprintf(stderr, "%s\n", "unable to run Python script");
+        return 1;
+    }
+
+    // get a reference to the Python evaluate() function (can be reused later)
+    // (note: PyRun_SimpleString creates objects in the __main__ module)
+    p_module = PyImport_AddModule("__main__");
+    p_evaluate = PyObject_GetAttrString(p_module, "evaluate");
+    if (!(p_evaluate &amp;&amp; PyCallable_Check(p_evaluate))) {
+        fprintf(stderr, "%s\n", "Cannot retrieve evaluate() function from __main__ module");
+        return 1;
+    }
+
+    /*
+       Call the Python evaluate() function with the expression to be evaluated.
+       The evaluate() function will call c_get_var_value() to obtain any
+       variable values needed to evaluate the expression. It will use 
+       caching and normal logical short-circuiting to reduce the number 
+       of requests.
+    */
+    p_args = Py_BuildValue("(s)", expr);
+    p_result = PyObject_CallObject(p_evaluate, p_args);
+    Py_DECREF(p_args);
+    if (PyErr_Occurred()) {
+        PyErr_Print();
+        return 1;
+    }
+    result = PyInt_AsLong(p_result);
+    Py_DECREF(p_result);
+
+    printf("result was %ld\n", result);
+
+    Py_DECREF(p_module);
+    Py_DECREF(p_evaluate);
+    return 0;
+}
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I don't know of any existing available library for handling this.</p>
+<p>The usual approach would be to build an expression-tree and evaluate what is possible - similarly to constant folding in compilers:
+<a href="https://en.wikipedia.org/wiki/Constant_folding" rel="noreferrer">https://en.wikipedia.org/wiki/Constant_folding</a></p>
+<p>One of the important aspects for that is to know the allowed values for variables, and thus the allowed partial evaluations, e.g. <code>x*0</code> (and <code>0*x</code>) is <code>0</code> if <code>x</code> is an integer, or finite floating point number, but cannot be evaluated if <code>x</code> is an IEEE floating number (since it could be Nan or infinity), or if <code>x</code> could be matrix since <code>[1,1]*0</code> is <code>[0,0]</code> not the scalar <code>0</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>One way is to parse the expression into a tree and evaluate the tree. Subexpressions for which all variables are known will be fully evaluated. The effect will be to simplify the tree.</p>
+<p>In your example, the tree has <code>&amp;&amp;</code> at the top with two subtrees, the left one being the tree for <code>A&gt;0</code>. To evaluate the tree, we evaluate the left subtree, which returns -1, and so we don't need to evaluate the right subtree, because the operator is <code>&amp;&amp;</code>. The whole tree evaluates to <em>false</em>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I don't understand exactly what you want to do or understand but I am OK with ivan_pozdeev about <strong>short-circuit evaluation</strong> and <strong>lazy evaluation</strong>. </p>
+<p>A boolean expression is evaluate <strong>from the left to the right</strong> and when the result is known the evaluation stop and ignore what is on the right.</p>
+<p>With Python:</p>
+<pre><code>E = "(A &gt; 0) and (B &gt; 5 or C &gt; 10)"
+A = -1
+print(eval(E))
+</code></pre>
+<p>gives</p>
+<pre><code>False
+</code></pre>
+<p>But</p>
+<pre><code>E = "(A &gt; 0) and (B &gt; 5 or C &gt; 10)"
+A = 1
+print(eval(E))
+</code></pre>
+<p>gives the error "<em>name 'B' is not defined</em>".</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>So from what I understand of your question, you want something like</p>
+<pre><code>if (A&gt;0) {
+  B = getB();
+  C = getC();
+  if (B&gt;23 || C==11)
+    explode();
+}
+</code></pre>
+<p>ie your expression must be split up so that you are only ever working with known values.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can do it like this:</p>
+<pre><code>class LazyValues():
+
+    def __init__(self):
+        self._known_values = {}
+
+    def __getitem__(self, var):
+        try:
+            return self._known_values[var]
+        except KeyError:
+            print("Evaluating %s..." % var)
+            return self._known_values.setdefault(var, eval(var))
+
+
+def lazy_eval(expr, lazy_vars):
+    for var in lazy_vars:
+        expr  = expr.replace(var, "lazy_values['%s']" % var)
+        # will look like ((lazy_value['A']&gt;0) &amp;&amp; (lazy_value['B']&gt;5 || lazy_value['C'] &gt; 10))
+
+    lazy_values = LazyValues()
+    return eval(expr)
+
+
+lazy_eval("((A&gt;0) and (B&gt;5 or C &gt; 10))", lazy_vars=['A', 'B', 'C'])
+
+# Evaluating A...
+# ....
+# NameError: name 'A' is not defined
+
+A = -1
+lazy_eval("((A&gt;0) and (B&gt;5 or C &gt; 10))", lazy_vars=['A', 'B', 'C'])
+
+#Evaluating A...
+#False
+
+A = 5
+B = 6
+lazy_eval("((A&gt;0) and (B&gt;5 or C &gt; 10))", lazy_vars=['A', 'B', 'C'])
+
+# Evaluating A...
+# Evaluating B...
+# True
+</code></pre>
+<p>More details later...</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It seems to me that the answer is yes, yes you can try to evaluate the expression with missing information.  You will need to define what happens though when a symbol lookup fails.</p>
+<p>In you case, you will need a boolean expression evaluator and a symbol table so the evaluator can lookup the symbols to execute the expression.</p>
+<p>If you succeed in looking up all the symbols, the result would be true or false.  If you fail to look up a symbol, then handle that case, perhaps returning None, nullptr, or raising / throwing an exception.</p>
+<p>I believe you can embed the python interpreter in your c++ program and call a function to evaluate the expression, more importantly, you can give it the dict to use as the symbol table.  If the call returns a result, it was able to find enough symbols or shortcut to a result, otherwise it will raise an exception which your c++ code can detect.</p>
+<p>You can prototype the function in python the evaluate if the approach works they way you want, then embed.</p>
+<p>Or you can do it all in c++, with a grammar, lexer, parser, and elevator.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>While this is a very crude implementation of your solution, but it suits your situation perfectly although using a lot of <code>if else</code> and Exception Handling.</p>
+<pre><code>def main_func():
+    def checker(a, b=None, c=None):
+        if a is None:
+            del a
+        if b is None:
+            del b
+        if c is None:
+            del c
+        d = eval('a&gt;0 and (b&gt;5 or c&gt;10)')
+        return d
+    return checker
+
+def doer(a=None, b=None, c=None):
+    try:
+        return main_func()(a,b,c)
+    except NameError as e:
+        if "'a' is not" in str(e):
+            return 'a'
+        elif "'b' is not" in str(e):
+            return 'b'
+        elif "'c' is not" in str(e):
+            return 'c'
+
+def check_ret(ret):
+    return type(ret) == bool
+
+def actual_evaluator():
+    getter = {
+        "a": get_a,
+        "b": get_b,
+        "c": get_c
+    }
+    args = []
+    while True:
+        ret = doer(*tuple(args))
+        if not check_ret(ret):
+            val = getter[ret]()
+            args.append(val)
+        else:
+            return ret
+
+if __name__ == '__main__':
+        print actual_evaluator()
+</code></pre>
+<p>Now explaining my code, <code>main_func</code> returns another function which is used to evaluate the given expression in a string. While here the string has been hardcoded, you can always pass it as a parameter to the function and replace the string inside <code>eval</code> with the parameter.</p>
+<p>In <code>doer</code>, the function returned by <code>main_func</code> is invoked and if a <code>NameError</code> is thrown, which happens in case of the previous conditions being false and new values to be calculated then it returns the specific variable which needs to be calculated. All of that is checked in the <code>actual_evaluator</code> where the values of the variables are fetched via some function <code>get_variable_name</code> which you can define in your <code>getter</code> dict. In my code, I'd used random numbers to check the validity, but like you said you'd have to evaluate the various variables by other means so you can call the respective functions.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Due to the short-circuit behaviour, Python can evaluate an expression even without all the contained values defined if it's possible. If not, it raises an exception:</p>
+<pre><code>In [1]: a= False
+
+In [3]: a and b
+Out[3]: False
+
+In [4]: a or b
+NameError: name 'b' is not defined
+</code></pre>
+<p>But the expression is evaluated left to right:</p>
+<pre><code>In [5]: b and a
+NameError: name 'b' is not defined
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I have done a "roll-my-own" approach for this in the past.  It's not that difficult for simple things; you simply create your own objects that implement magic math methods and that keep track of other objects.</p>
+<p>If you need something more full-featured, the <a href="http://www.sympy.org/en/index.html" rel="nofollow noreferrer">sympy</a> project is designed to do symbolic math...</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'd take a look at sympy or other computer algebra systems.  I believe that algebraic simplification of the pxeression plus short circuit evaluation will allow you to evaluate all the cases where it is possible to get a result.  There are some cases where you need to know the value of some variable.  For example if you have a simple expression like a == b, you are going to make no progress without knowing the value of a  and b.  However something like (a &gt;= 0) ||(a &lt;= 0), algebraic simplification will result in true assuming that a is not NAN or some other value that is not equal to itself.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I am assuming from this question that </p>
+<ol>
+<li>you have a logical expression that depends on the result of various functions; </li>
+<li>you use the values of some of those functions more than once (possibly before evaluating this expression, or possibly within this expression), so you want to store their results to avoid calling them twice; and </li>
+<li>you would like to evaluate the logical expression, and along the way you would like to retrieve and store values for functions that haven't previously been run, but only enough of them to evaluate the expression (using normal short-circuit behavior).</li>
+</ol>
+<p>I mentioned in a different answer that you might do best just to use the built-in short-circuit behavior in C++. To do that and achieve objective 2, you would need to use functions instead of variables in the logical expression. That way you can trigger the calculation of a missing value when the expression needs it. </p>
+<p>Below are two approaches to doing that. The first one wraps your slow functions with a general-purpose caching wrapper. The second defines a custom, caching helper for each of your slow functions. After compiling, either of these should be called with your A, B and C values for testing, e.g. <code>evaluate_cached 10 9 -1</code>. They will both behave the way you want.</p>
+<p><strong><code>evaluate_cached.cpp</code></strong></p>
+<pre><code># include &lt;stdio.h&gt;
+# include &lt;stdlib.h&gt;
+# include &lt;unordered_map&gt;
+
+static char **args;
+
+// define (slow) functions to calculate each of the needed values
+int A() {
+  printf("Calculating value for A\n");
+  return atoi(args[1]);
+}
+
+int B() {
+  printf("Calculating value for B\n");
+  return atoi(args[2]);
+}
+
+int C() {
+  printf("Calculating value for C\n");
+  return atoi(args[3]);
+}
+
+typedef int (*int_func)(void);
+
+// wrapper to cache results of other functions
+int cached(int_func func) {
+    // Create an unordered_map to hold function results
+    static std::unordered_map&lt;int_func, int&gt; results;
+
+    if (results.find(func) == results.end()) {
+        // function hasn't been called before; call and cache results
+        results[func] = func();
+    }
+    return results[func];
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc!=4) {
+        fprintf(stderr, "%s must be called with 3 values for A, B and C.\n", argv[0]);
+        return 1;
+    } else {
+        args = argv;
+    }
+    // do the evaluation, with short-circuiting
+    if (((cached(A)&gt;0) &amp;&amp; (cached(B)&gt;5 || cached(C) &gt; 10))) {
+        printf("condition was true\n");
+    } else {
+        printf("condition was false\n");
+    }
+    return 0;
+}
+</code></pre>
+<p><strong><code>evaluate_helpers.c</code></strong></p>
+<pre><code># include &lt;stdio.h&gt;
+# include &lt;stdlib.h&gt;
+
+static char **args;
+
+// define (slow) functions to calculate each of the needed values
+int calculate_A() {
+  printf("Calculating value for A\n");
+  return atoi(args[1]);
+}
+
+int calculate_B() {
+  printf("Calculating value for B\n");
+  return atoi(args[2]);
+}
+
+int calculate_C() {
+  printf("Calculating value for C\n");
+  return atoi(args[3]);
+}
+
+// define functions to retrieve values as needed,
+// with caching to avoid double-calculation
+int A() {
+  static int val, set=0;
+  if (!set) val=calculate_A();
+  return val;
+}
+int B() {
+  static int val, set=0;
+  if (!set) val=calculate_B();
+  return val;
+}
+int C() {
+  static int val, set=0;
+  if (!set) val=calculate_B();
+  return val;
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc!=4) {
+        fprintf(stderr, "%s must be called with 3 values for A, B and C.\n", argv[0]);
+        return 1;
+    } else {
+        args = argv;
+    }
+    // do the evaluation, with short-circuiting
+    if (((A()&gt;0) &amp;&amp; (B()&gt;5 || C() &gt; 10))) {
+        printf("condition was true\n");
+    } else {
+        printf("condition was false\n");
+    }
+    return 0;
+}
+</code></pre>
+</div>
+<span class="comment-copy">How will you evaluate the formulae when the corresponding values are unknown? You should be creating a function to execute this formulae and make a call to this function when you are sure that all the values are known</span>
+<span class="comment-copy">Python does this anyway, it's called <a href="https://docs.python.org/3/library/stdtypes.html#boolean-operations-and-or-not" rel="nofollow noreferrer">short circuiting</a></span>
+<span class="comment-copy">The term you're looking for is called "Partial Evaluation". Normally, partially evaluating <code>f(AB,B,C)</code> for <code>A=-1</code> will give you some function <code>g(B,C)</code> but as your example shows <code>g(B,C)</code> does not necessarily depend on either B or C. There are many similar variants. E.g. <code>f(A,B,C)=A*B*C</code> can be partially evaluated for <code>A=0</code>.</span>
+<span class="comment-copy">@cateof: There's really no general answer possible. The toughest level of partial evaluation would run a variant of Boolean Satisfiability on the partially evaluated formula to determine if there are any possible inputs for which the remaining formula would be true, and then the same for false. If either produces an empty set, <code>B</code> doesn't need to be evaluated. But what if that takes a week? Exactly how hard is B to compute? This would be far beyond the scope of a comment or even a StackOverflow question to completely address. You could even calculate B <b>while</b> figuring out if matters.</span>
+<span class="comment-copy">Most of the answers here don't actually show you how to use Python and C together to calculate B only if needed based on standard left-to-right short-circuiting behavior. I updated my answer to do that.</span>
+<span class="comment-copy">A duplicate of 2 other answers.</span>
+<span class="comment-copy">@ivan_pozdeev I can't tell which ones you mean. At any rate, I've now made it more complete, with a C interface and logic to evaluate the expression incrementally, rather than just indicating whether it can be evaluated.</span>
+<span class="comment-copy">Update: I've dropped the approach of looking up variable values based on <code>NameError</code> exceptions, and now use a namespace that can automatically request and cache missing values when needed. I think this is a much cleaner solution.</span>
+<span class="comment-copy">This is a minimal approach. Tree simplification means replacing <code>false &amp;&amp; X</code> with <code>false</code>, <code>true&amp;&amp;X</code> with <code>X</code>, and <code>X &amp;&amp; X</code> with <code>X</code>. But that's just logical AND. Consider <code>A&lt;5 &amp;&amp; A&lt;10</code>. The proper simplification is <code>A&lt;5</code>.  You can see that just with a single variable and a few constants and comparisons, this becomes very hard very quickly. The general problem is NP-hard.</span>
+<span class="comment-copy">@MSalters "NP-hard" doesn't mean "unsolvable". It isn't like he's going to use 3-page expressions here.</span>
+<span class="comment-copy">Yes. However I am receiving the expression as an "std::string", it might be difficult to create the if-then-else statement</span>
+<span class="comment-copy">I understand your approach and it solves the problem, however there are a lot of corner cases here. If instead of A = -1, we set B=6, ie set B first not A, exception occurs. It will not always be take A first, then B, then C.</span>
+<span class="comment-copy">@cateof Yes, B has to be defined if beforehand if it is needed. My idea was that, having control on the steps of the evaluation, you can trigger the calculation of some variables just when, and only if, they are needed, which is interesting if they are expensive to compute. I should have some time to finish it tomorrow... :)</span>
+<span class="comment-copy">This essentially boils down to <code>eval</code>. And <code>eval</code> suffers from strict left-to-right evaluation which makes the order the expression is written in significant, as I pointed out in my answer.</span>
+<span class="comment-copy">That is true, but most languages would evaluate from left to right. Even mathematically the expression would be evaluated from left to right (I think) so I can't think of a scenario where one would try to look for B without evaluating A.</span>
+<span class="comment-copy">Correct, correct. That's my problem. Left to Right...</span>
+<span class="comment-copy"><a href="http://stackoverflow.com/questions/43516792/evaluate-an-expression-when-all-variable-are-not-known-in-advance/43644930#comment74341155_43516792" title="evaluate an expression when all variable are not known in advance">stackoverflow.com/questions/43516792/…</a></span>
+<span class="comment-copy">This is a good approach, however I don't have A(), B() or C() at compile time. The rule "A&gt;0 and B&gt;5 or C &gt; 10" will be known only at run time. I don't know if your answer can be modified in order to catch the dynamic behavior.</span>
+<span class="comment-copy">@cateof Is it safe to assume there's a C++ function you can call like <code>get_var_value("A")</code> when needed? Also, will your expression only include variables, numbers, <code>(</code>, <code>)</code>, <code>&gt;</code>, <code>&lt;</code>, <code>&gt;=</code>, <code>&lt;=</code>, <code>==</code>, <code>&amp;&amp;</code> and <code>||</code>, or could there be other terms as well? And are you only dealing with integers, or also floating point values (in the expression and variables)? To do this in C++, you would need to parse the expression, but that might not be too hard if there are only a few possible symbols.</span>
+<span class="comment-copy">After taking a stab at writing a custom parser, I'm much less sanguine about that approach. There's a lot to worry about - syntax errors, operator precedence, unary operators like <code>-</code>, scientific notation for numbers, etc. The Python approach is pretty easy and robust. Alternatively you could use a C parsing library. "C expression parser" or "C expression evaluator" are good search terms. You would need to have the parser call your value-finding function for variables instead of using pre-supplied variable values and you might need to add short-circuiting behavior. Not sure how easy that is.</span>
+<span class="comment-copy">I think that using an embedded interpreter is the way to go here.</span>

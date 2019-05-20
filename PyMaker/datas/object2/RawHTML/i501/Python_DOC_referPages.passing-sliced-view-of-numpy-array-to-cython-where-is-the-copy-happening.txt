@@ -1,0 +1,57 @@
+<div class="post-text" itemprop="text">
+<p>In the following code I am slicing an array X, thereby creating a view on X, named <code>X_cut</code>. Then I use a cython memory view on the slice and pass it as 1d array to a c function that accesses the memory linearly.</p>
+<p>Can I be sure that the pointer passed to the C code is actually referring to a 6x6 linearised matrix?</p>
+<p>If so where is the copy operation happening? Is it in <code>X_cut.ravel()</code>?</p>
+<pre><code>%%cython
+
+import numpy as np
+
+cdef extern from "/some/path/to/get_5_5.c":
+    long get5_5(long* arr, int M, int N)
+
+M = 6
+N = 8
+
+X = np.arange(M*N).reshape(M, N)
+
+N_cut = 6
+X_cut = X[:, :N_cut]
+
+cdef long[::1] arr = X_cut.ravel()
+
+print(get5_5(&amp;arr[0], M, N_cut))
+</code></pre>
+<p>/some/path/to/get_5_5.c</p>
+<pre><code>long get5_5(long* arr, int M, int N) {
+  return arr[5*N + 5];
+}
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Cython's typed memory views use <a href="https://docs.python.org/3/c-api/buffer.html" rel="nofollow noreferrer">Buffer-Protocol</a> to get access to the data, that means they have nothing to do with copying of the data. </p>
+<p>Theoretically, an exporter could decide to copy the data when exposing it via Buffer-Protocol. However, usually Buffer-Protocol is used in order to avoid memory-copying, so copying is not the normal case. That means, you cannot be 100% sure, that no copying is happening when binding a typed memory view to an object exporting the buffer - you have to know the implementation of the exporter, but the cases of copying are really rare. And this is not what happening here.</p>
+<p>The copying must happen, when <code>X_cut.ravel()</code> is called - the <a href="https://docs.scipy.org/doc/numpy-1.15.0/reference/generated/numpy.ravel.html#numpy-ravel" rel="nofollow noreferrer">resulting memory must be contiguous</a>, but the underlying memory in <code>X_cut</code> isn't (see <code>X_cut.flags</code>), because it still shares memory with <code>X</code> and cutting off the last elements per row results in "holes" in memory.</p>
+<p>Here are the memory layouts (for simplicity M=2, N=3, N_cut=2):</p>
+<pre><code>  X:               X00,X01,X02,X10,X11,X12
+  X_cut:           X00,X01,...,X10,X11        # ... - hole in memory, no copying
+  X_cut.ravel():   X00,X01,X10,X11            # memory contiguous, copying needed
+</code></pre>
+<hr/>
+<p>Where does it leave you? You either have to accept the copying of the memory or extend the interface of <code>get5_5</code>, so you can also pass non-contiguous memory layouts - not unsimilar to the Buffer-Protocol. </p>
+<p>For example to pass <code>X_cut</code> without copying you will need to specify not (only) the shape, but also the strides along the dimensions, i.e.</p>
+<pre><code>#only stride along the the first dimension is needed:
+cdef long get5_5(long* arr, int stride_row, int stride_col):
+     return arr[stride_row*5+5]
+</code></pre>
+<p>The question is, how to get the pointer <code>long* arr</code> from <code>X_cut</code> without copying. </p>
+<p>One possibility is to use 2D-memory view I would choose this option):</p>
+<pre><code>cdef long[:,::1] arr = X_cut
+get5_5(&amp;arr[0][0], M, N) # and not M, N_cut
+</code></pre>
+<p>another would be to use <code>np.reshape(-1)</code>, which creates a new 1-dimensional-view and doesn't <strong>always</strong> copy the data (unlike <code>np.ravel()</code>):</p>
+<pre><code>cdef long[::1] arr = X.reshape(-1) # X_cut.reshape(-1) would copy the data!
+get5_5(&amp;arr[0], M, N)  # and not M, N_cut
+</code></pre>
+</div>
+<span class="comment-copy">This then raises a question - if the buffer protocol <i>could</i> copy, should it be used to modify arrays in place? (In practice it's fine for most real cases, of course). I'd think that a well-behaved buffer should give you access to the actual memory of an object and not a copy, although it might be acceptable to change how an object stores it's data before returning the buffer if you knew there were no other references to that data.</span>
+<span class="comment-copy">@DavidW I would be stuggling to name any widely used example where this happens, but it is technically possible - so I just trying to convey one cannot be 100% sure.</span>

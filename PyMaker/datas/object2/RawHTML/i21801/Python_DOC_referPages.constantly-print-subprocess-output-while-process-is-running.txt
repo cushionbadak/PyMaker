@@ -1,0 +1,276 @@
+<div class="post-text" itemprop="text">
+<p>To launch programs from my Python-scripts, I'm using the following method:</p>
+<pre><code>def execute(command):
+    process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    output = process.communicate()[0]
+    exitCode = process.returncode
+
+    if (exitCode == 0):
+        return output
+    else:
+        raise ProcessException(command, exitCode, output)
+</code></pre>
+<p>So when i launch a process like <code>Process.execute("mvn clean install")</code>, my program waits until the the process is finished, and only then i get the complete output of my program. This is annoying if i'm running a process that takes a while to finish.</p>
+<p>Can i let my program write the process output line by line, by polling the process output before it finishes in a loop or something?</p>
+<p>**[EDIT]
+Sorry i didn't search very well before posting this question. Threading is actually the key. Found an example here which shows how to do it: **
+<a href="https://stackoverflow.com/questions/984941/python-subprocess-popen-from-a-thread">Python Subprocess.Popen from a thread</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can use <a href="https://docs.python.org/3/library/functions.html#iter" rel="noreferrer">iter</a> to process lines as soon as the command outputs them: <code>lines = iter(fd.readline, "")</code>. Here's a full example showing a typical use case (thanks to @jfs for helping out):</p>
+<pre><code>from __future__ import print_function # Only Python 2.x
+import subprocess
+
+def execute(cmd):
+    popen = subprocess.Popen(cmd, stdout=subprocess.PIPE, universal_newlines=True)
+    for stdout_line in iter(popen.stdout.readline, ""):
+        yield stdout_line 
+    popen.stdout.close()
+    return_code = popen.wait()
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, cmd)
+
+# Example
+for path in execute(["locate", "a"]):
+    print(path, end="")
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Ok i managed to solve it without threads (any suggestions why using threads would be better are appreciated) by using a snippet from this question <a href="https://stackoverflow.com/questions/527197/intercepting-stdout-of-a-subprocess-while-it-is-running">Intercepting stdout of a subprocess while it is running</a></p>
+<pre><code>def execute(command):
+    process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    # Poll process for new output until finished
+    while True:
+        nextline = process.stdout.readline()
+        if nextline == '' and process.poll() is not None:
+            break
+        sys.stdout.write(nextline)
+        sys.stdout.flush()
+
+    output = process.communicate()[0]
+    exitCode = process.returncode
+
+    if (exitCode == 0):
+        return output
+    else:
+        raise ProcessException(command, exitCode, output)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>To print subprocess' output line-by-line as soon as its stdout buffer is flushed in Python 3:</p>
+<pre><code>from subprocess import Popen, PIPE, CalledProcessError
+
+with Popen(cmd, stdout=PIPE, bufsize=1, universal_newlines=True) as p:
+    for line in p.stdout:
+        print(line, end='') # process line here
+
+if p.returncode != 0:
+    raise CalledProcessError(p.returncode, p.args)
+</code></pre>
+<p>Notice: you do not need <code>p.poll()</code> -- the loop ends when eof is reached. And you do not need <code>iter(p.stdout.readline, '')</code> -- the read-ahead bug is fixed in Python 3.</p>
+<p>See also, <a href="https://stackoverflow.com/a/17698359/4279">Python: read streaming input from subprocess.communicate()</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>@tokland</p>
+<p>tried your code and corrected it for 3.4 and windows
+dir.cmd is a simple dir command, saved as cmd-file</p>
+<pre><code>import subprocess
+c = "dir.cmd"
+
+def execute(command):
+    popen = subprocess.Popen(command, stdout=subprocess.PIPE,bufsize=1)
+    lines_iterator = iter(popen.stdout.readline, b"")
+    while popen.poll() is None:
+        for line in lines_iterator:
+            nline = line.rstrip()
+            print(nline.decode("latin"), end = "\r\n",flush =True) # yield line
+
+execute(c)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>For anyone trying the answers to this question to get the stdout from a Python script note that Python buffers its stdout, and therefore it may take a while to see the stdout.</p>
+<p>This can be rectified by adding the following after each stdout write in the target script:</p>
+<pre><code>sys.stdout.flush()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>In case someone wants to read from both <code>stdout</code> and <code>stderr</code> at the same time using threads, this is what I came up with:</p>
+<pre><code>import threading
+import subprocess
+import Queue
+
+class AsyncLineReader(threading.Thread):
+    def __init__(self, fd, outputQueue):
+        threading.Thread.__init__(self)
+
+        assert isinstance(outputQueue, Queue.Queue)
+        assert callable(fd.readline)
+
+        self.fd = fd
+        self.outputQueue = outputQueue
+
+    def run(self):
+        map(self.outputQueue.put, iter(self.fd.readline, ''))
+
+    def eof(self):
+        return not self.is_alive() and self.outputQueue.empty()
+
+    @classmethod
+    def getForFd(cls, fd, start=True):
+        queue = Queue.Queue()
+        reader = cls(fd, queue)
+
+        if start:
+            reader.start()
+
+        return reader, queue
+
+
+process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+(stdoutReader, stdoutQueue) = AsyncLineReader.getForFd(process.stdout)
+(stderrReader, stderrQueue) = AsyncLineReader.getForFd(process.stderr)
+
+# Keep checking queues until there is no more output.
+while not stdoutReader.eof() or not stderrReader.eof():
+   # Process all available lines from the stdout Queue.
+   while not stdoutQueue.empty():
+       line = stdoutQueue.get()
+       print 'Received stdout: ' + repr(line)
+
+       # Do stuff with stdout line.
+
+   # Process all available lines from the stderr Queue.
+   while not stderrQueue.empty():
+       line = stderrQueue.get()
+       print 'Received stderr: ' + repr(line)
+
+       # Do stuff with stderr line.
+
+   # Sleep for a short time to avoid excessive CPU use while waiting for data.
+   sleep(0.05)
+
+print "Waiting for async readers to finish..."
+stdoutReader.join()
+stderrReader.join()
+
+# Close subprocess' file descriptors.
+process.stdout.close()
+process.stderr.close()
+
+print "Waiting for process to exit..."
+returnCode = process.wait()
+
+if returnCode != 0:
+   raise subprocess.CalledProcessError(returnCode, command)
+</code></pre>
+<p>I just wanted to share this, as I ended up on this question trying to do something similar, but none of the answers solved my problem. Hopefully it helps someone!</p>
+<p>Note that in my use case, an external process kills the process that we <code>Popen()</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>In Python &gt;= 3.5 using <code>subprocess.run</code> works for me:</p>
+<pre><code>import subprocess
+
+cmd = 'echo foo; sleep 1; echo foo; sleep 2; echo foo'
+subprocess.run(cmd, shell=True)
+</code></pre>
+<p>(getting the output during execution also works without <code>shell=True</code>)
+<a href="https://docs.python.org/3/library/subprocess.html#subprocess.run" rel="nofollow noreferrer">https://docs.python.org/3/library/subprocess.html#subprocess.run</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This PoC constantly reads the output from a process and can be accessed when needed. Only the last result is kept, all other output is discarded, hence prevents the PIPE from growing out of memory:</p>
+<pre><code>import subprocess
+import time
+import threading
+import Queue
+
+
+class FlushPipe(object):
+    def __init__(self):
+        self.command = ['python', './print_date.py']
+        self.process = None
+        self.process_output = Queue.LifoQueue(0)
+        self.capture_output = threading.Thread(target=self.output_reader)
+
+    def output_reader(self):
+        for line in iter(self.process.stdout.readline, b''):
+            self.process_output.put_nowait(line)
+
+    def start_process(self):
+        self.process = subprocess.Popen(self.command,
+                                        stdout=subprocess.PIPE)
+        self.capture_output.start()
+
+    def get_output_for_processing(self):
+        line = self.process_output.get()
+        print "&gt;&gt;&gt;" + line
+
+
+if __name__ == "__main__":
+    flush_pipe = FlushPipe()
+    flush_pipe.start_process()
+
+    now = time.time()
+    while time.time() - now &lt; 10:
+        flush_pipe.get_output_for_processing()
+        time.sleep(2.5)
+
+    flush_pipe.capture_output.join(timeout=0.001)
+    flush_pipe.process.kill()
+</code></pre>
+<p>print_date.py</p>
+<pre><code>#!/usr/bin/env python
+import time
+
+if __name__ == "__main__":
+    while True:
+        print str(time.time())
+        time.sleep(0.01)
+</code></pre>
+<p>output: You can clearly see that there is only output from ~2.5s interval nothing in between.</p>
+<pre><code>&gt;&gt;&gt;1520535158.51
+&gt;&gt;&gt;1520535161.01
+&gt;&gt;&gt;1520535163.51
+&gt;&gt;&gt;1520535166.01
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This works at least in Python3.4</p>
+<pre><code>import subprocess
+
+process = subprocess.Popen(cmd_list, stdout=subprocess.PIPE)
+for line in process.stdout:
+    print(line.decode().strip())
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>To answer the original question, the best way IMO is just redirecting subprocess <code>stdout</code> directly to your program's <code>stdout</code> (optionally, the same can be done for <code>stderr</code>, as in example below)</p>
+<pre><code>p = Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
+p.communicate()
+</code></pre>
+</div>
+<span class="comment-copy">Thread instead of subprocess, i think</span>
+<span class="comment-copy">No, you don't need threads. The entire piping idea works because you can get read/write from processes while they are running.</span>
+<span class="comment-copy">related: <a href="http://stackoverflow.com/a/17698359/4279">Python: read streaming input from subprocess.communicate()</a></span>
+<span class="comment-copy">I've tried this code (with a program that takes significant time to run) and can confirm it outputs lines as they're received, rather than waiting for execution to complete. This is the superior answer imo.</span>
+<span class="comment-copy">Note: In Python 3, you could use <code>for line in popen.stdout: print(line.decode(), end='')</code>. To support both Python 2 and 3, use bytes literal: <code>b''</code> otherwise <code>lines_iterator</code> never ends on Python 3.</span>
+<span class="comment-copy">The problem with this approach is that if the process pauses for a bit without writing anything to stdout there is no more input to read. You will need a loop to check whether or not the process has finished. I tried this using subprocess32 on python 2.7</span>
+<span class="comment-copy">it should work. To polish it, you could add <code>bufsize=1</code> (it may improve performance on Python 2), close the <code>popen.stdout</code> pipe explicitly (without waiting for the garbage collection to take care of it), and raise <code>subprocess.CalledProcessError</code> (like <code>check_call()</code>, <code>check_output()</code> do). The <code>print</code> statement is different on Python 2 and 3: you could use the softspace hack <code>print line,</code> (note: comma) to avoid doubling all newlines like your code does and passing <code>universal_newlines=True</code> on Python 3, to get text instead of bytes—<a href="http://stackoverflow.com/a/17698359/4279">related answer</a>.</span>
+<span class="comment-copy">@binzhang That's not an error, stdout is buffered by default on Python scripts (also for many Unix tools). Try <code>execute(["python", "-u", "child_thread.py"])</code>. More info: <a href="http://stackoverflow.com/questions/14258500/python-significance-of-u-option" title="python significance of u option">stackoverflow.com/questions/14258500/…</a></span>
+<span class="comment-copy">Merging the ifischer's and tokland's code works quite well (I had to change <code>print line,</code> to <code>sys.stdout.write(nextline); sys.stdout.flush()</code>. Otherwise, it would print out every two lines. Then again, this is using IPython's Notebook interface, so maybe something else was happening - regardless, explicitly calling <code>flush()</code> works.</span>
+<span class="comment-copy">mister you're my life saver!! really strange that this kind of things are not build-in in library itself.. cause if I write cliapp, i want to show everything what's processing in loop instantly.. s'rsly..</span>
+<span class="comment-copy">Can this solution be modified to constantly print <i>both</i> output and errors?  If I change <code>stderr=subprocess.STDOUT</code> to <code>stderr=subprocess.PIPE</code> and then call <code>process.stderr.readline()</code> from within the loop, I seem to run afoul of the very deadlock that is warned about in the documentation for the <code>subprocess</code> module.</span>
+<span class="comment-copy">@DavidCharles I think what you're looking for is <code>stdout=subprocess.PIPE,stderr=subprocess.STDOUT</code> this captures stderr, and I believe (but I've not tested) that it also captures stdin.</span>
+<span class="comment-copy">thanks for waiting for exit code. Didn't know how to work it out</span>
+<span class="comment-copy">This solution worked for me. The accepted solution given above just went on printing blank lines for me.</span>
+<span class="comment-copy">I did have to add sys.stdout.flush() to get prints immediately.</span>
+<span class="comment-copy">@Codename: you shouldn't need <code>sys.stdout.flush()</code> in the parent -- stdout is line-buffered if it is not redirected to a file/pipe and therefore printing <code>line</code> flushes the buffer automatically. You don't need <code>sys.stdout.flush()</code> in the child too -- pass <code>-u</code> command-line option instead.</span>
+<span class="comment-copy">@ J.F. Sebastian Sorry, I should have mentioned that I am redirecting the output to a file.</span>
+<span class="comment-copy">@Codename: if you want to use <code>&gt;</code> then run <code>python -u your-script.py &gt; some-file</code>. Notice: <code>-u</code> option that I've mentioned above (no need to use <code>sys.stdout.flush()</code>).</span>
+<span class="comment-copy">you could <a href="http://stackoverflow.com/a/28319191/4279">simplify your code</a>. <code>iter()</code> and <code>end='\r\n'</code> are unnecessary. Python uses universal newlines mode by default i.e., any <code>'\n'</code> is translated to <code>'\r\n'</code> during printing. <code>'latin'</code> is probably a wrong encoding, you could use <code>universal_newlines=True</code> to get text output in Python 3 (decoded using locale's preferred encoding). Don't stop on <code>.poll()</code>, there could be buffered unread data. If Python script is running in a console then its output is line-buffered; you can force line-buffering using <code>-u</code> option -- you don't need <code>flush=True</code> here.</span>
+<span class="comment-copy">But running Python as a subprocess of Python is crazy in the first place. Your script should simply <code>import</code> the other script; look into <code>multiprocessing</code> or <code>threading</code> if you need parallelized execution.</span>
+<span class="comment-copy">@triplee There are several scenarios in which running Python as a subprocess of Python is appropriate. I have a number of python batch scripts that I wish to run sequentially, daily. These can be orchestrated by a master Python script that initiates the execution, and emails me if the child script fails. Each script is sandboxed from the other - no naming conflicts. I'm not parallelising so multiprocessing and threading aren't relevant.</span>
+<span class="comment-copy">Care to explain the downvote?</span>
+<span class="comment-copy">Can anyone explain downvotes? If there's a problem with this code, I'd love to learn. Thanks!</span>
+<span class="comment-copy">I've had to use something almost exactly like this for python2.   While something like this should have been provided in python2, it is not so something like this is absolutely fine.</span>

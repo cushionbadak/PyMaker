@@ -1,0 +1,138 @@
+<div class="post-text" itemprop="text">
+<p>I have a function let's say <code>def temp</code>.i am mocking it the following way:</p>
+<pre><code>msg = "Mocked!!!!!!!"
+@mock.patch.object(Someothermodule.Someclass,'Somefunction',create=True,side_effect=Error(Error.something,msg))
+
+def temp(self,mock_A):
+</code></pre>
+<p>Its a huge project so cant post the details here.But what's happening is the function <code>temp</code> does get mocked and i do get the correct message but later on i get <code>stop called on unstarted patcher</code> and the program fails.Is there any workaround here,which somehow disables the <code>_exit</code> of <code>mock</code> or any other method.i guess the contents is somehow insufficient to create the whole scenario but that's d best i can do.</p>
+<p>Also,
+what happens if i dont provide <code>mock_A</code> to function <code>def temp</code>.What does the patch work on in that case?</p>
+<p>EDIT:</p>
+<p>I have got a workaround wherein i have defined my patch as follows:</p>
+<pre><code>@mock.patch.object(Someothermodule.Someclass,'Somefunction',create=True,some_function)
+def temp(self):
+</code></pre>
+<p>Now the question is </p>
+<p>1)When i used <code>side_effect</code> or <code>return_value</code> i had to provide a <code>mock_object</code> to the function following the decorator.</p>
+<p>2)When i just used a function instead of <code>side_effect</code>,i need not provide a mock_object to the function following the decorator..</p>
+<p>So,</p>
+<p><code>When we dont pass mock_obj,do all the function know about the patch?how exactly is this working?What is the difference between the scenario wherein we have to explicitly pass mock_object and wherein we dont have to?</code></p>
+<p>(P.S is this something to do with <code>new_callable</code> thing in the definition of <code>patch</code>.)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>First base things about <a href="https://docs.python.org/3/library/unittest.mock.html#patch" rel="noreferrer"><code>patch</code></a>:</p>
+<blockquote>
+<p>Inside the body of the function or with statement, the target is
+  patched with a new object. When the function/with statement exits the
+  patch is undone.</p>
+<p>If <code>new</code> is omitted, then the target is replaced with a <code>MagicMock</code>. If
+  <code>patch()</code> is used as a decorator and new is omitted, the created mock is
+  passed in as an extra argument to the decorated function. If <code>patch()</code>
+  is used as a context manager the created mock is returned by the
+  context manager.</p>
+</blockquote>
+<p>The first one tell us that patch act as context manager in the body of the function (decorator case). The second one tell if you don't specify <code>new</code> argument (the first after targeting arguments in <code>patch</code> class function) patch create a new <code>MagicMock()</code> object to patch the target and <em>the created mock is passed in as an extra argument to the decorated function</em>.</p>
+<p>That explain the last section of the question because by</p>
+<pre><code>@mock.patch.object(Someothermodule.Someclass,'Somefunction',create=True,some_function)
+def temp(self):
+</code></pre>
+<p>you replace <code>Someothermodule.Someclass.Somefunction</code> by <code>some_function</code> <em>object</em> and <code>patch</code> decorator doesn't need to pass it to <code>temp</code>. </p>
+<p>Now come back to the root of the question: the <code>stop called on unstarted patcher</code> error message.</p>
+<p>That means you try to remove the patch more that once. How could it possible? </p>
+<p>If you took a look to <a href="https://hg.python.org/cpython/file/3.4/Lib/unittest/mock.py#l1302" rel="noreferrer"><code>mock.py</code></a> code you can easily understand that patch doesn't support stack of patches and it was designed to be executed just one time per context. In other words if you try to patch something that is already patched in your context you will get the same error. At the end of the answer I provided a synthetic example that generate the error.</p>
+<p>Without saw your code I can just do some guess and speculations about why your issue <em>seams</em> fixed if you don't use mock but patch your method by a function. IMHO it work just by chance and you playing with some kind of race condition.</p>
+<p>What I can do is give you a way to catch your problem and a <em>good work around</em>.</p>
+<p>To catch if you are calling <code>__exit__</code> more that once in your patch simply use <code>patch</code> as a contex manager and override <code>__exit__</code>. An untested way to do it could be:</p>
+<pre><code>def my_wrapper(f):
+    count = 0
+    @functools.wraps(f)
+    def exit(*args, **kwargs):
+        count += 1
+        print ("EXIT CALL {}".format(count))
+        f(*args, **kwargs)
+
+def temp(self):
+   patcher = mock.patch.object(Someothermodule.Someclass,'Somefunction',create=True,side_effect=Error(Error.something,msg))
+   patcher.__exit__ = my_wrapper(patcher.__exit__)
+   with patcher as mock_A:
+       #... your stuff
+</code></pre>
+<p>Finally the workaround (to use just if you don't find any way to fix the double call)</p>
+<pre><code>class MyStackPatch():
+    def __init__(p):
+        self._patcher = p
+        self._count = 0
+        self._lock = threading.RLock()
+
+    def __enter__(self):
+        with self._lock:
+            if not self._count:
+                self._patcher.start()
+            self._count += 1
+
+    def __exit__(self, *exc_info):
+        with self._lock:
+            self._count -= 1
+            if not self._count:
+                self._patcher.stop()
+
+
+def temp(self):
+    patcher = mock.patch.object(Someothermodule.Someclass,'Somefunction',create=True,side_effect=Error(Error.something,msg))
+    with MyStackPatch(patcher) as mock_A:
+        #... your stuff
+</code></pre>
+<p>It easy to extend it and write the decorator too... but I think it is enough for a workaround.</p>
+<hr/>
+<p>That is a synthetic example that generate <code>stop called on unstarted patcher</code> error message. To generate it we must call patch one more time while we are just in patch context. We can do it by recursion or by threads, recursion is something really strange in this context.</p>
+<p><code>target</code> call patched method and start a new thread that call <code>t()</code> too. I used an <code>Event()</code> to force the error and make the race condition always true. </p>
+<pre><code>import threading
+from mock import patch
+
+def somemethod():
+    pass
+
+e = threading.Event()
+
+@patch("__main__.somemethod")
+def t(state,m):
+    if state:
+        e.set()
+        while e.is_set():
+            e.wait(.5)
+    somemethod()
+
+def target():
+    threading.Thread(target=t,args=(True,)).start()
+    while not e.is_set():
+        e.wait(.1)
+    t(False)
+    e.clear()
+
+target()
+</code></pre>
+<blockquote>
+<pre><code>/usr/bin/python2.7 /home/damico/PycharmProjects/untitled1/mock_and_thread.py
+Exception in thread Thread-1:
+Traceback (most recent call last):
+  File "/usr/lib/python2.7/threading.py", line 810, in __bootstrap_inner
+    self.run()
+  File "/usr/lib/python2.7/threading.py", line 763, in run
+    self.__target(*self.__args, **self.__kwargs)
+  File "/usr/local/lib/python2.7/dist-packages/mock.py", line 1214, in patched
+    patching.__exit__(*exc_info)
+  File "/usr/local/lib/python2.7/dist-packages/mock.py", line 1376, in __exit__
+    raise RuntimeError('stop called on unstarted patcher')
+RuntimeError: stop called on unstarted patcher
+</code></pre>
+</blockquote>
+</div>
+<span class="comment-copy">have you something like <code>patch.stopall()</code> in your project? I can give you some workaround but is better find where the problem is.</span>
+<span class="comment-copy">@Micheled'Amico no i am inserting <code>mock</code> the first time :(...please have a look at the edited question</span>
+<span class="comment-copy">Your <i>work around</i> is like pass <code>some_function</code> as <code>new</code> keyword arg and so <code>patch</code> replace the <code>Somefunction</code> method by <code>some_function</code> and not by a new <code>MagicMock</code> object. That means you don't need to pass <code>mock_A</code> argument to your test function because you already know what is the object. In the original case <code>patch</code> create a <code>MagicMock</code> object that use patch <code>Somefunction</code> method and use it to call <code>temp</code> as additional argument. I've no time now to go deep in your issue... maybe later. Can you post <code>temp</code> function code?</span>
+<span class="comment-copy">@Micheled'Amico <code>temp</code> code is actually complex with many threads.One of the many threads call the function being patched .I still dont get why the first one failed and second one passed.Maybe when you free you can offer some insight!!!!!!!!! :)</span>
+<span class="comment-copy">Can you little bit clear in your example? It seams to me you don't need a mock but just patch and create a new method in a class that raise an exception. Mocks are little bit more complex and designed for testing: they record all call and give to you tools to checks them. Moreover you need that the patch context is active just for <code>temp</code> context or you need it for all running cycle? If you call <code>temp</code> asynchronous  from two thread maybe that is the root cause of your issue.</span>
+<span class="comment-copy">Can you just give a brief explanation of how your example generater that error....i mean what exactly triggered that error.new to threads .</span>
+<span class="comment-copy">@vks take a look if it is clear now</span>
+<span class="comment-copy">Yeah dat clears up a bit......will be reading the thread module more to get insights!!!!!!!!thanx a lot ......this is a great answer......this should have had more upvotes.... :)</span>

@@ -1,0 +1,104 @@
+<div class="post-text" itemprop="text">
+<p>In an answer to <a href="https://stackoverflow.com/questions/34858088/truncating-a-text-file-does-not-change-the-file">another question</a>, an odd behavior was observed, specific to Python 3. The <a href="https://docs.python.org/3/library/io.html#io.IOBase.truncate" rel="nofollow noreferrer">documentation for the <code>truncate</code> command</a> states (emphasis mine):</p>
+<blockquote>
+<p>Resize the stream to the given size in bytes <strong>(or the current position if size is not specified)</strong>. The current stream position isn’t changed. This resizing can extend or reduce the current file size. In case of extension, the contents of the new file area depend on the platform (on most systems, additional bytes are zero-filled). <strong>The new file size is returned.</strong></p>
+</blockquote>
+<p>However...</p>
+<pre><code>&gt;&gt;&gt; open('temp.txt', 'w').write('ABCDE\nFGHIJ\nKLMNO\nPQRST\nUVWXY\nZ\n')
+32
+&gt;&gt;&gt; f = open('temp.txt', 'r+')
+&gt;&gt;&gt; f.readline()
+'ABCDE\n'
+&gt;&gt;&gt; f.tell()
+6                   # As expected, current position is 6 after the readline
+&gt;&gt;&gt; f.truncate()
+32                  # ?!
+</code></pre>
+<p>Instead of truncating at the current position (6), it truncated at the end of the file (i.e. not at all). This was verified by checking the file on disk.</p>
+<p>This process works as expected (file truncated to 6 bytes) in Python 2, and also in Python 3 using a <code>StringIO</code> instead of a file. Why is it not working as expected with files in Python 3? Is this a bug?</p>
+<p>(Edit: it also works properly if an explicit <code>f.seek(6)</code> is given right before the <code>truncate</code>.)</p>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>&gt;&gt;&gt; open('temp.txt', 'w').write('ABCDE\nFGHIJ\nKLMNO\nPQRST\nUVWXY\nZ\n')
+32
+&gt;&gt;&gt; f = open('temp.txt', 'r+')
+&gt;&gt;&gt; f.readline()
+'ABCDE\n'
+&gt;&gt;&gt; f.seek(6) 
+&gt;&gt;&gt; f.truncate()
+</code></pre>
+<p>This fixes the issue if nothing else, as to why this happens I have no idea but it would be a good thing to report this up-stream if it isn't already.</p>
+<p>These are the only textural differences to the <code>truncate()</code> functions between Python3 and Python2 that I could find (except for related function calls within the truncate function itself obviously):</p>
+<pre><code>33,34c33,34
+&lt;             except AttributeError as err:
+&lt;                 raise TypeError("an integer is required") from err
+---
+&gt;             except AttributeError:
+&gt;                 raise TypeError("an integer is required")
+54c54
+&lt;         """Truncate size to pos, where pos is an int."""
+---
+&gt;         """Truncate size to pos."""
+</code></pre>
+<p>I'm sure someone will slap my fingers on the subject, but I think it's more related to the <code>flush()</code> calls and how the buffer is handled once you call flush. Almost as if it doesn't reset to it's previous position after flushing all the I/O. it's a wild assumption with no technical stuff to back it up yet, but it would be my first guess.</p>
+<p>Checked into the <code>flush()</code> situation, here's the only difference between the two, of which Python2 performs the following operation that Python3 does not (even lacks the source code for it):</p>
+<pre><code>def _flush_unlocked(self):
+    if self.closed:
+        raise ValueError("flush of closed file")
+    while self._write_buf:
+        try:
+            n = self.raw.write(self._write_buf)
+        except BlockingIOError:
+            raise RuntimeError("self.raw should implement RawIOBase: it "
+                               "should not raise BlockingIOError")
+        except IOError as e:
+            if e.errno != EINTR:
+                raise
+            continue
+        if n is None:
+            raise BlockingIOError(
+                errno.EAGAIN,
+                "write could not complete without blocking", 0)
+        if n &gt; len(self._write_buf) or n &lt; 0:
+            raise IOError("write() returned incorrect number of bytes")
+        del self._write_buf[:n]
+</code></pre>
+<p>It's a function of <code>BufferedWriter</code> which appears to be used in this I/O operation.<br/>
+Now I'm late for a date so gotta dash, will be interesting to see what you guys find in the mean time! </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I opened <a href="http://bugs.python.org/issue26158" rel="nofollow">an issue</a> on the Python issue tracker for this, and the answer appears to be related to buffering:</p>
+<pre><code>&gt;&gt;&gt; open('temp.txt', 'w').write('ABCDE\nFGHIJ\nKLMNO\nPQRST\nUVWXY\nZ\n')
+32
+&gt;&gt;&gt; f = open('temp.txt', 'r+')
+&gt;&gt;&gt; f.readline()
+'ABCDE\n'
+&gt;&gt;&gt; f.tell()
+6
+&gt;&gt;&gt; f.buffer.tell()
+32
+</code></pre>
+<p>For some reason, <code>truncate</code> works with the buffer position, rather than the high-level stream position. This isn't actually limited to <code>truncate</code>, and creates other unexpected results, such as:</p>
+<pre><code>&gt;&gt;&gt; open('temp.txt', 'w').write('ABCDE\nFGHIJ\nKLMNO\nPQRST\nUVWXY\nZ\n')
+32
+&gt;&gt;&gt; f = open('temp.txt', 'r+')
+&gt;&gt;&gt; f.readline()
+'ABCDE\n'
+&gt;&gt;&gt; f.write('test')
+4
+&gt;&gt;&gt; f.close()
+&gt;&gt;&gt; open('temp.txt').read()
+'ABCDE\nFGHIJ\nKLMNO\nPQRST\nUVWXY\nZ\ntest'
+</code></pre>
+<p>A developer <a href="http://bugs.python.org/issue26158#msg258619" rel="nofollow">has stated</a> that there is an issue here, although I'm not entirely sure from his statement what the issue is. It looks to be marked for patching, though.</p>
+</div>
+<span class="comment-copy">Does this behavior still occur if you <code>close</code> the first file object before opening the second?</span>
+<span class="comment-copy">@Kevin Yes. (comment padding)</span>
+<span class="comment-copy">Does this behavior work the same way with context managing <code>with ... as f</code> and also which specific version of python 3 are you using? Could you also do <code>f.seek(6)</code> first and then <code>f.truncate()</code>? I was unaware of this bug and would like to the things mentioned but I'm on the go. <i>(I'm aware that <code>with ...</code> is just wrapping around <code>f = open()</code> but again, odd glitches and slip-ups can be found in all theoretical implementations)</i></span>
+<span class="comment-copy">@Torxed Just edited to add that an explicit <code>seek</code> before the <code>truncate</code> does work properly. I've tried 3.4.1 and 3.4.3. It's been duplicated by others but I can't speak to their specific versions.</span>
+<span class="comment-copy">@glibdud Not sure if I should write an answer or not to this. But I'm glad that <code>.truncate()</code> doesn't break a <code>.seek(x)</code> by implicitly calling it's own seek before hand.</span>
+<span class="comment-copy">Created <a href="http://bugs.python.org/issue26158" rel="nofollow noreferrer">Issue 26158</a> if you want to add your details when you're available.</span>
+<span class="comment-copy">@glibdud I would just like to inform you that I still follow this issue and that I haven't added any additional feedback yet since you guys cleared most of the ground and you pointed back to this SO question which I think is enough information for now. I'll follow this issue closely until it's solved since it interests me as well for numerous projects I've been involved in hehe.</span>
+<span class="comment-copy">Odd considering that the developers even added "should we do .seek() here"  in the truncate functions in _pyio.py</span>
+<span class="comment-copy">@Torxed He provided an example using UTF-7 to show the perils of trying to do anything with positioning in a text-mode file. It's a fair point, but it would be nice if they'd at least special-case UTF8, ASCII, and any other more straightforward encodings to work as expected.</span>
+<span class="comment-copy">i fully agree with you.</span>

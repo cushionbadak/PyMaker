@@ -1,0 +1,103 @@
+<div class="post-text" itemprop="text">
+<p>I am attempting to take the source code of a function, add code to it, and then put it back in the original function.</p>
+<p>Basically like so:</p>
+<pre><code>new_code = change_code(original_code)
+throwaway_module = ModuleType('m')
+exec(new_code, throwaway_module.__dict__)
+func.__code__ = getattr(throwaway_module, func.__name__).__code__
+</code></pre>
+<p>This works perfectly when <code>new_code</code> doesn't contain any name which wasn't in the original function.</p>
+<p>However when <code>new_code</code> contains a variable name which wasn't there in the original <code>func</code>, then on the last line I get the following error:</p>
+<pre><code>ValueError: func() requires a code object with 1 free vars, not 0
+</code></pre>
+<p>Any ideas?</p>
+<p>EDIT:</p>
+<p>It seems I have found where in the CPython source code this exception is raised (file funcobject.c). Omitted some lines for clarity:</p>
+<pre><code>static int
+func_set_code(PyFunctionObject *op, PyObject *value, void *Py_UNUSED(ignored))
+{
+    Py_ssize_t nfree, nclosure;
+
+    // ... lines omitted
+
+    nfree = PyCode_GetNumFree((PyCodeObject *)value);
+    nclosure = (op-&gt;func_closure == NULL ? 0 :
+            PyTuple_GET_SIZE(op-&gt;func_closure));
+    if (nclosure != nfree) {
+        PyErr_Format(PyExc_ValueError,
+                     "%U() requires a code object with %zd free vars,"
+                     " not %zd",
+                     op-&gt;func_name,
+                     nclosure, nfree);
+        return -1;
+    }
+    Py_INCREF(value);
+    Py_XSETREF(op-&gt;func_code, value);
+    return 0;
+}
+</code></pre>
+<p>Does this help you help me? :)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This exception is due to attempting to assign a code object to a function which closes over a different number of variables than the function it came from did. If that sentence sounded like gibberish then you should take a look at <a href="https://stackoverflow.com/a/4020443">this answer</a>.</p>
+<p>The easiest way to avoid this problem is to simply reassign the existing name in the obvious way, ie <code>f = g</code> instead of <code>f.__code__ = g.__code__</code>. By doing it this way the code object always stays with its matching closure (more on that later). In your case, that would look like <code>func = getattr(throwaway_module, func.__name__)</code>. Is there some reason you can't do this and were mucking around with internal implementation details instead?</p>
+<p>In order to better illustrate what's happening here, suppose we have some silly functions.</p>
+<pre><code>def dog():
+    return "woof"
+
+def cat():
+    return "meow"
+
+def do_stuff(seq):
+    t1 = sum(seq)
+    seq2 = [e + t1 for e in seq]
+    t2 = sum(seq2)
+    return t1 + t2
+
+def pair(animal):
+    def ret():
+        return animal() + animal()
+    return ret
+
+cats = pair(cat)
+
+print(dog()) # woof
+print(cat()) # meow
+print(cats()) # meowmeow
+print(do_stuff([1,2,3])) # 30
+</code></pre>
+<p>Even though <code>do_stuff</code> has a different number of local variables than <code>dog</code>, we can still successfully reassign code objects between them.</p>
+<pre><code>do_stuff.__code__ = dog.__code__
+print(do_stuff()) # woof
+</code></pre>
+<p>However, we can't reassign between <code>cats</code> and <code>dog</code> because <code>cats</code> closes over the argument <code>animal</code>.</p>
+<pre><code>print(cats.__code__.co_freevars) # ('animal',)
+dog.__code__ = cats.__code__
+</code></pre>
+<p><code>ValueError: dog() requires a code object with 0 free vars, not 1</code></p>
+<p>This problem can be avoided by simply reassigning the name to the desired function object.</p>
+<pre><code>dog = cats
+print(dog()) # meowmeow
+</code></pre>
+<p>In fact, if you <em>were</em> to successfully pull off a code object reassignment for a function with a closure, things would most likely not go as expected if the function were executed. This is because the closed over variables are saved separately from the compiled code, so they wouldn't match.</p>
+<pre><code>def get_sum_func(numbers):
+    def ret():
+        return sum(numbers)
+    return ret
+
+sum_func = get_sum_func([2,2,2]) # sum_func closes over the provided arg
+
+# swap code objects
+# quite possibly the most disturbing single line of python I've ever written
+sum_func.__code__, cats.__code__ = (cats.__code__, sum_func.__code__)
+
+print(sum_func()) # this will attempt to execute numbers() + numbers(), which will throw
+print(cats()) # this will attempt to execute sum(animal), which will throw
+</code></pre>
+<p>As it turns out, we can't easily replace the <code>__closure__</code> attribute because it is read-only. You could presumably <a href="https://stackoverflow.com/q/41927276">work around it</a> if you were really determined, but that's almost certainly a terrible idea.</p>
+<pre><code># swap closures
+# this results in "AttributeError: readonly attribute"
+sum_func.__closure__, cats.__closure__ = (cats.__closure__, sum_func.__closure__)
+</code></pre>
+<p>For more details about function object attributes, see <a href="https://stackoverflow.com/a/32221772">this answer</a> and <a href="https://docs.python.org/3/library/inspect.html" rel="nofollow noreferrer">the docs</a>.</p>
+</div>

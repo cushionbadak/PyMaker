@@ -1,0 +1,276 @@
+<div class="post-text" itemprop="text">
+<p>I have a generator producing a list of strings. Is there a utility/adapter in Python that could make it look like a file?</p>
+<p>For example,</p>
+<pre><code>&gt;&gt;&gt; def str_fn():
+...     for c in 'a', 'b', 'c':
+...         yield c * 3
+... 
+&gt;&gt;&gt; for s in str_fn():
+...     print s
+... 
+aaa
+bbb
+ccc
+&gt;&gt;&gt; stream = some_magic_adaptor(str_fn())
+&gt;&gt;&gt; while True:
+...    data = stream.read(4)
+...    if not data:
+...        break
+...    print data
+aaab
+bbcc
+c
+</code></pre>
+<p>Because data may be big and needs to be streamable (each fragment is a few kilobytes, the entire stream is tens of megabytes), I do not want to eagerly evaluate the whole generator before passing it to stream adaptor.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's a solution that should read from your iterator in chunks.</p>
+<pre><code>class some_magic_adaptor:
+  def __init__( self, it ):
+    self.it = it
+    self.next_chunk = ""
+  def growChunk( self ):
+    self.next_chunk = self.next_chunk + self.it.next()
+  def read( self, n ):
+    if self.next_chunk == None:
+      return None
+    try:
+      while len(self.next_chunk)&lt;n:
+        self.growChunk()
+      rv = self.next_chunk[:n]
+      self.next_chunk = self.next_chunk[n:]
+      return rv
+    except StopIteration:
+      rv = self.next_chunk
+      self.next_chunk = None
+      return rv
+
+
+def str_fn():
+  for c in 'a', 'b', 'c':
+    yield c * 3
+
+ff = some_magic_adaptor( str_fn() )
+
+while True:
+  data = ff.read(4)
+  if not data:
+    break
+  print data
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The "correct" way to do this is inherit from a standard Python <a href="http://docs.python.org/dev/library/io.html#io.TextIOBase" rel="noreferrer"><code>io</code></a> abstract base class. However it doesn't appear that Python allows you to provide a raw text class, and wrap this with a buffered reader of any kind.</p>
+<p>The best class to inherit from is <a href="http://docs.python.org/dev/library/io.html#io.TextIOBase" rel="noreferrer"><code>TextIOBase</code></a>. Here's such an implementation, handling <code>readline</code>, and <code>read</code> while being mindful of performance. (<a href="https://gist.github.com/3788413" rel="noreferrer">gist</a>)</p>
+<pre><code>import io
+
+class StringIteratorIO(io.TextIOBase):
+
+    def __init__(self, iter):
+        self._iter = iter
+        self._left = ''
+
+    def readable(self):
+        return True
+
+    def _read1(self, n=None):
+        while not self._left:
+            try:
+                self._left = next(self._iter)
+            except StopIteration:
+                break
+        ret = self._left[:n]
+        self._left = self._left[len(ret):]
+        return ret
+
+    def read(self, n=None):
+        l = []
+        if n is None or n &lt; 0:
+            while True:
+                m = self._read1()
+                if not m:
+                    break
+                l.append(m)
+        else:
+            while n &gt; 0:
+                m = self._read1(n)
+                if not m:
+                    break
+                n -= len(m)
+                l.append(m)
+        return ''.join(l)
+
+    def readline(self):
+        l = []
+        while True:
+            i = self._left.find('\n')
+            if i == -1:
+                l.append(self._left)
+                try:
+                    self._left = next(self._iter)
+                except StopIteration:
+                    self._left = ''
+                    break
+            else:
+                l.append(self._left[:i+1])
+                self._left = self._left[i+1:]
+                break
+        return ''.join(l)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem with StringIO is that you have to load everything into the buffer up front. This can be a problem if the generator is infinite :)</p>
+<pre><code>from itertools import chain, islice
+class some_magic_adaptor(object):
+    def __init__(self, src):
+        self.src = chain.from_iterable(src)
+    def read(self, n):
+        return "".join(islice(self.src, None, n))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>There is one called <code>werkzeug.contrib.iterio.IterIO</code> but note that it stores the entire iterator in its memory (up to the point you have read it as a file) so it might not be suitable.</p>
+<p><a href="http://werkzeug.pocoo.org/docs/contrib/iterio/" rel="nofollow">http://werkzeug.pocoo.org/docs/contrib/iterio/</a></p>
+<p>Source: <a href="https://github.com/mitsuhiko/werkzeug/blob/master/werkzeug/contrib/iterio.py" rel="nofollow">https://github.com/mitsuhiko/werkzeug/blob/master/werkzeug/contrib/iterio.py</a></p>
+<p>An open bug on <code>readline</code>/<code>iter</code>: <a href="https://github.com/mitsuhiko/werkzeug/pull/500" rel="nofollow">https://github.com/mitsuhiko/werkzeug/pull/500</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Here's a modified version of John and Matt's answer that can read a list/generator of strings and output bytearrays</p>
+<pre><code>import itertools as it
+from io import TextIOBase
+
+class IterStringIO(TextIOBase):
+    def __init__(self, iterable=None):
+        iterable = iterable or []
+        self.iter = it.chain.from_iterable(iterable)
+
+    def not_newline(self, s):
+        return s not in {'\n', '\r', '\r\n'}
+
+    def write(self, iterable):
+        to_chain = it.chain.from_iterable(iterable)
+        self.iter = it.chain.from_iterable([self.iter, to_chain])
+
+    def read(self, n=None):
+        return bytearray(it.islice(self.iter, None, n))
+
+    def readline(self, n=None):
+        to_read = it.takewhile(self.not_newline, self.iter)
+        return bytearray(it.islice(to_read, None, n))
+</code></pre>
+<p>usage:</p>
+<pre><code>ff = IterStringIO(c * 3 for c in ['a', 'b', 'c'])
+
+while True:
+    data = ff.read(4)
+
+    if not data:
+        break
+
+    print data
+
+aaab
+bbcc
+c
+</code></pre>
+<p>alternate usage:</p>
+<pre><code>ff = IterStringIO()
+ff.write('ddd')
+ff.write(c * 3 for c in ['a', 'b', 'c'])
+
+while True:
+    data = ff.read(4)
+
+    if not data:
+        break
+
+    print data
+
+ddda
+aabb
+bccc
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Looking at Matt's answer, I can see that it's not always necessary to implement all the read methods. <a href="https://docs.python.org/3/library/io.html?highlight=io.textiowrapper#io.BufferedIOBase.read1" rel="nofollow noreferrer"><code>read1</code></a> may be sufficient, which is described as:</p>
+<blockquote>
+<p>Read and return up to <em>size</em> bytes, with at most one call to the underlying raw stream’s read()...</p>
+</blockquote>
+<p>Then it can be wrapped with <a href="https://docs.python.org/3/library/io.html?highlight=io.textiowrapper#io.TextIOWrapper" rel="nofollow noreferrer"><code>io.TextIOWrapper</code></a> which, for instance, has implementation of <code>readline</code>. As an example here's streaming of CSV-file from S3's (Amazon Simple Storage Service) <code>boto.s3.key.Key</code> which implements iterator for reading.</p>
+<pre><code>import io
+import csv
+
+from boto import s3
+
+
+class StringIteratorIO(io.TextIOBase):
+
+    def __init__(self, iter):
+        self._iterator = iter
+        self._buffer = ''
+
+    def readable(self):
+        return True
+
+    def read1(self, n=None):
+        while not self._buffer:
+            try:
+                self._buffer = next(self._iterator)
+            except StopIteration:
+                break
+        result = self._buffer[:n]
+        self._buffer = self._buffer[len(result):]
+        return result
+
+
+conn = s3.connect_to_region('some_aws_region')
+bucket = conn.get_bucket('some_bucket')
+key = bucket.get_key('some.csv')    
+
+fp = io.TextIOWrapper(StringIteratorIO(key))
+reader = csv.DictReader(fp, delimiter = ';')
+for row in reader:
+    print(row)
+</code></pre>
+<h1>Update</h1>
+<p>Here's <a href="https://stackoverflow.com/a/20260030/2072035">an answer</a> to related question which looks a little better. It inherits <code>io.RawIOBase</code> and overrides <code>readinto</code>. In Python 3 it's sufficient, so instead of wrapping <code>IterStream</code> in <code>io.BufferedReader</code> one can wrap it in <code>io.TextIOWrapper</code>. In Python 2 <code>read1</code> is needed but it can be simply expressed though <code>readinto</code>.      </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>this is exactly what stringIO is for ..</p>
+<pre><code>&gt;&gt;&gt; import StringIO
+&gt;&gt;&gt; some_var = StringIO.StringIO("Hello World!")
+&gt;&gt;&gt; some_var.read(4)
+'Hell'
+&gt;&gt;&gt; some_var.read(4)
+'o Wo'
+&gt;&gt;&gt; some_var.read(4)
+'rld!'
+&gt;&gt;&gt;
+</code></pre>
+<p>Or if you wanna do what it sounds like </p>
+<pre><code>Class MyString(StringIO.StringIO):
+     def __init__(self,*args):
+         StringIO.StringIO.__init__(self,"".join(args))
+</code></pre>
+<p>then you can simply</p>
+<pre><code>xx = MyString(*list_of_strings)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>First of all, your generator will have to yield byte objects. While there isn't anything built-in, you can use a combination of <a href="http://docs.python.org/library/stringio.html" rel="nofollow">http://docs.python.org/library/stringio.html</a> and itertools.chain.</p>
+</div>
+<span class="comment-copy">Not as built-in as I'd like, but still does the job well. :thumbsup:</span>
+<span class="comment-copy">Not as complete as using an <code>io</code> ABC, and there's a performance hit when adding lots of yielded strings in this fashion. Better to <code>join</code> them in one hit only to satisfy the interface, but nice regardless.</span>
+<span class="comment-copy">Great! I had to add "some_magic_adaptor.readline()" copying "read()" and replacing "while len(self.next_chunk)&lt;n" with "while not "\n" in self.next_chunk:", and adding "n = self.next_chunk.index('\n')+1"" before the first "return".</span>
+<span class="comment-copy">Hm, I'd love to use it this way, the problem is that this will yield characters one by one. In my stream, each fragment is in kilobytes, the entire stream is in megabytes, which (given CPython's pitiful nominal code performance) may create a bottleneck where it could be easily avoided.</span>
+<span class="comment-copy">@AlexB No, it won't.</span>
+<span class="comment-copy">@AlexB, Perhaps you can write up the results when you try out the various alternatives. I will be interested to see the results.</span>
+<span class="comment-copy">@gnibbler In a purely synthetic microbenchmark I get about 20x slowdown in CPython and 100x in PyPy because its optimiser isn't itertools-friendly, compared to chunked solution in the other answer, which is similar in performance to straight up read from StringIO. In our prod code related tasks take ~50% longer (not fatal, but not trivial either). The setup was still more artificial than I'd like, but running a real prod-like test is a bit of a hassle for me right now. See synthetic test code: <a href="https://gist.github.com/3786538" rel="nofollow noreferrer">gist.github.com/3786538</a></span>
+<span class="comment-copy">@AlexB, good to know, thanks</span>
+<span class="comment-copy">This only works on a single string, not a list of strings.</span>
+<span class="comment-copy">After edit: This evaluates the whole list of strings upfront (see the last sentence of the question).</span>
+<span class="comment-copy">Yes, I have already considered StringIO, and no I do not want to yield bytes one by one.</span>
+<span class="comment-copy">@AlexB I'm sorry, did you fall asleep part way through the second sentence? You can code this trivially with stringio and the thing I mention after it.</span>
+<span class="comment-copy">itertools.chain still feeds bytes one by one to StringIO, this is why I won't use it. No need to be condescending.</span>
+<span class="comment-copy">I do not intend to yield characters from a string individually, so I'm not sure what you are getting at. I want to operate on blocks of data as much as possible for performance reasons. Anyway, this conversation is starting to bore me to tears, so see Michael Anderson's answer, which is the closest in spirit to what I am after, alas not a standard library solution.</span>
+<span class="comment-copy">Marcin I cannot fathom how you'd combine <code>itertools.chain</code> and <code>StringIO</code> in any fashion to solve this problem. Alex wants to avoid evaluating the generator up front, and there is no reason to involve bytes at all (doing so will be a huge performance cost additionally).</span>

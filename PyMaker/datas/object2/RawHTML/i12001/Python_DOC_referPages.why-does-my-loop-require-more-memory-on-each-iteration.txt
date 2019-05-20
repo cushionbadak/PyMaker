@@ -1,0 +1,137 @@
+<div class="post-text" itemprop="text">
+<p>I am trying to reduce the memory requirements of my python 3 code. Right now each iteration of the for loop requires more memory than the last one. </p>
+<p>I wrote a small piece of code that has the same behaviour as my project:</p>
+<pre><code>import numpy as np
+from multiprocessing import Pool
+from itertools import repeat
+
+
+def simulation(steps, y):  # the function that starts the parallel execution of f()
+    pool = Pool(processes=8, maxtasksperchild=int(steps/8))
+    results = pool.starmap(f, zip(range(steps), repeat(y)), chunksize=int(steps/8))
+    pool.close()
+    return results
+
+
+def f(steps, y):  # steps is used as a counter. My code doesn't need it.
+        a, b = np.random.random(2)
+        return y*a, y*b
+
+def main():
+    steps = 2**20  # amount of times a random sample is taken
+    y = np.ones(5)  # dummy variable to show that the next iteration of the code depends on the previous one
+    total_results = np.zeros((0,2))
+    for i in range(5):
+        results = simulation(steps, y[i-1])
+        y[i] = results[0][0]
+        total_results = np.vstack((total_results, results))
+
+    print(total_results, y)
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<p>For each iteration of the for loop the threads in simulation() each have a memory usage equal to the total memory used by my code.</p>
+<p>Does Python clone my entire environment each time the parallel processes are run, including the variables not required by f()? How can I prevent this behaviour?</p>
+<p>Ideally I would want my code to only copy the memory it requires to execute f() while I can save the results in memory.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Though the script does use quite a bit of memory even with the "smaller" example values, the answer to</p>
+<blockquote>
+<p>Does Python clone my entire environment each time the parallel
+  processes are run, including the variables not required by f()? How
+  can I prevent this behaviour?</p>
+</blockquote>
+<p>is that it does in a way <em>clone</em> the environment with <a href="https://en.wikipedia.org/wiki/Fork_%28system_call%29" rel="nofollow">forking</a> a new process, but if <a href="https://en.wikipedia.org/wiki/Copy-on-write" rel="nofollow">copy-on-write</a> semantics are available, no actual physical memory needs to be copied until it is written to. For example on this system
+</p>
+<pre><code> % uname -a 
+Linux mypc 4.2.0-27-generic #32-Ubuntu SMP Fri Jan 22 04:49:08 UTC 2016 x86_64 x86_64 x86_64 GNU/Linux
+</code></pre>
+<p><code>COW</code> seems to be available and in use, but this may not be the case on other systems. On Windows this is strictly different as a new Python interpreter is executed from <code>.exe</code> instead of forking. Since you mention using <code>htop</code>, you're using some flavour of UNIX or UNIX like system, and you get <code>COW</code> semantics.</p>
+<blockquote>
+<p>For each iteration of the for loop the <em>processes</em> in simulation() each
+  have a memory usage equal to the total memory used by my code.</p>
+</blockquote>
+<p>The spawned processes will display almost identical values of <a href="https://en.wikipedia.org/wiki/Resident_set_size" rel="nofollow"><code>RSS</code></a>, but this can be misleading, because mostly they occupy the same actual physical memory mapped to multiple processes, if writes do not occur. With <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.pool.Pool.map" rel="nofollow"><code>Pool.map</code></a> the story is a bit more complicated, since it "chops the iterable into a number of chunks which it submits to the process pool as separate tasks". This submitting happens over <a href="https://en.wikipedia.org/wiki/Inter-process_communication" rel="nofollow"><code>IPC</code></a> and submitted data will be copied. In your example the <code>IPC</code> and 2**20 function calls also dominate the CPU usage. Replacing the mapping with a single vectorized multiplication in <code>simulation</code> took the script's runtime from around 150s to <em>0.66s</em> on this machine.</p>
+<p>We can observe <code>COW</code> with a (somewhat) simplified example that allocates a large array and passes it to a spawned process for read-only processing:</p>
+<pre><code>import numpy as np
+from multiprocessing import Process, Condition, Event
+from time import sleep
+import psutil
+
+
+def read_arr(arr, done, stop):
+    with done:
+        S = np.sum(arr)
+        print(S)
+        done.notify()
+    while not stop.is_set(): 
+        sleep(1)
+
+
+def main():
+    # Create a large array
+    print('Available before A (MiB):', psutil.virtual_memory().available / 1024 ** 2)
+    input("Press Enter...")
+    A = np.random.random(2**28)
+    print('Available before Process (MiB):', psutil.virtual_memory().available / 1024 ** 2)
+    input("Press Enter...")
+    done = Condition()
+    stop = Event()
+    p = Process(target=read_arr, args=(A, done, stop))
+    with done:
+        p.start()
+        done.wait()
+    print('Available with Process (MiB):', psutil.virtual_memory().available / 1024 ** 2)
+    input("Press Enter...")
+    stop.set()
+    p.join()
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>Output on this machine:
+</p>
+<pre><code> % python3 test.py
+Available before A (MiB): 7779.25
+Press Enter...
+Available before Process (MiB): 5726.125
+Press Enter...
+134221579.355
+Available with Process (MiB): 5720.79296875
+Press Enter...
+</code></pre>
+<p>Now if we replace the function <code>read_arr</code> with a function that modifies the array:</p>
+<pre><code>def mutate_arr(arr, done, stop):
+    with done:
+        arr[::4096] = 1
+        S = np.sum(arr)
+        print(S)
+        done.notify()
+    while not stop.is_set(): 
+        sleep(1)
+</code></pre>
+<p>the results are quite different:
+</p>
+<pre><code>Available before A (MiB): 7626.12109375
+Press Enter...
+Available before Process (MiB): 5571.82421875
+Press Enter...
+134247509.654
+Available with Process (MiB): 3518.453125
+Press Enter...
+</code></pre>
+<hr/>
+<p>The for-loop does indeed require more memory after each iteration, but that's obvious: it stacks the <code>total_results</code> from the mapping, so it has to allocate space for a new array to hold both the old results and the new and free the now unused array of old results.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Maybe you should know the difference between <code>thread</code> and <code>process</code> in <code>Operating System</code>. see this <a href="https://stackoverflow.com/questions/200469/what-is-the-difference-between-a-process-and-a-thread">What is the difference between a process and a thread</a>.</p>
+<p>In the for loop, there are <code>processes</code>, not <code>threads</code>. Threads share the address space of the process that created it; processes have their own address space.</p>
+<p>You can print the process id, type <code>os.getpid()</code>.</p>
+</div>
+<span class="comment-copy">How big is results[0][0]?</span>
+<span class="comment-copy">yes it clones the entire context of the program</span>
+<span class="comment-copy">You should guard those main operations with <code>if __name__ == '__main__':</code> at least.</span>
+<span class="comment-copy">@snakecharmerb results[0][0] is just a float.</span>
+<span class="comment-copy">@Isea after your edit I can observe the behaviour you describe.</span>
+<span class="comment-copy">It's not so black and white, as I pointed out. Processes may share physical memory, though they have their own address spaces.</span>

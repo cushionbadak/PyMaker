@@ -1,0 +1,252 @@
+<div class="post-text" itemprop="text">
+<h2>Base scenario</h2>
+<p>For a recommendation service I am training a matrix factorization model (LightFM) on a set of user-item interactions. For the matrix factorization model to yield the best results, I need to map my user and item IDs to a continuous range of integer IDs starting at 0.</p>
+<p>I'm using a pandas DataFrame in the process, and I have found a MultiIndex to be extremely convenient to create this mapping, like so:</p>
+<pre><code>ratings = [{'user_id': 1, 'item_id': 1, 'rating': 1.0},
+           {'user_id': 1, 'item_id': 3, 'rating': 1.0},
+           {'user_id': 3, 'item_id': 1, 'rating': 1.0},
+           {'user_id': 3, 'item_id': 3, 'rating': 1.0}]
+
+df = pd.DataFrame(ratings, columns=['user_id', 'item_id', 'rating'])
+df = df.set_index(['user_id', 'item_id'])
+df
+
+Out:
+                 rating
+user_id item_id 
+1       1        1.0
+1       3        1.0
+3       1        1.0
+3       1        1.0
+</code></pre>
+<p>And then allows me to get the continuous maps like so</p>
+<pre><code>df.index.labels[0]    # For users
+
+Out:
+FrozenNDArray([0, 0, 1, 1], dtype='int8')
+
+df.index.labels[1]    # For items
+
+Out:
+FrozenNDArray([0, 1, 0, 1], dtype='int8')
+</code></pre>
+<p>Afterwards, I can map them back using <code>df.index.levels[0].get_loc</code> method. Great!</p>
+<h2>Extension</h2>
+<p>But, now I'm trying to streamline my model training process, ideally by training it incrementally on new data, preserving the old ID mappings. Something like:</p>
+<pre><code>new_ratings = [{'user_id': 2, 'item_id': 1, 'rating': 1.0},
+               {'user_id': 2, 'item_id': 2, 'rating': 1.0}]
+
+df2 = pd.DataFrame(new_ratings, columns=['user_id', 'item_id', 'rating'])
+df2 = df2.set_index(['user_id', 'item_id'])
+df2
+
+Out:
+                 rating
+user_id item_id 
+2       1        1.0
+2       2        1.0
+</code></pre>
+<p>Then, simply appending the new ratings to the old DataFrame</p>
+<pre><code>df3 = df.append(df2)
+df3
+
+Out:
+                 rating
+user_id item_id 
+1       1        1.0
+1       3        1.0
+3       1        1.0
+3       3        1.0
+2       1        1.0
+2       2        1.0
+</code></pre>
+<p>Looks good, but</p>
+<pre><code>df3.index.labels[0]    # For users
+
+Out:
+FrozenNDArray([0, 0, 2, 2, 1, 1], dtype='int8')
+
+df3.index.labels[1]    # For items
+
+Out:
+FrozenNDArray([0, 2, 0, 2, 0, 1], dtype='int8')
+</code></pre>
+<p>I added user_id=2 and item_id=2 in the later DataFrame on purpose, to illustrate where it goes wrong for me. In <code>df3</code>, labels 3 (for both user and item), have moved from integer position 1 to 2. So the mapping is no longer the same. What I'm looking for is <code>[0, 0, 1, 1, 2, 2]</code> and <code>[0, 1, 0, 1, 0, 2]</code> for user and item mappings respectively.</p>
+<p>This is probably because of ordering in pandas Index objects, and I'm unsure if what I want is at all possible using a MultiIndex strategy. Looking for help on how most to effectively tackle this problem :)</p>
+<p>Some notes:</p>
+<ul>
+<li>I find using DataFrames convenient for several reasons, but I use the MultiIndex purely for the ID mappings. Alternatives without MultiIndex are completely acceptable.</li>
+<li>I cannot guarantee that new user_id and item_id entries in new ratings are larger than any values in the old dataset, hence my example of adding id 2 when [1, 3] were present.</li>
+<li>For my incremental training approach, I will need to store my ID maps somewhere. If I only load new ratings partially, I will have to store the old DataFrame and ID maps somewhere. Would be great if it could all be in one place, like it would be with an index, but columns work too.</li>
+<li>EDIT: An additional requirement is to allow for row re-ordering of the original DataFrame, as might happen when duplicate ratings exist, and I want to keep the most recent one.</li>
+</ul>
+<h2>Solution (credits to @jpp for original)</h2>
+<p>I've made a modification to @jpp's answer to satisfy the additional requirement I've added later (tagged with EDIT). This also truly satisfies the original question as posed in the title, since it preserves the old index integer positions, regardless of rows being reordered for whatever reason. I've also wrapped things into functions:</p>
+<pre><code>from itertools import chain
+from toolz import unique
+
+
+def expand_index(source, target, index_cols=['user_id', 'item_id']):
+
+    # Elevate index to series, keeping source with index
+    temp = source.reset_index()
+    target = target.reset_index()
+
+    # Convert columns to categorical, using the source index and target columns
+    for col in index_cols:
+        i = source.index.names.index(col)
+        col_cats = list(unique(chain(source.index.levels[i], target[col])))
+
+        temp[col] = pd.Categorical(temp[col], categories=col_cats)
+        target[col] = pd.Categorical(target[col], categories=col_cats)
+
+    # Convert series back to index
+    source = temp.set_index(index_cols)
+    target = target.set_index(index_cols)
+
+    return source, target
+
+
+def concat_expand_index(old, new):
+    old, new = expand_index(old, new)
+    return pd.concat([old, new])
+
+
+df3 = concat_expand_index(df, df2)
+</code></pre>
+<p>The result:</p>
+<pre><code>df3.index.labels[0]    # For users
+
+Out:
+FrozenNDArray([0, 0, 1, 1, 2, 2], dtype='int8')
+
+df3.index.labels[1]    # For items
+
+Out:
+FrozenNDArray([0, 1, 0, 1, 0, 2], dtype='int8')
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Forcing alignment of index labels after concatenation does not appear straightforward and, if there is a solution, it is poorly documented.</p>
+<p>One option which may appeal to you is <a href="https://pandas.pydata.org/pandas-docs/stable/categorical.html" rel="nofollow noreferrer">Categorical Data</a>. With some careful manipulation, this can achieve the same purpose: each unique index value within a level has a one-to-one mapping to an integer, and this mapping persists even after concatenation with other dataframes.</p>
+<pre><code>from itertools import chain
+from toolz import unique
+
+# elevate index to series
+df = df.reset_index()
+df2 = df2.reset_index()
+
+# define columns for reindexing
+index_cols = ['user_id', 'item_id']
+
+# convert to categorical with merged categories
+for col in index_cols:
+    col_cats = list(unique(chain(df[col], df2[col])))
+    df[col] = pd.Categorical(df[col], categories=col_cats)
+    df2[col] = pd.Categorical(df2[col], categories=col_cats)
+
+# convert series back to index
+df = df.set_index(index_cols)
+df2 = df2.set_index(index_cols)
+</code></pre>
+<p>I use <code>toolz.unique</code> to return an ordered unique list, but if you don't have access to this library, you can use the identical <code>unique_everseen</code> recipe from the <code>itertool</code> <a href="https://docs.python.org/3/library/itertools.html#itertools-recipes" rel="nofollow noreferrer">docs</a>.</p>
+<p>Now let's have a look at the category codes underlying the 0th index level:</p>
+<pre><code>for data in [df, df2]:
+    print(data.index.get_level_values(0).codes.tolist())
+
+[0, 0, 1, 1]
+[2, 2]
+</code></pre>
+<p>Then perform our concatenation:</p>
+<pre><code>df3 = pd.concat([df, df2])
+</code></pre>
+<p>Finally, check that categorical codes are aligned:</p>
+<pre><code>print(df3.index.get_level_values(0).codes.tolist())
+[0, 0, 1, 1, 2, 2]
+</code></pre>
+<p>For each index level, note we must take the union of all index values across dataframes to form <code>col_cats</code>, otherwise the concatenation will fail.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think the use of MultiIndex overcomplicates this objective:</p>
+<blockquote>
+<p>I need to map my user and item IDs to a continuous range of integer IDs starting at 0.</p>
+</blockquote>
+<p>This solution falls in to the below category:</p>
+<blockquote>
+<p>Alternatives without MultiIndex are completely acceptable.</p>
+</blockquote>
+<hr/>
+<pre><code>def add_mapping(df, df2, df3, column_name='user_id'):
+
+    initial = df.loc[:, column_name].unique()
+    new = df2.loc[~df2.loc[:, column_name].isin(initial), column_name].unique()
+    maps = np.arange(len(initial))
+    mapping = dict(zip(initial, maps))
+    maps = np.append(maps, np.arange(np.max(maps)+1, np.max(maps)+1+len(new)))
+    total = np.append(initial, new)
+    mapping = dict(zip(total, maps))
+
+    df3[column_name+'_map'] = df3.loc[:, column_name].map(mapping) 
+
+    return df3
+
+add_mapping(df, df2, df3, column_name='item_id')
+add_mapping(df, df2, df3, column_name='user_id')
+
+ user_id    item_id rating  item_id_map user_id_map
+0   1          1    1.0         0           0
+1   1          3    1.0         1           0
+2   3          1    1.0         0           1
+3   3          3    1.0         1           1
+0   2          1    1.0         0           2
+1   2          2    1.0         2           2
+</code></pre>
+<hr/>
+<h1>Explaination</h1>
+<p>This is how to maintain a mapping for the <code>user_id</code> values. Same holds for the <code>item_id</code> values as well.</p>
+<p>These are the initial <code>user_id</code> values (unique):</p>
+<pre><code>initial_users = df['user_id'].unique()
+# initial_users = array([1, 3])
+</code></pre>
+<p><code>user_map</code> maintains a mapping for <code>user_id</code> values, as per your requirement:</p>
+<pre><code>user_id_maps = np.arange(len(initial_users))
+# user_id_maps = array([0, 1])
+
+user_map = dict(zip(initial_users, user_id_maps))
+# user_map = {1: 0, 3: 1}
+</code></pre>
+<p>These are the new <code>user_id</code> values you got from <code>df2</code> - ones that you didn't see in <code>df</code>:</p>
+<pre><code>new_users = df2[~df2['user_id'].isin(initial_users)]['user_id'].unique()
+# new_users = array([2])
+</code></pre>
+<p>Now we update <code>user_map</code> for the total user base with the new users:</p>
+<pre><code>user_id_maps = np.append(user_id_maps, np.arange(np.max(user_id_maps)+1, np.max(user_id_maps)+1+len(new_users)))
+# array([0, 1, 2])
+total_users = np.append(initial_users, new_users)
+# array([1, 3, 2])
+
+user_map = dict(zip(total_users, user_id_maps))
+# user_map = {1: 0, 2: 2, 3: 1}
+</code></pre>
+<p>Then, just map the values from <code>user_map</code> to <code>df['user_id']</code>:</p>
+<pre><code>df3['user_map'] = df3['user_id'].map(user_map)
+
+user_id item_id rating  user_map
+0   1   1       1.0          0
+1   1   3       1.0          0
+2   3   1       1.0          1
+3   3   3       1.0          1
+0   2   1       1.0          2
+1   2   2       1.0          2
+</code></pre>
+</div>
+<span class="comment-copy">Is there a specific reason you need consistent <code>labels</code>, e.g. do you use them in logic? If they are important, should they not be part of your dataframe?</span>
+<span class="comment-copy">The thing I am trying to accomplish is to have consistent references to row or column positions in matrices or vectors generated from my DataFrame. This allows me to do incremental training on a machine learning model when introducing new users and items. Having it be part of the DataFrame is an acceptable approach, as noted at the bottom of my question. But since MultiIndex is so convenient for the initial step, I wonder if it can be extended.</span>
+<span class="comment-copy">@Fulco I suggested the <code>numpy</code> tag for a more appropriate audience.</span>
+<span class="comment-copy">Many new things; I didn't even know they existed!</span>
+<span class="comment-copy">Thanks @jpp. I found your answer to be most elegant and extensible. I made a modification to satisfy a requirement I forgot to mention, and one that truly preserves the old index. I'll put this in my original question.</span>
+<span class="comment-copy">A few points. (1) Please don't use chained indexing, e.g. use <code>.loc</code> instead of <code>df2[~df2[column_name].isin(initial)][column_name].unique()</code>; (2) <code>np.append</code> is expensive, I fear performance issues. Wider point is the mapping is not intrinsically linked (versus for example, categoricals). Nevertheless, this does accomplish the task and you took the effort to wrap in a function. So +1.</span>
+<span class="comment-copy">Thanks @jpp ! (1) I had the thought of using <code>loc</code> but just went with chained indexing to make it less verbose. (Why is chained indexing frowned upon though?) (2) Instead of <code>np.append</code>, is list a good idea?</span>
+<span class="comment-copy">(1) See <a href="https://pandas.pydata.org/pandas-docs/stable/indexing.html#indexing-view-versus-copy" rel="nofollow noreferrer">Returning a view versus a copy</a>, (2) I'm not sure, with this method it may be unavoidable.</span>
+<span class="comment-copy">Thanks. Function updated.</span>
+<span class="comment-copy">Thanks @akilat90. Your answer satisfies the requirements as specified and like jpp I appreciate the effort of providing of providing a copy/paste working function. However, I find jpp's answer more elegant, so I've awarded him the bounty.</span>

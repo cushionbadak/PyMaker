@@ -1,0 +1,121 @@
+<div class="post-text" itemprop="text">
+<p>Can anyone explain me how to add SSL to the Python STOMP client I'm using.
+I added the stomp+ssl transport connector in the ActiveMQ configuration file and my basic Python STOMP client is below:</p>
+<pre><code>import time
+import sys
+import stomp
+class MyListener(stomp.ConnectionListener):
+    def on_error(self, headers, message):
+        print('received an error "%s"' % message)
+    def on_message(self, headers, message):
+        print('received a message "%s"' % message)
+conn = stomp.Connection()
+conn.set_listener('', MyListener())
+conn.start()
+conn.connect('admin', 'password', wait=True)
+conn.subscribe(destination='/queue/test', id=1, ack='auto')
+conn.send(body=' '.join(sys.argv[1:]), destination='/queue/test')
+time.sleep(2)
+conn.disconnect()
+</code></pre>
+<hr/>
+<p>I created the key store and trust store given in the <a href="http://activemq.apache.org/how-do-i-use-ssl.html" rel="nofollow noreferrer">http://activemq.apache.org/how-do-i-use-ssl.html</a> docs and added them to the <code>SSL_OPTS</code> environment variable in the broker but I'm unable to find how to initialize the Python STOMP client with the key store and trust store. Should I use the SSL paraments given in the <code>stomp.Connection()</code> method, and if yes how to do so?</p>
+<p>Can anyone please explain if there is any other way to add SSL over STOMP?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <a href="https://github.com/jasonrbriggs/stomp.py" rel="nofollow noreferrer">Python STOMP client</a> (as of version 4.1.20) uses an <a href="https://docs.python.org/3/library/ssl.html#ssl.SSLContext" rel="nofollow noreferrer"><code>SSLContext</code></a> to process its key pair/certificate, so there is no reason to produce a Java KeyStore for the client.</p>
+<p>With this in mind, let us go through the entire process of setting up ApacheMQ to support SSL-wrapped STOMP connections. The process below has been tested on ApacheMQ 5.15.4. We explicitly set up two-way trust by manually moving self-signed certificates between the broker and client; using a certificate authority is also possible but how to do so is a different question.</p>
+<h1>Create a client certificate</h1>
+<p>As mentioned above, on the Python side of things, a KeyStore will have little use, and since <code>SSLContext</code> expects PEM encoded certificates, we might as well create the key pair and certificate by hand (that is, using <code>openssl</code>). First, on the client machine, let us create a 4096-bit RSA key:</p>
+<pre><code>openssl genrsa -out client.key 4096
+</code></pre>
+<p>Using this, turn the public key part into a certificate and sign it with the key itself; since we will be manually moving the certificate to the broker, self-signing the certificate is not an issue:</p>
+<pre><code>openssl req -new -out client.csr -key client.key
+openssl x509 -req -days 365 -in client.csr -signkey client.key -out client.pem
+rm client.csr
+</code></pre>
+<p>The STOMP client will need both the signed certificate, <code>client.pem</code>, and the private key, <code>client.key</code>, while the broker will only need the certificate.</p>
+<h1>Create a broker certificate</h1>
+<p>On the broker, we can follow the first part of the Apache guide and use the Java <code>keytool</code> to create a KeyStore with a key for the server:</p>
+<pre><code>keytool -genkeypair -alias broker -keyalg RSA -keysize 4096 -keystore broker.ks
+</code></pre>
+<p>When prompted for "first and last name", provide the hostname of the server, which in our example we will take simply to be <code>localhost</code>; if the broker and client are running on different servers, make sure that this is set to whatever the Python client will end up using to identify the broker:</p>
+<pre><code>What is your first and last name?
+  [Unknown]:  localhost
+</code></pre>
+<p>All other input values can be left as "Unknown".      </p>
+<p>At the end of the day, we will only want to allow connections to the broker from clients with certificates that we know, so at this point copy the <code>client.pem</code> generated above to the broker and add it to a trust store through</p>
+<pre><code>keytool -import -alias client -keystore broker.ts -file client.pem
+</code></pre>
+<p>If the broker is to allow connections from any client, then this final step can be skipped.</p>
+<h1>Setting up ApacheMQ</h1>
+<p>By default, all connections through STOMP (and indeed all connections) are plaintext ones, and in order to enable STOMP connections over SSL, add the following <code>&lt;transportConnector /&gt;</code> to <code>conf/apachemq.xml</code>:</p>
+<pre><code>&lt;transportConnectors&gt;
+    &lt;transportConnector name="stomp+ssl" uri="stomp+nio+ssl://0.0.0.0:61613?transport.enabledProtocols=TLSv1.2&amp;amp;needClientAuth=true" /&gt;
+&lt;/transportConnectors&gt;
+</code></pre>
+<p>Make sure to remove any existing plaintext connectors such as the default STOMP connector as otherwise clients will be able to simply use those and bypass the SSL requirement. Note also that <code>needClientAuth=true</code> is what forces client certificate validation; without this, clients are able to connect without providing a trusted certificate.</p>
+<p>To configure ApacheMQ to use the key and trust stores defined above, define the environment variable <code>ACTIVEMQ_SSL_OPTS</code> through (on Unix)</p>
+<pre><code>export ACTIVEMQ_SSL_OPTS = -Djavax.net.ssl.keyStore=/path/to/broker.ks -Djavax.net.ssl.trustStore=/path/to/broker.ts -Djavax.net.ssl.keyStorePassword=passwordForBrokerKs -Djavax.net.ssl.trustStorePassword=passwordForBrokerTs
+</code></pre>
+<p>or (on Windows)</p>
+<pre><code>set ACTIVEMQ_SSL_OPTS=-Djavax.net.ssl.keyStore=C:\path\to\broker.ks -Djavax.net.ssl.trustStore=C:\path\to\broker.ts -Djavax.net.ssl.keyStorePassword=passwordForBrokerKs -Djavax.net.ssl.trustStorePassword=passwordForBrokerTs
+</code></pre>
+<p>Here, the two passwords are those chosen after running <code>keytool</code> in the previous step. If client certificate validation is not desired, simply leave out the configuration of <code>trustStore</code> and <code>trustStorePassword</code>.</p>
+<p>With this, ActiveMQ can be started as usual through <code>bin/activemq start</code>. To make sure that the SSL configuration matches expectation, pay attention to the <code>JVM args</code> part of the output printed when starting the server.</p>
+<h1>Testing the STOMP client</h1>
+<p>With the broker properly set up, we can configure the client as well. Here, we provide <code>stomp.Connection.set_ssl</code> with references to the key and certificate created in the first step. Assuming that the ActiveMQ server is running on localhost:61613, your test script simply becomes</p>
+<pre><code>import time
+import sys
+import stomp
+
+class MyListener(stomp.ConnectionListener):
+    def on_error(self, headers, message):
+        print('received an error "%s"' % message)
+    def on_message(self, headers, message):
+        print('received a message "%s"' % message)
+
+host = 'localhost'
+port = 61613
+conn = stomp.Connection([(host, port)])
+conn.set_ssl(for_hosts=[(host, port)], key_file='/path/to/client.key', cert_file='/path/to/client.pem')
+conn.set_listener('', MyListener())
+conn.start()
+conn.connect('admin', 'password', wait=True)
+conn.subscribe(destination='/queue/test', id=1, ack='auto')
+conn.send(body='test message', destination='/queue/test')
+time.sleep(2)
+conn.disconnect()
+</code></pre>
+<p>To make sure that ApacheMQ is indeed validating the client certificate, we could repeat step 1 and create a new pair, <code>client2.key</code>/<code>client2.pem</code> say, and use that instead. Doing so should result in the following non-sensical error message being printed by ApacheMQ:</p>
+<pre><code>ERROR | Could not accept connection from null : {}
+java.io.IOException: javax.net.ssl.SSLHandshakeException: General SSLEngine problem
+</code></pre>
+<h1>Validating the broker certificate</h1>
+<p>Now, the attentive reader will have noticed that we never actually moved the broker certificate to the client, and yet things seem to work regardless. As it turns out, the default behavior of <code>stomp.py</code> is to perform <em>no certificate validation at all</em>, allowing an (active) attacker to MITM the connection.</p>
+<p>As we are rolling self-signed certificates, all we need to do to fix this situation is to provide the actual broker certificate to the Python client. On the broker, export the certificate through</p>
+<pre><code>keytool -exportcert -rfc -alias broker -keystore broker.ks -file broker.pem
+</code></pre>
+<p>and move <code>broker.pem</code> to the Python client. Now, in the test script above, include the certificate by replacing the SSL configuration with</p>
+<pre><code>conn.set_ssl(for_hosts=[(host, port)], key_file='/path/to/client.key', cert_file='/path/to/client.pem', ca_certs='/path/to/broker.pem')
+</code></pre>
+<p>As above, we can test that this is indeed performing the proper validation by repeating the broker certificate generation process to create a <code>broker2.pem</code>, use that in the test script, and note that it will fail with an</p>
+<pre><code>ssl.SSLError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed (_ssl.c:833)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Try this.</p>
+<pre><code> conn = stomp.Connection([(host, port)])
+ conn.set_listener('', MyListener())
+
+ conn.set_ssl(for_hosts=[(host, port)], ssl_version=ssl.PROTOCOL_TLS)
+
+ conn.start()
+ conn.connect(login, password, wait=True)
+ conn.send(body=message, destination=queue)
+ conn.disconnect()
+</code></pre>
+<p>or </p>
+<pre><code>conn.set_ssl(for_hosts=[(host, port)], ssl_version=_ssl.PROTOCOL_TLS)
+</code></pre>
+</div>

@@ -1,0 +1,88 @@
+<div class="post-text" itemprop="text">
+<p>I have a python script where at the top of the file I have:</p>
+<pre><code>result_queue = Queue.Queue()
+key_list = *a large list of small items* #(actually from bucket.list() via boto)
+</code></pre>
+<p>I have learned that Queues are process safe data structures. I have a method:</p>
+<pre><code>def enqueue_tasks(keys):
+    for key in keys:
+        try:
+            result = perform_scan.delay(key)
+            result_queue.put(result)
+        except:
+           print "failed"
+</code></pre>
+<p>The <code>perform_scan.delay()</code> function here actually calls a celery worker, but I don't think is relevant (it is an asynchronous process call).</p>
+<p>I also have:</p>
+<pre><code>def grouper(iterable, n, fillvalue=None):
+    args = [iter(iterable)] * n
+    return izip_longest(fillvalue=fillvalue, *args)
+</code></pre>
+<p>Lastly I have a <code>main()</code> function:</p>
+<pre><code>def main():
+
+    executor = concurrent.futures.ProcessPoolExecutor(10)
+    futures = [executor.submit(enqueue_tasks, group) for group in grouper(key_list, 40)]
+    concurrent.futures.wait(futures)
+    print len(result_queue)
+</code></pre>
+<p>The result from the print statement is a 0. Yet if I include a print statement of the size of <code>result_queue</code> in <code>enqueue_tasks</code>, while the program is running, I can see that the size is increasing and things are being added to the queue.</p>
+<p>Ideas of what is happening?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It looks like there's a simpler solution to this problem.</p>
+<p>You're building a list of futures. The whole point of futures is that they're <em>future results</em>. In particular, whatever each function returns, that's the (eventual) value of the future. So, don't do the whole "push results onto a queue" thing at all, just return them from the task function, and pick them up from the futures.</p>
+<hr/>
+<p>The simplest way to do this is to break that loop up so that each key is a separate task, with a separate future. I don't know whether that's appropriate for your real code, but if it is:</p>
+<pre><code>def do_task(key):
+    try:
+        return perform_scan.delay(key)
+    except:
+        print "failed"
+
+def main():
+    executor = concurrent.futures.ProcessPoolExecutor(10)
+    futures = [executor.submit(do_task, key) for key in key_list]
+    # If you want to do anything with these results, you probably want
+    # a loop around concurrent.futures.as_completed or similar here,
+    # rather than waiting for them all to finish, ignoring the results,
+    # and printing the number of them.
+    concurrent.futures.wait(futures)
+    print len(futures)
+</code></pre>
+<hr/>
+<p>Of course that doesn't do the grouping. But do you need it?</p>
+<p>The most likely reason for the grouping to be necessary is that the tasks are so tiny that the overhead in scheduling them (and pickling the inputs and outputs) swamps the actual work. If that's true, then you can almost certainly wait until a whole batch is done to return any results. Especially given that you're not even looking at the results until they're all done anyway. (This model of "split into groups, process each group, merge back together" is pretty common in cases like numerical work, where each element may be tiny, or elements may not be independent of each other, but there are groups that are big enough or independent from the rest of the work.)</p>
+<p>At any rate, that's almost as simple:</p>
+<pre><code>def do_tasks(keys):
+    results = []
+    for key in keys:
+        try:
+            result = perform_scan.delay(key)
+            results.append(result)
+        except:
+           print "failed"
+    return results
+
+def main():
+    executor = concurrent.futures.ProcessPoolExecutor(10)
+    futures = [executor.submit(enqueue_tasks, group) for group in grouper(key_list, 40)]
+    print sum(len(results) for results in concurrent.futures.as_completed(futures))
+</code></pre>
+<p>Or, if you prefer to first wait and then calculate:</p>
+<pre><code>def main():
+    executor = concurrent.futures.ProcessPoolExecutor(10)
+    futures = [executor.submit(enqueue_tasks, group) for group in grouper(key_list, 40)]
+    concurrent.futures.wait(futures)
+    print sum(len(future.result()) for future in futures)
+</code></pre>
+<p>But again, I doubt you need even this.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You need to use a <a href="https://docs.python.org/2/library/multiprocessing.html#multiprocessing.Queue" rel="nofollow"><code>multiprocessing.Queue</code></a>, not a <code>Queue.Queue</code>. <code>Queue.Queue</code> is <em>thread-safe</em>, not process-safe, so the changes you make to it in one process are not reflected in any others.</p>
+</div>
+<span class="comment-copy">If <code>perform_scan.delay()</code> is an asynchronous remote call, which presumably means it's doing no processing and just waiting around for a response, why are you using processes instead of threads in the first place?</span>
+<span class="comment-copy">My eyes have been opened. I don't even know why I didn't think of futures as a simple list comprehension -- this completely defeats the purpose for my intermediary queue as you stated (building off the other comment to your comment). I also took out grouping -- I was thinking of grouping the wrong way. It seems I don't need it, as even though my individual tasks are very small, I do not to look at any of them until the end. One thing I don't understand is 'future.result'. I thought future was the actual result, is a future its own object?</span>
+<span class="comment-copy">@jeffrey: Yes, a <a href="https://docs.python.org/3/library/concurrent.futures.html#future-objects" rel="nofollow noreferrer"><code>Future</code></a> is an object that holds a result that may not be available yet. It's possible to design a whole language's concurrency model around implicit futures (see AliceML, or any actor or dataflow language), which can be very cool, but that wouldn't fit into Python, so it has explicit futures instead. See <a href="http://en.wikipedia.org/wiki/Futures_and_promises" rel="nofollow noreferrer">Wikipedia</a> for some more discussion.</span>
+<span class="comment-copy">Also note that I mentioned this in <a href="http://stackoverflow.com/questions/26409865/can-i-have-two-multithreaded-functions-running-at-the-same-time#comment41469218_26410020">a comment</a> in your earlier question on this topic. I apologize if it wasn't clear what I meant.</span>
+<span class="comment-copy">I appreciate the help! There was no way you could have known as I did not give the context of my problem.</span>

@@ -1,0 +1,180 @@
+<div class="post-text" itemprop="text">
+<p>I have written a Python program and Cythonize it. The speed-up gained by Cython (30%) wasn't satisfying. There is definitely room to optimise it by either changing the code structure or the way it is Cythonized. Any help would be appreciated.
+The program is basically takes a digital elevation model (DEM) raster map and a excess water map with the same shape. For each pixel in the excess water map, it searches for the four neighbouring pixels and determines if the pixel is lower than surrounding neighbors, has same level or is higher than them. Based on this, it increases water level at the pixel or divides its excess water among neighbours that have lower elevation. The code continues until all the excess water is spread over the ground. Here's the Cython version of the code. </p>
+<pre><code>import numpy as np
+cimport numpy as np
+
+cdef unravel(np.ndarray[np.int_t, ndim = 1] idx,int shape0, int shape1):
+    return idx//shape0, idx%shape1
+
+cdef find_lower_neighbours(int i, int j, np.ndarray[np.double_t, ndim=2] water_level, double friction_head_loss):
+
+    cdef double current_water_el, minlevels, deltav_total, deltav_min
+    current_water_el = water_level[i,j]
+    cdef np.ndarray[np.double_t, ndim = 1] levels = np.zeros(4, dtype = np.double)
+
+    levels[:] = water_level[i - 1, j], water_level[i, j + 1], water_level[i + 1, j], water_level[i, j - 1]
+    minlevels = levels.min()
+
+    if current_water_el - minlevels &lt; 0:
+        return 0, minlevels, 0
+
+    elif np.absolute(current_water_el - minlevels) &lt; 0.0001:
+        res = np.where(np.absolute(levels - current_water_el) &lt; 0.0001)
+        return 1, res[0], 0
+
+    else:
+        levels = current_water_el - levels
+        low_values_flags = levels &lt; 0
+        levels[low_values_flags] = 0
+
+        deltav_total = np.sum(levels)
+        deltav_min = levels[levels &gt; 0].min()
+        return 2, levels / (deltav_total + deltav_min), deltav_min / (deltav_total + deltav_min)
+
+
+cpdef np.ndarray[np.double_t, ndim=2] new_algorithm( np.ndarray[np.double_t, ndim=2] DEM, np.ndarray[np.double_t, ndim=2] extra_volume_map, double nodata, double pixel_area, double friction_head_loss , int von_neuman):
+
+    cdef int terminate = 0
+    cdef int iteration = 1
+
+    cdef double sum_extra_volume_map
+
+
+    index_dic_von_neuman = [[-1, 0], [0, 1], [1, 0], [0, -1]]
+    cdef int DEMshape0 = DEM.shape[0]
+    cdef int DEMshape1 = DEM.shape[1]
+
+    cdef np.ndarray[np.double_t, ndim = 2] water_levels
+    water_levels = np.copy(DEM)
+
+    cdef np.ndarray[np.double_t, ndim = 2] temp_water_levels
+    temp_water_levels = np.copy(water_levels)
+
+    cdef np.ndarray[np.double_t, ndim = 2] temp_extra_volume_map
+    temp_extra_volume_map = np.copy(extra_volume_map)
+
+
+    cdef np.ndarray[np.int_t, ndim = 2] wetcells
+    wetcells = np.zeros((DEMshape0,DEMshape1), dtype= np.int)
+    wetcells[extra_volume_map &gt; 0] = 1
+
+    cdef np.ndarray[np.int_t, ndim = 2] temp_wetcells
+    temp_wetcells = np.zeros((DEMshape0,DEMshape1), dtype= np.int )
+
+    cdef double min_excess = friction_head_loss * pixel_area
+    cdef np.ndarray[np.int_t, ndim = 1] fdx
+    cdef int i, j , k, condition, have_any_dry_cells_in_neghbors
+    cdef double water_level_difference, n , volume_to_each_neghbour, weight, w0
+
+    if von_neuman == 0:
+        index_dic = index_dic_von_neuman
+
+
+    while terminate != 1:
+        fdx = np.flatnonzero(extra_volume_map &gt; min_excess)
+        extra_volume_locations = unravel(fdx, DEMshape1,DEMshape1)
+        if not extra_volume_locations[0].size:
+            terminate = 1
+            return water_levels
+
+        for item in zip(*extra_volume_locations):
+            i = item[0]
+            j = item[1]
+
+            if DEM[i,j] == nodata:
+                print "warningggggg", i, j
+                temp_extra_volume_map[i,j] = 0.
+            else:
+                condition, wi, w0 = find_lower_neighbours(i, j, water_levels, friction_head_loss)
+
+                if condition == 0:
+                    water_level_difference = wi - water_levels[i,j]
+                    temp_water_levels[i,j] = wi
+                    temp_extra_volume_map[i,j] -= water_level_difference * pixel_area
+
+                elif condition == 1:
+                    n = len(wi)
+                    volume_to_each_neghbour = (extra_volume_map[i, j] - friction_head_loss * pixel_area * .02)/ (n * 1. )
+                    for itemm in wi:
+                        temp_extra_volume_map[i + index_dic[itemm][0], j + index_dic[itemm][1]] += volume_to_each_neghbour
+                        temp_wetcells[i + index_dic[itemm][0], j + index_dic[itemm][1]] += 1
+                    temp_extra_volume_map[i,j] -= extra_volume_map[i,j]
+                    temp_water_levels[i,j] += friction_head_loss * .02
+
+                elif condition == 2:
+                    temp_wetcells[i,j] += 1
+                    have_any_dry_cells_in_neghbors = 0 # means "no"
+                    for k, weight in enumerate(wi):
+                        if weight &gt; 0:
+                            temp_extra_volume_map[i + index_dic[k][0], j + index_dic[k][1]] += weight * (extra_volume_map[i,j])
+                            if wetcells[i + index_dic[k][0], j + index_dic[k][1]] == 0:
+                                have_any_dry_cells_in_neghbors = 1
+                            temp_wetcells[i + index_dic[k][0], j + index_dic[k][1]] += 1
+                    if have_any_dry_cells_in_neghbors == 1:
+                        temp_water_levels[i,j] += friction_head_loss
+                        temp_extra_volume_map[i, j] -= (1. - w0) * (extra_volume_map[i, j])
+                    else:
+                        temp_extra_volume_map[i, j] -= (1. - w0) * (extra_volume_map[i, j])
+
+
+        wetcells = np.copy(temp_wetcells)
+        water_levels = np.copy(temp_water_levels)
+        extra_volume_map = np.copy(temp_extra_volume_map)
+
+        iteration += 1
+        if iteration*1. %500. == 0.:
+            sum_extra_volume_map = np.sum(extra_volume_map)
+            print "iteration", iteration, "volume left =",  sum_extra_volume_map
+
+
+    print "finished at iteration =", iteration - 1
+
+    return water_levels
+</code></pre>
+<p>Here is the result of profiling:</p>
+<pre><code>6712150 function calls in 29.005 seconds
+
+Ordered by: standard name
+
+ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      1    0.000    0.000   29.005   29.005 &lt;string&gt;:1(&lt;module&gt;)
+2017444    0.497    0.000    4.414    0.000 _methods.py:28(_amin)
+289757    0.070    0.000    0.543    0.000 _methods.py:31(_sum)
+289757    0.437    0.000    1.098    0.000 fromnumeric.py:1730(sum)
+506055    0.203    0.000    0.705    0.000 function_base.py:1453(copy)
+168685    0.140    0.000    0.300    0.000 numeric.py:859(flatnonzero)
+     1    0.000    0.000    0.000    0.000 test.py:22(print_dem_for_excel)
+     1    0.000    0.000   29.005   29.005 test.py:27(test)
+289757    0.119    0.000    0.119    0.000 {isinstance}
+     1    0.000    0.000    0.000    0.000 {len}
+    20    0.000    0.000    0.000    0.000 {map}
+    20    0.000    0.000    0.000    0.000 {method 'append' of 'list' objects}
+     1    0.000    0.000    0.000    0.000 {method 'disable' of '_lsprof.Profiler' objects}
+    20    0.000    0.000    0.000    0.000 {method 'join' of 'str' objects}
+168685    0.106    0.000    0.106    0.000 {method 'nonzero' of 'numpy.ndarray' objects}
+168685    0.054    0.000    0.054    0.000 {method 'ravel' of 'numpy.ndarray' objects}
+2307201    4.390    0.000    4.390    0.000 {method 'reduce' of 'numpy.ufunc' objects}
+ 506056    0.501    0.000    0.501    0.000 {numpy.core.multiarray.array}
+     1    0.000    0.000    0.000    0.000 {numpy.core.multiarray.zeros}
+     1    0.000    0.000    0.000    0.000 {time.time}
+     1   22.488   22.488   29.005   29.005 {version3Cython.new_algorithm}
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You need first to <a href="https://en.wikipedia.org/wiki/Profiling_(computer_programming)" rel="nofollow noreferrer">profile</a> your program and measure precisely what takes time (what functions consume the most CPU time).</p>
+<p>You could improve the algorithms in your program and lower the <a href="https://en.wikipedia.org/wiki/Time_complexity" rel="nofollow noreferrer">time complexity</a> of some of your functions.</p>
+<p>You could also <em>manually</em> rewrite the heavy (resource demanding, e.g. CPU consuming) parts of your code, e.g. as <a href="https://docs.python.org/3/extending/index.html" rel="nofollow noreferrer">Python extensions</a> in (hand written) C (perhaps also with some parts in C++ or any language easily callable from C and compatible with the memory models of Python and C). Don't expect any tool (e.g. Cython) to do that automatically and efficiently.</p>
+<p>Your program is small enough. Consider spending a few weeks (or months) in rewriting some parts of it, or even redesigning and rewriting it entirely. I guess that statically typed compiled languages (like Ocaml, Go, D, C++) could provide some performance improvement. Perhaps you might consider <em>redesigning entirely</em> your code as a concurrent application (multi-<a href="https://en.wikipedia.org/wiki/Thread_(computing)" rel="nofollow noreferrer">threaded</a>, or <a href="https://en.wikipedia.org/wiki/OpenCL" rel="nofollow noreferrer">OpenCL</a>, <a href="https://en.wikipedia.org/wiki/Message_Passing_Interface" rel="nofollow noreferrer">MPI</a>, ....)</p>
+<p>Look at the existing Python prototype as just a way to begin understanding the problem you are tackling, but redesign and rewrite your code entirely (probably in a different language). Spend also some time reading existing literature on the subject and discussing with experts.</p>
+<p>BTW, an execution time of less than a minute might be considered acceptable by your users. Then you don't need to rewrite code. Remember that your development time has some costs too! There is <a href="https://en.wikipedia.org/wiki/No_Silver_Bullet" rel="nofollow noreferrer"><em>No Silver Bullet</em></a> ...</p>
+</div>
+<span class="comment-copy">Don't expect SO to do your work .....</span>
+<span class="comment-copy">I'm sorry if my question is interpreted in this way. I thought by putting the whole algorithm SO professionals can see areas that I don't even know is possible to improve.</span>
+<span class="comment-copy"><code>cython -a</code> is a good first place to look. Things like an untyped <code>index_dic_von_neuman = ...</code> are going to kill your performance.</span>
+<span class="comment-copy">@Veedrac Untyped items in my code are Python objects (list, dictionary, ...) should I try to avoid using them or there is a specific way to declare their type? I'm having problem interpreting the -a html file, I should learn how to use it. Thanks for the tips.</span>
+<span class="comment-copy">Thanks, I added result of profiling.</span>
+<span class="comment-copy">Run time for a real case takes around 3 hours. Besides I will run this algorithm for many cases at the same time, so I can take all the computational resources I have.</span>
+<span class="comment-copy">It is your decision to decide if spending a month of work (and perhaps even several, depends upon your current skills) is worthwhile. Remember <a href="https://en.wikipedia.org/wiki/Hofstadter%27s_law" rel="nofollow noreferrer">Hofstadter's law</a>. Perhaps speak with your PhD advisor.</span>
+<span class="comment-copy">@BasileStarynkevitch great answer</span>
+<span class="comment-copy">With respect to profiling, Cython does support line by line profiling (which might give additional insight)</span>

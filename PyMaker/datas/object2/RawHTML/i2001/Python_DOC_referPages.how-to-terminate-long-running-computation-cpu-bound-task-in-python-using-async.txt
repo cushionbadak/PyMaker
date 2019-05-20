@@ -1,0 +1,186 @@
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>Similar Question (but answer does not work for me): <a href="https://stackoverflow.com/questions/42325559/how-to-cancel-long-running-subprocesses-running-using-concurrent-futures-proces">How to cancel long-running subprocesses running using concurrent.futures.ProcessPoolExecutor?</a></p>
+</blockquote>
+<p>Unlike the question linked above and the solution provided, in my case the computation itself is rather long (CPU bound) and cannot be run in a loop to check if some event has happened.</p>
+<p>Reduced version of the code below:</p>
+<pre class="lang-python prettyprint-override"><code>import asyncio
+import concurrent.futures as futures
+import time
+
+class Simulator:
+    def __init__(self):
+        self._loop = None
+        self._lmz_executor = None
+        self._tasks = []
+        self._max_execution_time = time.monotonic() + 60
+        self._long_running_tasks = []
+
+    def initialise(self):
+        # Initialise the main asyncio loop
+        self._loop = asyncio.get_event_loop()
+        self._loop.set_default_executor(
+            futures.ThreadPoolExecutor(max_workers=3))
+
+        # Run separate processes of long computation task
+        self._lmz_executor = futures.ProcessPoolExecutor(max_workers=3)
+
+    def run(self):
+        self._tasks.extend(
+            [self.bot_reasoning_loop(bot_id) for bot_id in [1, 2, 3]]
+        )
+
+        try:
+            # Gather bot reasoner tasks
+            _reasoner_tasks = asyncio.gather(*self._tasks)
+            # Send the reasoner tasks to main monitor task
+            asyncio.gather(self.sample_main_loop(_reasoner_tasks))
+            self._loop.run_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._loop.close()
+
+    async def sample_main_loop(self, reasoner_tasks):
+        """This is the main monitor task"""
+        await asyncio.wait_for(reasoner_tasks, None)
+        for task in self._long_running_tasks:
+            try:
+                await asyncio.wait_for(task, 10)
+            except asyncio.TimeoutError:
+                print("Oops. Some long operation timed out.")
+                task.cancel()  # Doesn't cancel and has no effect
+                task.set_result(None)  # Doesn't seem to have an effect
+
+        self._lmz_executor.shutdown()
+        self._loop.stop()
+        print('And now I am done. Yay!')
+
+    async def bot_reasoning_loop(self, bot):
+        import math
+
+        _exec_count = 0
+        _sleepy_time = 15
+        _max_runs = math.floor(self._max_execution_time / _sleepy_time)
+
+        self._long_running_tasks.append(
+            self._loop.run_in_executor(
+                    self._lmz_executor, really_long_process, _sleepy_time))
+
+        while time.monotonic() &lt; self._max_execution_time:
+            print("Bot#{}: thinking for {}s. Run {}/{}".format(
+                    bot, _sleepy_time, _exec_count, _max_runs))
+            await asyncio.sleep(_sleepy_time)
+            _exec_count += 1
+
+        print("Bot#{} Finished Thinking".format(bot))
+
+def really_long_process(sleepy_time):
+    print("I am a really long computation.....")
+    _large_val = 9729379273492397293479237492734 ** 344323
+    print("I finally computed this large value: {}".format(_large_val))
+
+if __name__ == "__main__":
+    sim = Simulator()
+    sim.initialise()
+    sim.run()
+</code></pre>
+<p>The idea is that there is a main simulation loop that runs and monitors three bot threads. Each of these bot threads then perform some reasoning but also start a really long background process using <code>ProcessPoolExecutor</code>, which may end up running longer their own threshold/max execution time for reasoning on things.</p>
+<p>As you can see in the code above, I attempted to <code>.cancel()</code> these tasks when a timeout occurs. Though this is not really cancelling the actual computation, which keeps happening in the background and the <code>asyncio</code> loop doesn't terminate until after all the long running computation have finished.</p>
+<p>How do I terminate such long running CPU-bound computations within a method?</p>
+<blockquote>
+<p>Other similar SO questions, but not necessarily related or helpful:</p>
+<ol>
+<li><a href="https://stackoverflow.com/questions/26413613/asyncio-is-it-possible-to-cancel-a-future-been-run-by-an-executor">asyncio: Is it possible to cancel a future been run by an Executor?</a></li>
+<li><a href="https://stackoverflow.com/questions/32703599/how-to-terminate-a-single-async-task-in-multiprocessing-if-that-single-async-tas">How to terminate a single async task in multiprocessing if that single async task exceeds a threshold time in Python</a></li>
+<li><a href="https://stackoverflow.com/questions/20991968/asynchronous-multiprocessing-with-a-worker-pool-in-python-how-to-keep-going-aft">Asynchronous multiprocessing with a worker pool in Python: how to keep going after timeout?</a></li>
+</ol>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>How do I terminate such long running CPU-bound computations within a method?</p>
+</blockquote>
+<p>The approach you tried doesn't work because the futures returned by <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ProcessPoolExecutor" rel="nofollow noreferrer"><code>ProcessPoolExecutor</code></a> are not cancellable. Although asyncio's <code>run_in_executor</code> <a href="https://github.com/python/cpython/blob/3df85404d4bf420db3362eeae1345f2cad948a71/Lib/asyncio/futures.py#L357" rel="nofollow noreferrer">tries</a> to propagate the cancellation, it is simply <a href="https://github.com/python/cpython/blob/3df85404d4bf420db3362eeae1345f2cad948a71/Lib/concurrent/futures/_base.py#L359" rel="nofollow noreferrer">ignored</a> by <code>Future.cancel</code> once the task starts executing.</p>
+<p>There is no fundamental reason for that. Unlike threads, processes can be safely terminated, so it would be perfectly possible for <code>ProcessPoolExecutor.submit</code> to return a future whose <code>cancel</code> terminated the corresponding process. Asyncio coroutines have defined cancellation semantics and would automatically make use of it. Unfortunately, <code>ProcessPoolExecutor.submit</code> returns a regular <a href="https://docs.python.org/3/library/concurrent.futures.html#future-objects" rel="nofollow noreferrer"><code>concurrent.futures.Future</code></a>, which assumes the lowest common denominator and treats a running future as untouchable.</p>
+<p>As a result, to cancel tasks executed in subprocesses, one must circumvent the <code>ProcessPoolExecutor</code> altogether and manage one's own processes. The challenge is how to do this without reimplementing half of <code>multiprocessing</code>. One option offered by the standard library is to (ab)use <a href="https://docs.python.org/3/library/multiprocessing.html?highlight=multiprocessing#module-multiprocessing.pool" rel="nofollow noreferrer"><code>multiprocessing.Pool</code></a> for this purpose, because it supports reliable shutdown of worker processes. A <code>CancellablePool</code> could work as follows:</p>
+<ul>
+<li>Instead of spawning a fixed number of processes, spawn a fixed number of 1-worker pools.</li>
+<li>Assign tasks to pools from an asyncio coroutine. If the coroutine is canceled while waiting for the task to finish in the other process, <a href="https://docs.python.org/3/library/multiprocessing.html?highlight=multiprocessing#multiprocessing.pool.Pool.terminate" rel="nofollow noreferrer">terminate</a> the single-process pool and create a new one.</li>
+<li>Since everything is coordinated from the single asyncio thread, don't worry about race conditions such as accidentally killing a process which has already started executing another task. (This would need to be prevented if one were to support cancellation in <code>ProcessPoolExecutor</code>.)</li>
+</ul>
+<p>Here is a sample implementation of that idea:</p>
+<pre><code>import asyncio
+import multiprocessing
+
+class CancellablePool:
+    def __init__(self, max_workers=3):
+        self._free = {self._new_pool() for _ in range(max_workers)}
+        self._working = set()
+        self._change = asyncio.Event()
+
+    def _new_pool(self):
+        return multiprocessing.Pool(1)
+
+    async def apply(self, fn, *args):
+        """
+        Like multiprocessing.Pool.apply_async, but:
+         * is an asyncio coroutine
+         * terminates the process if cancelled
+        """
+        while not self._free:
+            await self._change.wait()
+            self._change.clear()
+        pool = usable_pool = self._free.pop()
+        self._working.add(pool)
+
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
+        def _on_done(obj):
+            loop.call_soon_threadsafe(fut.set_result, obj)
+        def _on_err(err):
+            loop.call_soon_threadsafe(fut.set_exception, err)
+        pool.apply_async(fn, args, callback=_on_done, error_callback=_on_err)
+
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            pool.terminate()
+            usable_pool = self._new_pool()
+        finally:
+            self._working.remove(pool)
+            self._free.add(usable_pool)
+            self._change.set()
+
+    def shutdown(self):
+        for p in self._working | self._free:
+            p.terminate()
+        self._free.clear()
+</code></pre>
+<p>A minimalistic test case showing cancellation:</p>
+<pre><code>def really_long_process():
+    print("I am a really long computation.....")
+    large_val = 9729379273492397293479237492734 ** 344323
+    print("I finally computed this large value: {}".format(large_val))
+
+async def main():
+    loop = asyncio.get_event_loop()
+    pool = CancellablePool()
+
+    tasks = [loop.create_task(pool.apply(really_long_process))
+             for _ in range(5)]
+    for t in tasks:
+        try:
+            await asyncio.wait_for(t, 1)
+        except asyncio.TimeoutError:
+            print('task timed out and cancelled')
+    pool.shutdown()
+
+asyncio.get_event_loop().run_until_complete(main())
+</code></pre>
+<p>Note how the CPU usage never exceeds 3 cores, and how it starts dropping near the end of the test, indicating that the processes are  being terminated as expected.</p>
+<p>To apply it to the code from the question, make <code>self._lmz_executor</code> an instance of <code>CancellablePool</code> and change <code>self._loop.run_in_executor(...)</code> to <code>self._loop.create_task(self._lmz_executor.apply(...))</code>.</p>
+</div>
+<span class="comment-copy">This is wonderful and works just as I wanted. It's a shame that asyncio library doesn't actually terminate processes run within ProcessPoolExecutor. It makes sense for ThreadPoolExecutor. I will reserve such a discussion for the Python mailing list perhaps. Thanks.</span>
+<span class="comment-copy">@Darkfish I think it would be a worthwhile suggestion for the Python bug tracker. (Though realistically it might be ignored unless accompanied by a patch implementing it.) Also, be careful before using tihs in production. My first attempt was to use <code>ProcessPoolExecutor</code> as the underlying pool, but that class was <b>very</b> unhappy when someone terminated the pool with a pending tasks - its management thread started raising "bad file descriptor" and similar exceptions, and they couldn't be caught. <code>multiprocessing</code> handles it gracefully, but I'm not sure anyone actually tests that.</span>
+<span class="comment-copy">Good to know. For now I am only implementing a research prototype, so I suppose will have to test it thoroughly before release. Perhaps when I am over this, I shall look into either patching or at least starting a discussion on Python list. Thanks mate.</span>

@@ -1,0 +1,110 @@
+<div class="post-text" itemprop="text">
+<p>I was trying to implement a (prototype, not production) version of a persistent dictionary that uses pickle on disk as persistent storage. However, <code>pickle.load</code> calls <code>__setitem__</code> for its own purposes, and that's the method that is (of course) overridden to ensure changes to the dictionary are propagated back to the persistent storage -- and so it calls <code>pickle.dump</code>. Of course, it's not ok to call <code>pickle.dump</code> as every item is being set during unpickling.</p>
+<p>Is there any way to solve this, other than by brute force (as below)? I tried reading <a href="https://docs.python.org/3/library/pickle.html#pickling-class-instances" rel="nofollow noreferrer">Pickling Class Instances</a> in search of a solution using of special methods, but didn't find any.</p>
+<p>The code below monitors whether unpickling is in progress, and skips <code>pickle.dump</code> in that case; while it works fine, it feels hacky.</p>
+<pre><code>import os, pickle
+
+class PersistentDict(dict):
+    def __new__(cls, *args, **kwargs):
+        if not args: # when unpickling
+            obj = dict.__new__(cls)
+            obj.uninitialized = True
+            return obj
+        path, *args = args
+        if os.path.exists(path):
+            obj = pickle.load(open(path, 'rb'))
+            del obj.uninitialized
+            return obj
+        else:
+            obj = dict.__new__(cls, *args, **kwargs)
+            obj.path = path
+            obj.dump()
+            return obj
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.dump()
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self.dump()
+
+    def dump(self):
+        if not hasattr(self, 'uninitialized'):
+            pickle.dump(self, open(self.path, 'wb'))
+
+    def clear(self):
+        os.remove(self.path)
+
+pd = PersistentDict('abc')
+assert pd == {}
+pd[1] = 2
+assert pd == {1: 2}
+pd[2] = 4
+assert pd == {1: 2, 2: 4}
+del pd[1]
+assert pd == {2: 4}
+xd = PersistentDict('abc')
+assert xd == {2: 4}
+xd[3] = 6
+assert xd == {2: 4, 3: 6}
+yd = PersistentDict('abc')
+assert yd == {2: 4, 3: 6}
+yd.clear()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Inheriting directly from <code>dict</code> is not advised when trying to get to fancy dictionary implementations. For one thing, Python's ABI takes some shortcuts on dict class that might eventually skip some calls tos certain dunder methods - and also, as you can perceive when pikcling and unpickling - dictionaries and direct subclasses of it will be treated in a different way than ordinary objects (which have their <code>__dict__</code> attribute pickled, not their keys set with <code>__setitem__</code>.</p>
+<p>So, for one thing, start with inheriting from <code>collections.UserDict</code> - this is a different implementation of <code>dict</code> which ensures all data access is done through a proper Python side call to the dunder special methods. You might even want to implement it as an implementation of <code>collections.abc.MutableMapping</code> - that ensures you have to implement a minimal number of methods in your code to have your class working like if it were a real dictionary. </p>
+<p>Second thing: the Pickle protocol will do "its thing" by default - which in mapping classes is (I haven't checked, but apparently is), pickling the (key, value) pairs and calling <code>__setitem__</code> for each of those on unpicling.  But the pickling behavior is fully customizable-  as you can see <a href="https://docs.python.org/3/library/pickle.html#object.__setstate__" rel="nofollow noreferrer">on the documentation</a> - you can simply implement explict <code>__getstate__</code> and <code>__setstate__</code> methods on your class to have full control over the pickling/unpickling code.</p>
+<p>Example using MutableMapping, and storing the dictionary contents in an associated internal dictionary:</p>
+<pre><code>from collections.abc import MutableMapping
+
+class SpecialDict(MutableMapping):
+    def __init__(self, path, **kwargs):
+        self.path = path
+        self.content = dict(**kwargs)
+        self.dump()
+    def __getitem__(self, key):
+        return self.content[key]
+
+    def __setitem__(self, key, value):
+        self.content[key] = value
+        self.dump()
+
+    def __delitem__(self, key):
+        del self.content[key]
+        self.dump()
+
+    def __iter__(self):
+        return iter(self.content)
+
+    def __len__(self):
+        return len(self.content)
+
+    def dump(self):
+        ...
+
+    def __getstate__(self):
+        return (self.path, self.content)
+
+    def __setstate__(self, state):
+        self.path = state[0]
+        self.content = state[1]
+</code></pre>
+<p>BTW, a big advantage of using the MutableMapping super class is that it is guarranteed that if you implement properly the methods described <a href="https://docs.python.org/3/library/collections.abc.html" rel="nofollow noreferrer">in the documentation</a>, your code is ready for production (so, no need to worry about missing exquisite corner cases).   </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The strategy employed in this <a href="https://github.com/ActiveState/code/blob/73b09edc1b9850c557a79296655f140ce5e853db/recipes/Python/576642_Persistent_dict_multiple_standard_file/recipe-576642.py" rel="nofollow noreferrer">recipe</a> by Raymond Hettinger is to:</p>
+<pre><code>pickle.dump(dict(self), ...)
+</code></pre>
+<p>and inside <code>__init__</code> (you therefore don't need to implement <code>__new__</code>)</p>
+<pre><code>self.update(pickle.load(...))
+</code></pre>
+</div>
+<span class="comment-copy">It may be easier to give your class an attribute that is a dict, and store the data there, rather than making your class inherit from dict.  Then you can pickle the stored dict instead of your PersistentDict, separating the two layers.</span>
+<span class="comment-copy">@BrenBarn that's exactly what I was thinking, but I'm very biased against inheritance to begin with, to the point that I always replace it with composition. So this time, I wanted to give inheritance a try. The only argument in favor of inheritance I know is that automatic forwarding using <code>__getattr__</code> doesn't forward special methods (like <code>__getitem__</code>, <code>__contains__</code>, <code>__eq__</code>, etc.), and it's a bit of a hassle to forward them all manually. But this seems to end up as another example where inheritance is much more frustrating to deal with than composition.</span>
+<span class="comment-copy">Inheriting from <code>collections.UserDict</code> causes <code>isinstance(obj, dict) == False</code>, which may be an important use case.</span>

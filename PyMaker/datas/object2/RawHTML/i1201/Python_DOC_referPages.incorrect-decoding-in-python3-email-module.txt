@@ -1,0 +1,95 @@
+<div class="post-text" itemprop="text">
+<p>I have recently run into an EML file I wanted to parse with Python email module.
+In <code>from</code> header, there was following text: </p>
+<pre><code>From: "=?utf-8?b?5b2t5Lul5Zu9L+esrOS6jOS6i+S4mumDqOmhueebrumDqC/nrKzkuozkuovkuJrp?=
+=?utf-8?b?g6g=?=" &lt;email@address.com&gt;
+</code></pre>
+<p>So the name is encoded in 2 parts. When I concatenate the code and decode this manually to hex, I get the following result, which is correct UTF-8 string:</p>
+<pre><code>e5 bd ad e4 bb a5 e5 9b bd 2f e7 ac ac e4 ba 8c e4 ba 8b e4 b8 9a e9 83 a8 e9 a1 b9 e7 9b ae e9 83 a8 2f e7 ac ac e4 ba 8c e4 ba 8b e4 b8 9a e9 83 a8
+</code></pre>
+<p>However, when I call the Python email Parser <code>parse</code>, the last 3 bytes are not decoded correctly. Instead, when I read the values of <code>message['from']</code>, there are surrogates:</p>
+<pre><code>dce9:20:dc83:dca8
+</code></pre>
+<p>So when I, for example, want to print the string, it ends up with </p>
+<pre><code>UnicodeEncodeError('utf-8', '彭以国/第二事业部项目部/第二事业\udce9\udc83\udca8', 17, 18, 'surrogates not allowed')
+</code></pre>
+<p>When I join the 2 encoded parts in <code>From</code> header into one, which looks like this:</p>
+<pre><code>From: "=?utf-8?b?5b2t5Lul5Zu9L+esrOS6jOS6i+S4mumDqOmhueebrumDqC/nrKzkuozkuovkuJrpg6g=?=" &lt;email@address.com&gt;
+</code></pre>
+<p>The string is decoded correctly by the library and can be printed just fine.</p>
+<p>Is this a bug inside Python email module? Is the double-encoded value even permitted by EML standard?</p>
+<p>Here is a sample EML file + Python code to reproduce the bad decoding (this does not actually trigger the exception, which happens later i.e. with SQLAlchemy not being able to encode the string back to UTF-8)</p>
+<p>EML:</p>
+<pre><code>Content-Type: multipart/mixed; boundary="===============2193163039290138103=="
+MIME-Version: 1.0
+Date: Wed, 25 Aug 2018 19:21:23 +0100
+From: "=?utf-8?b?5b2t5Lul5Zu9L+esrOS6jOS6i+S4mumDqOmhueebrumDqC/nrKzkuozkuovkuJrp?=
+ =?utf-8?b?g6g=?=" &lt;addr@addr.com&gt;
+Message-Id: &lt;12312924463694945698.525C0AC435BA7D0E@xxxxx.com&gt;
+Subject: Sample subject
+To: addr@addr.com
+
+--===============2193163039290138103==
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: base64
+
+VGhpcyBpcyBhIHNhbXBsZSB0ZXh0
+
+--===============2193163039290138103==--
+</code></pre>
+<p>Python code:</p>
+<pre><code>from email.parser import Parser
+from email import policy
+from sys import argv
+
+
+with open(argv[1], 'r', encoding='utf-8') as eml_file:
+    msg = Parser(policy=policy.default).parse(eml_file)
+
+print(msg['from'])
+</code></pre>
+<p>Result:</p>
+<p>彭以国/第二事业部项目部/第二事业� �� </p>
+</div>
+<div class="post-text" itemprop="text">
+<p>This appears to be a problem with how the <code>email.parser</code> infrastructure is handling unfolding of multi-line headers containing encoded-word tokens for the From header and other structured headers. It does this correctly for <em>unstructured</em> headers such as <code>Subject</code>.</p>
+<p>Your header has two <a href="https://en.wikipedia.org/wiki/MIME#Encoded-Word" rel="nofollow noreferrer">encoded word</a> parts, on two separate lines. This is perfectly normal, an encoded-word token has limited space (there is a maximum length limit) and so your UTF-8 data was split into two such words, and there is a line-separator plus space in-between. All great and fine. Whatever generated the email was wrong to split in the middle of a UTF-8 character (RFC2047 states that is strictly forbidden), a <em>decoder</em> of such data should not insert spaces between the decoded bytes. It is the extra space that then prevents the <code>email</code> header handling from joining the surrogates and repairing the data.</p>
+<p>So this appears to be a bug in the way the headers are parsed when handling structured headers; the parser does not correctly handle spaces between encoded words, here the space was introduced by the folded header line. This then results in the space being preserved in between the two encoded-word parts, preventing proper decoding. So while RFC2047 does state that encoded-word sections <em>MUST</em> contain whole characters (multi-byte encodings must not be split), it also states that encoded words can be split up with CRLF SPACE delimiters and any spaces in between encoded words are to be ignored.</p>
+<p>You can work around this by supplying a custom policy class, which removes the leading white space from lines in your own implementation of the <a href="https://docs.python.org/3/library/email.policy.html#email.policy.Policy.header_fetch_parse" rel="nofollow noreferrer"><code>Policy.header_fetch_parse()</code> method</a>.</p>
+<pre><code>import re
+from email.policy import EmailPolicy
+
+class UnfoldingEncodedStringHeaderPolicy(EmailPolicy):
+    def header_fetch_parse(self, name, value):
+        # remove any leading white space from header lines
+        # that separates apparent encoded-word tokens before further processing 
+        # using somewhat crude CRLF-FWS-between-encoded-word matching
+        value = re.sub(r'(?&lt;=\?=)((?:\r\n|[\r\n])[\t ]+)(?==\?)', '', value)
+        return super().header_fetch_parse(name, value)
+</code></pre>
+<p>and use that as your policy when loading:</p>
+<pre><code>custom_policy = UnfoldingEncodedStringHeaderPolicy()
+
+with open(argv[1], 'r', encoding='utf-8') as eml_file:
+    msg = Parser(policy=custom_policy).parse(eml_file)
+</code></pre>
+<p>Demo:</p>
+<pre><code>&gt;&gt;&gt; from io import StringIO
+&gt;&gt;&gt; from email.parser import Parser
+&gt;&gt;&gt; from email.policy import default as default_policy
+&gt;&gt;&gt; custom_policy = UnfoldingEncodedStringHeaderPolicy()
+&gt;&gt;&gt; Parser(policy=default_policy).parse(StringIO(data))['from']
+'彭以国/第二事业部项目部/第二事业� �� &lt;addr@addr.com&gt;'
+&gt;&gt;&gt; Parser(policy=custom_policy).parse(StringIO(data))['from']
+'彭以国/第二事业部项目部/第二事业部 &lt;addr@addr.com&gt;'
+</code></pre>
+<p>I filed <a href="https://bugs.python.org/issue35547" rel="nofollow noreferrer">Python issue #35547</a> to track this.</p>
+</div>
+<span class="comment-copy">Also, I am running Linux and the EML does not have CRLF separator between the 2 strings, just LF. Is that a problem?</span>
+<span class="comment-copy">No, the <code>email.parser</code> package can handle any combination, actually.</span>
+<span class="comment-copy">OK, thank you for the answers! Anyway, I think the way <code>email.parse</code> behave is a bug. It should at least raise an exception, that it cannot decode the string, not just decode it wrong! It seems as an easy thing to do anyway, to join these codes.</span>
+<span class="comment-copy">Added the sample EML file with Python code to reproduce the bad decoding.</span>
+<span class="comment-copy">Thank you for your MCVE, I was able to trace this down to how folded headers are treated. I'll file a bug with the Python project.</span>
+<span class="comment-copy">Encoded words are certainly completely permissible in <code>Subject:</code> and <code>From:</code>; this is what they were introduced for</span>
+<span class="comment-copy">Yup, and RFC 2047 explicitly named the phrases portion of From. I just wanted to cover all bases. I've removed that section now.</span>

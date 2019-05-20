@@ -1,0 +1,146 @@
+<div class="post-text" itemprop="text">
+<p>I would like to use python to ssh into a remote machine, launch an interactive executable on the remote, and then interact with said executable.</p>
+<p>In other words, I would like to mimic what happens when you do something like:</p>
+<pre><code>ssh me@host -t python2
+</code></pre>
+<p>(python2 is just python, but I named it differently to avoid confusion).</p>
+<p>When I do the command line above, I am "seamlessly" interacting with python2 on the remote.  </p>
+<p>I can't seem to do this in python.  I've tried using paramiko and subprocess, both have the same problem at this point.  For example, in subprocess:</p>
+<pre><code>ssh = subprocess.Popen("ssh me@host -t python2",
+                       shell=True,
+                       stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE)
+result = ssh.stdout.readlines()
+if result == []:
+    error = ssh.stderr.readlines()
+    print &gt;&gt; sys.stderr, "ERROR: %s" % error
+else:
+    print result
+</code></pre>
+<p>When I do that, I see nothing at the command line, but I can see via <code>ps</code> that python2 is indeed running, I just can't interact with it the way I'd like.  I can't see output from Python.</p>
+<p>I want to be able to submit commands from the host python script, like ssh.execute("1+1").  Which would basically tell python2 to compute 1+1.  I then want to read the output back into the host python script.  </p>
+</div>
+<div class="post-text" itemprop="text">
+<h2>Issues</h2>
+<p>Your issue is that ① <code>ssh.stdout.readlines()</code> is reading all existing input that has been buffered up to the point you're accessing it, split by line ending (either <code>\r</code> or <code>\n</code>).</p>
+<p>But because you're opening a prompt, there's ② likely to be only one line, which is <code>&gt;&gt;&gt;</code> which does not have a line ending.</p>
+<h2>handle streams</h2>
+<p>What you need to do is to create a while loop to read the output as it comes:</p>
+<pre><code>def handle_output(out):
+    while True:
+        out_line = out.readline()
+        print("OUT: {}".format(out_line))
+
+def handle_errput(err):
+    while True:
+        err_line = err.readline()
+        print("ERR: {}".format(err_line))
+</code></pre>
+<p>and that would work that way:</p>
+<pre><code>handle_output(ssh.stdout)
+handle_errput(ssh.stderr)
+</code></pre>
+<p>then as soon as a complete line is printed out by the remote python interpreter, you'll have something showing up on your console. But that only solves ①.</p>
+<p>You still need to have the remote process to output at least one full line, and the only way to do so, is to actually send data to it!</p>
+<p>So you want to add another function that does that:</p>
+<pre><code>def handle_input(inp):
+    while True:
+        inp_line = sys.stdin.readline()
+        inp.write(inp_line)
+</code></pre>
+<p>which you would call that way:</p>
+<pre><code>handle_input(ssh.stdin)
+</code></pre>
+<p>And that will solve ②.</p>
+<h2>parallelize reading</h2>
+<h3>with threads</h3>
+<p>But now, you've got another problem, logically speaking if you do:</p>
+<pre><code>handle_output(ssh.stdout)
+handle_errput(ssh.stderr)
+handle_input(ssh.stdin)
+</code></pre>
+<p>your program flow will never reach <code>handle_errput()</code> or <code>handle_input()</code>, because it will get stuck in the <code>handle_output()</code> infinite loop.</p>
+<p>The solution to that is to parallelize execution of the three loops:</p>
+<pre><code>out_thread = Thread(target=handle_output, args=(ssh.stdout,))
+err_thread = Thread(target=handle_errput, args=(ssh.stderr,))
+try:
+    out_thread.start()
+    err_thread.start()
+    handle_input()
+finally:
+    out_thread.join()
+    err_thread.join()
+</code></pre>
+<p>That way reading from external process will happen in another thread, and writing will happen in the current thread. You could as well start three threads (one for reading stdout, one for reading stderr, one for writing) and have the main thread run a loop that will do "stuff" and communicate with those threads (hint: use <code>threading.Queue</code> to exchange data between the threads).</p>
+<h3>with an event library (py3 only)</h3>
+<p>You can avoid using multithreading, and the pain of inter-thread communication if you use an async library <a href="https://docs.python.org/3/library/asyncio.html" rel="nofollow noreferrer">like asyncio offered with python 3</a> (for py2 you can use tornado or greenlet), which will offer you a very nice abstraction over using <code>select()</code>:</p>
+<pre><code>async def handle_output(out):
+    while True:
+        await out_line = out.readline()
+        print("OUT: {}".format(out_line))
+
+async def handle_errput(err):
+    while True:
+        await err_line = err.readline()
+        print("ERR: {}".format(err_line))
+
+async def handle_input(inp):
+    while True:
+        await inp_line = sys.stdin.readline()
+        inp.write(inp_line)
+
+asyncio.Task(handle_output(ssh.stdout))
+asyncio.Task(handle_errput(ssh.stderr))
+asyncio.Task(handle_input(ssh.stdin))
+
+asyncio.get_event_loop().run_forever()
+</code></pre>
+<h3>using select() call</h3>
+<p>In python 2, the best and simplest (but far from being the easiest) way to implement this, is to use a <a href="https://docs.python.org/2/library/select.html" rel="nofollow noreferrer">select()</a>:</p>
+<p>Basically a select call would <em>look like</em>:</p>
+<pre><code>while True:
+  readable, writable, excepts = select.select(
+           [ssh.stdout, ssh.stderr], # outputs to watch
+           [sys.stdin],              # inputs to watch
+           [ssh.stdout, ssh.stderr], # exceptions to watch
+           1)                        # timeout
+  for r in readable:
+    print(r.read())
+  for w in writable:
+    p.stdin.write(w.read())
+</code></pre>
+<p>but you should better <a href="https://pymotw.com/2/select/" rel="nofollow noreferrer">read a thorough documentation about <code>select()</code></a>.</p>
+<h2>Where to go from there?</h2>
+<blockquote>
+<p>I want to be able to submit commands from the host python script, like ssh.execute("1+1"). Which would basically tell python2 to compute 1+1. I then want to read the output back into the host python script. </p>
+</blockquote>
+<p>The solution I gave you is helping you to handle transparent communication from your terminal to the remote python process. It's exposing all the tools you're missing to implement the above, except one, how to communicate between the 3 loops?</p>
+<p>The simplest way is to use three queues, two that handle results incoming from the remote process, the last that handles outgoing commands:</p>
+<pre><code>input_queue = queue.Queue()
+output_queue = queue.Queue()
+errput_queue = queue.Queue()
+</code></pre>
+<p>Then in your main thread you can implement:</p>
+<pre><code>def remote_python_execute(command, output_queue, errput_queue):
+    # send a command to the remote process
+    input_queue.put(command)
+    out, err = ([], [])
+    # read the output and then the errput as long as
+    # there's something to read
+    while not output_queue.empty():
+        out.append(output_queue.get())
+    while not errput_queue.empty():
+        err.append(errput_queue.get())
+    return out, err
+</code></pre>
+<p>and your <code>handle_output</code> function would look like (you can adapt to both :</p>
+<pre><code>def handle_output(out, output_queue):
+    while True:
+        output_queue.put(out.readline())
+</code></pre>
+<p>Just to give you the idea… Now it's your turn to fill the blanks and choose what suits best your needs 😉</p>
+<hr/>
+<p>DISCLAIMER: <em>this answer has untested code aimed at giving you a direction on how to achieve what you want. Don't copy/paste it but read the documentation and <strong>understand</strong> what you're doing. Also use threading with care, as a hint, never use a variable in two threads, or you might get bitten. hard.</em></p>
+<hr/>
+<p>HTH</p>
+</div>

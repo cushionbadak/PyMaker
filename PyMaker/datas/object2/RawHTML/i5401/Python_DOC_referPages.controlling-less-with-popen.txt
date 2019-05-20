@@ -1,0 +1,107 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to control <code>less</code> from a Python script on Mac OSX. Basically what I would like is to be able to forward control characters (up/down/left/right) but process other input within the Python program. I'm using <a href="https://docs.python.org/3/library/subprocess.html?highlight=subprocess#subprocess.Popen" rel="nofollow noreferrer">Popen</a> to start <code>less</code>, but <a href="https://stackoverflow.com/questions/1441251/less-gets-keyboard-input-from-stderr/1441368#1441368"><code>less</code> reads user input from a source other than <code>stdin</code></a>. Because of that, I'm unsure how to send any characters to less.</p>
+<p>The program opens less, waits one second, and then tries to send <code>q</code> to quit using two separate channels: <code>stdin</code> and <code>/dev/tty</code> (since it was mentioned in the SO question I linked above). Neither works.</p>
+<pre><code>from subprocess import Popen, PIPE
+import time
+p1 = Popen("echo hello | less -K -R", stdin=PIPE, shell=True)
+time.sleep(1)
+p1.stdin.write(bytes('q', 'utf-8'))
+with open("/dev/tty", 'w') as tty:
+    tty.write('q')
+p1.wait()
+</code></pre>
+<p>How can I control <code>less</code> from a Python script?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It's a bit involved, but it's possible to use <a href="https://manpages.debian.org/forkpty.3.en.html" rel="nofollow noreferrer"><code>forkpty(3)</code></a> to create a new TTY in which you have full control over <code>less</code>, forwarding input and output to the original TTY so that it feels seamless.</p>
+<p>The code below uses Python 3 and its standard library. <a href="https://pexpect.readthedocs.io/" rel="nofollow noreferrer">pexpect</a> can do a lot of the heavy lifting but that doesn't ship with Python. Plus it's more educational this way.</p>
+<pre><code>import contextlib
+import fcntl
+import io
+import os
+import pty
+import select
+import signal
+import struct
+import termios
+import time
+import tty
+</code></pre>
+<p>Assume the rest of the code is indented to run within this context manager.</p>
+<pre><code>with contextlib.ExitStack() as stack:
+</code></pre>
+<p>We need to grab the real TTY and set it to raw mode. This can confuse other users of the TTY (for example, the shell after this program exits), so make sure to put it back to the same state after.</p>
+<pre><code>tty_fd = os.open('/dev/tty', os.O_RDWR | os.O_CLOEXEC)
+stack.callback(os.close, tty_fd)
+tc = termios.tcgetattr(tty_fd)
+stack.callback(termios.tcsetattr, tty_fd, termios.TCSANOW, tc)
+tty.setraw(tty_fd, when=termios.TCSANOW)
+</code></pre>
+<p>Then we can invoke <code>forkpty</code>, which is named <code>pty.fork()</code> in Python. This does a couple things:</p>
+<ul>
+<li>Creates a <a href="https://manpages.debian.org/pty.7.en.html" rel="nofollow noreferrer">pseudoterminal</a>.</li>
+<li>Forks a new child.</li>
+<li>Attach the child to the slave end of the PTY.</li>
+<li>Return the child's PID and the master end of the PTY to the original process.</li>
+</ul>
+<p>The child should run <code>less</code>. Note the use of <a href="https://manpages.debian.org/_exit.2.en.html" rel="nofollow noreferrer"><code>_exit(2)</code></a> as it can be unsafe to continue executing other code after a <code>fork</code>.</p>
+<pre><code>child_pid, master_fd = pty.fork()
+if child_pid == 0:
+    os.execv('/bin/sh', ('/bin/sh', '-c', 'echo hello | less -K -R'))
+    os._exit(0)
+stack.callback(os.close, master_fd)
+</code></pre>
+<p>Then there's a bit of work involved to set up a few asynchronous signal handlers.</p>
+<ul>
+<li><code>SIGCHLD</code> is received when a child process changes state (such as exiting). We can use this to keep track of whether the child is still running.</li>
+<li><code>SIGWINCH</code> is received when the controlling terminal changes size. We forward this size to the PTY (which will automatically send another window change signal to the processes attached to it). We should set the PTY's window size to match to start, too.</li>
+</ul>
+<p>It may also make sense to forward signals such as <code>SIGINT</code>, <code>SIGTERM</code>, etc.</p>
+<pre><code>child_is_running = True
+def handle_chld(signum, frame):
+    while True:
+        pid, status = os.waitpid(-1, os.P_NOWAIT)
+        if not pid:
+            break
+        if pid == child_pid:
+            child_is_running = False
+def handle_winch(signum, frame):
+    tc = struct.pack('HHHH', 0, 0, 0, 0)
+    tc = fcntl.ioctl(tty_fd, termios.TIOCGWINSZ, tc)
+    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, tc)
+handler = signal.signal(signal.SIGCHLD, handle_chld)
+stack.callback(signal.signal, signal.SIGCHLD, handler)
+handler = signal.signal(signal.SIGWINCH, handle_winch)
+stack.callback(signal.signal, signal.SIGWINCH, handler)
+handle_winch(0, None)
+</code></pre>
+<p>Now for the real meat: copying data between the real and fake TTY.</p>
+<pre><code>target_time = time.clock_gettime(time.CLOCK_MONOTONIC_RAW) + 1
+has_sent_q = False
+with contextlib.suppress(OSError):
+    while child_is_running:
+        now = time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
+        if now &lt; target_time:
+            timeout = target_time - now
+        else:
+            timeout = None
+            if not has_sent_q:
+                os.write(master_fd, b'q')
+                has_sent_q = True
+        rfds, wfds, xfds = select.select((tty_fd, master_fd), (), (), timeout)
+        if tty_fd in rfds:
+            data = os.read(tty_fd, io.DEFAULT_BUFFER_SIZE)
+            os.write(master_fd, data)
+        if master_fd in rfds:
+            data = os.read(master_fd, io.DEFAULT_BUFFER_SIZE)
+            os.write(tty_fd, data)
+</code></pre>
+<p>It looks straightforward, although I'm glossing over a few things, such as proper short write and <code>SIGTTIN</code>/<code>SIGTTOU</code> handling (partly hidden by suppressing <code>OSError</code>).</p>
+</div>
+<span class="comment-copy">This smells like an <a href="https://xyproblem.info" rel="nofollow noreferrer">XY Problem</a> - can I ask <i>why</i> you want to do this?</span>
+<span class="comment-copy">@match I want to use it to display dictionary entries on the command line, where the workflow should be type word, ENTER -&gt; display entry using <code>less</code> -&gt; type word, ENTER -&gt; display with <code>less</code>... I don't want to require quitting less with "q" for each lookup. python-pager is too limited, and using less's key file functionality to quit on any key except for arrows would still require the user to press some key to quit before typing in the next word. If there were a way to get the last key pressed within <code>less</code> then it would also solve my problem.</span>
+<span class="comment-copy">So you just want to show the first n lines for a second? Would <code>head</code> work instead of <code>less</code>?</span>
+<span class="comment-copy">@L3viathan No, the one second pause and quit thing is just for demoing; I didn't want <code>less</code> to quit immediately because then it would be difficult to tell if it ran at all. I actually need to control the <code>less</code> program, or another suitable pager.</span>
+<span class="comment-copy">Programs that use the tty in raw mode don't work well with pipes. You need to interact with it using a pty and make the parent the master/controlling terminal.</span>
+<span class="comment-copy">Thanks for the writeup! "straightforward", heh. I'll try pexpect and see what I can do. That also contains cross-platform support, which is a plus.</span>
+<span class="comment-copy">@NateGlenn Heh yeah, this is all a bit esoteric. The "straightfoward" part is using a <code>select</code> loop, but using <code>pty</code>/<code>termios</code> is relatively rarer. Some combination of <code>pexpect.spawn().interact()</code> should get you most of the way there, you just have to wire up <code>WINCH</code> and a few other things you can probably copy from here or the pexpect source code. Good luck!</span>

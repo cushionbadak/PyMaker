@@ -1,0 +1,83 @@
+<div class="post-text" itemprop="text">
+<p>I'm using the following code to read 1 million rows of SQL data and replace any control characters which might appear in the data, the only problem is that is slow and it is definitely the 'replace' which is slowing it down. Anyone have any suggestion about taking a different approach or tweaking to might make the code any faster?</p>
+<pre><code>d = {}
+x = map(chr, list(range(0,9)) + list(range(11,13)) + list(range(14,32)) + 
+list(range(127,160)))
+for item in list(x):
+    d.update({item:' '})
+
+with open("out_cleaned.csv", "w", encoding='utf-8') as fh:
+    chunks = pd.read_sql_query(SQLCommand, connection, chunksize=10000)  
+    c = next(chunks)
+    c.replace(d, regex=True, inplace=True)
+    c.to_csv(fh, index=False, header=False, sep='\t', chunksize=10000)  
+
+    for chunk in chunks:
+        chunk.replace(d, regex=True, inplace=True)
+        chunk.to_csv(fh, index=False, header=False, sep='\t', chunksize=10000) 
+</code></pre>
+<p>Takes 16 minutes to read, clean and write out 1 million rows (of 31 fields.)</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You don't need regex for this to begin with - you're just replacing 'special' characters with an empty space in an one-to-one replacement - but apart from that you hardly need to parse and turn your data into a DataFrame to begin with.</p>
+<p>You can work directly with a DB connection and export the columns using the built-in <code>csv</code> module without ever venturing into <code>pandas</code>, <code>SQLAlchemy</code> and similar heavyweights that add unnecessary overhead for your use case.</p>
+<p>So, first things first, instead of regex you can create a translation table and use it with <a href="https://docs.python.org/3/library/stdtypes.html?#str.translate" rel="nofollow noreferrer"><code>str.translate()</code></a> to clean up any string:</p>
+<pre><code>chr_ranges = (0x00, 0x09), (0x0B, 0x20), (0x7F, 0xA0)  # 'special' character ranges
+trans_table = {x: " " for r in chr_ranges for x in range(*r)} # 'special'-&gt;space trans. table
+</code></pre>
+<p>This allows you to quickly and effortlessly <em>translate</em> all of the <em>special</em> characters, defined within the ranges of <code>chr_ranges</code>, into a space on any string, for example:</p>
+<pre><code>print("Your string with &gt;\x05\x06\x1A&lt; special characters!".translate(trans_table))
+# Your string with &gt;   &lt; special characters!
+</code></pre>
+<p>And while we're at it, we can create a small function to handle the translation attempts for any passed field so we don't need to check the type when iterating over our database data:</p>
+<pre><code>def trans_field(value):
+    try:
+        return value.translate(trans_table)  # try to translate and return
+    except AttributeError:  # if there's no translate method on the passed value...
+        return value  # return the original value
+</code></pre>
+<p>Now all we need is to connect to the database, and execute our query, which depends on the database that you're using - I'll write the next example as if you were using SQLite but most database drivers use <a href="https://www.python.org/dev/peps/pep-0249/" rel="nofollow noreferrer">Python Database API</a> and are largely interchangeable so the code should work with minimal changes:</p>
+<pre><code>import sqlite3
+
+connection = sqlite3.connect("your_db")  # connect to the database
+cursor = connection.cursor()  # grab a database cursor
+results = cursor.execute("select * from your_table")  # execute the select query
+header = [c[0] for c in cursor.description]  # get the column names for our CSV header
+</code></pre>
+<p>And, finally, we can iterate over the results, process each field and store all into a CSV:</p>
+<pre><code>import csv
+
+with open("output.csv", "w", newline="") as f:  # open("output.csv", "wb") on Python 2.x
+    writer = csv.writer(f, delimiter="\t")  # create a CSV writer with \t as a delimiter
+    writer.writerow(header)  # write the header (column names)
+    for result in results:  # iterate over the returned results
+        writer.writerow(map(trans_field, result))  # process result fields and write the row
+</code></pre>
+<p>This avoids all unnecessary conversions and should work as fast as Python and your database is capable of. You could, technically, squeeze out some more speed by inspecting the <code>cursor.description</code> and creating a replacement map only for the strings in your result set (instead of attempting to process each field) but it probably won't add much to the overall speed.</p>
+<p>So, putting it all together:</p>
+<pre><code>import csv
+import sqlite3
+
+chr_ranges = (0x00, 0x09), (0x0B, 0x20), (0x7F, 0xA0)  # 'special' character ranges
+trans_table = {x: " " for r in chr_ranges for x in range(*r)} # 'special'-&gt;space trans. table
+
+def trans_field(value):
+    try:
+        return value.translate(trans_table)  # try to translate and return
+    except AttributeError:  # if there's no translate method on the passed value...
+        return value  # return the original value
+
+connection = sqlite3.connect("your_db")  # connect to the database
+cursor = connection.cursor()  # grab a database cursor
+results = cursor.execute("select * from your_table")  # execute the select query
+header = [c[0] for c in cursor.description]  # get the column names for our CSV header
+
+with open("output.csv", "w", newline="") as f:  # open("output.csv", "wb") on Python 2.x
+    writer = csv.writer(f, delimiter="\t")  # create a CSV writer with \t as a delimiter
+    writer.writerow(header)  # write the header (column names)
+    for result in results:  # iterate over the returned results
+        writer.writerow(map(trans_field, result))  # process result fields and write the row
+</code></pre>
+<p>As a test I've created a <code>31x1M</code> table in SQLite with 22 <code>TEXT</code> fields (each filled with 10-50 random characters in the <code>0x00 - 0xA0</code> range), interspersed with <code>INTEGER</code> and <code>REAL</code> fields and, on my system, it <em>cleaned up</em> the data and produced the <code>output.csv</code> in under <strong>56 seconds</strong>. YMMV, of course, but it certainly shouldn't take 16 minutes.</p>
+</div>
+<span class="comment-copy">You're beautiful! My 1 million rows runs in 52 secs now. Also I'm not using sqllite, I used pyodbc to connect MSSQL. Thanks for your help! Parenthetically, looks like pandas was overkill, and it has much overhead.</span>

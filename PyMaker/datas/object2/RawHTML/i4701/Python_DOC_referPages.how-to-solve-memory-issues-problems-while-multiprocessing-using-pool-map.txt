@@ -1,0 +1,583 @@
+<div class="post-text" itemprop="text">
+<p>I have written the program (below) to:</p>
+<ul>
+<li>read a huge text file as <code>pandas dataframe</code></li>
+<li>then <code>groupby</code> using a specific column value to split the data and store as list of dataframes.</li>
+<li>then pipe the data to <code>multiprocess Pool.map()</code> to process each dataframe in parallel.</li>
+</ul>
+<p>Everything is fine, the program works well on my small test dataset. But, when I pipe in my large data (about 14 GB), the memory consumption exponentially increases and then freezes the computer or gets killed (in HPC cluster). </p>
+<p>I have added codes to clear the memory as soon as the data/variable isn't useful. I am also closing the pool as soon as it is done. Still with 14 GB input I was only expecting 2*14 GB memory burden, but it seems like lot is going on. I also tried to tweak using <code>chunkSize and maxTaskPerChild, etc</code> but I am not seeing any difference in optimization in both test vs. large file.</p>
+<p>I think improvements to this code is/are required at this code position, when I start <code>multiprocessing</code>. </p>
+<p><code>p = Pool(3)  # number of pool to run at once; default at 1
+    result = p.map(matrix_to_vcf, list(gen_matrix_df_list.values()))</code>
+but, I am posting the whole code.</p>
+<p><strong>Test example:</strong> I created a test file ("genome_matrix_final-chr1234-1mb.txt") of upto 250 mb and ran the program. When I check the system monitor I can see that memory consumption increased by about 6 GB. I am not so clear why so much memory space is taken by 250 mb file plus some outputs. I have shared that file via drop box if it helps in seeing the real problem. <a href="https://www.dropbox.com/sh/coihujii38t5prd/AABDXv8ACGIYczeMtzKBo0eea?dl=0" rel="nofollow noreferrer">https://www.dropbox.com/sh/coihujii38t5prd/AABDXv8ACGIYczeMtzKBo0eea?dl=0</a> </p>
+<p>Can someone suggest, How I can get rid of the problem?</p>
+<p><strong>My python script:</strong></p>
+<pre><code>#!/home/bin/python3
+
+import pandas as pd
+import collections
+from multiprocessing import Pool
+import io
+import time
+import resource
+
+print()
+print('Checking required modules')
+print()
+
+
+''' change this input file name and/or path as need be '''
+genome_matrix_file = "genome_matrix_final-chr1n2-2mb.txt"   # test file 01
+genome_matrix_file = "genome_matrix_final-chr1234-1mb.txt"  # test file 02
+#genome_matrix_file = "genome_matrix_final.txt"    # large file 
+
+def main():
+    with open("genome_matrix_header.txt") as header:
+        header = header.read().rstrip('\n').split('\t')
+        print()
+
+    time01 = time.time()
+    print('starting time: ', time01)
+
+    '''load the genome matrix file onto pandas as dataframe.
+    This makes is more easy for multiprocessing'''
+    gen_matrix_df = pd.read_csv(genome_matrix_file, sep='\t', names=header)
+
+    # now, group the dataframe by chromosome/contig - so it can be multiprocessed
+    gen_matrix_df = gen_matrix_df.groupby('CHROM')
+
+    # store the splitted dataframes as list of key, values(pandas dataframe) pairs
+    # this list of dataframe will be used while multiprocessing
+    gen_matrix_df_list = collections.OrderedDict()
+    for chr_, data in gen_matrix_df:
+        gen_matrix_df_list[chr_] = data
+
+    # clear memory
+    del gen_matrix_df
+
+    '''Now, pipe each dataframe from the list using map.Pool() '''
+    p = Pool(3)  # number of pool to run at once; default at 1
+    result = p.map(matrix_to_vcf, list(gen_matrix_df_list.values()))
+
+    del gen_matrix_df_list  # clear memory
+
+    p.close()
+    p.join()
+
+
+    # concat the results from pool.map() and write it to a file
+    result_merged = pd.concat(result)
+    del result  # clear memory
+
+    pd.DataFrame.to_csv(result_merged, "matrix_to_haplotype-chr1n2.txt", sep='\t', header=True, index=False)
+
+    print()
+    print('completed all process in "%s" sec. ' % (time.time() - time01))
+    print('Global maximum memory usage: %.2f (mb)' % current_mem_usage())
+    print()
+
+
+'''function to convert the dataframe from genome matrix to desired output '''
+def matrix_to_vcf(matrix_df):
+
+    print()
+    time02 = time.time()
+
+    # index position of the samples in genome matrix file
+    sample_idx = [{'10a': 33, '10b': 18}, {'13a': 3, '13b': 19},
+                    {'14a': 20, '14b': 4}, {'16a': 5, '16b': 21},
+                    {'17a': 6, '17b': 22}, {'23a': 7, '23b': 23},
+                    {'24a': 8, '24b': 24}, {'25a': 25, '25b': 9},
+                    {'26a': 10, '26b': 26}, {'34a': 11, '34b': 27},
+                    {'35a': 12, '35b': 28}, {'37a': 13, '37b': 29},
+                    {'38a': 14, '38b': 30}, {'3a': 31, '3b': 15},
+                    {'8a': 32, '8b': 17}]
+
+    # sample index stored as ordered dictionary
+    sample_idx_ord_list = []
+    for ids in sample_idx:
+        ids = collections.OrderedDict(sorted(ids.items()))
+        sample_idx_ord_list.append(ids)
+
+
+    # for haplotype file
+    header = ['contig', 'pos', 'ref', 'alt']
+
+    # adding some suffixes "PI" to available sample names
+    for item in sample_idx_ord_list:
+        ks_update = ''
+        for ks in item.keys():
+            ks_update += ks
+        header.append(ks_update+'_PI')
+        header.append(ks_update+'_PG_al')
+
+
+    #final variable store the haplotype data
+    # write the header lines first
+    haplotype_output = '\t'.join(header) + '\n'
+
+
+    # to store the value of parsed the line and update the "PI", "PG" value for each sample
+    updated_line = ''
+
+    # read the piped in data back to text like file
+    matrix_df = pd.DataFrame.to_csv(matrix_df, sep='\t', index=False)
+
+    matrix_df = matrix_df.rstrip('\n').split('\n')
+    for line in matrix_df:
+        if line.startswith('CHROM'):
+            continue
+
+        line_split = line.split('\t')
+        chr_ = line_split[0]
+        ref = line_split[2]
+        alt = list(set(line_split[3:]))
+
+        # remove the alleles "N" missing and "ref" from the alt-alleles
+        alt_up = list(filter(lambda x: x!='N' and x!=ref, alt))
+
+        # if no alt alleles are found, just continue
+        # - i.e : don't write that line in output file
+        if len(alt_up) == 0:
+            continue
+
+        #print('\nMining data for chromosome/contig "%s" ' %(chr_ ))
+        #so, we have data for CHR, POS, REF, ALT so far
+        # now, we mine phased genotype for each sample pair (as "PG_al", and also add "PI" tag)
+        sample_data_for_vcf = []
+        for ids in sample_idx_ord_list:
+            sample_data = []
+            for key, val in ids.items():
+                sample_value = line_split[val]
+                sample_data.append(sample_value)
+
+            # now, update the phased state for each sample
+            # also replacing the missing allele i.e "N" and "-" with ref-allele
+            sample_data = ('|'.join(sample_data)).replace('N', ref).replace('-', ref)
+            sample_data_for_vcf.append(str(chr_))
+            sample_data_for_vcf.append(sample_data)
+
+        # add data for all the samples in that line, append it with former columns (chrom, pos ..) ..
+        # and .. write it to final haplotype file
+        sample_data_for_vcf = '\t'.join(sample_data_for_vcf)
+        updated_line = '\t'.join(line_split[0:3]) + '\t' + ','.join(alt_up) + \
+            '\t' + sample_data_for_vcf + '\n'
+        haplotype_output += updated_line
+
+    del matrix_df  # clear memory
+    print('completed haplotype preparation for chromosome/contig "%s" '
+          'in "%s" sec. ' %(chr_, time.time()-time02))
+    print('\tWorker maximum memory usage: %.2f (mb)' %(current_mem_usage()))
+
+    # return the data back to the pool
+    return pd.read_csv(io.StringIO(haplotype_output), sep='\t')
+
+
+''' to monitor memory '''
+def current_mem_usage():
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.
+
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p><strong>Update for bounty hunters:</strong></p>
+<p>I have achieved multiprocessing using <code>Pool.map()</code> but the code is causing a big memory burden (input test file ~ 300 mb, but memory burden is about 6 GB). I was only expecting 3*300 mb memory burden at max. </p>
+<ul>
+<li>Can somebody explain, What is causing such a huge memory requirement for such a small file and for such small length computation. </li>
+<li>Also, i am trying to take the answer and use that to improve multiprocess in my large program. So, addition of any method, module that doesn't change the structure of computation part (CPU bound process) too much should be fine. </li>
+<li>I have included two test files for the test purposes to play with the code. </li>
+<li>The attached code is full code so it should work as intended as it is when copied-pasted. Any changes should be used only to improve optimization in multiprocessing steps.</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<h1>Prerequisite</h1>
+<ol>
+<li><p>In Python (in the following I use 64-bit build of Python 3.6.5) everything is an object. This has its overhead and with <a href="https://docs.python.org/3/library/sys.html#sys.getsizeof" rel="noreferrer"><code>getsizeof</code></a> we can see exactly the size of an object in bytes:</p>
+<pre><code>&gt;&gt;&gt; import sys
+&gt;&gt;&gt; sys.getsizeof(42)
+28
+&gt;&gt;&gt; sys.getsizeof('T')
+50
+</code></pre></li>
+<li>When fork system call used (default on *nix, see <code>multiprocessing.get_start_method()</code>) to create a child process, parent's physical memory is not copied and <a href="https://en.wikipedia.org/wiki/Copy-on-write" rel="noreferrer">copy-on-write</a> technique is used. </li>
+<li>Fork child process will still report full RSS (resident set size) of the parent process. Because of this fact, <a href="https://en.wikipedia.org/wiki/Proportional_set_size" rel="noreferrer">PSS</a> (proportional set size) is more appropriate metric to estimate memory usage of forking application. Here's an example from the page:</li>
+</ol>
+<blockquote>
+<ul>
+<li>Process A has 50 KiB of unshared memory</li>
+<li>Process B has 300 KiB of unshared memory</li>
+<li>Both process A and process B have 100 KiB of the same shared memory region</li>
+</ul>
+<p>Since the PSS is defined as the sum of the unshared memory of a process and the proportion of memory shared with other processes, the PSS for these two processes are as follows:</p>
+<ul>
+<li>PSS of process A = 50 KiB + (100 KiB / 2) = 100 KiB</li>
+<li>PSS of process B = 300 KiB + (100 KiB / 2) = 350 KiB</li>
+</ul>
+</blockquote>
+<h1>The data frame</h1>
+<p>Not let's look at your <code>DataFrame</code> alone. <a href="https://pypi.python.org/pypi/memory_profiler" rel="noreferrer"><code>memory_profiler</code></a> will help us.</p>
+<p><em>justpd.py</em></p>
+<pre><code>#!/usr/bin/env python3
+
+import pandas as pd
+from memory_profiler import profile
+
+@profile
+def main():
+    with open('genome_matrix_header.txt') as header:
+        header = header.read().rstrip('\n').split('\t')
+
+    gen_matrix_df = pd.read_csv(
+        'genome_matrix_final-chr1234-1mb.txt', sep='\t', names=header)
+
+    gen_matrix_df.info()
+    gen_matrix_df.info(memory_usage='deep')
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>Now let's use the profiler:</p>
+<pre><code>mprof run justpd.py
+mprof plot
+</code></pre>
+<p>We can see the plot:</p>
+<p><a href="https://i.stack.imgur.com/xYt0h.png" rel="noreferrer"><img alt="memory_profile" src="https://i.stack.imgur.com/xYt0h.png"/></a></p>
+<p>and line-by-line trace:</p>
+<pre><code>Line #    Mem usage    Increment   Line Contents
+================================================
+     6     54.3 MiB     54.3 MiB   @profile
+     7                             def main():
+     8     54.3 MiB      0.0 MiB       with open('genome_matrix_header.txt') as header:
+     9     54.3 MiB      0.0 MiB           header = header.read().rstrip('\n').split('\t')
+    10                             
+    11   2072.0 MiB   2017.7 MiB       gen_matrix_df = pd.read_csv('genome_matrix_final-chr1234-1mb.txt', sep='\t', names=header)
+    12                                 
+    13   2072.0 MiB      0.0 MiB       gen_matrix_df.info()
+    14   2072.0 MiB      0.0 MiB       gen_matrix_df.info(memory_usage='deep')
+</code></pre>
+<p>We can see that the data frame takes ~2 GiB with peak at ~3 GiB while it's being built. What's more interesting is the output of <a href="https://pandas.pydata.org/pandas-docs/stable/generated/pandas.DataFrame.info.html" rel="noreferrer"><code>info</code></a>. </p>
+<pre><code>&lt;class 'pandas.core.frame.DataFrame'&gt;
+RangeIndex: 4000000 entries, 0 to 3999999
+Data columns (total 34 columns):
+...
+dtypes: int64(2), object(32)
+memory usage: 1.0+ GB
+</code></pre>
+<p>But <code>info(memory_usage='deep')</code> ("deep" means introspection of the data deeply by interrogating <code>object</code> <code>dtype</code>s, see below) gives:</p>
+<pre><code>memory usage: 7.9 GB
+</code></pre>
+<p>Huh?! Looking outside of the process we can make sure that  <code>memory_profiler</code>'s figures are correct. <code>sys.getsizeof</code> also shows the same value for the frame (most probably because of custom <code>__sizeof__</code>) and so will other tools that use it to estimate allocated <code>gc.get_objects()</code>, e.g. <a href="https://pypi.python.org/pypi/Pympler" rel="noreferrer"><code>pympler</code></a>.</p>
+<pre><code># added after read_csv
+from pympler import tracker
+tr = tracker.SummaryTracker()
+tr.print_diff()   
+</code></pre>
+<p>Gives:</p>
+<pre><code>                                             types |   # objects |   total size
+================================================== | =========== | ============
+                 &lt;class 'pandas.core.series.Series |          34 |      7.93 GB
+                                      &lt;class 'list |        7839 |    732.38 KB
+                                       &lt;class 'str |        7741 |    550.10 KB
+                                       &lt;class 'int |        1810 |     49.66 KB
+                                      &lt;class 'dict |          38 |      7.43 KB
+  &lt;class 'pandas.core.internals.SingleBlockManager |          34 |      3.98 KB
+                             &lt;class 'numpy.ndarray |          34 |      3.19 KB
+</code></pre>
+<p>So where do these 7.93 GiB come from? Let's try to explain this. We have 4M rows and 34 columns, which gives us 134M values. They are either <code>int64</code> or <code>object</code> (which is a 64-bit pointer; see <a href="https://www.dataquest.io/blog/pandas-big-data/" rel="noreferrer">using pandas with large data</a> for detailed explanation). Thus we have <code>134 * 10 ** 6 * 8 / 2 ** 20</code> ~1022 MiB only for values in the data frame. What about the remaining ~ 6.93 GiB?</p>
+<h1>String interning</h1>
+<p>To understand the behaviour it's necessary to know that Python does string interning. There are two good articles (<a href="http://guilload.com/python-string-interning/" rel="noreferrer">one</a>, <a href="https://www.laurentluce.com/posts/python-string-objects-implementation/" rel="noreferrer">two</a>) about string interning in Python 2. Besides the Unicode change in Python 3 and <a href="https://www.python.org/dev/peps/pep-0393/" rel="noreferrer">PEP 393</a> in Python 3.3 the C-structures have changed, but the idea is the same. Basically, every short string that looks like an identifier will be cached by Python in an internal dictionary and references will point to the same Python objects. In other word we can say it behaves like a singleton. Articles that I mentioned above explain what significant memory profile and performance improvements it gives. We can check if a string is interned using <a href="https://github.com/python/cpython/blob/7ed7aead/Include/unicodeobject.h#L283" rel="noreferrer"><code>interned</code></a> field of <code>PyASCIIObject</code>:</p>
+<pre><code>import ctypes
+
+class PyASCIIObject(ctypes.Structure):
+     _fields_ = [
+         ('ob_refcnt', ctypes.c_size_t),
+         ('ob_type', ctypes.py_object),
+         ('length', ctypes.c_ssize_t),
+         ('hash', ctypes.c_int64),
+         ('state', ctypes.c_int32),
+         ('wstr', ctypes.c_wchar_p)
+    ]
+</code></pre>
+<p>Then:</p>
+<pre><code>&gt;&gt;&gt; a = 'name'
+&gt;&gt;&gt; b = '!@#$'
+&gt;&gt;&gt; a_struct = PyASCIIObject.from_address(id(a))
+&gt;&gt;&gt; a_struct.state &amp; 0b11
+1
+&gt;&gt;&gt; b_struct = PyASCIIObject.from_address(id(b))
+&gt;&gt;&gt; b_struct.state &amp; 0b11
+0
+</code></pre>
+<p>With two strings we can also do identity comparison (addressed in memory comparison in case of CPython).</p>
+<pre><code>&gt;&gt;&gt; a = 'foo'
+&gt;&gt;&gt; b = 'foo'
+&gt;&gt;&gt; a is b
+True
+&gt;&gt; gen_matrix_df.REF[0] is gen_matrix_df.REF[6]
+True
+</code></pre>
+<p>Because of that fact, in regard to <code>object</code> <code>dtype</code>, the data frame allocates at most 20 strings (one per amino acids). Though, it's worth noting that Pandas recommends <a href="https://www.dataquest.io/blog/pandas-big-data/#optimizingobjecttypesusingcategoricals" rel="noreferrer">categorical types</a> for enumerations.</p>
+<h1>Pandas memory</h1>
+<p>Thus we can explain the naive estimate of 7.93 GiB like:</p>
+<pre><code>&gt;&gt;&gt; rows = 4 * 10 ** 6
+&gt;&gt;&gt; int_cols = 2
+&gt;&gt;&gt; str_cols = 32
+&gt;&gt;&gt; int_size = 8
+&gt;&gt;&gt; str_size = 58  
+&gt;&gt;&gt; ptr_size = 8
+&gt;&gt;&gt; (int_cols * int_size + str_cols * (str_size + ptr_size)) * rows / 2 ** 30
+7.927417755126953
+</code></pre>
+<p>Note that <code>str_size</code> is 58 bytes, not 50 as we've seen above for 1-character literal. It's because PEP 393 defines compact and non-compact strings. You can check it with <code>sys.getsizeof(gen_matrix_df.REF[0])</code>.</p>
+<p>Actual memory consumption should be ~1 GiB as it's reported by <code>gen_matrix_df.info()</code>, it's twice as much. We can assume it has something to do with memory (pre)allocation done by Pandas or NumPy. The following experiment shows that it's not without reason (multiple runs show the save picture):</p>
+<pre><code>Line #    Mem usage    Increment   Line Contents
+================================================
+     8     53.1 MiB     53.1 MiB   @profile
+     9                             def main():
+    10     53.1 MiB      0.0 MiB       with open("genome_matrix_header.txt") as header:
+    11     53.1 MiB      0.0 MiB           header = header.read().rstrip('\n').split('\t')
+    12                             
+    13   2070.9 MiB   2017.8 MiB       gen_matrix_df = pd.read_csv('genome_matrix_final-chr1234-1mb.txt', sep='\t', names=header)
+    14   2071.2 MiB      0.4 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[gen_matrix_df.keys()[0]])
+    15   2071.2 MiB      0.0 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[gen_matrix_df.keys()[0]])
+    16   2040.7 MiB    -30.5 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+    ...
+    23   1827.1 MiB    -30.5 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+    24   1094.7 MiB   -732.4 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+    25   1765.9 MiB    671.3 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+    26   1094.7 MiB   -671.3 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+    27   1704.8 MiB    610.2 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+    28   1094.7 MiB   -610.2 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+    29   1643.9 MiB    549.2 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+    30   1094.7 MiB   -549.2 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+    31   1582.8 MiB    488.1 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+    32   1094.7 MiB   -488.1 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])    
+    33   1521.9 MiB    427.2 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])    
+    34   1094.7 MiB   -427.2 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+    35   1460.8 MiB    366.1 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+    36   1094.7 MiB   -366.1 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+    37   1094.7 MiB      0.0 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+    ...
+    47   1094.7 MiB      0.0 MiB       gen_matrix_df = gen_matrix_df.drop(columns=[random.choice(gen_matrix_df.keys())])
+</code></pre>
+<p>I want to finish this section by a quote from <a href="http://wesmckinney.com/blog/apache-arrow-pandas-internals/" rel="noreferrer">fresh article about design issues and future Pandas2</a> by original author of Pandas.</p>
+<blockquote>
+<p>pandas rule of thumb: have 5 to 10 times as much RAM as the size of your dataset</p>
+</blockquote>
+<h1>Process tree</h1>
+<p>Let's come to the pool, finally, and see if can make use of copy-on-write. We'll use <a href="http://manpages.ubuntu.com/manpages/artful/man8/smemstat.8.html" rel="noreferrer"><code>smemstat</code></a> (available form an Ubuntu repository) to estimate process group memory sharing and <a href="https://pypi.python.org/pypi/Glances" rel="noreferrer"><code>glances</code></a> to write down system-wide free memory. Both can write JSON. </p>
+<p>We'll run original script with <code>Pool(2)</code>. We'll need 3 terminal windows.</p>
+<ol>
+<li><code>smemstat -l -m -p "python3.6 script.py" -o smemstat.json 1</code> </li>
+<li><code>glances -t 1 --export-json glances.json</code></li>
+<li><code>mprof run -M script.py</code></li>
+</ol>
+<p>Then <code>mprof plot</code> produces:</p>
+<p><a href="https://i.stack.imgur.com/6uWZx.png" rel="noreferrer"><img alt="3 processes" src="https://i.stack.imgur.com/6uWZx.png"/></a></p>
+<p>The sum chart (<code>mprof run --nopython --include-children ./script.py</code>) looks like:</p>
+<p><a href="https://i.stack.imgur.com/G19sU.png" rel="noreferrer"><img alt="enter image description here" src="https://i.stack.imgur.com/G19sU.png"/></a></p>
+<p>Note that two charts above show RSS. The hypothesis is that because of copy-on-write it's doesn't reflect actual memory usage. Now we have two JSON files from <code>smemstat</code> and <code>glances</code>. I'll the following script to covert the JSON files to CSV.</p>
+<pre><code>#!/usr/bin/env python3
+
+import csv
+import sys
+import json
+
+def smemstat():
+  with open('smemstat.json') as f:
+    smem = json.load(f)
+
+  rows = []
+  fieldnames = set()    
+  for s in smem['smemstat']['periodic-samples']:
+    row = {}
+    for ps in s['smem-per-process']:
+      if 'script.py' in ps['command']:
+        for k in ('uss', 'pss', 'rss'):
+          row['{}-{}'.format(ps['pid'], k)] = ps[k] // 2 ** 20
+
+    # smemstat produces empty samples, backfill from previous
+    if rows:            
+      for k, v in rows[-1].items():
+        row.setdefault(k, v)
+
+    rows.append(row)
+    fieldnames.update(row.keys())
+
+  with open('smemstat.csv', 'w') as out:
+    dw = csv.DictWriter(out, fieldnames=sorted(fieldnames))
+    dw.writeheader()
+    list(map(dw.writerow, rows))
+
+def glances():
+  rows = []
+  fieldnames = ['available', 'used', 'cached', 'mem_careful', 'percent',
+    'free', 'mem_critical', 'inactive', 'shared', 'history_size',
+    'mem_warning', 'total', 'active', 'buffers']
+  with open('glances.csv', 'w') as out:
+    dw = csv.DictWriter(out, fieldnames=fieldnames)
+    dw.writeheader()
+    with open('glances.json') as f:
+      for l in f:
+        d = json.loads(l)
+        dw.writerow(d['mem'])
+
+if __name__ == '__main__':
+  globals()[sys.argv[1]]()
+</code></pre>
+<p>First let's look at <code>free</code> memory.</p>
+<p><a href="https://i.stack.imgur.com/rdHyP.png" rel="noreferrer"><img alt="enter image description here" src="https://i.stack.imgur.com/rdHyP.png"/></a></p>
+<p>The difference between first and minimum is ~4.15 GiB. And here is how PSS figures look like:</p>
+<p><a href="https://i.stack.imgur.com/8H2OP.png" rel="noreferrer"><img alt="enter image description here" src="https://i.stack.imgur.com/8H2OP.png"/></a></p>
+<p>And the sum:</p>
+<p><a href="https://i.stack.imgur.com/KCwzl.png" rel="noreferrer"><img alt="enter image description here" src="https://i.stack.imgur.com/KCwzl.png"/></a></p>
+<p>Thus we can see that because of copy-on-write actual memory consumption is ~4.15 GiB. But we're still serialising data to send it to worker processes via <code>Pool.map</code>. Can we leverage copy-on-write here as well?</p>
+<h1>Shared data</h1>
+<p>To use copy-on-write we need to have the <code>list(gen_matrix_df_list.values())</code> be accessible globally so the worker after fork can still read it. </p>
+<ol>
+<li><p>Let's modify code after <code>del gen_matrix_df</code> in <code>main</code> like the following:</p>
+<pre><code>...
+global global_gen_matrix_df_values
+global_gen_matrix_df_values = list(gen_matrix_df_list.values())
+del gen_matrix_df_list
+
+p = Pool(2)
+result = p.map(matrix_to_vcf, range(len(global_gen_matrix_df_values)))
+...
+</code></pre></li>
+<li>Remove <code>del gen_matrix_df_list</code> that goes later.</li>
+<li><p>And modify first lines of <code>matrix_to_vcf</code> like:</p>
+<pre><code>def matrix_to_vcf(i):
+    matrix_df = global_gen_matrix_df_values[i]
+</code></pre></li>
+</ol>
+<p>Now let's re-run it. Free memory:</p>
+<p><a href="https://i.stack.imgur.com/wkEaQ.png" rel="noreferrer"><img alt="free" src="https://i.stack.imgur.com/wkEaQ.png"/></a></p>
+<p>Process tree:</p>
+<p><a href="https://i.stack.imgur.com/uFsTD.png" rel="noreferrer"><img alt="process tree" src="https://i.stack.imgur.com/uFsTD.png"/></a></p>
+<p>And its sum:</p>
+<p><a href="https://i.stack.imgur.com/ieW5P.png" rel="noreferrer"><img alt="sum" src="https://i.stack.imgur.com/ieW5P.png"/></a></p>
+<p>Thus we're at maximum of ~2.9 GiB of actual memory usage (the peak main process has while building the data frame) and copy-on-write has helped! </p>
+<p>As a side note, there's so called copy-on-read, the behaviour of Python's reference cycle garbage collector, <a href="https://engineering.instagram.com/dismissing-python-garbage-collection-at-instagram-4dca40b29172" rel="noreferrer">described in Instagram Engineering</a> (which led to <code>gc.freeze</code> in <a href="https://bugs.python.org/issue31558" rel="noreferrer">issue31558</a>). But <code>gc.disable()</code> doesn't have an impact in this particular case.</p>
+<h2>Update</h2>
+<p>An alternative to copy-on-write copy-less data sharing can be delegating it to the kernel from the beginning by using <a href="https://docs.scipy.org/doc/numpy/reference/generated/numpy.memmap.html" rel="noreferrer"><code>numpy.memmap</code></a>. Here's <a href="https://github.com/DonaldWhyte/high-performance-data-processing-in-python/blob/master/code/find_outliers_parallel_nocopy.py" rel="noreferrer">an example implementation</a> from <em>High Performance Data Processing in Python</em> talk. The <a href="https://stackoverflow.com/q/45943160/2072035">tricky part</a> is then to make Pandas to use the mmaped Numpy array.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>When you use <code>multiprocessing.Pool</code> a number of child processes will be created using the <code>fork()</code> system call. Each of those processes start off with an exact copy of the memory of the parent process at that time. Because you're loading the csv before you create the <code>Pool</code> of size 3, each of those 3 processes in the pool will unnecessarily have a copy of the data frame. (<code>gen_matrix_df</code> as well as <code>gen_matrix_df_list</code> will exist in the current process as well as in each of the 3 child processes, so 4 copies of each of these structures will be in memory)</p>
+<p>Try creating the <code>Pool</code> before loading the file (at the very beginning actually) That should reduce the memory usage.</p>
+<p>If it's still too high, you can:</p>
+<ol>
+<li><p>Dump gen_matrix_df_list to a file, 1 item per line, e.g: </p>
+<pre><code>import os
+import cPickle
+
+with open('tempfile.txt', 'w') as f:
+    for item in gen_matrix_df_list.items():
+        cPickle.dump(item, f)
+        f.write(os.linesep)
+</code></pre></li>
+<li><p>Use <code>Pool.imap()</code> on an iterator over the lines that you dumped in this file, e.g.:</p>
+<pre><code>with open('tempfile.txt', 'r') as f:
+    p.imap(matrix_to_vcf, (cPickle.loads(line) for line in f))
+</code></pre>
+<p>(Note that <code>matrix_to_vcf</code> takes a <code>(key, value)</code> tuple in the example above, not just a value)</p></li>
+</ol>
+<p>I hope that helps.</p>
+<p>NB: I haven't tested the code above. It's only meant to demonstrate the idea.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I had the same issue. I needed to process a huge text corpus while keeping a knowledge base of few DataFrames of millions of rows loaded in memory. I think this issue is common so I will keep my answer oriented for general purposes.</p>
+<p>A <strong>combination</strong> of settings solved the problem for me (1 &amp; 3 &amp; 5 only might do it for you):</p>
+<ol>
+<li><p>Use <code>Pool.imap</code> (or <code>imap_unordered</code>) instead of <code>Pool.map</code>. This will iterate over data lazily than loading all of it in memory before starting processing.</p></li>
+<li><p>Set a value to <code>chunksize</code> parameter. This will make <code>imap</code> faster too.</p></li>
+<li><p>Set a value to <code>maxtasksperchild</code> parameter.</p></li>
+<li><p>Append output to disk than in memory. Instantly or every while when it reaches a certain size.</p></li>
+<li><p>Run the code in different batches. You can use <a href="https://docs.python.org/3/library/itertools.html#itertools.islice" rel="nofollow noreferrer">itertools.islice</a> if you have an iterator. The idea is to split your <code>list(gen_matrix_df_list.values())</code> to three or more lists, then you pass the first third only to <code>map</code> or <code>imap</code>, then the second third in another run, etc. Since you have a list you can simply slice it in the same line of code.</p></li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<p><strong>GENERAL ANSWER ABOUT MEMORY WITH MULTIPROCESSING</strong></p>
+<p>You asked: "What is causing so much memory to be allocated". The answer relies on two parts. </p>
+<p><em>First</em>, as you already noticed, <strong>each <code>multiprocessing</code> worker gets it's own copy of the data</strong> (quoted <a href="https://pythonhosted.org/joblib/parallel.html" rel="nofollow noreferrer">from here</a>), so you should chunk large arguments. Or for large files, read them in a little bit at a time, if possible.</p>
+<blockquote>
+<p>By default the workers of the pool are real Python processes forked 
+  using the multiprocessing module of the Python standard library when 
+  n_jobs != 1. The arguments passed as input to the Parallel call are 
+  serialized and reallocated in the memory of each worker process.</p>
+<p>This can be problematic for large arguments as they will be
+  reallocated n_jobs times by the workers.</p>
+</blockquote>
+<p><em>Second</em>, if you're trying to reclaim memory, you need to understand that python works differently than other languages, and <strong>you are relying on <a href="http://effbot.org/pyfaq/why-doesnt-python-release-the-memory-when-i-delete-a-large-object.htm" rel="nofollow noreferrer">del to release the memory when it doesn't</a></strong>. I don't know if it's best, but in my own code, I've overcome this be reassigning the variable to a None or empty object.</p>
+<p><strong>FOR YOUR SPECIFIC EXAMPLE - MINIMAL CODE EDITING</strong></p>
+<p>As long as you can fit your large data in memory <em>twice</em>, I think you can do what you are trying to do by just changing a single line. I've written very similar code and it worked for me when I reassigned the variable (vice call del or any kind of garbage collect). If this doesn't work, you may need to follow the suggestions above and use disk I/O:</p>
+<pre><code>    #### earlier code all the same
+    # clear memory by reassignment (not del or gc)
+    gen_matrix_df = {}
+
+    '''Now, pipe each dataframe from the list using map.Pool() '''
+    p = Pool(3)  # number of pool to run at once; default at 1
+    result = p.map(matrix_to_vcf, list(gen_matrix_df_list.values()))
+
+    #del gen_matrix_df_list  # I suspect you don't even need this, memory will free when the pool is closed
+
+    p.close()
+    p.join()
+    #### later code all the same
+</code></pre>
+<p><strong>FOR YOUR SPECIFIC EXAMPLE - OPTIMAL MEMORY USAGE</strong></p>
+<p>As long as you can fit your large data in memory <em>once</em>, and you have some idea of how big your file is, you can use <strong>Pandas <a href="https://pandas.pydata.org/pandas-docs/stable/generated/pandas.read_csv.html" rel="nofollow noreferrer">read_csv</a> partial file reading</strong>, to read in <a href="https://stackoverflow.com/questions/23853553/python-pandas-how-to-read-only-first-n-rows-of-csv-files-in">only nrows at a time</a> if you really want to micro-manage how much data is being read in, or a [fixed amount of memory at a time using chunksize], which returns an iterator<a href="https://stackoverflow.com/questions/25962114/how-to-read-a-6-gb-csv-file-with-pandas">5</a>. By that I mean, the nrows parameter is just a single read: you might use that to just get a peek at a file, or if for some reason you wanted each part to have exactly the same number of rows (because, for example, if any of your data is strings of variable length, each row will not take up the same amount of memory). But I think for the purposes of prepping a file for multiprocessing, it will be far easier to use chunks, because that directly relates to memory, which is your concern. It will be easier to use trial &amp; error to fit into memory based on specific sized chunks than number of rows, which will change the amount of memory usage depending on how much data is in the rows. The only other difficult part is that for some application specific reason, you're grouping some rows, so it just makes it a little bit more complicated. Using your code as an example: </p>
+<pre><code>   '''load the genome matrix file onto pandas as dataframe.
+    This makes is more easy for multiprocessing'''
+
+    # store the splitted dataframes as list of key, values(pandas dataframe) pairs
+    # this list of dataframe will be used while multiprocessing
+    #not sure why you need the ordered dict here, might add memory overhead
+    #gen_matrix_df_list = collections.OrderedDict()  
+    #a defaultdict won't throw an exception when we try to append to it the first time. if you don't want a default dict for some reason, you have to initialize each entry you care about.
+    gen_matrix_df_list = collections.defaultdict(list)   
+    chunksize = 10 ** 6
+
+    for chunk in pd.read_csv(genome_matrix_file, sep='\t', names=header, chunksize=chunksize)
+        # now, group the dataframe by chromosome/contig - so it can be multiprocessed
+        gen_matrix_df = chunk.groupby('CHROM')
+        for chr_, data in gen_matrix_df:
+            gen_matrix_df_list[chr_].append(data)
+
+    '''Having sorted chunks on read to a list of df, now create single data frames for each chr_'''
+    #The dict contains a list of small df objects, so now concatenate them
+    #by reassigning to the same dict, the memory footprint is not increasing 
+    for chr_ in gen_matrix_df_list.keys():
+        gen_matrix_df_list[chr_]=pd.concat(gen_matrix_df_list[chr_])
+
+    '''Now, pipe each dataframe from the list using map.Pool() '''
+    p = Pool(3)  # number of pool to run at once; default at 1
+    result = p.map(matrix_to_vcf, list(gen_matrix_df_list.values()))
+    p.close()
+    p.join()
+</code></pre>
+</div>
+<span class="comment-copy">My suggestion is  to work on pyspark if you have heavy file to process.</span>
+<span class="comment-copy">@DinushaDilanka : I just briefly skimmed through pyspark. It looks good, but is it a replacement for pandas. IAlso, another problem is that I will have to learn a new package and rewrite my whole program. This above program is a just a mock run of my program and data to rid of the memory issue on multiprocessing. Any examples on your suggestion would be good. Thanks,</span>
+<span class="comment-copy">Python does not have good performance in multiprocessing because it was a script language. Therefore it is better get help from other library that support to python API like pyspark.</span>
+<span class="comment-copy">If you are using pyspark you can read all files at one time, also possible to do groupby without using any multiprocessing.</span>
+<span class="comment-copy">Please refer this <a href="https://www.analyticsvidhya.com/blog/2016/10/spark-dataframe-and-operations/" rel="nofollow noreferrer">link</a></span>
+<span class="comment-copy">Such a comprehensive, detailed and beautiful answer. I wish I could put 50 points on you. But, it was already given. But, this is the accepted answer. I am going to reflect back several time to this Q/A in my programming career. Most helpful are the method you put there for finding the devil that was causing memory issue. There is a saying, “Devil is in the details.”</span>
+<span class="comment-copy">thanks for the answer. I will try this answer in about a day and let you know. I am hoping this is going to work.</span>
+<span class="comment-copy">You might not need to suffer the disk IO if you can fit your data in memory twice. I had exactly this problem with a large DataFrame (stored in self.big_df), but I was able to get away with an easier solution: just chunk the DataFrame. I had a quick loop build a list of parameters with chunks of the df, (so now memory is 2x self.big_df - one for original and one for the chunks) and then I explicitly assigned self.big_df={}.  I subsequently created the pool and no longer had memory issues, each thread only had memory demands equal to a small percentage of the original df.</span>
+<span class="comment-copy">Ok, I didn't see that's what @everestial007 was already doing, and too long had elapsed to edit my comment. I think it's just that the GC isn't happening. This answer is better if your data can only fit in memory once, but you're potentially waiting a long time for the disk if you write it back out and then read it back in again if you don't have to.</span>
+<span class="comment-copy">The suggestion to dump data into disk and stream from there is only in case creating the pool at the top of the function doesn't reduce memory consumption enough. I think starting the pool before loading anything will have the greatest impact though, because right now everything is stored in memory in 4 different processes.</span>
+<span class="comment-copy">@tomas  The only thing that improved my memory usage was to move the <code>p=Pool(3)</code> at the beginning of the main function. Thank you. All, other things really didn't improve anything. Even reassignment of the variable rather than deletion made no difference. I think I am going to take this approach: <a href="https://stackoverflow.com/questions/34143397/python-multiprocessing-on-a-generator-that-reads-files-in" title="python multiprocessing on a generator that reads files in">stackoverflow.com/questions/34143397/…</a> by splitting my file by <code>chr_</code>. I received not complete answer, but still I would like to offer the bounty. @jeff ellen too suggested moving the <code>Pool()</code> ahead.</span>
+<span class="comment-copy">Thanks for the answer. Can you should me the code style of yours (using your own data, or my data) so I can transfer the idea on this question and my large program.</span>
+<span class="comment-copy">I think there is no gain for me using #5, since the data will be in queue (as input, and as output) regardless. Only 4 seems to make a reasonable gain in memory optimization, but would it not cause i/o bottleneck, and unordered output.  Also, I just tried <code>imap</code> and I don't see any gain (both speed and memory consuption).</span>
+<span class="comment-copy">It will depend on your processing specifics. You have to try but bottlenecks occur. (4) will slow down processing too. Here is one module of mine <a href="https://files.fm/u/uqrq4zje" rel="nofollow noreferrer">files.fm/u/uqrq4zje</a></span>
+<span class="comment-copy">there are modules <code>settings</code> and <code>read_data</code>. Are those your local module ?</span>
+<span class="comment-copy">Yes few are, settings has files paths, and read-data has iterator to read from a huge json file item by item. While annotator module takes an item and returns processed text. I don't mind showing all the project, but it is not done yet and not all parts are needed or work.</span>
+<span class="comment-copy">Yours and answer by Tomas look promising. And, I hadn’t had time to test it. I will do it tomorrow. I like the idea of reassignment. For now about <code>As long as you can fit .... in memory twice</code> - why not 3 times, 4 times? I was also thinking if there is a way to create the list as interator, generator or yield and pass it to <code>Pool.map()</code> process. Any suggestions?</span>
+<span class="comment-copy">@everestial007 Because you only need to fit it in twice: the full original copy, and each chunk as you make the chunks, so twice. 3 or 4 times is just excessive. When you make a generator you only save on memory if you don't first have the whole item in memory (or if you are doing something new, like the generator being the result of a zip of two existing lists). And actually, I didn't know it before, but after looking, pandas has a partial file read method that would work better in your case, I bet. I'll edit my answer.</span>
+<span class="comment-copy">The only thing that improved my memory usage was to move the <code>p=Pool(3)</code> at the beginning of the main function. The assignment of chunksize won't be helpful to me because I have to read the whole data from one chromosome at once - a little complicated reason. I was also thinking if reading data as iterator, generator would help. Rather, this method <a href="https://stackoverflow.com/questions/34143397/python-multiprocessing-on-a-generator-that-reads-files-in" title="python multiprocessing on a generator that reads files in">stackoverflow.com/questions/34143397/…</a> was able to work better than anything. But, there will be some drag due to I/O rewriting.</span>
+<span class="comment-copy">Also, the reassignment really didn't reduce the memory use. I am not sure for what reason.</span>
+<span class="comment-copy">@everestial007 Your response to me makes no sense, did you try my code? You say my solution won't work because "you have to read the whole data from one chromosome at once". But your original code doesn't do that. It reads in the whole CSV end to end, nothing special. Then your code uses the 'group by' to prepare some chromosome group for each member in the pool. My code does almost exactly the same: It reads in a chunk of the file, then uses 'group by' to prepare a chromosome group. The only question is whether or not I picked a good chunksize for your system, you might have to adjust it.</span>

@@ -1,0 +1,233 @@
+<div class="post-text" itemprop="text">
+<p>Dealing with processing large matrices (NxM with 1K &lt;= N &lt;= 20K &amp; 10K &lt;= M &lt;= 200K), I often need to pass Numpy matrices to C++ through Cython to get the job done and this works as expected &amp; without copying. </p>
+<p><strong>However</strong>, there are times when I need to initiate and preprocess a matrix in C++ and pass it to <strong>Numpy (Python 3.6)</strong>. Let's assume the matrices are linearized (so the size is N*M and it's a 1D matrix - col/row major doesn't matter here). Following the information in here: <a href="https://gist.github.com/GaelVaroquaux/1249305" rel="noreferrer">exposing C-computed arrays in Python without data copies</a> &amp; modifying it for C++ compatibility, I'm able to pass C++ array. </p>
+<p><strong>The problem is</strong> if I want to use std vector instead of initiating array, I'd get Segmentation fault. For example, considering the following files:</p>
+<p><strong>fast.h</strong></p>
+<pre><code>#include &lt;iostream&gt;
+#include &lt;vector&gt;
+
+using std::cout; using std::endl; using std::vector;
+int* doit(int length);
+</code></pre>
+<p><strong>fast.cpp</strong> </p>
+<pre><code>#include "fast.h"
+int* doit(int length) {
+    // Something really heavy
+    cout &lt;&lt; "C++: doing it fast " &lt;&lt; endl; 
+
+    vector&lt;int&gt; WhyNot;
+
+    // Heavy stuff - like reading a big file and preprocessing it
+    for(int i=0; i&lt;length; ++i)
+        WhyNot.push_back(i); // heavy stuff
+
+    cout &lt;&lt; "C++: did it really fast" &lt;&lt; endl;
+    return &amp;WhyNot[0]; // or WhyNot.data()
+}
+</code></pre>
+<p><strong>faster.pyx</strong></p>
+<pre><code>cimport numpy as np
+import numpy as np
+from libc.stdlib cimport free
+from cpython cimport PyObject, Py_INCREF
+
+np.import_array()
+
+cdef extern from "fast.h":
+    int* doit(int length)
+
+cdef class ArrayWrapper:
+    cdef void* data_ptr
+    cdef int size
+
+    cdef set_data(self, int size, void* data_ptr):
+        self.data_ptr = data_ptr
+        self.size = size
+
+    def __array__(self):
+        print ("Cython: __array__ called")
+        cdef np.npy_intp shape[1]
+        shape[0] = &lt;np.npy_intp&gt; self.size
+        ndarray = np.PyArray_SimpleNewFromData(1, shape,
+                                               np.NPY_INT, self.data_ptr)
+        print ("Cython: __array__ done")
+        return ndarray
+
+    def __dealloc__(self):
+        print("Cython: __dealloc__ called")
+        free(&lt;void*&gt;self.data_ptr)
+        print("Cython: __dealloc__ done")
+
+
+def faster(length):
+    print("Cython: calling C++ function to do it")
+    cdef int *array = doit(length)
+    print("Cython: back from C++")
+    cdef np.ndarray ndarray
+    array_wrapper = ArrayWrapper()
+    array_wrapper.set_data(length, &lt;void*&gt; array)
+    print("Ctyhon: array wrapper set")
+    ndarray = np.array(array_wrapper, copy=False)
+    ndarray.base = &lt;PyObject*&gt; array_wrapper
+    Py_INCREF(array_wrapper)
+    print("Cython: all done - returning")
+    return ndarray 
+</code></pre>
+<p><strong>setup.py</strong></p>
+<pre><code>from distutils.core import setup
+from distutils.extension import Extension
+from Cython.Distutils import build_ext
+import numpy 
+
+ext_modules = [Extension(
+    "faster", 
+    ["faster.pyx", "fast.cpp"], 
+    language='c++',
+    extra_compile_args=["-std=c++11"],
+    extra_link_args=["-std=c++11"]
+)]
+
+setup(
+    cmdclass = {'build_ext': build_ext}, 
+    ext_modules = ext_modules,
+    include_dirs=[numpy.get_include()]
+)
+</code></pre>
+<p>If you build this with</p>
+<pre><code>python setup.py build_ext --inplace
+</code></pre>
+<p>and run Python 3.6 interpreter, if you enter the following you'd get seg fault after a couple of tries.</p>
+<pre><code>&gt;&gt;&gt; from faster import faster
+&gt;&gt;&gt; a = faster(1000000)
+Cython: calling C++ function to do it
+C++: doing it fast
+C++: did it really fast
+Cython: back from C++
+Ctyhon: array wrapper set
+Cython: __array__ called
+Cython: __array__ done
+Cython: all done - returning
+&gt;&gt;&gt; a = faster(1000000)
+Cython: calling C++ function to do it
+C++: doing it fast
+C++: did it really fast
+Cython: back from C++
+Ctyhon: array wrapper set
+Cython: __array__ called
+Cython: __array__ done
+Cython: all done - returning
+Cython: __dealloc__ called
+Segmentation fault (core dumped)
+</code></pre>
+<p><strong>Couple of things to note:</strong></p>
+<ul>
+<li>If you use array instead of vector (in fast.cpp) this would work like a charm!</li>
+<li>If you call <code>faster(1000000)</code> and put the result into something other than <code>variable a</code> this would work.</li>
+</ul>
+<p>If you enter smaller number like <code>faster(10)</code> you'd get a more detailed info like:</p>
+<pre><code>Cython: calling C++ function to do it
+C++: doing it fast
+C++: did it really fast
+Cython: back from C++
+Ctyhon: array wrapper set
+Cython: __array__ called
+Cython: __array__ done
+Cython: all done - returning
+Cython: __dealloc__ called &lt;--- Perhaps this happened too early or late?
+*** Error in 'python': double free or corruption (fasttop): 0x0000000001365570 ***
+======= Backtrace: =========
+More info here ....
+</code></pre>
+<p><strong>It's really puzzling that why this doesn't happen with arrays? No matter what!</strong></p>
+<p>I make use of vectors a lot and would love to be able to use them in these scenarios.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I think @FlorianWeimer's answer provides a decent solution (allocate a <code>vector</code> and pass that into your C++ function) but it should be possible to return a vector from <code>doit</code> and avoid copies by using the move constructor.</p>
+<pre><code>from libcpp.vector cimport vector
+
+cdef extern from "&lt;utility&gt;" namespace "std" nogil:
+  T move[T](T) # don't worry that this doesn't quite match the c++ signature
+
+cdef extern from "fast.h":
+    vector[int] doit(int length)
+
+# define ArrayWrapper as holding in a vector
+cdef class ArrayWrapper:
+    cdef vector[int] vec
+    cdef Py_ssize_t shape[1]
+    cdef Py_ssize_t strides[1]
+
+    # constructor and destructor are fairly unimportant now since
+    # vec will be destroyed automatically.
+
+    cdef set_data(self, vector[int]&amp; data):
+       self.vec = move(data)
+
+    # now implement the buffer protocol for the class
+    # which makes it generally useful to anything that expects an array
+    def __getbuffer__(self, Py_buffer *buffer, int flags):
+        # relevant documentation http://cython.readthedocs.io/en/latest/src/userguide/buffer.html#a-matrix-class
+        cdef Py_ssize_t itemsize = sizeof(self.vec[0])
+
+        self.shape[0] = self.vec.size()
+        self.strides[0] = sizeof(int)
+        buffer.buf = &lt;char *&gt;&amp;(self.vec[0])
+        buffer.format = 'i'
+        buffer.internal = NULL
+        buffer.itemsize = itemsize
+        buffer.len = self.v.size() * itemsize   # product(shape) * itemsize
+        buffer.ndim = 1
+        buffer.obj = self
+        buffer.readonly = 0
+        buffer.shape = self.shape
+        buffer.strides = self.strides
+        buffer.suboffsets = NULL
+</code></pre>
+<p>You should then be able to use it as:</p>
+<pre><code>cdef vector[int] array = doit(length)
+cdef ArrayWrapper w
+w.set_data(array) # "array" itself is invalid from here on
+numpy_array = np.asarray(w)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>When you return from <code>doit</code>, the <code>WhyNot</code> object goes out of scope, and the array elements are deallocated.  This means that <code>&amp;WhyNot[0]</code> is no longer a valid pointer.  You need to store the <code>WhyNot</code> object somewhere else, probably in a place provided by the caller.</p>
+<p>One way to do this is to split <code>doit</code> into three functions, <code>doit_allocate</code> which allocates the vector and returns a pointer to it, <code>doit</code> as before (but with an argument which receives a pointer to the preallocated vector<code>, and</code>doit_free` which deallocates the vector.</p>
+<p>Something like this:</p>
+<pre><code>vector&lt;int&gt; *
+doit_allocate()
+{
+    return new vector&lt;int&gt;;
+}
+
+int *
+doit(vector&lt;int&gt; *WhyNot, int length)
+{
+    // Something really heavy
+    cout &lt;&lt; "C++: doing it fast " &lt;&lt; endl; 
+
+    // Heavy stuff - like reading a big file and preprocessing it
+    for(int i=0; i&lt;length; ++i)
+        WhyNot-&gt;push_back(i); // heavy stuff
+
+    cout &lt;&lt; "C++: did it really fast" &lt;&lt; endl;
+    return WhyNot-&gt;front();
+}
+
+void
+doit_free(vector&lt;int&gt; *WhyNot)
+{
+    delete WhyNot;
+}
+</code></pre>
+</div>
+<span class="comment-copy">@AndyG when do you think this is happening? When the <code>doit</code> function gets called the second time? Wouldn't that initiate a new vector? or it is basically resizing the previously filled vector? if so, why?</span>
+<span class="comment-copy">I didn't actually look at your code before, sorry. Your code has undefined behavior because it's returning a reference to a temporary. The vector goes out of scope after <code>doit</code>. You'd have the same issue with arrays (I'm assuming <code>std::array</code> here). That you get a segmentation fault at all you can count your blessings, because it could just silently give you garbage instead. With dynamically allocated arrays (C-style array) you wouldn't have this issue because the memory isn't being deallocated. I presume you can hand the memory off to Cython to own, then? Otherwise you'd have memory leaks</span>
+<span class="comment-copy">@AndyG I see, yeah that make sense. Dynamic arrays (C-style arrays) work just fine as I mentioned. Is there anyway that I can avoid copying vector to array for return?</span>
+<span class="comment-copy">Not in a way that would be desirable. A C-Style array appears to be the best route to go here, just make sure that Cython properly manages the memory.</span>
+<span class="comment-copy">Awesome! Just couple of questions. 1- where is a good doc or source about types of values buffer format get, like 'i', 'f', etc? 2- So numpy takes care of releasing memory from now on?</span>
+<span class="comment-copy">1. The buffer formats largely match those used by the numpy array module <a href="https://docs.python.org/3/library/array.html" rel="nofollow noreferrer">docs.python.org/3/library/array.html</a>. 2. Yes - in this scheme the <code>ArrayWrapper</code> holds the memory and numpy keeps a reference to that alive for as long as is needed, so you don't need to do anything yourself.</span>
+<span class="comment-copy">I tried to use your array wrapper and my compiler complaints that move 'move' is not a member of 'std'. One more question, what if we pass the vector[int] array directly to numpy_array? For example, numpy_array = np.asarray(array)? That's the way I am returning my c++ vectors in python class properties. Is it wrong?</span>
+<span class="comment-copy">Move is a relatively recent addition to the c++ standard (c++11 I think) so if you have an older compiler it may not work. There may be an option you can pass to the compiler to turn it on though. If you pass the vector directly to numpy array it will be copied twice, first to a Python list then to the numpy array. It's not wrong, but if the vector is large then the copying will be inefficient.</span>
+<span class="comment-copy">Right. It'd be cool if you could elaborate on how to do this in Cython e.g. what modification to the code? I have never dealt with vectors in Cython.</span>
+<span class="comment-copy">Thanks for the edit. I meant how do deal with vector to numpy in Cython. @DavidW response seems to address this.</span>

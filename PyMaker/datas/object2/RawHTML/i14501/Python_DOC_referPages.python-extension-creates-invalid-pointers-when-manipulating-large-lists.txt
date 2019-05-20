@@ -1,0 +1,128 @@
+<div class="post-text" itemprop="text">
+<p>I managed to implement a Fisher–Yates shuffle function for python lists as an exercise for getting used to extending python. It works perfectly for relatively small lists, unless I run the function several times.</p>
+<p>Whenever the list size goes over about 100, I get all kinds of memory problems:</p>
+<pre><code>&gt;&gt;&gt;import evosutil
+&gt;&gt;&gt; a=[i for i in range(100)]
+&gt;&gt;&gt; evosutil.shuffle(a)
+&gt;&gt;&gt; a
+[52, 66, 0, 58, 41, 18, 50, 37, 81, 43, 74, 49, 90, 20, 63, 32, 89, 60, 2, 44, 3, 80, 15, 24, 22, 69, 86, 31, 56, 68, 34, 13, 38, 26, 14, 91, 73, 79, 39, 65, 5, 75, 84, 55, 7, 53, 93, 42, 40, 9, 51, 82, 29, 30, 99, 64, 33, 97, 27, 11, 6, 67, 16, 94, 95, 62, 57, 17, 78, 77, 71, 98, 72, 8, 88, 36, 85, 59, 21, 96, 23, 46, 10, 12, 48, 83, 4, 92, 45, 54, 1, 25, 19, 70, 35, 61, 47, 28, 87, 76]
+&gt;&gt;&gt; (Ctrl-D)
+*** Error in `python3': free(): invalid next size (fast): 0x083fe680 ***
+</code></pre>
+<p>Or, when trying to operate on a list with 1000 elements:</p>
+<pre><code>*** Error in `python3': munmap_chunk(): invalid pointer: 0x083ff0e0 ***
+</code></pre>
+<p>Or,</p>
+<pre><code>Segmentation fault (core dumped)
+</code></pre>
+<p>Here's my code for the module that produces the error:</p>
+<pre><code>inline void _List_SwapItems(PyObject* list, Py_ssize_t i1, Py_ssize_t i2){
+    PyObject* tmp=PyList_GetItem(list, i2);
+    PyList_SetItem(list, i2, PyList_GetItem(list, i1));
+    PyList_SetItem(list, i1, tmp);
+}
+
+//Naive Fisher–Yates shuffle
+static PyObject* shuffle(PyObject* self, PyObject* args){
+    PyObject* list;
+    PyArg_ParseTuple(args,"O", &amp;list);
+    unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
+    std::minstd_rand0 rand(seed);
+    Py_ssize_t size = PyList_Size(list);
+    for(int i=0; i&lt;size;++i){
+        int randIndex = rand()%size;
+        _List_SwapItems(list, randIndex, i);
+    }
+    Py_RETURN_NONE;
+}
+</code></pre>
+<p>I feel like I should be able to solve this either with free() or with Py_DECREF() somewhere, but I don't see where. I don't think I'm creating any objects, just moving them around. So where is the memory problem coming from?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You need to <code>Py_XINCREF()</code> both objects before passing them to <code>PyList_SetItem()</code>. Further, catch the special case where <code>i1 == i2</code>:</p>
+<pre><code>inline void _List_SwapItems(PyObject* list, Py_ssize_t i1, Py_ssize_t i2){
+    if (i1 == i2) {
+        return;
+    }
+    PyObject* obj1=PyList_GetItem(list, i1);
+    PyObject* obj2=PyList_GetItem(list, i2);
+    Py_XINCREF(obj1);
+    Py_XINCREF(obj2);
+    PyList_SetItem(list, i2, obj1);
+    PyList_SetItem(list, i1, obj2);
+}
+</code></pre>
+<p><code>PyList_GetItem()</code> returns a borrowed reference, i.e. it doesn't <code>INCREF</code> the object it returns. If you don't hold any other references, the refcount will be <code>1</code> (as it is only referenced from the list). When you call <code>PyList_SetItem(list, i2, ...)</code>, the list <code>Py_XDECREF()</code>'s the object previously stored at <code>i2</code> (which you keep in <code>tmp</code>). At that point, the refcount reaches <code>0</code> and the object is freed. Whoops.</p>
+<p>Similarly, you can't just call <code>PyList_SetItem(list, i, PyList_GetItem())</code>, because <code>SetItem</code> steals the reference you pass to it. You don't own the reference, however, the 'old' list does. So you need an <code>Py_XINCREF</code> here as well.</p>
+<p>See the <a href="https://docs.python.org/3.4/c-api/list.html" rel="nofollow">list API documentation</a> for more details.</p>
+<p>As a further suggestion, you might consider not programming directly against the Python extension API. It takes a lot of code to get anything done and it's subtly difficult to keep the refcounts correct. By now, there are multiple other ways to interface Python with C or C++. <a href="https://cffi.readthedocs.org/en/latest/" rel="nofollow">CFFI</a> seems to be the low-level interface the Python ecosystem will standardize on. <a href="http://www.riverbankcomputing.com/software/sip/intro" rel="nofollow">SIP</a> and <a href="http://www.swig.org/" rel="nofollow">SWIG</a> may offer better support for C++, though. For a SIP example, see <a href="https://stackoverflow.com/questions/29928074/how-to-pass-python-instance-to-c-via-python-c-api/29935113#29935113">this answer</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There are more problems in your extension function beyond the reference counting errors, more of them below:</p>
+<hr/>
+<p>While the <code>PyList_SetItem</code> with  proper reference counting is the preferred way, an (ugly) option is to use the <a href="https://docs.python.org/3/c-api/list.html#c.PyList_SET_ITEM" rel="nofollow"><code>PyList_SET_ITEM</code></a> macro that gets away with doing INCREFs:</p>
+<blockquote>
+<p><code>void PyList_SET_ITEM(PyObject *list, Py_ssize_t i, PyObject *o)</code></p>
+<p>Macro form of <code>PyList_SetItem()</code> without error checking. This is normally only used to fill in new lists where there is no previous
+  content.</p>
+<p><strong>Note</strong></p>
+<p>This macro “steals” a reference to item, and, <em>unlike <code>PyList_SetItem()</code>, does not discard a reference to any item that is
+  being replaced; any reference in list at position <code>i</code> will be leaked</em>.</p>
+</blockquote>
+<p>Thus the <code>PyList_SET_ITEM</code> neither increments nor decrements any reference counters, which is suitable for us since both initially and finally the elements are in the same list.</p>
+<pre><code>inline void _List_SwapItems(PyObject* list, Py_ssize_t i1, Py_ssize_t i2){
+    PyObject* tmp = PyList_GET_ITEM(list, i2);
+    PyList_SET_ITEM(list, i2, PyList_GET_ITEM(list, i1));
+    PyList_SET_ITEM(list, i1, tmp);
+}
+</code></pre>
+<p>Notice that this does not do any error checking at all, so you need to ensure that your index is within the bounds (which the <code>for</code> loop takes care of).</p>
+<hr/>
+<p>Your code has another bad problem that is not discussed yet - total lack of error checking. For example, when passed in a non-list object, you ought to raise a <code>TypeError</code>. Now the code will fail at <a href="https://hg.python.org/cpython/file/3.4/Objects/listobject.c#l182" rel="nofollow"><code>PyList_Size</code></a>, returning -1 and setting an internal exception, this can lead to erroneous behaviour of all future C extensions:</p>
+<p>Likewise <a href="https://docs.python.org/3/c-api/arg.html#c.PyArg_ParseTuple" rel="nofollow"><code>PyArg_ParseTuple</code></a> can and <strong>will fail if incorrect number of arguments is passed in</strong>, thus you must check its return value; in this case the <code>list</code> can be uninitialized and your code will have totally undefined behaviour.</p>
+<p>The C-API documentation <a href="https://docs.python.org/3/c-api/exceptions.html#exception-handling" rel="nofollow">states the following</a>:</p>
+<blockquote>
+<p>When a function must fail because some function it called failed, it
+  generally doesn’t set the error indicator; the function it called
+  already set it. It is responsible for either handling the error and
+  clearing the exception or returning after cleaning up any resources it
+  holds (such as object references or memory allocations); <strong>it should not
+  continue normally if it is not prepared to handle the error. If
+  returning due to an error, it is important to indicate to the caller
+  that an error has been set. If the error is not handled or carefully
+  propagated, additional calls into the Python/C API may not behave as
+  intended and may fail in mysterious ways.</strong></p>
+</blockquote>
+<p>Thus here is the correct way to write your extension function:</p>
+<pre><code>static PyObject* shuffle(PyObject* self, PyObject* args){
+    PyObject* list;
+    if (! PyArg_ParseTuple(args, "O", &amp;list)) {
+        // PyArg_ParseTuple set the proper exception
+        return NULL;
+    }
+
+    if (! PyList_Check(list)) {
+        PyErr_SetString(PyExc_TypeError,
+            "bad argument to shuffle; list expected");
+        return NULL;
+    }
+
+    unsigned seed = std::chrono::system_clock::now().time_since_epoch().count();
+    std::minstd_rand0 rand(seed);
+
+    Py_ssize_t size = PyList_Size(list);
+    for(int i=0; i&lt;size;++i){
+        int randIndex = rand()%size;
+        _List_SwapItems(list, randIndex, i);
+    }
+    Py_RETURN_NONE;
+}
+</code></pre>
+</div>
+<span class="comment-copy">That's not a Fisher-Yates shuffle, you're not supposed to pick the random element in the whole set, only between the cursor (excluded) and the end of the list. With what you have you might be swapping an element with itself which <i>might</i> do funny things (but I'm not familiar with the python API at all, so...)</span>
+<span class="comment-copy">@Mat Ah, that's true. I read over the pseudocode a bit too quickly. I don't think it makes any functional difference in this case though.</span>
+<span class="comment-copy">Surprisingly, it does a whole lot of difference. See <a href="http://blog.codinghorror.com/the-danger-of-naivete/" rel="nofollow noreferrer">blog.codinghorror.com/the-danger-of-naivete</a></span>
+<span class="comment-copy">@Mat Oh, neat. So, since the number of possible orderings given by the function is both larger than and not divisible by the number of permutations, some permutations are overrepresented.</span>
+<span class="comment-copy">Yup. I ignored error checking for the sake of brevity. It didn't fail when PyList_Size returned -1 when I was figuring out how to pass in arguments though, it just skipped over the for loop. If Py_ssize_t was unsigned, the program would probably crash</span>
+<span class="comment-copy">It <b>will</b> fail, -1 returned from <code>PyList_Size</code> means that an exception was thrown and you <b>must</b> handle it orderly, either clear the exception or pass it forward - you just didn't meet the proper condition in your code yet :D</span>
+<span class="comment-copy">Ah, whoops, I missed the part about it setting an internal exception.</span>

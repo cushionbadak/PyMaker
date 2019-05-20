@@ -1,0 +1,156 @@
+<div class="post-text" itemprop="text">
+<p>I'm writing a Python 2.7 extension module in Cython.  <strong>How do I create a Python object implementing the new-style buffer interface that wraps a chunk of memory given to me by a C library?</strong>  The chunk of memory is just a string of bytes, not a structure or multidimensional array.  I'm given a <code>const void *</code> pointer and a length, and some details about how long the pointer stays valid.</p>
+<p>I can't copy the memory—that would kill performance for my application.</p>
+<p>With the old-style buffer objects I could simply use <code>PyBuffer_FromMemory()</code>, but I can't seem to find a similarly easy way to produce a new-style buffer object.</p>
+<p>Do I have to create my own class that implements the buffer interface?  Or does Cython provide an easy way to do this?</p>
+<p>I've read the <a href="http://docs.cython.org/src/tutorial/strings.html">Unicode and Passing Strings</a> and <a href="http://docs.cython.org/src/userguide/memoryviews.html">Typed Memoryviews</a> pages from the Cython documentation, but the documentation is imprecise and not very complete and there are no examples that look similar to what I want to do.</p>
+<p>Here's what I've tried (<code>test.pyx</code>):</p>
+<pre><code>from libc.stdlib cimport malloc
+from libc.string cimport memcpy
+
+## pretend that this function is in some C library and that it does
+## something interesting.  (this function is unrelated to the problem
+## I'm experiencing -- this is just an example function that returns a
+## chunk of memory that I want to wrap in an object that follows the
+## new buffer protocol.)
+cdef void dummy_function(const void **p, size_t *l):
+    cdef void *tmp = malloc(17)
+    memcpy(tmp, "some test\0 bytes", 17)
+    p[0] = tmp
+    l[0] = 17
+
+cpdef getbuf():
+    cdef const void *cstr
+    cdef size_t l
+    dummy_function(&amp;cstr, &amp;l)
+
+    ## error: test.pyx:21:20: Invalid base type for memoryview slice: void
+    #cdef const void[:] ret = cstr[:l]
+
+    ## error: test.pyx:24:9: Assignment to const 'ret'
+    #cdef const char[:] ret = cstr[:l]
+
+    ## error: test.pyx:27:27: Cannot convert 'void const *' to memoryviewslice
+    #cdef char[:] ret = cstr[:l]
+
+    ## this next attempt cythonizes, but raises an exception:
+    ## $ python -c 'import test; test.getbuf()'
+    ## Traceback (most recent call last):
+    ##   File "&lt;string&gt;", line 1, in &lt;module&gt;
+    ##   File "test.pyx", line 15, in test.getbuf (test.c:1411)
+    ##   File "test.pyx", line 38, in test.getbuf (test.c:1350)
+    ##   File "stringsource", line 614, in View.MemoryView.memoryview_cwrapper (test.c:6763)
+    ##   File "stringsource", line 321, in View.MemoryView.memoryview.__cinit__ (test.c:3309)
+    ## BufferError: Object is not writable.
+    cdef char[:] ret = (&lt;const char *&gt;cstr)[:l]
+
+    ## this raises the same exception as above
+    #cdef char[:] ret = (&lt;char *&gt;cstr)[:l]
+
+    return ret
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can define an <a href="http://docs.cython.org/src/userguide/extension_types.html" rel="nofollow">extension type</a> that implements the buffer protocol by defining the <code>__getbuffer__</code> and <code>__releasebuffer__</code> <a href="http://docs.cython.org/src/userguide/special_methods.html#buffer-interface-pep-3118-no-python-equivalents-see-note-1" rel="nofollow">special methods</a>.  For example:</p>
+<pre><code>from cpython.buffer cimport PyBuffer_FillInfo
+from libc.stdlib cimport free, malloc
+from libc.string cimport memcpy
+
+cdef void dummy_function(const void **p, size_t *l):
+    cdef void *tmp = malloc(17)
+    memcpy(tmp, "some test\0 bytes", 17)
+    p[0] = tmp
+    l[0] = 17
+
+cdef void free_dummy_data(const void *p, size_t l, void *arg):
+    free(&lt;void *&gt;p)
+
+cpdef getbuf():
+    cdef const void *p
+    cdef size_t l
+    dummy_function(&amp;p, &amp;l)
+    return MemBuf_init(p, l, &amp;free_dummy_data, NULL)
+
+ctypedef void dealloc_callback(const void *p, size_t l, void *arg)
+
+cdef class MemBuf:
+    cdef const void *p
+    cdef size_t l
+    cdef dealloc_callback *dealloc_cb_p
+    cdef void *dealloc_cb_arg
+
+    def __getbuffer__(self, Py_buffer *view, int flags):
+        PyBuffer_FillInfo(view, self, &lt;void *&gt;self.p, self.l, 1, flags)
+    def __releasebuffer__(self, Py_buffer *view):
+        pass
+
+    def __dealloc__(self):
+        if self.dealloc_cb_p != NULL:
+            self.dealloc_cb_p(self.p, self.l, self.dealloc_cb_arg)
+
+# Call this instead of constructing a MemBuf directly.  The __cinit__
+# and __init__ methods can only take Python objects, so the real
+# constructor is here.  See:
+# https://mail.python.org/pipermail/cython-devel/2012-June/002734.html
+cdef MemBuf MemBuf_init(const void *p, size_t l,
+                        dealloc_callback *dealloc_cb_p,
+                        void *dealloc_cb_arg):
+    cdef MemBuf ret = MemBuf()
+    ret.p = p
+    ret.l = l
+    ret.dealloc_cb_p = dealloc_cb_p
+    ret.dealloc_cb_arg = dealloc_cb_arg
+    return ret
+</code></pre>
+<p>With the above (named <code>test.pyx</code>) you get the following behavior:</p>
+<pre class="lang-none prettyprint-override"><code>$ python -c 'import test; print repr(memoryview(test.getbuf()).tobytes())'
+'some test\x00 bytes\x00'
+</code></pre>
+<p>I don't know if there's an easier way.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Python 3.3 has <a href="https://docs.python.org/3/c-api/memoryview.html#c.PyMemoryView_FromMemory" rel="nofollow"><code>PyMemoryView_FromMemory</code></a> C-API function, which creates a <code>memoryview</code> Python object from supplied C buffer. <code>memoryview</code> objects indeed implement new-style buffer interface.</p>
+<p>If you look into <a href="https://hg.python.org/cpython/file/763d98f0a105/Objects/memoryobject.c#l716" rel="nofollow">its sources</a>, you'll notice that they're rather simple.
+It does that same thing as <code>PyMemoryView_FromBuffer</code> does, except the former
+fills <code>Py_buffer</code> with <code>PyBuffer_FillInfo</code> itself.</p>
+<p>Since the latter one exists in Python 2.7, so why we can't just call <code>PyBuffer_FillInfo</code> ourselves?</p>
+<pre><code>from libc.stdlib cimport malloc
+from libc.string cimport memcpy
+
+cdef extern from "Python.h":
+    ctypedef struct PyObject
+    object PyMemoryView_FromBuffer(Py_buffer *view)
+    int PyBuffer_FillInfo(Py_buffer *view, PyObject *obj, void *buf, Py_ssize_t len, int readonly, int infoflags)
+    enum:
+        PyBUF_FULL_RO
+
+cdef void dummy_function(const void **p, size_t *l):
+    cdef void *tmp = malloc(17)
+    memcpy(tmp, "some test\0 bytes", 17)
+    p[0] = tmp
+    l[0] = 17
+
+cpdef getbuf():
+    cdef const void *cstr
+    cdef size_t l
+    cdef Py_buffer buf_info
+    cdef char[:] ret
+    cdef int readonly
+
+    dummy_function(&amp;cstr, &amp;l)
+
+    readonly = 1
+    PyBuffer_FillInfo(&amp;buf_info, NULL, &lt;void*&gt;cstr, l, readonly, PyBUF_FULL_RO)
+    ret = PyMemoryView_FromBuffer(&amp;buf_info)
+
+    return ret
+</code></pre>
+<p>Note that, however, that the returned value will have a repr that looks like this: <code>&lt;MemoryView of 'memoryview' at 0x7f216fc70ad0&gt;</code>. This is because Cython seems to wrap bare <code>memoryview</code> inside <code>_memoryviewslice</code>. Since <code>memoryview</code> objects implement buffer interface already, you should probably simply return the result of <code>PyMemoryView_FromBuffer</code> call instead.</p>
+<p>Additionally, you're responsible for managing the lifetime of your buffer. <code>memoryview</code> objects created this way will not free memory automatically. You must do it yourself, ensuring that you only do that once no <code>memorybuffer</code> references it. In this regard, answer by Richard Hansen is much better alternative.</p>
+</div>
+<span class="comment-copy">Perhaps it's failing because you're casting to <code>const char *</code> instead of <code>char *</code>?</span>
+<span class="comment-copy">@Kevin: I updated my question to state that the same exception happens even if I cast to <code>char *</code> instead of <code>const char *</code>.  Thanks for pointing that out.</span>
+<span class="comment-copy">Having studied the problem in greater detail, I'd like to point out that the memcpy is illegal.  You declared <code>tmp</code> as const, and then you modified it.  That's undefined behavior by the C standard.  Since you also said you are trying to avoid copying memory, I'm a little confused on this point.</span>
+<span class="comment-copy">@Kevin:  Thank you for investigating.  Casting away <code>const</code> is unrelated to the problem I'm having, but I updated the question anyway to eliminate the <code>const</code> cast.  Regarding the copying, that's just dummy code to help set up the problem code.  Please see the revised question; hopefully it's now more clear.</span>
+<span class="comment-copy"><code>MemBuf</code> is creating a memory leak. <code>__releasebuffer__</code> should call  <code>PyBuffer_Release(view)</code>. You should probably write a <code>__dealloc__</code> function for <code>MemBuf</code> that calls <code>free</code> if it owns the memory that was returned by the C function.</span>
+<span class="comment-copy">@Dunes:  Yes, you are right.  I updated my answer to free the memory in <code>__dealloc__</code>.  In my real-world code the C function retains ownership of the memory block so I didn't think to free the memory in this example code.</span>

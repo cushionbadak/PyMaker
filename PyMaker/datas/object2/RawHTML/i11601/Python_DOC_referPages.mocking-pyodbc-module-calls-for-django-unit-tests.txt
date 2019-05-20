@@ -1,0 +1,112 @@
+<div class="post-text" itemprop="text">
+<p>I want to make unit tests for some django views which use a custom pyodbc database connection</p>
+<h1>views.py</h1>
+<pre><code>from django.http import JsonResponse, HttpResponseNotFound, HttpResponseBadRequest, HttpResponseServerError, HttpResponseForbidden
+from django.core.exceptions import SuspiciousOperation
+from django.utils.datastructures import MultiValueDictKeyError
+import os
+import pyodbc
+
+# Create your views here.
+
+db_credentials = os.environ.get('DATABASE_CREDENTIALS')
+dbh = pyodbc.connect(db_credentials)
+
+def get_domains(request):
+    if request.method == 'GET':
+        args = request.GET
+    elif request.method == 'POST':
+        args = request.POST
+
+    try:
+        cursor = dbh.cursor()
+        if 'owner' in args:
+            owner = args['owner']
+            cursor.execute('{call GET_DOMAINS_FOR_OWNER(?)}', owner)
+        else:
+            cursor.execute('{call GET_DOMAINS()}')
+        result = cursor.fetchall()
+        if(result):
+            return JsonResponse([row[0] for row in result], safe=False)
+        else:
+            return JsonResponse([], safe=False)
+    except pyodbc.Error as e:
+        return HttpResponseServerError(e)
+    except SuspiciousOperation as e:
+        return HttpResponseForbidden(e)
+</code></pre>
+<p>Since I don't want the unit tests to be hitting the database, how can I mock the behaviour given that:</p>
+<ul>
+<li>The mock library won't work since pyodbc is a Python C extension</li>
+<li>Using sys.modules doesn't seem to work, probably because the module is being used in views.py and not on tests.py</li>
+</ul>
+<p>Here is my test driver</p>
+<h1>tests.py</h1>
+<pre><code>from django.test import SimpleTestCase
+from sms_admin import *
+
+# Create your tests here.
+
+
+HTTP_OK = 200
+HTTP_NOTFOUND = 404
+
+
+class AdminTestCase(SimpleTestCase):
+    """docstring for AdminTestCase"""
+
+    def test_get_pool_for_lds(self):
+        response = self.client.get('/sms_admin/get_pool_for_lds', {'domain': 'sqlconnect', 'stage': 'dev', 'lds': 'reader'})
+        self.assertEqual(response.content, b'pdss_reader')
+        self.assertEqual(response.status_code, HTTP_OK)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can patch <code>pyodbc.connect</code> without any limitations as showed in the follow example:</p>
+<pre><code>import pyodbc
+from unittest.mock import patch
+
+with patch("pyodbc.connect") as mock_connect:
+    pyodbc.connect("Credentials")
+    mock_connect.assert_called_with("Credentials")
+</code></pre>
+<p>Now the real issue in <code>view.py</code> is the line </p>
+<pre><code>dbh = pyodbc.connect(db_credentials)
+</code></pre>
+<p>That line is executed while <strong>your are importing</strong> <code>view.py</code> and you cannot control it without implement some kind of hack in your test code like patching connect <strong>before</strong> importing <code>view.py</code> or anything else importing it.</p>
+<p>I would like strongly discourage you on write this kind of dirty tricks and change just a little your code to implement a lazy <code>dbh</code> property. Another way can write your own db class wrapper (better) and patch it in your tests but that is a strong design change and you can introduce it later by take the power of implemented tests.</p>
+<p>In <code>view.py</code> use:</p>
+<pre><code>_dbh = None
+def get_db():
+    global _dbh
+    if _dbh is None:
+        _dbh = pyodbc.connect(db_credentials)
+    return _dbh
+</code></pre>
+<p>where <code>cusror</code> become </p>
+<pre><code>cursor = get_db().cursor()
+</code></pre>
+<p>Now you can patch <code>get_db()</code> and use <code>return_value</code> mock in your test </p>
+<pre><code>class AdminTestCase(SimpleTestCase):
+    """docstring for AdminTestCase"""
+
+    def setUp(self):
+        super().setUp()
+        p = patch("yourpackage.view.get_db")
+        self.addCleanup(p.stop)
+        self.get_db_mock = p.start()
+        self.db_mock = self.get_db_mock.return_value
+        self.cursor_mock = self.db_mock.cursor.return_value
+
+    def test_get_pool_for_lds(self, get_db_mock):
+        .... configure self.cursor_mock to behave as you need
+
+        response = self.client.get('/sms_admin/get_pool_for_lds', {'domain': 'sqlconnect', 'stage': 'dev', 'lds': 'reader'})
+        self.assertEqual(response.content, b'pdss_reader')
+        self.assertEqual(response.status_code, HTTP_OK)
+</code></pre>
+<p>I left out the detail of how <code>mock_cursor</code> should behave and cursor calls asserts. You can write it by reading <a href="https://docs.python.org/3/library/unittest.mock.html" rel="nofollow"><code>mock</code> framework documentation</a>. I used to patch connection in <code>setUp()</code> method because I can guess that you need it in almost all your tests in this class where <code>cursor_mock</code>, <code>db_mock</code> and <code>get_db_mock</code> can be used with different behavior: my experience is that this approach will pay a lot later while you'll add more tests.</p>
+</div>
+<span class="comment-copy">In this case should db_mock be another Mock object?</span>
+<span class="comment-copy">db_mock is another mock and it is the same that the patched get_db return in test context</span>
+<span class="comment-copy">@tiagovrtr I tried to make my answer more clear.</span>

@@ -1,0 +1,160 @@
+<div class="post-text" itemprop="text">
+<p>I need a Python TCP server that can handle at least tens of thousands  of concurrent socket connections. I was trying to test Python SocketServer package capabilities in both multiprocessor and multithreaded modes, but both were far from desired performance.</p>
+<p>At first, I'll describe client, because it's common for both cases.</p>
+<p><strong>client.py</strong></p>
+<pre><code>import socket
+import sys
+import threading
+import time
+
+
+SOCKET_AMOUNT = 10000
+HOST, PORT = "localhost", 9999
+data = " ".join(sys.argv[1:])
+
+
+def client(ip, port, message):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.connect((ip, port))
+    while 1:
+        sock.sendall(message)
+        time.sleep(1)
+    sock.close()
+
+
+for i in range(SOCKET_AMOUNT):
+    msg = "test message"
+    client_thread = threading.Thread(target=client, args=(HOST, PORT, msg))
+    client_thread.start()
+</code></pre>
+<p>Multiprocessor server:</p>
+<p><strong>foked_server.py</strong></p>
+<pre><code>import os
+import SocketServer
+
+
+class ForkedTCPRequestHandler(SocketServer.BaseRequestHandler):
+
+    def handle(self):
+        cur_process = os.getpid()
+        print "launching a new socket handler, pid = {}".format(cur_process)
+        while 1:
+            self.request.recv(4096)
+
+
+class ForkedTCPServer(SocketServer.ForkingMixIn, SocketServer.TCPServer):
+    pass
+
+
+if __name__ == "__main__":
+    HOST, PORT = "localhost", 9999
+
+    server = ForkedTCPServer((HOST, PORT), ForkedTCPRequestHandler)
+    print "Starting Forked Server"
+    server.serve_forever()
+</code></pre>
+<p>Multithreaded server:</p>
+<p><strong>threaded_server.py</strong></p>
+<pre><code>import threading
+import SocketServer
+
+
+class ThreadedTCPRequestHandler(SocketServer.BaseRequestHandler):
+
+    def handle(self):
+        cur_thread = threading.current_thread()
+        print "launching a new socket handler, thread = {}".format(cur_thread)
+        while 1:
+            self.request.recv(4096)
+
+
+class ThreadedTCPServer(SocketServer.ThreadingMixIn, SocketServer.TCPServer):
+    pass
+
+
+if __name__ == "__main__":
+    HOST, PORT = "localhost", 9999
+
+    server = ThreadedTCPServer((HOST, PORT), ForkedTCPRequestHandler)
+    print "Starting Threaded Server"
+    server.serve_forever()
+</code></pre>
+<p>In the first case, with <strong>forked_server.py</strong>, only 40 processes are created and approximately 20 of those start breaking in a while with the following error:</p>
+<blockquote>
+<p>error: [Errno 104] Connection reset by peer</p>
+</blockquote>
+<p>on a client side.</p>
+<p>Threaded version is much more durable and holds more than 4000 connections, but eventually starts showing</p>
+<blockquote>
+<p>gaierror: [Errno -5] No address associated with hostname</p>
+</blockquote>
+<p>The tests were made on my local machine, Kubuntu 14.04 x64 on kernel v3.13.0-32. These are the steps I've made to increase general performance of the system:</p>
+<ol>
+<li>Raise kernel limit on file handles: <code>sysctl -w fs.file-max=10000000</code></li>
+<li>Increase the connection backlog, <code>sysctl -w net.core.netdev_max_backlog = 2500</code></li>
+<li>Raise the maximum connections, <code>sysctl -w net.core.somaxconn = 250000</code></li>
+</ol>
+<p>So, the questions are:</p>
+<ol>
+<li>Were the tests correct, can I rely on those results? I'm new to all this Network/Socket   stuff, so please correct me in my conclusions.</li>
+<li>Is it really the multiprocessor/multithreaded approach not viable in a heavy loaded systems?</li>
+<li>If yes, what options do we have left? Asynchronous approach? Tornado/Twisted/Gevent frameworks?</li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<p><code>socketserver</code> is not going to handle anywhere near 10k connections. No threaded or forked server will on current hardware and OS's. Thousands of threads means you spend more time context-switching and scheduling than actually working. Modern linux is getting very good at scheduling threads and processes, and Windows is pretty good with threads (but horrible with processes), but there's a limit to what it can do.</p>
+<p>And <code>socketserver</code> doesn't even <em>try</em> to be high-performance.</p>
+<p>And of course CPython's GIL makes things worse. If you're not using 3.2+; any thread doing even a trivial amount of CPU-bound work is going to choke all of the other threads and block your I/O. With the new GIL, if you avoid non-trivial CPU you don't add <em>too</em> much to the problem, but it still makes context switches more expensive than raw pthreads or Windows threads.</p>
+<hr/>
+<p>So, what <em>do</em> you want?</p>
+<p>You want a single-threaded "reactor" that services events in a loop and kicks off handlers. (On Windows, and Solaris, there are advantages to instead using a "proactor", a pool of threads that all service the same event queue, but since you're on Linux, let's not worry about that.) Modern OS's have very good multiplexing APIs to build on—<code>kqueue</code> on BSD/Mac, <code>epoll</code> on Linux, <code>/dev/poll</code> on Solaris, IOCP on Windows—that can easily handle 10K connections even on hardware from years ago.</p>
+<p><code>socketserver</code> isn't a terrible reactor, it's just that it doesn't provide any good way to dispatch asynchronous work, only threads or processes. In theory, you could build a <code>GreenletMixIn</code> (with the <code>greenlet</code> extension module) or a <code>CoroutineMixIn</code> (assuming you either have or know how to write a trampoline and scheduler) without too much work on top of <code>socketserver</code>, and that might not be too heavy-weight. But I'm not sure how much benefit you're getting out of <code>socketserver</code> at that point.</p>
+<p>Parallelism <em>can</em> help, but only to dispatch any slow jobs off the main work thread. First get your 10K connections up, doing minimal work. Then, if the real work you want to add is I/O-bound (e.g., reading files, or making requests to other services), add a pool of threads to dispatch to; if you need to add a lot of CPU-bound work, add a pool of processes instead (or, in some cases, even one of each).</p>
+<p>If you can use Python 3.4, the stdlib has an answer in <a href="https://docs.python.org/3/library/asyncio.html"><code>asyncio</code></a> (and there's a backport on PyPI for 3.3, but it's inherently impossible to backport to earlier versions).</p>
+<p>If not… well, you <em>can</em> build something yourself on top of <a href="https://docs.python.org/3/library/selectors.html"><code>selectors</code></a> in 3.4+ if you don't care about Windows, or <a href="https://docs.python.org/3/library/select.html"><code>select</code></a> in 2.6+ if you only care about linux, *BSD, and Mac and are willing to write two versions of your code, but it's going to be a lot of work. Or you can write your core event loop in C (or just use an existing one like <code>libev</code> or <code>libuv</code> or <code>libevent</code>) and wrap it in an extension module.</p>
+<p>But really, you probably want to turn to third-party libraries. There are many of them, with very different APIs, from <code>gevent</code> (which tries to make your code look like preemptively threaded code but actually runs in greenlets on a single-threaded event loop) to <code>Twisted</code> (which is based around explicit callbacks and futures, similar to many modern JavaScript frameworks). </p>
+<p>StackOverflow isn't a good place to get recommendations for specific libraries, but I can give you a general recommendation: Look them over, pick the one whose API sounds best for your application, test whether it's good enough, and only fall back to another one if the one you like can't cut it (or if you turned out to be wrong about liking the API). Fans of some of these libraries (especially <code>gevent</code> and <code>tornado</code> will tell you that their favorite is "fastest", but who cares about that? What matters is whether they're <em>fast enough</em> and usable to write your app.</p>
+<p>Off the top of my head, I'd search for <code>gevent</code>, <code>eventlet</code>, <code>concurrence</code>, <code>cogen</code>, <code>twisted</code>, <code>tornado</code>, <code>monocle</code>, <code>diesel</code>, and <code>circuits</code>. That probably isn't a great list, but if you google all those terms together, I'll bet you'll find an up-to-date comparison, or an appropriate forum to ask on.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="http://coreygoldberg.blogspot.com/2008/09/performance-testing-load-balancer-ssl.html" rel="nofollow">This guy</a> seemed to have a pretty good solution using <code>threading</code> and <code>subprocess</code>.</p>
+<pre><code>#!/usr/bin/env python
+# ssl_load.py - Corey Goldberg - 2008
+
+import httplib
+from threading import Thread
+
+threads = 250
+host = '192.168.1.14'
+file = '/foo.html'
+
+def main():
+    for i in range(threads):
+        agent = Agent()
+        agent.start()
+
+class Agent(Thread):
+    def __init__(self):
+        Thread.__init__(self)
+
+    def run(self):
+        while True:
+            conn = httplib.HTTPSConnection(host)
+            conn.request('GET', file)
+            resp = conn.getresponse()
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+<p>Allowed him to have at most 250 threads per process due to Windows XP constraints. This is considering he had pretty poor hardware compared to today's standards. He was able to reach a 15k thread max by running this script as multiple processes as shown here:</p>
+<pre><code>#!/usr/bin/env python
+
+import subprocess
+processes = 60
+for i in range(processes):
+    subprocess.Popen('python ssl_load.py') 
+</code></pre>
+<p>Hope this helps you out!</p>
+</div>
+<span class="comment-copy">For background, google "<i>C10K</i>" and "<i>C10K Python</i>".</span>
+<span class="comment-copy">Ha, googling exactly that set of terms, I found <a href="http://nichol.as/asynchronous-servers-in-python" rel="nofollow noreferrer">this article</a> from 2009 comparing all but one of those frameworks and no others… which implies my list is 5 years out of date. :) I also think the author missed the point of why explicit <code>yields</code> can be a much better API than <code>gevent</code>-style implicit ones, at least if you have any shared mutable data or other nondeterminism.</span>

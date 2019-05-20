@@ -1,0 +1,112 @@
+<div class="post-text" itemprop="text">
+<p>I have a large program (specifically, a function) that I'm attempting to parallelize using a <code>JoinableQueue</code> and the multiprocessing <code>map_async</code> method. The function that I'm working with does several operations on multidimensional arrays, so I break up each array into sections, and each section evaluates independently; however I need to stitch together one of the arrays early on, but the "stitch" happens before the "evaluate" and I need to introduce some kind of delay in the JoinableQueue. I've searched all over for a workable solution but I'm very new to multiprocessing and most of it goes over my head.</p>
+<p>This phrasing may be confusing- apologies. Here's an outline of my code (I can't put all of it because it's very long, but I can provide additional detail if needed)</p>
+<pre><code>import numpy as np
+import multiprocessing as mp
+from multiprocessing import Pool, Pipe, JoinableQueue
+
+def main_function(section_number):
+
+    #define section sizes
+    array_this_section = array[:,start:end+1,:]
+    histogram_this_section = np.zeros((3, dataset_size, dataset_size))
+    #start and end are defined according to the size of the array
+    #dataset_size is to show that the histogram is a different size than the array
+
+    for m in range(1,num_iterations+1):
+        #do several operations- each section of the array 
+                 #corresponds to a section on the histogram
+
+        hist_queue.put(histogram_this_section)
+
+        #each process sends their own part of the histogram outside of the pool 
+                 #to be combined with every other part- later operations 
+                 #in this function must use the full histogram
+
+        hist_queue.join()
+        full_histogram = full_hist_queue.get()
+        full_hist_queue.task_done()
+
+        #do many more operations
+
+
+hist_queue = JoinableQueue()
+full_hist_queue = JoinableQueue()
+
+if __name__ == '__main__':
+    pool = mp.Pool(num_sections)
+    args = np.arange(num_sections)
+    pool.map_async(main_function, args, chunksize=1)    
+
+    #I need the map_async because the program is designed to display an output at the 
+        #end of each iteration, and each output must be a compilation of all processes
+
+    #a few variable definitions go here
+
+    for m in range(1,num_iterations+1):
+        for i in range(num_sections):
+            temp_hist = hist_queue.get()    #the code hangs here because the queue 
+                                            #is attempting to get before anything 
+                                            #has been put
+            hist_full += temp_hist
+        for i in range(num_sections):
+            hist_queue.task_done()
+        for i in range(num_sections):
+            full_hist_queue.put(hist_full)    #the full histogram is sent back into 
+                                              #the pool
+
+
+            full_hist_queue.join()
+
+        #etc etc
+
+    pool.close()
+    pool.join()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I'm pretty sure that your issue is how you're creating the <code>Queue</code>s and trying to share them with the child processes. If you just have them as global variables, they may be recreated in the child processes instead of inherited (the exact details depend on what OS and/or <a href="https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods" rel="nofollow noreferrer">context</a> you're using for <code>multiprocessing</code>).</p>
+<p>A better way to go about solving this issue is to avoid using <code>multiprocessing.Pool</code> to spawn your processes and instead explicitly create <code>Process</code> instances for your workers yourself. This way you can pass the <code>Queue</code> instances to the processes that need them without any difficulty (it's <em>technically</em> possible to pass the queues to the <code>Pool</code> workers, but it's awkward).</p>
+<p>I'd try something like this:</p>
+<pre><code>def worker_function(section_number, hist_queue, full_hist_queue): # take queues as arguments
+    # ... the rest of the function can work as before
+    # note, I renamed this from "main_function" since it's not running in the main process
+
+if __name__ == '__main__':
+    hist_queue = JoinableQueue()   # create the queues only in the main process
+    full_hist_queue = JoinableQueue()  # the workers don't need to access them as globals
+
+    processes = [Process(target=worker_function, args=(i, hist_queue, full_hist_queue)
+                 for i in range(num_sections)]
+    for p in processes:
+        p.start()
+
+    # ...
+</code></pre>
+<p>If the different stages of your worker function are more or less independent of one another (that is, the "do many more operations" step doesn't depend directly on the "do several operations" step above it, just on <code>full_histogram</code>), you might be able to keep the <code>Pool</code> and instead split up the different steps into separate functions, which the main process could call via several calls to <code>map</code> on the pool. You don't need to use your own <code>Queue</code>s in this approach, just the ones built in to the Pool. This might be best especially if the number of "sections" you're splitting the work up into doesn't correspond closely with the number of processor cores on your computer. You can let the <code>Pool</code> match the number of cores, and have each one work on several sections of the data in turn.</p>
+<p>A rough sketch of this would be something like:</p>
+<pre><code>def worker_make_hist(section_number):
+    # do several operations, get a partial histogram
+    return histogram_this_section
+
+def worker_do_more_ops(section_number, full_histogram):
+    # whatever...
+    return some_result
+
+if __name__ == "__main__":
+    pool = multiprocessing.Pool() # by default the size will be equal to the number of cores
+
+    for temp_hist in pool.imap_unordered(worker_make_hist, range(number_of_sections)):
+        hist_full += temp_hist
+
+    some_results = pool.starmap(worker_do_more_ops, zip(range(number_of_sections),
+                                                        itertools.repeat(hist_full)))
+</code></pre>
+</div>
+<span class="comment-copy">I'm not sure I understand what's happening in your code. What's going wrong? Are you getting an exception? A deadlock? The only potentially sketchy thing I see in your code is that it's not obvious if the child processes will get the same <code>Queue</code> objects as the parent, since you're not passing them as arguments (to a setup function in the <code>Pool</code>). The code <i>might</i> work if <code>multiprocessing</code> is forking, but if you're not, it probably won't work since the queues will be different.</span>
+<span class="comment-copy">My code hangs at the <code>temp_hist = hist_queue.get()</code> line because the main function takes much longer to progress to the <code>hist_queue.put()</code> command, so the <code>get()</code> command hangs because there is nothing in the queue. I would like to somehow delay the <code>.get()</code> call until there is something in the queue, if possible</span>
+<span class="comment-copy">Doesn't the <code>get</code> call block? That seems like it should do exactly what you want. There's no deadlock, since the other processes will eventually add their histograms to the queue. What's the problem, exactly?</span>
+<span class="comment-copy">The blocking stops the program completely. It just hangs. The main function doesn't continue to evaluate, so no histograms get sent through the queue. I've tested this with a series of print commands to tell me where the function progresses, and it stops before any <code>put()</code> commands can be called. I believe it's an artifact of the <code>map_async</code> method, which allows code below the call to execute at the same time as the function argument, but I'd like to postpone the code below <code>map_async</code> until the main function reaches the <code>put()</code> commands</span>
+<span class="comment-copy">It shouldn't matter when the original process calls <code>get</code>, it should until the first child process does its <code>put</code>, then wake up. The only way for it to deadlock is if the queues aren't working correctly. Does anything ever get sent successfully over the queues?</span>
+<span class="comment-copy">The first solution you gave unblocked a great deal of the code. So thank you for that! Unfortunately the operations at the bottom of the worker function do depend on what happens before, so while I've considered the second solution before it would be awkward to implement. There's still some sticking happening at the <code>hist_queue.put()</code> call, but at least the function is getting there now. I'm going to hold off on accepting this until I have a chance to play with it more, but you've given me a fantastic starting point. Thank you very much</span>
+<span class="comment-copy">You're a genius. Thank you for taking the time to help me. Accepted</span>

@@ -1,0 +1,292 @@
+<div class="post-text" itemprop="text">
+<p>I have a process running with <code>asyncio</code> which should run forever.</p>
+<p>I can interact with that process with a ProcessIterator, which can (left out here) send data to stdin and fetch from stdout.</p>
+<p>I can access the data with <code>async for fd, data in ProcessIterator(...):</code>.</p>
+<p>The problem is now that the execution of this async iterator must be timelimited. If the time runs out, the <code>timeout()</code> function is called,
+but the exception does not originate out of the <code>__anext__</code> function to notify of the timeout.</p>
+<p>How can I raise this exception in the async iterator?
+I found no way of calling <code>awaitable.throw(something)</code> or similar for it.</p>
+<pre><code>class ProcessIterator:
+    def __init__(self, process, loop, run_timeout):
+        self.process = process
+        self.loop = loop
+
+        self.run_timeout = run_timeout
+
+        # set the global timer
+        self.overall_timer = self.loop.call_later(
+            self.run_timeout, self.timeout)
+
+    def timeout(self):
+        # XXX: how do i pass this exception into the iterator?
+        raise ProcTimeoutError(
+            self.process.args,
+            self.run_timeout,
+            was_global,
+        )
+
+    async def __aiter__(self):
+        return self
+
+    async def __anext__(self):    
+        if self.process.exited:
+            raise StopAsyncIteration()
+
+        else:
+            # fetch output from the process asyncio.Queue()
+            entry = await self.process.output_queue.get()
+            if entry == StopIteration:
+                raise StopAsyncIteration()
+
+            return entry
+</code></pre>
+<p>The usage of the async iterator is now roughly:</p>
+<pre><code>async def test_coro(loop):
+    code = 'print("rofl"); time.sleep(5); print("lol")'
+
+    proc = Process([sys.executable, '-u', '-c', code])
+
+    await proc.create()
+
+    try:
+        async for fd, line in ProcessIterator(proc, loop, run_timeout=1):
+            print("%d: %s" % (fd, line))
+
+    except ProcessTimeoutError as exc:
+        # XXX This is the exception I'd like to get here! How can i throw it?
+        print("timeout: %s" % exc)
+
+    await proc.wait()
+</code></pre>
+<p>tl;dr: How can I throw a timed exception so it originates from a async iterator?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>EDIT: Added solution 2</p>
+<p><strong>Solution 1:</strong></p>
+<p>Can the <code>timeout()</code> callback store the ProcTimeoutError exception in an instance variable?  Then <code>__anext__()</code> can check the instance variable and raise the exception if it is set.</p>
+<pre><code>class ProcessIterator:
+    def __init__(self, process, loop, run_timeout):
+        self.process = process
+        self.loop = loop
+        self.error = None
+
+        self.run_timeout = run_timeout
+
+        # set the global timer
+        self.overall_timer = self.loop.call_later(
+            self.run_timeout, self.timeout)
+
+    def timeout(self):
+        # XXX: set instance variable
+        self.error = ProcTimeoutError(
+                         self.process.args,
+                         self.run_timeout,
+                         was_global
+                     )
+
+    async def __aiter__(self):
+        return self
+
+    async def __anext__(self): 
+        # XXX: if error is set, then raise the exception
+        if self.error:
+            raise self.error
+
+        elif self.process.exited:
+            raise StopAsyncIteration()
+
+        else:
+            # fetch output from the process asyncio.Queue()
+            entry = await self.process.output_queue.get()
+            if entry == StopIteration:
+                raise StopAsyncIteration()
+
+            return entry
+</code></pre>
+<p><strong>Solution 2:</strong></p>
+<p>Put the exception on the process.output_queue.</p>
+<pre><code>....
+def timeout(self):
+    # XXX: set instance variable
+    self.process.ouput_queue.put(ProcTimeoutError(
+                                     self.process.args,
+                                     self.run_timeout,
+                                     was_global
+                                 ))
+
+....
+
+# fetch output from the process asyncio.Queue()
+entry = await self.process.output_queue.get()
+if entry == StopIteration:
+    raise StopAsyncIteration()
+
+elif entry = ProcTimeoutError:
+    raise entry
+....
+</code></pre>
+<p>If there may be entries on the queue, use a priority queue.  Assign ProcTimeoutError a higher priority than the other entries, e.g., (0, ProcTimeoutError) vs (1, other_entry).</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Please check out <code>timeout</code> context manager from <code>asyncio</code>:</p>
+<pre><code>with asyncio.timeout(10):
+    async for i in get_iter():
+        process(i)
+</code></pre>
+<p>It is not released yet but you can copy-paste the implementation from <a href="https://github.com/python/asyncio/blob/master/asyncio/tasks.py#L738-L785" rel="nofollow">asyncio master branch</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You could use <a href="https://docs.python.org/3/library/asyncio-queue.html#asyncio.Queue.get_nowait" rel="nofollow">get_nowait</a>, which will return entry or throw <code>QueueEmpty</code> immediately. Wrapping it in <code>while</code> loop on <code>self.error</code> with some async sleep should do the trick. Something like:</p>
+<pre><code>async def __anext__(self):    
+    if self.process.exited:
+        raise StopAsyncIteration()
+
+    else:
+        while self.error is None:
+            try:
+                entry = self.process.output_queue.get_nowait()
+                if entry == StopIteration:
+                    raise StopAsyncIteration()
+                return entry
+            except asyncio.QueueEmpty:
+                # some sleep to give back control to ioloop
+                # since we using nowait
+                await asyncio.sleep(0.1)
+        else:
+            raise self.error
+</code></pre>
+<p>And as a hint approach that is used in <a href="https://github.com/tornadoweb/tornado/blob/master/tornado/queues.py#L188" rel="nofollow">Tornado's Queue.get</a> implementation with timeout:</p>
+<pre><code>def get(self, timeout=None):
+    """Remove and return an item from the queue.
+    Returns a Future which resolves once an item is available, or raises
+    `tornado.gen.TimeoutError` after a timeout.
+    """
+    future = Future()
+    try:
+        future.set_result(self.get_nowait())
+    except QueueEmpty:
+        self._getters.append(future)
+        _set_timeout(future, timeout)
+    return future
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>This is the solution I came up with by now.</p>
+<p>See <a href="https://github.com/SFTtech/kevin" rel="nofollow">https://github.com/SFTtech/kevin</a> <code>kevin/process.py</code> for the upstream  version.</p>
+<p>It also features line counting and output timeouts, which I stripped from this example.</p>
+<pre><code>class Process:
+    def __init__(self, command, loop=None):
+
+        self.loop = loop or asyncio.get_event_loop()
+
+        self.created = False
+        self.killed = asyncio.Future()
+
+        self.proc = self.loop.subprocess_exec(
+            lambda: WorkerInteraction(self),  # see upstream repo
+            *command)
+
+        self.transport = None
+        self.protocol = None
+
+    async def create(self):
+        self.transport, self.protocol = await self.proc
+
+    def communicate(self, timeout):
+        if self.killed.done():
+            raise Exception("process was already killed "
+                            "and no output is waiting")
+
+        return ProcessIterator(self, self.loop, timeout)
+
+class ProcessIterator:
+    """
+    Asynchronous iterator for the process output.   
+    Use like `async for (fd, data) in ProcessIterator(...):`
+    """
+
+    def __init__(self, process, loop, run_timeout):
+        self.process = process
+        self.loop = loop
+        self.run_timeout = run_timeout
+
+        self.overall_timer = None
+
+        if self.run_timeout &lt; INF:
+            # set the global timer
+            self.overall_timer = self.loop.call_later(
+                self.run_timeout,
+                functools.partial(self.timeout, was_global=True))
+
+    def timeout(self):
+        if not self.process.killed.done():
+            self.process.killed.set_exception(ProcTimeoutError(
+                self.process.args,
+                self.run_timeout,
+            ))
+
+    async def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        # either the process exits,
+        # there's an exception (process killed, timeout, ...)
+        # or the queue gives us the next data item.
+        # wait for the first of those events.
+        done, pending = await asyncio.wait(
+            [self.process.protocol.queue.get(), self.process.killed],
+            return_when=asyncio.FIRST_COMPLETED)
+
+        # at least one of them is done now:
+        for future in done:
+            # if something failed, cancel the pending futures
+            # and raise the exception
+            # this happens e.g. for a timeout.
+            if future.exception():
+                for future_pending in pending:
+                    future_pending.cancel()
+
+                # kill the process before throwing the error!
+                await self.process.pwn()
+                raise future.exception()
+
+            # fetch output from the process
+            entry = future.result()
+
+            # it can be stopiteration to indicate the last data chunk
+            # as the process exited on its own.
+            if entry == StopIteration:
+                if not self.process.killed.done():
+                    self.process.killed.set_result(entry)
+
+                    # raise the stop iteration
+                    await self.stop_iter(enough=False)
+
+            return entry
+
+        raise Exception("internal fail: no future was done!")
+
+    async def stop_iter(self):
+        # stop the timer
+        if self.overall_timer:
+            self.overall_timer.cancel()
+
+        retcode = self.process.returncode()
+
+        raise StopAsyncIteration()
+</code></pre>
+<p>The magic function is this:</p>
+<pre><code>done, pending = await asyncio.wait(
+    [self.process.protocol.queue.get(), self.process.killed],
+    return_when=asyncio.FIRST_COMPLETED)
+</code></pre>
+<p>When the timeout occurs, the queue fetching is aborted reliably.</p>
+</div>
+<span class="comment-copy">solution 1 doesn't work because potentially the queue produces no output and we'll hang in the <code>queue.get()</code> forever.    solution 2 doesn't work because the queue potentially spams a near-infinite amount of messages, which would block the enqueued <code>StopIteration</code> or take a very long time until it's the next element.  The timeout must have maximum priority (but using a priority queue seems wrong) to be able to kill the process reliably, as it is untrusted code.</span>
+<span class="comment-copy">A better approach may be waiting on both a future and the queue and continue when one of them is ready, and if both, the future is preferred. That allows to react when the exception is set as a result for it instantly. I think I have an idea for that, let's see.</span>
+<span class="comment-copy">Looks promising. If I now could do that with a timeout I specified and set up in get_iter(timeout=10), then it would be exactly what i want :)</span>
+<span class="comment-copy">I don't think it's an acceptable way of solving this with some "busy" waiting like this. The exception should be thrown when the loop is processed again and not after trying again and again.</span>
+<span class="comment-copy">You may disagree but this is like <code>asyncio.Queue.get</code> works - busy waiting <a href="https://github.com/python/asyncio/blob/master/asyncio/queues.py#L157" rel="nofollow noreferrer">github.com/python/asyncio/blob/master/asyncio/queues.py#L157</a></span>
+<span class="comment-copy">Of course it can be written better, as a hint I've added Tornado's implentation</span>
+<span class="comment-copy">I'm sorry but in the queue implementation I only see <code>yield from getter</code> where it waits until an item in available. How can that be busy waiting?</span>
+<span class="comment-copy">I've abused "busy waiting" term a bit... However, back to the solution, async.sleep uses different approach (ioloop timer) and it is aiming  "The timeout must have maximum priority"</span>

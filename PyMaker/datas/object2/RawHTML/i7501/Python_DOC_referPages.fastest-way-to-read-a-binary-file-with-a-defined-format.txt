@@ -1,0 +1,157 @@
+<div class="post-text" itemprop="text">
+<p>I have large binary data files that have a predefined format, originally written by a Fortran program as little endians. I would like to read these files in the fastest, most efficient manner, so using the <a href="https://docs.python.org/3/library/array.html" rel="nofollow noreferrer"><code>array</code></a> package seemed right up my alley as suggested <a href="https://stackoverflow.com/questions/5804052/improve-speed-of-reading-and-converting-from-binary-file-with-python">here</a>.</p>
+<p>The problem is the pre-defined format is non-homogeneous. It looks something like this:
+<code>['&lt;2i','&lt;5d','&lt;2i','&lt;d','&lt;i','&lt;3d','&lt;2i','&lt;3d','&lt;i','&lt;d','&lt;i','&lt;3d']</code></p>
+<p>with each integer <code>i</code> taking up 4 bytes, and each double <code>d</code> taking 8 bytes.</p>
+<p>Is there a way I can still use the super efficient <code>array</code> package (or another suggestion) but with the right format?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Use <a href="https://docs.python.org/3/library/struct.html" rel="nofollow noreferrer"><code>struct</code></a>. In particular, <code>struct.unpack</code>.</p>
+<pre><code>result = struct.unpack("&lt;2i5d...", buffer)
+</code></pre>
+<p>Here <code>buffer</code> holds the given binary data.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>It's not clear from your question whether you're concerned about the actual file <strong>reading</strong> speed (and building data structure in memory), or about later data <strong>processing</strong> speed.</p>
+<p>If you are reading only once, and doing heavy processing later, you can read the file record by record (if your binary data is a recordset of repeated records with identical format), parse it with <code>struct.unpack</code> and append it to a <code>[double]</code> array:</p>
+<pre><code>from functools import partial
+
+data = array.array('d')
+record_size_in_bytes = 9*4 + 16*8   # 9 ints + 16 doubles
+
+with open('input', 'rb') as fin:
+    for record in iter(partial(fin.read, record_size_in_bytes), b''):
+        values = struct.unpack("&lt;2i5d...", record)
+        data.extend(values)
+</code></pre>
+<p>Under assumption you are allowed to cast all your <code>int</code>s to <code>double</code>s <em>and</em> willing to accept increase in allocated memory size (22% increase for your record from the question).</p>
+<p>If you are reading the data from file many times, it could be worthwhile to convert everything to one large <code>array</code> of <code>double</code>s (like above) and write it back to another file from which you can later read with <a href="https://docs.python.org/3/library/array.html#array.array.fromfile" rel="nofollow noreferrer"><code>array.fromfile()</code></a>:</p>
+<pre><code>data = array.array('d')
+with open('preprocessed', 'rb') as fin:
+    n = os.fstat(fin.fileno()).st_size // 8
+    data.fromfile(fin, n)
+</code></pre>
+<p><strong>Update</strong>. Thanks to a nice <a href="https://stackoverflow.com/a/45019271/404556">benchmark by @martineau</a>, now we know for a fact that preprocessing the data and turning it into an homogeneous array of doubles ensures that loading such data from file (with <code>array.fromfile()</code>) is <code>~20x to ~40x</code> faster than reading it record-per-record, unpacking and appending to <code>array</code> (as shown in the first code listing above).</p>
+<p>A faster (and a more standard) variation of record-by-record reading in @martineau's answer which appends to <code>list</code> and doesn't upcast to <code>double</code> is only <code>~6x to ~10x</code> slower than <code>array.fromfile()</code> method and seems like a better reference benchmark.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><strong>Major Update:</strong> Modified to use proper code for reading in a preprocessed array file (function <code>using_preprocessed_file()</code> below), which dramatically changed the results.</p>
+<p>To determine what method is faster in Python (using only built-ins and the standard libraries), I created a script to benchmark (via <code>timeit</code>) the different techniques that could be used to do this. It's a bit on the longish side, so to avoid distraction, I'm only posting the code tested and related results. (If there's sufficient interest in the methodology, I'll post the whole script.)</p>
+<p>Here are the snippets of code that were compared:</p>
+<pre><code>@TESTCASE('Read and constuct piecemeal with struct')
+def read_file_piecemeal():
+    structures = []
+    with open(test_filenames[0], 'rb') as inp:
+        size = fmt1.size
+        while True:
+            buffer = inp.read(size)
+            if len(buffer) != size:  # EOF?
+                break
+            structures.append(fmt1.unpack(buffer))
+    return structures
+
+@TESTCASE('Read all-at-once, then slice and struct')
+def read_entire_file():
+    offset, unpack, size = 0, fmt1.unpack, fmt1.size
+    structures = []
+    with open(test_filenames[0], 'rb') as inp:
+        buffer = inp.read()  # read entire file
+        while True:
+            chunk = buffer[offset: offset+size]
+            if len(chunk) != size:  # EOF?
+                break
+            structures.append(unpack(chunk))
+            offset += size
+
+    return structures
+
+@TESTCASE('Convert to array (@randomir part 1)')
+def convert_to_array():
+    data = array.array('d')
+    record_size_in_bytes = 9*4 + 16*8   # 9 ints + 16 doubles (standard sizes)
+
+    with open(test_filenames[0], 'rb') as fin:
+        for record in iter(partial(fin.read, record_size_in_bytes), b''):
+            values = struct.unpack("&lt;2i5d2idi3d2i3didi3d", record)
+            data.extend(values)
+
+    return data
+
+@TESTCASE('Read array file (@randomir part 2)', setup='create_preprocessed_file')
+def using_preprocessed_file():
+    data = array.array('d')
+    with open(test_filenames[1], 'rb') as fin:
+        n = os.fstat(fin.fileno()).st_size // 8
+        data.fromfile(fin, n)
+    return data
+
+def create_preprocessed_file():
+    """ Save array created by convert_to_array() into a separate test file. """
+    test_filename = test_filenames[1]
+    if not os.path.isfile(test_filename):  # doesn't already exist?
+        data = convert_to_array()
+        with open(test_filename, 'wb') as file:
+            data.tofile(file)
+</code></pre>
+<p>And here were the results running them on my system:</p>
+<pre class="lang-none prettyprint-override"><code>Fastest to slowest execution speeds using Python 3.6.1
+(10 executions, best of 3 repetitions)
+Size of structure: 164
+Number of structures in test file: 40,000
+file size: 6,560,000 bytes
+
+     Read array file (@randomir part 2): 0.06430 secs, relative  1.00x (   0.00% slower)
+Read all-at-once, then slice and struct: 0.39634 secs, relative  6.16x ( 516.36% slower)
+Read and constuct piecemeal with struct: 0.43283 secs, relative  6.73x ( 573.09% slower)
+    Convert to array (@randomir part 1): 1.38310 secs, relative 21.51x (2050.87% slower)
+</code></pre>
+<p>Interestingly, most of the snippets are actually faster in Python 2...</p>
+<pre class="lang-none prettyprint-override"><code>Fastest to slowest execution speeds using Python 2.7.13
+(10 executions, best of 3 repetitions)
+Size of structure: 164
+Number of structures in test file: 40,000
+file size: 6,560,000 bytes
+
+     Read array file (@randomir part 2): 0.03586 secs, relative  1.00x (   0.00% slower)
+Read all-at-once, then slice and struct: 0.27871 secs, relative  7.77x ( 677.17% slower)
+Read and constuct piecemeal with struct: 0.40804 secs, relative 11.38x (1037.81% slower)
+    Convert to array (@randomir part 1): 1.45830 secs, relative 40.66x (3966.41% slower)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Take a look at the documentation for <code>numpy</code>'s <code>fromfile</code> function: <a href="https://docs.scipy.org/doc/numpy-1.13.0/reference/generated/numpy.fromfile.html" rel="nofollow noreferrer">https://docs.scipy.org/doc/numpy-1.13.0/reference/generated/numpy.fromfile.html</a> and <a href="https://docs.scipy.org/doc/numpy/reference/arrays.dtypes.html#arrays-dtypes-constructing" rel="nofollow noreferrer">https://docs.scipy.org/doc/numpy/reference/arrays.dtypes.html#arrays-dtypes-constructing</a></p>
+<p>Simplest example:</p>
+<pre><code>import numpy as np
+data = np.fromfile('binary_file', dtype=np.dtype('&lt;i8, ...'))
+</code></pre>
+<p>Read more about "Structured Arrays" in <code>numpy</code> and how to specify their data type(s) here: <a href="https://docs.scipy.org/doc/numpy/user/basics.rec.html#" rel="nofollow noreferrer">https://docs.scipy.org/doc/numpy/user/basics.rec.html#</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>There's a lot of good and helpful answers here, but I think the best solution needs more explaining. I implemented a method that reads the entire data file in one pass using the built-in <code>read()</code> <em>and</em> constructs a <code>numpy</code> <code>ndarray</code> all at the same time. This is more efficient than reading the data and constructing the array separately, but it's also a bit more finicky.</p>
+<pre><code>line_cols = 20              #For example
+line_rows = 40000           #For example
+data_fmt = 15*'f8,'+5*'f4,' #For example (15 8-byte doubles + 5 4-byte floats)
+data_bsize = 15*8 + 4*5     #For example
+with open(filename,'rb') as f:
+        data = np.ndarray(shape=(1,line_rows),
+                          dtype=np.dtype(data_fmt),
+                          buffer=f.read(line_rows*data_bsize))[0].astype(line_cols*'f8,').view(dtype='f8').reshape(line_rows,line_cols)[:,:-1]
+</code></pre>
+<p>Here, we open the file as a binary file using the <code>'rb'</code> option in <code>open</code>. Then, we construct our <code>ndarray</code> with the proper shape and dtype to fit our read buffer. We then reduce the <code>ndarray</code> into a 1D array by taking its zeroth index, where all our data is hiding. Then, we reshape the array using <code>np.astype</code>, <code>np.view</code> and <code>np.reshape</code> methods. This is because <code>np.reshape</code> doesn't like having data with mixed dtypes, and I'm okay with having my integers expressed as doubles.</p>
+<p><strong>This method is ~100x faster</strong> than looping line-for-line through the data, and could potentially be compressed down into a single line of code.</p>
+<p>In the future, I may try to read the data in even faster using a <code>Fortran</code> script that essentially converts the binary file into a text file. I don't know if this will be faster, but it may be worth a try.</p>
+</div>
+<span class="comment-copy">What do you cal a "large binary data files" ? you mean that in your original file all data are not format in the same way ? how do you know foramt of each one ?</span>
+<span class="comment-copy">The binary files contain anywhere between ~1000 to ~1,000,000 lines of data each from a physical simulation. For testing purposes, I am using files that contain only about 40,000 lines of data. I know the format to each one because I have the original Fortran code and can see what type and how large each data are in memory.</span>
+<span class="comment-copy">What are '&lt;5d' and <code>&lt;3d'? When you say *"... each double </code>d` taking 8 bytes"*, what do you mean by "double d"? Is each <code>d</code> 4 bytes? Please clarify.</span>
+<span class="comment-copy">What do you mean by "lines" of data in a binary file? Is the file essentially an collection of structures, each in a predefined format such as shown in your question?</span>
+<span class="comment-copy">I took a look at using struct, and that's what I originally fell back on, but I read that the array package is faster. Was I mislead??</span>
+<span class="comment-copy">@boof, <code>array.array</code> holds a sequence of elements <i>of the same type</i>, so processing data <code>struct</code>ured like this at once is impossible with it.</span>
+<span class="comment-copy">Casting all the <code>int</code>s into <code>double</code>s would increase the amount of memory needed which might be important if the file is large and can't be processed a line-at-a-time—although I'm not sure what a "line" is in a binary file.</span>
+<span class="comment-copy">A 22% increase in this case, yes. Also, on second thought I was interpreting "lines" from the OP too literal. It makes much more sense to assume a fixed-size record, and a file as a sequence of such records (non-newline delimited). I've edited my answer to reflect this.</span>
+<span class="comment-copy">Besides using more memory and possibly requiring a preprocessing step, your approach of using <code>array</code> does <i>not</i> appear to be faster than using <code>struct.upack()</code>, as suggested by @ForceBru. See the <a href="https://stackoverflow.com/a/45019271/355230">answer I posted</a> for details.</span>
+<span class="comment-copy">But you are not using preprocessed file in your <code>using_preprocessed_file</code>. Can you fix it, I'm really curious is <code>array</code> that much efficient as the OP said.</span>
+<span class="comment-copy">You're right, I believe that was OP's initial approach. I've updated my update. :)</span>
+<span class="comment-copy">From the code posted, looks like you actually didn't use preprocessed file in your final test case (complete file should be read with <code>array.fromfile()</code>).</span>
+<span class="comment-copy">@randomir: You're absolutely correct—and I'm very sorry for the mistake (artifact of benchmark development). My answer has been updated accordingly...congratulations! <code>;-)</code></span>
+<span class="comment-copy">I happens. :) But, the results are interesting indeed. Thank you for doing this benchmark.</span>

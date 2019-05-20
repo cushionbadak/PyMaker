@@ -1,0 +1,103 @@
+<div class="post-text" itemprop="text">
+<p>Under Python 3.4 on Windows, I need to stream data written to stdout/stderr by a child process, i.e. receive its output as it occurs, using the <a href="https://docs.python.org/3/library/asyncio.html" rel="nofollow">asyncio</a> framework introduced in Python 3.4. I also have to determine the program's exit code afterwards. How can I do this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The solution I've come up with so far uses <a href="https://docs.python.org/3/library/asyncio-protocol.html" rel="nofollow noreferrer">SubprocessProtocol</a> to receive output from the child process, and the associated transport to get the process' exit code. I don't know if this is optimal though. I've based my approach on an <a href="https://stackoverflow.com/a/20697159/265261">answer to a similar question by J.F. Sebastian</a>.</p>
+<pre><code>import asyncio
+import contextlib
+import os
+import locale
+
+
+class SubprocessProtocol(asyncio.SubprocessProtocol):
+    def pipe_data_received(self, fd, data):
+        if fd == 1:
+            name = 'stdout'
+        elif fd == 2:
+            name = 'stderr'
+        text = data.decode(locale.getpreferredencoding(False))
+        print('Received from {}: {}'.format(name, text.strip()))
+
+    def process_exited(self):
+        loop.stop()
+
+
+if os.name == 'nt':
+    # On Windows, the ProactorEventLoop is necessary to listen on pipes
+    loop = asyncio.ProactorEventLoop()
+    asyncio.set_event_loop(loop)
+else:
+    loop = asyncio.get_event_loop()
+with contextlib.closing(loop):
+    # This will only connect to the process
+    transport = loop.run_until_complete(loop.subprocess_exec(
+        SubprocessProtocol, 'python', '-c', 'print(\'Hello async world!\')'))[0]
+    # Wait until process has finished
+    loop.run_forever()
+    print('Program exited with: {}'.format(transport.get_returncode()))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Since the event loop may see and notify the process exit before reading
+the remaining data for stdout/stderr, we need to check PIPE close events
+in addition to the process exit event.</p>
+<p>This is a correction for aknuds1 answer:</p>
+<pre><code>class SubprocessProtocol(asyncio.SubprocessProtocol):
+    def __init__(self):
+        self._exited = False
+        self._closed_stdout = False
+        self._closed_stderr = False
+
+    @property
+    def finished(self):
+        return self._exited and self._closed_stdout and self._closed_stderr
+
+    def signal_exit(self):
+        if not self.finished:
+            return
+        loop.stop()        
+
+    def pipe_data_received(self, fd, data):
+        if fd == 1:
+            name = 'stdout'
+        elif fd == 2:
+            name = 'stderr'
+        text = data.decode(locale.getpreferredencoding(False))
+        print('Received from {}: {}'.format(name, text.strip()))
+
+    def pipe_connection_lost(self, fd, exc):
+        if fd == 1:
+            self._closed_stdout = True
+        elif fd == 2:
+            self._closed_stderr = True
+        self.signal_exit()
+
+    def process_exited(self):
+        self._exited = True
+        self.signal_exit()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>I guess to use <a href="https://docs.python.org/3.4/library/asyncio-subprocess.html" rel="nofollow">high-level api</a>:</p>
+<pre><code>proc = yield from asyncio.create_subprocess_exec(
+    'python', '-c', 'print(\'Hello async world!\')')
+
+stdout, stderr = yield from proc.communicate()
+
+retcode = proc.returncode
+</code></pre>
+<p>Also you can do more:</p>
+<pre><code>yield from proc.stdin.write(b'data')
+yield from proc.stdin.drain()
+
+stdout = yield from proc.stdout.read()
+stderr = yield from proc.stderr.read()
+
+retcode = yield from proc.wait()
+</code></pre>
+<p>and so on.</p>
+<p>But, please, keep in mind that waiting for, say, <code>stdout</code> when child process prints nothing can hang you coroutine.</p>
+</div>
+<span class="comment-copy">None of these techniques are non-blocking though? I need to handle output on both stdout and stderr as it arrives, not after the child exits.</span>
+<span class="comment-copy">Can the second example deadlock if the child process generates enough output on stderr?</span>
+<span class="comment-copy">Yes, it can. You may create separate reader coroutines for both stdout and stderr and execute those in parallel by <code>asyncio.gather()</code> for example.</span>

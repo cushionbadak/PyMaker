@@ -1,0 +1,148 @@
+<div class="post-text" itemprop="text">
+<p>How can I make a fifo between two python processes, that allow dropping of lines if the reader is not able to handle the input?</p>
+<ul>
+<li>If the reader tries to <code>read</code> or <code>readline</code> faster then the writer writes, it should block.</li>
+<li>If the reader cannot work as fast as the writer writes, the writer should not block. Lines should not be buffered (except one line at a time) and only the last line written should be received by the reader on its next <code>readline</code> attempt.</li>
+</ul>
+<p>Is this possible with a named fifo, or is there any other simple way for achiving this?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The following code uses a named FIFO to allow communication between two scripts.</p>
+<ul>
+<li>If the reader tries to <code>read</code> faster than the writer, it blocks.</li>
+<li>If the reader cannot keep up with the writer, the writer does not block.</li>
+<li>Operations are buffer oriented. Line oriented operations are not currently implemented.</li>
+<li>This code should be considered a proof-of-concept. The delays and buffer sizes are arbitrary.</li>
+</ul>
+<p><strong>Code</strong></p>
+<pre><code>import argparse
+import errno
+import os
+from select import select
+import time
+
+class OneFifo(object):
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        if os.path.exists(self.name):
+            os.unlink(self.name)
+        os.mkfifo(self.name)
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        if os.path.exists(self.name):
+            os.unlink(self.name)
+
+    def write(self, data):
+        print "Waiting for client to open FIFO..."
+        try:
+            server_file = os.open(self.name, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno == errno.ENXIO:
+                server_file = None
+            else:
+                raise
+        if server_file is not None:
+            print "Writing line to FIFO..."
+            try:
+                os.write(server_file, data)
+                print "Done."
+            except OSError as exc:
+                if exc.errno == errno.EPIPE:
+                    pass
+                else:
+                    raise
+            os.close(server_file)
+
+    def read_nonblocking(self):
+        result = None
+        try:
+            client_file = os.open(self.name, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                client_file = None
+            else:
+                raise
+        if client_file is not None:
+            try:
+                rlist = [client_file]
+                wlist = []
+                xlist = []
+                rlist, wlist, xlist = select(rlist, wlist, xlist, 0.01)
+                if client_file in rlist:
+                    result = os.read(client_file, 1024)
+            except OSError as exc:
+                if exc.errno == errno.EAGAIN or exc.errno == errno.EWOULDBLOCK:
+                    result = None
+                else:
+                    raise
+            os.close(client_file)
+        return result
+
+    def read(self):
+        try:
+            with open(self.name, 'r') as client_file:
+                result = client_file.read()
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                result = None
+            else:
+                raise
+        if not len(result):
+            result = None
+        return result
+
+def parse_argument():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--client', action='store_true',
+                        help='Set this flag for the client')
+    parser.add_argument('-n', '--non-blocking', action='store_true',
+                        help='Set this flag to read without blocking')
+    result = parser.parse_args()
+    return result
+
+if __name__ == '__main__':
+    args = parse_argument()
+    if not args.client:
+        with OneFifo('known_name') as one_fifo:
+            while True:
+                one_fifo.write('one line')
+                time.sleep(0.1)
+    else:
+        one_fifo = OneFifo('known_name')
+        while True:
+            if args.non_blocking:
+                result = one_fifo.read_nonblocking()
+            else:
+                result = one_fifo.read()
+            if result is not None:
+                print result
+</code></pre>
+<p>The <code>server</code> checks if the <code>client</code> has opened the FIFO. If the <code>client</code> has opened the FIFO, the <code>server</code> writes a line. Otherwise, the <code>server</code> continues running. I have implemented a non-blocking read because the blocking read causes a problem: If the <code>server</code> restarts, most of the time the <code>client</code> stays blocked and never recovers. With a non-blocking <code>client</code>, a <code>server</code> restart is more easily tolerated.</p>
+<p><strong>Output</strong></p>
+<pre><code>[user@machine:~] python onefifo.py
+Waiting for client to open FIFO...
+Waiting for client to open FIFO...
+Writing line to FIFO...           
+Done.
+Waiting for client to open FIFO...
+Writing line to FIFO...
+Done.
+
+[user@machine:~] python onefifo.py -c
+one line
+one line
+</code></pre>
+<p><strong>Notes</strong></p>
+<p>On startup, if the <code>server</code> detects that the FIFO already exists, it removes it. This is the easiest way to notify <code>clients</code> that the <code>server</code> has restarted. This notification is usually ignored by the blocking version of the <code>client</code>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Well, that's not actually a FIFO (queue) as far as I am aware - it's a single variable. I suppose it might be implementable if you set up a queue or pipe with a maximum size of 1, but it seems that it would work better to use a <a href="https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Lock" rel="nofollow noreferrer"><code>Lock</code></a> on a single object in one of the processes, which the other process references via a <a href="https://docs.python.org/3/library/multiprocessing.html#proxy-objects" rel="nofollow noreferrer">proxy object</a>. The reader would set it to <code>None</code> whenever it reads, and the writer would overwrite the contents every time it writes.</p>
+<p>You can get those to the other processes by passing the proxy of the object, and a proxy of the lock, as an argument to all relevant processes. To get it slightly more conveniently, you can use a <a href="https://docs.python.org/3/library/multiprocessing.html#managers" rel="nofollow noreferrer"><code>Manager</code></a>, which provides a single object with proxy that you can pass in, which contains and provides proxies for whatever other objects (including locks) you want to put in it. <a href="https://stackoverflow.com/a/9436866/6051861">This answer</a> provides a useful example of proper use of a Manager to pass objects into a new process.</p>
+</div>
+<span class="comment-copy">This is cool. How does the client tell the server it is ready to receive? Can it tell if the client has opened the fifo? Is this enforced by the server using using<code>os.O_NONBLOCK</code>?</span>
+<span class="comment-copy">If the <code>server</code> tries to <code>open</code> the FIFO and gets the <code>ENXIO</code> (Device not configured) error, it knows that the <code>client</code> has not opened the FIFO. This kind of test only works if the <code>server</code> opens the FIFO with <code>os.O_NONBLOCK</code>. Otherwise, when the <code>server</code> calls <code>open</code>, it blocks.</span>
+<span class="comment-copy">Ok, but <code>Lock</code> and <code>proxy object</code> have no external represenation, eg. I can use them in one python program, but not to wire two programs together without any handle in the file system.</span>
+<span class="comment-copy">@dronus You can pass it as an argument when starting a new process, or use a <a href="https://docs.python.org/3/library/multiprocessing.html#managers" rel="nofollow noreferrer"><code>manager</code></a> to get it more conveniently (because you only need to pass one thing). Will edit answer to include that.</span>

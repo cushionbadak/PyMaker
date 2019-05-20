@@ -1,0 +1,108 @@
+<div class="post-text" itemprop="text">
+<p>I'm trying to find out if it's possible to resolve variables in stack frames (as returned by <a href="https://docs.python.org/3/library/inspect.html#inspect.currentframe" rel="nofollow noreferrer"><code>inspect.currentframe()</code></a>).</p>
+<p>In other words, I'm looking for a function</p>
+<pre><code>def resolve_variable(variable_name, frame_object):
+    return value_of_that_variable_in_that_stackframe
+</code></pre>
+<hr/>
+<p>For an example, consider the following piece of code:</p>
+<pre><code>global_var = 'global'
+
+def foo():
+    closure_var = 'closure'
+
+    def bar(param):
+        local_var = 'local'
+
+        frame = inspect.currentframe()
+        assert resolve_variable('local_var', frame) == local_var
+        assert resolve_variable('param', frame) == param
+        assert resolve_variable('closure_var', frame) == closure_var
+        assert resolve_variable('global_var', frame) == global_var
+
+    bar('parameter')
+
+foo()
+</code></pre>
+<p>Local and global variables are trivially looked up through the <code>f_locals</code> and <code>f_globals</code> attributes of the frame object:</p>
+<pre><code>def resolve_variable(variable_name, frame_object):
+    try:
+        return frame_object.f_locals[variable_name]
+    except KeyError:
+        try:
+            return frame_object.f_globals[variable_name]
+        except KeyError:
+            raise NameError(varname) from None
+</code></pre>
+<p>But the problem are closure variables. They aren't stored in a dictionary like the local and global variables, as far as I know. To make things even worse, variables only become closure variables if the function actually accesses them (for example by reading its value like <code>_ = closure_var</code> or writing to it with <code>nonlocal closure_var; closure_var = _</code>). So there are actually 3 different cases:</p>
+<pre><code>global_var = 'global'
+
+def foo():
+    unused_cvar = 'unused'  # actually not a closure variable at all
+    readonly_cvar = 'closure'
+    nonlocal_cvar = 'nonlocal'
+
+    def bar(param):
+        nonlocal nonlocal_cvar
+
+        local_var = 'local'
+        _ = readonly_cvar
+        nonlocal_cvar = 'nonlocal'
+
+        frame = inspect.currentframe()
+        assert resolve_variable('local_var', frame) == local_var
+        assert resolve_variable('param', frame) == param
+        assert resolve_variable('unused_cvar', frame) == 'unused'
+        assert resolve_variable('readonly_cvar', frame) == readonly_cvar
+        assert resolve_variable('nonlocal_cvar', frame) == nonlocal_cvar
+        assert resolve_variable('global_var', frame) == global_var
+
+    bar('parameter')
+
+foo()
+</code></pre>
+<p>How can I rewrite my <code>resolve_variable</code> function to support all of these? Is it even possible?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Not generally possible. Python only holds onto closure variables that closures actually refer to.</p>
+<pre><code>&gt;&gt;&gt; import inspect
+&gt;&gt;&gt; class Demo(object):
+...     def __del__(self):
+...         print("Too late, it's gone.")
+... 
+&gt;&gt;&gt; def f():
+...     a = Demo()
+...     def g():
+...         return inspect.currentframe()
+...     return g
+... 
+&gt;&gt;&gt; frame = f()()
+Too late, it's gone.
+</code></pre>
+<p>As you can see from this example, there's no hope of inspecting <code>a</code> from the frame <code>frame</code>. It's gone.</p>
+<p>As for closure variables the frame actually used, those <em>usually</em> show up in <code>f_locals</code>. I know of one weird case where they won't, which is if the frame is for a class statement with closure variables:</p>
+<pre><code>&gt;&gt;&gt; def f():
+...     a = 1
+...     class Foo(object):
+...         print(a)
+...         print(inspect.currentframe().f_locals)
+...     return Foo
+... 
+&gt;&gt;&gt; f()
+1
+{'__module__': '__main__', '__qualname__': 'f.&lt;locals&gt;.Foo'}
+&lt;class '__main__.f.&lt;locals&gt;.Foo'&gt;
+</code></pre>
+<p>After digging through the CPython implementation (specifically frame objects, the <code>LOAD_CLASSDEREF</code> opcode, and <code>inspect.getclosurevars</code>), I think the only way to access class frame closure variables is going to be with <code>ctypes</code>, <code>gc.get_referents</code>, or similarly nasty means.</p>
+<p>Also, note that the <code>f_locals</code> dict may not be up to date if the closure variable values have changed since it was accessed; accessing <code>frame.f_locals</code> again <a href="https://github.com/python/cpython/blob/v3.6.5/Objects/frameobject.c#L21" rel="nofollow noreferrer">refreshes the contents</a>, but it might be out of date again by the time you look.</p>
+</div>
+<span class="comment-copy">Are you looking to get the closure cells, or the values in those cells?</span>
+<span class="comment-copy">@abarnert I want the value in the cell. Obscure cpython objects like closure cells aren't of much use to me :)</span>
+<span class="comment-copy">Obscure? I think as of 3.7 they're finally mentioned in the docs somewhere. And, even better, the set-contents method is exposed to Python code, so you grub through a function's <code>__closure__</code> and change the captured values.</span>
+<span class="comment-copy">PS, doesn’t <code>nonlocal closure_var</code> capture it even if you never reference or assign to it? It did in 3.0; I don’t know if I’ve ever checked since then…</span>
+<span class="comment-copy">But meanwhile, for this particular use case, where you’re actually calling <code>bar</code> from within the same function it was defined in, you can cheat and look at <code>f_back.f.locals</code> to see all the locals of <code>foo</code>, captured or not. I don’t know if that’ll help for your real use case, if you have one, but it’ll work here.</span>
+<span class="comment-copy">Makes sense, for unused variables. What about actual closure variables though? Is it possible for those?</span>
+<span class="comment-copy">@Aran-Fey: Those show up in <code>f_locals</code>, which confusingly, is not just locals.</span>
+<span class="comment-copy">Huh, so they do. Most curious. Could I ask you to add that to the answer? It doesn't feel like a complete answer without that.</span>
+<span class="comment-copy"><code>f_locals</code> is really a faked useless thing. You can distinguish real locals from captured nonlocals by looking at <code>f_code.co_varnames</code>, <code>co_cellvars</code>, and <code>co_freevars</code> for the names of uncaptured locals, locals captured by an inner function, and closure variables handed down by an outer function. These also give you the indices into the real locals array on the frame (which has cell objects for cellvars and freevars), but you can't do much with that without the C API.</span>
+<span class="comment-copy">@Aran-Fey: That holds closure cells, which is what Python actually uses for closure variable lookup; it doesn't look in <code>f_locals</code> for closure variables.</span>

@@ -1,0 +1,218 @@
+<div class="post-text" itemprop="text">
+<p>I'm on Python 3.4 making a practice app to learn Python's <em>asyncio</em> module.</p>
+<p>I've got several modules in my application:</p>
+<p><strong>app.py</strong></p>
+<pre><code>import asyncio
+import logging
+
+
+class Client(asyncio.Protocol):
+
+    def __init__(self, loop):
+        self.loop = loop
+
+    def connection_made(self, transport):
+        print('Connection with server established')
+        self.transport = transport
+
+    def data_received(self, data):
+        data = data.decode()
+        print('Received: ', data)
+        if not int(data):
+            print('Stopping loop')
+            self.loop.stop()
+        else:
+            message = 'remove one'.encode()
+            self.transport.write(message)
+            print('Sent:', message)
+
+    def connection_lost(self, exc):
+        print('Connection with server lost.')
+        self.loop.stop()
+
+
+loop = asyncio.get_event_loop()
+
+fn = loop.create_connection(
+    lambda: Client(loop), '127.0.0.1', 9999
+)
+
+logging.basicConfig(level=logging.DEBUG)
+
+client = loop.run_until_complete(fn)
+
+try:
+    loop.run_forever()
+except KeyboardInterrupt:
+    pass
+
+print('Loop ended')
+loop.close()
+</code></pre>
+<p><strong>counter.py</strong></p>
+<pre><code>import asyncio
+
+
+class Counter:
+
+    def __init__(self, maxcount):
+        self.maxcount = maxcount
+
+    @asyncio.coroutine
+    def count(self):
+        yield from asyncio.sleep(self.maxcount)
+        print('Done counting')
+</code></pre>
+<p><strong>serie.py</strong></p>
+<pre><code>import asyncio
+
+
+class Serie:
+
+    def __init__(self, loop, items=None):
+        self.loop = loop
+        self.items = items or []
+
+    @asyncio.coroutine
+    def remove_one(self, counter):
+        if len(self.items) is not 0:
+            yield from counter.count()
+            item = self.items.pop(0)
+            print('Removed', item)
+        else:
+            print('Serie is empty')
+
+    @asyncio.coroutine
+    def start_removing(self, counter):
+        while self.items:
+            yield from self.remove_one(counter)
+
+        print('Serie.start_removing() has finished')
+</code></pre>
+<p><strong>mission_control.py</strong></p>
+<pre><code>import asyncio
+import logging
+
+from counter import Counter
+from serie import Serie
+
+
+class MissionControl(asyncio.Protocol):
+
+    def __init__(self, loop, counter, serie):
+        self.loop = loop
+        self.counter = counter
+        self.serie = serie
+
+    def connection_made(self, transport):
+        print('Connection established with', transport.get_extra_info('peername'))
+        self.transport = transport
+        self.transport.write(str(len(self.serie.items)).encode())
+
+    def data_received(self, data):
+        data = data.decode()
+        print('Received:', data)
+        if data == 'remove one':
+            yield from self.serie.remove_one()
+            print('Removed one: {}'.format(self.serie.items))
+            self.transport.write(str(len(self.serie.items)).encode())
+        else:
+            print('Done')
+
+    def connection_lost(self, exc):
+        print('Connection with {} ended'.format(self.transport.get_extra_info('peername')))
+
+
+logging.basicConfig(level=logging.DEBUG)
+
+loop = asyncio.get_event_loop()
+
+counter = Counter(2)
+planets = Serie(loop, ['Mercúrio', 'Vênus', 'Terra', 'Marte',
+                       'Júpiter', 'Saturno', 'Urano', 'Netuno'])
+
+fn = loop.create_server(
+    lambda: MissionControl(loop, counter, planets), '127.0.0.1', 9999
+)
+
+server = loop.run_until_complete(fn)
+
+print('Server started')
+
+try:
+    loop.run_forever()
+except KeyboardInterrupt:
+    pass
+
+server.close()
+loop.run_until_complete(server.wait_closed())
+loop.stop()
+loop.close()
+</code></pre>
+<p>You can also find the source at this <a href="https://gist.github.com/andradei/6c4707addcb5dfdf6e2b" rel="nofollow">Github gist</a>.</p>
+<p>In <em>mission_control.py</em>, the method <code>data_received()</code> appears not to be called when the client (<em>app.py</em>) sends data via its <code>self.transport</code> property.</p>
+<p>Where is the implementation error and how can I fix it?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem is that <code>data_received</code> is not (<a href="https://docs.python.org/3/library/asyncio-protocol.html#coroutines-and-protocols" rel="nofollow">and cannot be</a>) a coroutine, but you're using <code>yield from</code> inside it. Internally <code>asyncio</code> is just calling <code>self.data_received(data)</code> without any <code>yield from</code> call, which means the body of the method isn't being executed at all - instead a generator object is immediately returned. You need to refactor your implementation to not use <code>yield from</code>, which requires using callbacks instead:</p>
+<pre><code>class MissionControl(asyncio.Protocol):
+
+    def __init__(self, loop, counter, serie):
+        self.loop = loop
+        self.counter = counter
+        self.serie = serie
+
+    def connection_made(self, transport):
+        print('Connection established with', transport.get_extra_info('peername'))
+        self.transport = transport
+        self.transport.write(str(len(self.serie.items)).encode())
+
+    def data_received(self, data):
+        data = data.decode()
+        print('Received:', data)
+        if data == 'remove one':
+            fut = asyncio.async(self.serie.remove_one(self.counter))
+            fut.add_done_callback(self.on_removed_one)
+        else:
+            print('Done')
+
+    def on_removed_one(self, result):
+        print('Removed one: {}'.format(self.serie.items))
+        self.transport.write(str(len(self.serie.items)).encode())
+
+    def connection_lost(self, exc):
+        print('Connection with {} ended'.format(self.transport.get_extra_info('peername')))
+</code></pre>
+<p>Another option would be to use the <code>asyncio</code> <a href="https://docs.python.org/3/library/asyncio-stream.html#asyncio-streams" rel="nofollow">Streams API</a> instead of  <code>asyncio.Protocol</code>, which will allow you to use coroutines:</p>
+<pre><code>import asyncio
+import logging
+
+from counter import Counter
+from serie import Serie
+
+@asyncio.coroutine
+def mission_control(reader, writer):
+    counter = Counter(2)
+    serie = Serie(loop, ['Mercúrio', 'Vênus', 'Terra', 'Marte',
+                           'Júpiter', 'Saturno', 'Urano', 'Netuno'])
+    writer.write(str(len(serie.items)).encode())
+    while True:
+        data = (yield from reader.read(100)).decode()
+        print('Received:', data)
+        if data == 'remove one':
+            result = yield from serie.remove_one(counter)
+        else:
+            print('Done')
+            return
+        print('Removed one: {}'.format(serie.items))
+        writer.write(str(len(serie.items)).encode())
+
+
+logging.basicConfig(level=logging.DEBUG)
+loop = asyncio.get_event_loop()
+coro = asyncio.start_server(mission_control, '127.0.0.1', 9999, loop=loop)
+server = loop.run_until_complete(coro)
+# The rest is the same
+</code></pre>
+</div>
+<span class="comment-copy">The future solution fit really well into the flow I wanted.</span>

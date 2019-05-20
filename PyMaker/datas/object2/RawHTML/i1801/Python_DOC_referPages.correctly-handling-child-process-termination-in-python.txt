@@ -1,0 +1,157 @@
+<div class="post-text" itemprop="text">
+<p>I'm using python 3.7 and following this <a href="https://docs.python.org/2/library/multiprocessing.html#the-process-class" rel="nofollow noreferrer">documentation</a>. I want to have a process, which should spawn a child process,  wait for it to finish a task, and get some info back. I use the following code:</p>
+<pre><code>if __name__ == '__main__':
+    q = Queue()
+    p = Process(target=some_func, args=(q,))
+    p.start()
+    print q.get()
+    p.join()
+</code></pre>
+<p>When the child process finishes correctly there is no problem, and it works great, but the problem starts when my child process is terminated before it finished. 
+In this case, my application is hanging on wait.</p>
+<p>Giving a timeout to <code>q.get()</code> and <code>p.join()</code> not completely solves the issue, because I want to know immediately that the child process died and not to wait to the timeout. </p>
+<p>Another problem is that timeout on <code>q.get()</code> yields an exception, which I prefer to avoid. </p>
+<p>Can someone suggest me a more elegant way to overcome those issues?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p><strong>Queue &amp; Signal</strong></p>
+<p>One possibility would be registering a signal handler and use it to pass a sentinel value.
+On Unix you could handle <code>SIGCHLD</code> in the parent, but that's not an option in your case. According to the signal module <a href="https://docs.python.org/3/library/signal.html" rel="nofollow noreferrer">docs</a>: </p>
+<blockquote>
+<p>On Windows, signal() can only be called with SIGABRT, SIGFPE, SIGILL, SIGINT, SIGSEGV, SIGTERM, or SIGBREAK.</p>
+</blockquote>
+<p>Not sure if killing it through Task-Manager will translate into <code>SIGTERM</code> but you can give it a try.</p>
+<p>For handling <code>SIGTERM</code> you would need to register the signal handler in the child. </p>
+<pre><code>import os
+import sys
+import time
+import signal
+from functools import partial
+from multiprocessing import Process, Queue
+
+SENTINEL = None
+
+
+def _sigterm_handler(signum, frame, queue):
+    print("received SIGTERM")
+    queue.put(SENTINEL)
+    sys.exit()
+
+
+def register_sigterm(queue):
+    global _sigterm_handler
+    _sigterm_handler = partial(_sigterm_handler, queue=queue)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+
+def some_func(q):
+    register_sigterm(q)
+    print(os.getpid())
+    for i in range(30):
+        time.sleep(1)
+        q.put(f'msg_{i}')
+
+
+if __name__ == '__main__':
+
+    q = Queue()
+    p = Process(target=some_func, args=(q,))
+    p.start()
+    for msg in iter(q.get, SENTINEL):
+        print(msg)
+    p.join()
+</code></pre>
+<p>Example Output:</p>
+<pre><code>12273
+msg_0
+msg_1
+msg_2
+msg_3
+received SIGTERM
+
+Process finished with exit code 0
+</code></pre>
+<hr/>
+<p><strong>Queue &amp; Process.is_alive()</strong></p>
+<p>Even if this works with Task-Manager, your use-case sounds like you can't exclude force kills, so I think you're better off with an approach which doesn't rely on signals.</p>
+<p>You can check in a loop if your process <code>p.is_alive()</code>, call <code>queue.get()</code> with a <code>timeout</code> specified and handle the <code>Empty</code> exceptions:</p>
+<pre><code>import os
+import time
+from queue import Empty
+from multiprocessing import Process, Queue
+
+def some_func(q):
+    print(os.getpid())
+    for i in range(30):
+        time.sleep(1)
+        q.put(f'msg_{i}')
+
+
+if __name__ == '__main__':
+
+    q = Queue()
+    p = Process(target=some_func, args=(q,))
+    p.start()
+
+    while p.is_alive():
+        try:
+            msg = q.get(timeout=0.1)
+        except Empty:
+            pass
+        else:
+            print(msg)
+
+    p.join()
+</code></pre>
+<p>It would be also possible to avoid an exception, but I wouldn't recommend this because you don't spend your waiting time "on the queue", hence decreasing the responsiveness:</p>
+<pre><code>while p.is_alive():
+    if not q.empty():
+        msg = q.get_nowait()
+        print(msg)
+        time.sleep(0.1)
+</code></pre>
+<hr/>
+<hr/>
+<p><strong>Pipe &amp; Process.is_alive()</strong></p>
+<p>If you intend to utilize one connection per-child, it would however be possible to use a pipe instead of a queue. It's more performant than a queue
+(which is mounted on top of a pipe) and you can use <code>multiprocessing.connection.wait</code> to await readiness of multiple objects at once.</p>
+<blockquote>
+<p><strong>multiprocessing.connection.wait(object_list, timeout=None)</strong></p>
+<p>Wait till an object in object_list is ready. Returns the list of those objects in object_list which are ready. If timeout is a float then the call blocks for at most that many seconds. If timeout is None then it will block for an unlimited period. A negative timeout is equivalent to a zero timeout.</p>
+<p>For both Unix and Windows, an object can appear in object_list if it is a readable Connection object;
+  a connected and readable socket.socket object; or
+  the sentinel attribute of a Process object.
+  A connection or socket object is ready when there is data available to be read from it, or the other end has been closed.</p>
+<p><strong>Unix</strong>: wait(object_list, timeout) almost equivalent select.select(object_list, [], [], timeout). The difference is that, if select.select() is interrupted by a signal, it can raise OSError with an error number of EINTR, whereas wait() will not.</p>
+<p><strong>Windows</strong>: An item in object_list must either be an integer handle which is waitable (according to the definition used by the documentation of the Win32 function WaitForMultipleObjects()) or it can be an object with a fileno() method which returns a socket handle or pipe handle. (Note that pipe handles and socket handles are not waitable handles.)</p>
+<p>New in version 3.3. <a href="https://docs.python.org/3.6/library/multiprocessing.html#multiprocessing.connection.wait" rel="nofollow noreferrer">docs</a></p>
+</blockquote>
+<p>You can use this to await the sentinel attribute of the process and the parental end of the pipe concurrently.</p>
+<pre><code>import os
+import time
+from multiprocessing import Process, Pipe
+from multiprocessing.connection import wait
+
+
+def some_func(conn_write):
+    print(os.getpid())
+    for i in range(30):
+        time.sleep(1)
+        conn_write.send(f'msg_{i}')
+
+
+if __name__ == '__main__':
+
+    conn_read, conn_write = Pipe(duplex=False)
+    p = Process(target=some_func, args=(conn_write,))
+    p.start()
+
+    while p.is_alive():
+        wait([p.sentinel, conn_read])  # block-wait until something gets ready
+        if conn_read.poll():  # check if something can be received
+            print(conn_read.recv())
+    p.join()
+</code></pre>
+</div>
+<span class="comment-copy">Which OS do you use? Who kills your process and through which signal?</span>
+<span class="comment-copy">I start with Windows, though supposed to work with Linux too. Let's assume for the simplicity that it killed through the task manager by the user.</span>

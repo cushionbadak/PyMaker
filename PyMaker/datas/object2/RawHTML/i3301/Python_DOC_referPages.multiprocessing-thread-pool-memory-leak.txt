@@ -1,0 +1,118 @@
+<div class="post-text" itemprop="text">
+<p>I am observing memory usage that I cannot explain to myself. Below I provide a stripped down version of my actual code that still exhibits this behavior. The code is intended to accomplish the following:</p>
+<p>Read a text file in chunks of 1000 lines. Each line is a sentence. Split these 1000 sentences into 4 generators. Pass these generators to a thread pool and run feature extraction in parallel on 250 sentences.
+In my actual code I accumulate features and labels from all sentences of the entire file.
+Now here comes the weird thing: Memory gets allocated but not freed again even when not accumulating these values! And it has something to do with the thread pool I think. The amount of memory taken in total is dependent on how many features are extracted for any given word. I simulate this here with <code>range(100)</code>. Have a look:</p>
+<pre><code>from sys import argv
+from itertools import chain, islice
+from multiprocessing import Pool
+from math import ceil
+
+
+# dummyfied feature extraction function
+# the lengt of the range determines howmuch mamory is used up in total,
+# eventhough the objects are never stored
+def features_from_sentence(sentence):
+    return [{'some feature'  'some value'} for i in range(100)], ['some label' for i in range(100)]
+
+
+# split iterable into generator of generators of length `size`
+def chunks(iterable, size=10):
+    iterator = iter(iterable)
+    for first in iterator:
+        yield chain([first], islice(iterator, size - 1))
+
+
+def features_from_sentence_meta(l):
+    return list(map (features_from_sentence, l))
+
+
+def make_X_and_Y_sets(sentences, i):
+    print(f'start: {i}')
+    pool = Pool()
+    # split sentences into a generator of 4 generators
+    sentence_chunks = chunks(sentences, ceil(50000/4))
+    # results is a list containing the lists of pairs of X and Y of all chunks
+    results = map(lambda x : x[0], pool.map(features_from_sentence_meta, sentence_chunks))
+    X, Y = zip(*results)
+    print(f'end: {i}')
+    return X, Y
+
+
+# reads file in chunks of `lines_per_chunk` lines
+def line_chunks(textfile, lines_per_chunk=1000):
+    chunk = []
+    i = 0
+    with open(textfile, 'r') as textfile:
+        for line in textfile:
+            if not line.split(): continue
+            i+=1
+            chunk.append(line.strip())
+            if i == lines_per_chunk:
+                yield chunk
+                i = 0
+                chunk = []
+        yield chunk
+
+textfile = argv[1]
+
+for i, line_chunk in enumerate(line_chunks(textfile)):
+    # stop processing file after 10 chunks to demonstrate
+    # that memory stays occupied (check your system monitor)
+    if i == 10:
+        while True:
+            pass
+    X_chunk, Y_chunk = make_X_and_Y_sets(line_chunk, i)
+</code></pre>
+<p>The file I am using to debug this has 50000 nonempty lines, which is why I use the hardcoded 50000 at one place. If you want to use the same file, he is a link for your convenience: </p>
+<p><a href="https://www.dropbox.com/s/v7nxb7vrrjim349/de_wiki_50000_lines?dl=0" rel="nofollow noreferrer">https://www.dropbox.com/s/v7nxb7vrrjim349/de_wiki_50000_lines?dl=0</a></p>
+<p>Now when you run this script and open your system monitor you will observe that memory gets used up and the usage keeps going until the 10th chunk, where I artificially go into an endless loop to demonstrate that the memory stays in use, even though I never store anything.</p>
+<p>Can you explain to me why this happens? I seem to be missing something about how multiprocessing pools are supposed to be used.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>First, let's clear up some misunderstandings—although, as it turns out, this wasn't actually the right avenue to explore in the first place.</p>
+<p>When you allocate memory in Python, of course it has to go get that memory from the OS.</p>
+<p>When you release memory, however, it rarely gets returned to the OS, until you finally exit. Instead, it goes into a "free list"—or, actually, multiple levels of free lists for different purposes. This means that the next time you need memory, Python already has it lying around, and can find it immediately, without needing to talk to the OS to allocate more. This usually makes memory-intensive programs much faster.</p>
+<p>But this also means that—especially on modern 64-bit operating systems—trying to understand whether you really do have any memory pressure issues by looking at your Activity Monitor/Task Manager/etc. is next to useless.</p>
+<hr/>
+<p>The <a href="https://docs.python.org/3/library/tracemalloc.html" rel="nofollow noreferrer"><code>tracemalloc</code></a> module in the standard library provides low-level tools to see what actually is going on with your memory usage. At a higher level, you can use something like <a href="https://pypi.org/project/memory_profiler/" rel="nofollow noreferrer"><code>memory_profiler</code></a>, which (if you enable <code>tracemalloc</code> support—this is important) can put that information together with OS-level information from sources like <code>psutil</code> to figure out where things are going.</p>
+<p>However, if you aren't seeing any actual problems—your system isn't going into swap hell, you aren't getting any <code>MemoryError</code> exceptions, your performance isn't hitting some weird cliff where it scales linearly up to N and then suddenly goes all to hell at N+1, etc.—you usually don't need to bother with any of this in the first place.</p>
+<hr/>
+<p>If you <em>do</em> discover a problem, then, fortunately, you're already half-way to solving it. As I mentioned at the top, most memory that you allocated doesn't get returned to the OS until you finally exit. But if all of your memory usage is happening in child processes, and those child processes have no state, you can make them exit and restart whenever you want.</p>
+<p>Of course there's a performance cost to doing so—process teardown and startup time, and page maps and caches that have to start over, and asking the OS to allocate the memory again, and so on. And there's also a complexity cost—you can't just run a pool and let it do its thing; you have to get involved in its thing and make it recycle processes for you.</p>
+<p>There's no builtin support in the <code>multiprocessing.Pool</code> class for doing this.</p>
+<p>You can, of course, build your own <code>Pool</code>. If you want to get fancy, you can look at the source to <code>multiprocessing</code> and do what it does. Or you can build a trivial pool out of a list of <code>Process</code> objects and a pair of <code>Queue</code>s. Or you can just directly use <code>Process</code> objects without the abstraction of a pool.</p>
+<hr/>
+<p>Another reason you can have memory problems is that your individual processes are fine, but you just have too many of them.</p>
+<p>And, in fact, that seems to be the case here.</p>
+<p>You create a <code>Pool</code> of 4 workers in this function:</p>
+<pre><code>def make_X_and_Y_sets(sentences, i):
+    print(f'start: {i}')
+    pool = Pool()
+    # ...
+</code></pre>
+<p>… and you call this function for every chunk:</p>
+<pre><code>for i, line_chunk in enumerate(line_chunks(textfile)):
+    # ...
+    X_chunk, Y_chunk = make_X_and_Y_sets(line_chunk, i)
+</code></pre>
+<p>So, you end up with 4 new processes for every chunk. Even if each one has pretty low memory usage, having hundreds of them at once is going to add up.</p>
+<p>Not to mention that you're probably severely hurting your time performance by having hundreds of processes competing over 4 cores, so you waste time in context switching and OS scheduling instead of doing real work.</p>
+<p>As you pointed out in a comment, the fix for this is trivial: just make a single global <code>pool</code> instead of a new one for each call.</p>
+<hr/>
+<p>Sorry for getting all Columbo here, but… just one more thing… This code runs at the top level of your module:</p>
+<pre><code>for i, line_chunk in enumerate(line_chunks(textfile)):
+    # ...
+    X_chunk, Y_chunk = make_X_and_Y_sets(line_chunk, i)
+</code></pre>
+<p>… and that's the code that tries to spin up the pool and all the child tasks. But each child process in that pool needs to <code>import</code> this module, which means they're all going to end up running the same code, and spinning up another pool and a whole extra set of child tasks.</p>
+<p>You're presumably running this on Linux or macOS, where the default <code>startmethod</code> is <code>fork</code>, which means <code>multiprocessing</code> can avoid this <code>import</code>, so you don't have a problem. But with the other startmethods, this code would basically be a forkbomb that eats up all of your system resources. And that includes <code>spawn</code>, which is the default startmethod on Windows. So, if there's ever any chance anyone might run this code on Windows, you should put all of that top-level code in a <code>if __name__ == '__main__':</code> guard.</p>
+</div>
+<span class="comment-copy">Once you use some memory, Python very rarely returns it to the OS. That normally isn’t a problem—the memory isn’t leaked, it’s just in one of three levels of free lists so when you need memory again, it doesn’t have to allow, so it goes faster. When it <i>is</i> a problem, the answer is pretty simple: you’re already using <code>multiprocessing</code>, so you can just recycle the pool processes every so often.</span>
+<span class="comment-copy">You mean I am currently making new pools for every 1000 line chunk and they don't get destroyed after the chunk has been processed? How can I reuse the same 4 threads for all 1000 line chunks in the file?</span>
+<span class="comment-copy">OK, first, you aren't making threads at all, you're making processes. But second, no, you are not making any new processes after the initial 4. You're reusing the same ones over and over, just as you want to. And that's exactly why the memory isn't getting released: memory usually doesn't get released until a process exits. But, again, that's probably not a problem in the first place.</span>
+<span class="comment-copy">I meant processes, yes. But it is a problem here. How then can I recycle (destroy and make new ones?) the processes as you suggested?</span>
+<span class="comment-copy">What makes you think it is a problem here? What's the actual symptom you're trying to fix? Not the mostly meaningless values you're measuring, but the symptom you're trying to diagnose by measuring them?</span>
+<span class="comment-copy">Hm, I think I just fixed my problem by merely making <code>pool</code> a global variable. Memory usage stays constant now.</span>
+<span class="comment-copy">@lotolmencre Ah, just noticed that. You actually <i>are</i> creating separate pools for each chunk! Oops… If you understand why that's a problem, you should write your own answer and accept it. (You can still upvote this one if it helped.) Or, if it seems like an obvious typo-level bug that won't help anyone else, we could even just close the question as a typo.</span>
+<span class="comment-copy">It was not a type from my perspective, because I did not know that it was necessary to keep using the same pool object. But now I do. Thanks.</span>

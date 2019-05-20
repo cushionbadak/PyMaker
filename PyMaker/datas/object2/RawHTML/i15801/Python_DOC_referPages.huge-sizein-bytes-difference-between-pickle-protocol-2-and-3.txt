@@ -1,0 +1,103 @@
+<div class="post-text" itemprop="text">
+<p>The streamer side keeps sending a sound sample of 2048 bytes along with the time as an integer, together in a tuple that gets pickled using pickle.dumps, and then its send in an UDP packet to the receiver, who then unpickles it, buffers it and then plays the sound sample.</p>
+<p>Everything was fine using python 3, the bits/seconds speed on the receiver were expected.</p>
+<p>When I runned the streamer in python 2.7, the speed was faster! I tough python 2 was somehow faster.</p>
+<p>Then I checked with wireshark the UDP packets the receiver was receiving, and they were larger than they needed to be.</p>
+<p>The streamer side:</p>
+<pre><code>while True:
+    data = next(gen)
+    print("data:{}".format(len(data)))
+    stime +=1
+    msg = (stime,data)
+    payload = pickle.dumps(msg)
+    print("payload:{}".format(len(payload)))
+    bytes_sent = s.sendto(payload,addr)
+    time.sleep(INTERVAL)
+</code></pre>
+<p>The receiver side:</p>
+<pre><code>while True:
+    if stop_receiving.get():
+        break
+    try:
+        (payload,addr) = self.sock.recvfrom(32767)      
+        (t,data) = pickle.loads(payload,encoding="bytes")       
+        if stime &gt;= self.frame_time.get():
+            self.frames.put((t,data))
+    except socket.timeout:          
+        pass
+</code></pre>
+<p>On python 3.4 using pickle format 3, if I pickle.dumps a tuple of an integer and 2048 bytes, I get 2063 bytes.</p>
+<p>Strangely, on python 2.7 using pickle format 2, I get 5933 bytes, almost 3 times more.</p>
+<p>Why is this difference so big? </p>
+<p>Should I just make a protocol and append those bytes instead? Which I could have, but after I found pickle I tought it would work.</p>
+<p>Python docs also say one could use compressing libraries to reduce size, but I dont know if the extra time overhead compensates.</p>
+<p>thank you.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>First, as a general rule, it shouldn't be all that surprising that major new versions of protocols, libraries, etc. have major improvements. Otherwise, why would anyone have bothered to do all the work to create them?</p>
+<p>But you're probably looking for specifics.</p>
+<hr/>
+<p>Before we get into anything else, your big problem is that you <em>aren't</em> comparing protocol 2 and protocol 3, you're comparing protocol 0 and protocol 3. Notice the last line in the <code>pickletools.dumps</code> dumps below: <code>highest protocol among opcodes = 2</code>. If you see <code>0</code> instead of <code>2</code> there, that means you're using protocol 0. Protocol 0 was designed for human readability (well, at least human debuggability without a library like <code>pickletools</code>), not for compactness. In particular, it's going to backslash-escape non-printable-ASCII bytes, expanding most of them to 4 characters.</p>
+<p>So, why are you getting 0 instead of 2? Because, for backward compatibility reasons, the highest protocol is not the default. The default is 0 in 2.x, and 3 in 3.x. See the docs for <a href="https://docs.python.org/2.7/library/pickle.html#pickle.dumps" rel="nofollow">2.7</a> and <a href="https://docs.python.org/3.4/library/pickle.html#pickle.dumps" rel="nofollow">3.4</a>.</p>
+<p>If you change your code to <code>pickle.dumps(msg, protocol=pickle.HIGHEST_PROTOCOL)</code> (or just <code>protocol=-1</code>), you'll get 2 and 4 instead of 0 and 3. The 2.x will still probably be bigger than the 3.x, for the reasons explained below, but nowhere near the same scale you're seeing now.</p>
+<p>If you really want parity, if the protocol-2 results are compact enough for you, you might want to explicitly use <code>protocol=2</code>.</p>
+<p>If you want to explicitly go with only 2 or 3, as you thought you were doing, there's no <em>direct</em> way to write that, but <code>protocol=min(3, pickle.HIGHEST_PROTOCOL)</code> will do it.</p>
+<hr/>
+<p>The <a href="https://docs.python.org/3/library/pickletools.html#module-pickletools" rel="nofollow"><code>pickletools</code></a> module (and comments in the source code, which is linked from the docs) make it easy to explore the difference.</p>
+<p>Let's use a shorter string, to make it easier to look at:</p>
+<pre><code>&gt;&gt;&gt; t = (1, string.ascii_lowercase.encode('ascii'))
+&gt;&gt;&gt; p2 = pickle.dumps(t, protocol=2)
+&gt;&gt;&gt; p3 = pickle.dumps(t, protocol=3)
+&gt;&gt;&gt; len(p2), len(p3)
+78, 38
+</code></pre>
+<p>So, the obvious difference is still there.</p>
+<p>Now, let's look at what's in the pickles. (You'll probably want to use <code>pickletools.dis(p2, annotate=1)</code> in your own interpreter, but since most of the information scrolls off the edge of the screen, that's not as useful here…)</p>
+<pre><code>&gt;&gt;&gt; pickletools.dis(p2)
+    0: \x80 PROTO      2
+    2: K    BININT1    1
+    4: c    GLOBAL     '_codecs encode'
+   20: q    BINPUT     0
+   22: X    BINUNICODE 'abcdefghijklmnopqrstuvwxyz'
+   53: q    BINPUT     1
+   55: X    BINUNICODE 'latin1'
+   66: q    BINPUT     2
+   68: \x86 TUPLE2
+   69: q    BINPUT     3
+   71: R    REDUCE
+   72: q    BINPUT     4
+   74: \x86 TUPLE2
+   75: q    BINPUT     5
+   77: .    STOP
+highest protocol among opcodes = 2
+</code></pre>
+<p>As you can see, protocol 2 stores <code>bytes</code> as a Unicode string plus a codec.</p>
+<pre><code>&gt;&gt;&gt; pickletools.dis(p3)
+    0: \x80 PROTO      3
+    2: K    BININT1    1
+    4: C    SHORT_BINBYTES b'abcdefghijklmnopqrstuvwxyz'
+   32: q    BINPUT     0
+   34: \x86 TUPLE2
+   35: q    BINPUT     1
+   37: .    STOP
+highest protocol among opcodes = 3
+</code></pre>
+<p>… but protocol 3 stores them as a <code>bytes</code> object, using a new opcode that didn't exist in protocol 2.</p>
+<hr/>
+<p>In more detail:</p>
+<p>The <code>BINUNICODE</code> family of opcodes takes a Unicode string and stores it as length-prefixed UTF-8.</p>
+<p>The <code>BINBYTES</code> family of opcodes takes a byte string and stores it as length-prefixed bytes.</p>
+<p>Because protocols 1 and 2 don't have <code>BINBYTES</code>, <code>bytes</code> are stored as, in effect, a call to <code>_codecs.encode</code> with the result of <code>b.decode('latin-1')</code> and <code>u'latin-1'</code> as the arguments. (Why Latin-1? Probably because it's the simplest codec that maps every byte to a single Unicode character.)</p>
+<p>This adds 40 bytes of fixed overhead (which accounts for the difference between my <code>p2</code> and <code>p3</code>).</p>
+<p>More importantly, for your case, most non-ASCII bytes will end up being two bytes of UTF-8. For random bytes, that's about 51% total overhead.</p>
+<p>Note that there <em>is</em> a <code>BINSTRING</code> type in protocol 1 and later, which is pretty similar to <code>BINBYTES</code>, but it's defined as storing bytes <em>in the default encoding</em>, which is pretty much never useful. In 2.x, that wouldn't really make a difference, because you're not going to <code>decode</code> it anyway to get a <code>str</code>, but my guess would be that 2.6+ don't use it for 3.x compatibility.</p>
+<p>There's also a <code>STRING</code> type that dates back to protocol 0, which stores an ASCII-encoded <code>repr</code> on the string. I don't think it's ever used in protocols 1 and higher. This would of course blow up any non-printable-ASCII bytes to a 2 or 4 byte backslash escape.</p>
+</div>
+<span class="comment-copy">I can't reproduce that 5933 bytes; when I try it with random values, I get a bit over 3000 bytes, and even when I try to give it something pathological I can't get more than 4K (in either Python 2.7 or 3.4). Maybe in your particular case it's using something other than latin-1-encoded BINUNICODE? If you can dump the bytes somewhere (or just look at it with <code>pickletools</code> yourself) I'd be curious to see what's different.</span>
+<span class="comment-copy">Also, have you tested what you get in 3.4 with pickle format 2? Is it the same as you get in 2.7 with the same pickle format? (And does it matter if you use <code>bytearray</code>, which is basically the same type in both languages, as opposed to <code>bytes</code> in 3.4 and <code>str</code> in 2.7, which are only sort of the same type?)</span>
+<span class="comment-copy">@abarnert its using latin-1-encoded BINUNICODE. My data is simply a stream of samples of short integers (2 bytes) <a href="http://puu.sh/cn9bB/6a28d0d469.png" rel="nofollow noreferrer">generated from int(math.sin)</a>. I send chunks of 1024 samples (2048 bytes), in each packet. When I run the script on 2.7 I left all <code>b""</code> bytes literals, which in fact convert to <code>str</code> in 2.7. I didnt know that 3.4 <code>bytes</code> equivalent in 2.7 was <code>bytearray</code>. Does that means that in 3.4 I could also use <code>bytearray</code> without loss of significant performance? I would be good to have compatible code in each side.</span>
+<span class="comment-copy">I wrote a <a href="https://dl.dropboxusercontent.com/u/15691159/sin_dump.txt" rel="nofollow noreferrer">dump of the result in python 2.7</a></span>
+<span class="comment-copy">The 2.7 <code>bytearray</code> is the equivalent of the 3.4 <code>bytearray</code>, not the 3.4 <code>bytes</code>. 2.7 doesn't really have a direct equivalent of <code>bytes</code>; <code>str</code> is as close as it gets. Anyway, <code>bytearray</code> is mutable, and only supports part of the <code>str</code> interface in 2.7 (basically the part that matches <code>bytes</code> in 3.4); unless it makes a difference somewhere important (and it sounds like it doesn't here?), I think switching to a mutable type when you don't need one is more of a cost than having slightly different types between 2.x and 3.x, but… judgment call, I guess.</span>
+<span class="comment-copy">Since I was confused about 2 bytes end up being 3(or 4) bytes. I tested it my self: <code>counter = {}</code> <code>for i in range(10): counter[i] = 0</code> <code>for i in range(32767): counter[len(_codecs.encode(struct.pack("h",i).decode("latin1"),"latin1"))]+=1 </code> And to my surprise every number only used 2 bytes. Maybe on python 2.7 I will get that different result</span>
+<span class="comment-copy">@RuiBotelho: Maybe I didn't explain very well. A Latin-1 byte decoded to Unicode is always 1 Unicode character. But a Latin-1 byte decoded to Unicode and then encoded as UTF-8 can be 2 characters, and that's what protocol 2 is storing. Try <code>struct.pack("h",i).decode("latin1").encode("utf-8")</code>.</span>
+<span class="comment-copy">@RuiBotelho: Or, more simply: <code>len(bytearray(range(256)).decode('latin-1').encode('utf-8'))</code> is 384. And, while we're at it, len(bytearray(range(256)).decode('latin-1').encode('unicode-escape'))<code>, which is roughly what you get with protocol 0, is 734 (because, e.g., byte 0x0A becomes </code>'\n'<code>, and byte 0x0B becomes </code>'\x0b'`).</span>

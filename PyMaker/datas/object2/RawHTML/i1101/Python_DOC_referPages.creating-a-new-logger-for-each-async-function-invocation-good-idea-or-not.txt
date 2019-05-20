@@ -1,0 +1,81 @@
+<div class="post-text" itemprop="text">
+<p>When writing Python asyncio programs, often there is an async function that have many invocations running concurrently. I want to add some logging to this function, but the logging output from different invocations will be interleaved, making it hard to follow. My current solution is to somehow create a unique name for each invocation, and log that name each time, like this:</p>
+<pre><code>async def make_request(args):
+    logger = logging.getLogger('myscript.request')
+    log_name = unique_name()
+    logger.debug('[%s] making request with args %r', log_name, args)
+    response = await request(args)
+    logger.debug('[%s] response: %r', log_name, response)
+</code></pre>
+<p>However, having to put <code>log_name</code> in every logging call gets tiring pretty quickly. To save those keystrokes, I came up with a different solution, creating a new logger with a unique name for each invocation:</p>
+<pre><code>async def make_request(args):
+    logger = logging.getLogger(f'myscript.request.{unique_name()}')
+    logger.debug('making request with args %r', args)
+    response = await request(args)
+    logger.debug('response: %r', response)
+</code></pre>
+<p>Are there any down sides to this approach? The only thing I can think of is that creating a new logger may be expensive, but is that actually the case? Are there any pitfalls I'm not seeing?</p>
+</div>
+<div class="post-text" itemprop="text">
+<blockquote>
+<p>Are there any down sides to [creating a new logger for each coroutine]?</p>
+</blockquote>
+<p>Other than the possible price of creating a logger, another downside is that the logger you create stays associated with the unique name forever and is never destroyed, so you effectively have a  memory leak. This is explicitly promised by the documentation:</p>
+<blockquote>
+<p>Multiple calls to <code>getLogger()</code> with the same name will always return a reference to the same Logger object.</p>
+</blockquote>
+<p>I'd recommend just biting the bullet and creating a helper with the desired functionality. Building on Brad Solomon's answer, the wrapper might look like this (untested):</p>
+<pre><code>import itertools, weakref, logging
+
+logging.basicConfig(format='%(asctime)-15s %(task_name)s %(message)s')
+
+class TaskLogger:
+    _next_id = itertools.count().__next__
+    _task_ids = weakref.WeakKeyDictionary()
+
+    def __init__(self):
+        self._logger = logging.getLogger('myscript.request')
+
+    def _task_name(self):
+        task = asyncio.current_task()
+        if task not in self._task_ids:
+            self._task_ids[task] = self._next_id()
+        return f'task-{self._task_ids[task]}'
+
+    def debug(self, *args, **kwargs):
+        self._logger.debug(*args, task_name=self._task_name(), **kwargs)
+
+    # the same for info, etc.
+
+logger = TaskLogger()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Instead of creating a new logger, you may want to consider taking advantage of using <a href="https://docs.python.org/3/library/logging.html#logging.debug" rel="nofollow noreferrer">custom attributes</a> in the log message, via the <code>extra</code> parameter:</p>
+<p>For example:</p>
+<pre><code>FORMAT = '%(asctime)-15s %(unique_name)s %(message)s'
+# [Configure/format loggers &amp; handlers]
+</code></pre>
+<p>Then within the coroutine call logging a debug level message would look something like:</p>
+<pre><code>logger.debug('making request with args %r', args, extra={'unique_name': unique_name())
+</code></pre>
+<hr/>
+<p>One other thing to keep in mind: <code>unique_name()</code> could get expensive if you're making a lot of requests.  A common pattern when creating concurrency via multiprocessing is to log the calling process ID via <code>os.getpid()</code>.  With <code>asyncio</code>, perhaps a very rough cousin would be some identifier for the current <a href="https://docs.python.org/3/library/asyncio-task.html#task-object" rel="nofollow noreferrer"><code>Task</code></a>, which you could get to via <code>asyncio.current_task()</code>.  Each task has a <code>_name</code> attribute that should be unique because it calls an incrementing <code>_task_name_counter()</code>:</p>
+<pre><code>class Task(futures._PyFuture): # Inherit Python Task implementation
+    def __init__(self, coro, *, loop=None, name=None):
+    # ...
+        if name is None:
+            self._name = f'Task-{_task_name_counter()}'
+        else:
+            self._name = str(name)
+</code></pre>
+</div>
+<span class="comment-copy">As far as I can say from my experience, you should have one logger. To identify which message is coming from which task, you need to write that information into the log. So that by looking at a line in the log file, you can see from which task this was written.</span>
+<span class="comment-copy">@JoeyMallone Any particular reason to use just one logger? What's the down side of having too many loggers?</span>
+<span class="comment-copy">I say, first from experience. I have worked with realtime systems with dozens of tasks running in parallel. There was always only one logger running on any single device. I'd expect that the people who implemented those systems, knew what they were doing. Also, I saw the same approach about logging task name in the logfile. BUT, my cargo-cult-programming approach aside, I think, a logger for every process is, point 1, not scalable and point 2, how do you log the interaction of those processes when every logger is detached? In a single logger, it'd be easier to see who called what and when.</span>
+<span class="comment-copy">One big advantage of using the same logger is that you can configure it once and reuse that configuration rather than needing to configure a new one each time a function is called.</span>
+<span class="comment-copy">@dirn With Python's logging module, there's a separation between "loggers" and "handlers". Most configuration are attached to handlers, like formatting and output. Loggers are hierarchical, so if I attach a handler to the logger "myscript.request", messages logged to any of the loggers "myscript.request.*" will be handled by the handler. Therefore, in this case configuration is not really a concern.</span>
+<span class="comment-copy">This is a good point, though I imagine garbage collection will remove stale loggers from memory?</span>
+<span class="comment-copy">@twisteroidambassador It won't, that's precisely my point. The GC is not <i>allowed</i> to collect stale loggers because it cannot prove that you won't call <code>getLogger('myscript.request')</code> a bit later, and expect (as per the documentation) to get the logger object you've previously configured.</span>
+<span class="comment-copy">"extra" is pretty cool, but with such a formatter, I will have to pass the extra dict in every logging call, even those outside of the interesting function. The docs do say "While this might be annoying, this feature is intended for use in specialized circumstances, such as multi-threaded servers where the same code executes in many contexts, and interesting conditions which arise are dependent on this context ... In such circumstances, it is likely that specialized Formatters would be used with particular Handlers", so this feature is pretty much designed for this case, but annoying it is.</span>
+<span class="comment-copy">@twisteroidambassador you can use <code>LoggerAdapter</code> to avoid passing <code>extra</code> each time. You pass the <code>extra</code> value to the adapter instance when you create it - <a href="https://docs.python.org/3/howto/logging-cookbook.html#adding-contextual-information-to-your-logging-output" rel="nofollow noreferrer">docs.python.org/3/howto/…</a></span>

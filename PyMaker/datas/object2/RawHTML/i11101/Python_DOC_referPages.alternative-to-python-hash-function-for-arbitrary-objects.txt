@@ -1,0 +1,87 @@
+<div class="post-text" itemprop="text">
+<p>In python2.7, I'm successfully using <code>hash()</code> to place objects into buckets stored persistently on disk. A mockup code looks like this:</p>
+<pre><code>class PersistentDict(object):
+  def __setitem__(self, key, value):
+    bucket_index = (hash(key)&amp;0xffffffff) % self.bucket_count
+    self._store_to_bucket(bucket_index, key, value)
+
+  def __getitem__(self, key):
+    bucket_index = (hash(key)&amp;0xffffffff) % self.bucket_count
+    return self._fetch_from_bucket(bucket_index)[key]
+</code></pre>
+<p>In python3, <code>hash()</code> uses a random or fixed salt, which makes it unusable/suboptimal for this [1]. Apparently, it's not possible to use a <a href="https://stackoverflow.com/q/38001874/5349916">fixed salt for specific invocations</a>. So, I need an alternative:</p>
+<ul>
+<li>Must be stable across interpreter invocations</li>
+<li>May require parameters supplied at execution time, e.g. setting a salt in the call</li>
+<li>Must support arbitrary objects (anything supported by <code>dict</code>/<code>set</code>)</li>
+</ul>
+<p>I've already tried using hash functions from <a href="https://docs.python.org/3/library/hashlib.html" rel="nofollow noreferrer">hashlib</a> (slow!) and checksums from <a href="https://docs.python.org/3/library/zlib.html#zlib.adler32" rel="nofollow noreferrer">zlib</a> (apparently not ideal for hashing, but meh) which work fine with strings/bytes. However, they work <em>only</em> on bytes-like objects, whereas <code>hash()</code> works with almost everything.</p>
+<hr/>
+<p>[1] Using <code>hash()</code> to identify buckets is either:</p>
+<ul>
+<li>Not reliable across interpreter invocations, if salts are random</li>
+<li>Prevents applications from using the random salting feature, if salts are fixed</li>
+<li>Unusable if two <code>PersistentDict</code>s were created with different salts</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p>I've had success using a combination of <code>hash</code> and <code>zlib.adler32</code>. The most straightforward implementation is this:</p>
+<pre><code>def hashkey(obj, salt=0):
+  """
+  Create a key suitable for use in hashmaps
+
+  :param obj: object for which to create a key
+  :type: str, bytes, :py:class:`datetime.datetime`, object
+  :param salt: an optional salt to add to the key value
+  :type salt: int
+  :return: numeric key to `obj`
+  :rtype: int
+  """
+  if obj is None:
+    return 0
+  if isinstance(obj, str):
+    return zlib.adler32(obj.encode(), salt) &amp; 0xffffffff
+  elif isinstance(obj, bytes):
+    return zlib.adler32(obj, salt) &amp; 0xffffffff
+  elif isinstance(obj, datetime_type):
+    return zlib.adler32(str(obj).encode(), salt) &amp; 0xffffffff
+  return hash(obj) &amp; 0xffffffff
+</code></pre>
+<p>With Python 3.4.3, this is a lot slower than calling plain <code>hash</code>, which takes roughly 0.07 usec. For a regular object, <code>hashkey</code> takes ~1.0 usec instead. 0.8 usec for <code>bytes</code> and 0.7 for <code>str</code>.</p>
+<p>Overhead is roughly as follows:</p>
+<ul>
+<li>0.1 usec for the function call (<code>hash(obj)</code> vs <code>def pyhash(obj): return hash(obj)</code>)</li>
+<li>0.2 usec to 0.5 usec for selecting the hash function via <code>isinstance</code></li>
+<li>0.75 usec for <code>zlib.adler32</code> or <code>zlib.crc32</code> vs <code>hash</code>: ~0.160 usec vs ~ 0.75 usec (adler and crc are +/- 4 usec)</li>
+<li>0.15 usec for <code>obj.encode()</code> of <code>str</code> objects (<code>"foobar"</code>)</li>
+<li>1.5 usec for <code>str(obj).encode()</code> of <code>datetime.datetime</code> objects</li>
+</ul>
+<p>The most optimization comes from ordering of the <code>if</code> statements. If one mostly expects plain objects, the following is the fastest I could come up with:</p>
+<pre><code>def hashkey_c(obj, salt=0):
+  if obj.__class__ in hashkey_c.types:
+    if obj is None:
+      return 0
+    if obj.__class__ is str:
+      return zlib.adler32(obj.encode(), salt) &amp; 0xffffffff
+    elif obj.__class__ is bytes:
+      return zlib.adler32(obj, salt) &amp; 0xffffffff
+    elif obj.__class__ is datetime_type:
+      return zlib.adler32(str(obj).encode(), salt) &amp; 0xffffffff
+  return hash(obj) &amp; 0xffffffff
+hashkey_c.types = {str, bytes, datetime_type, type(None)}
+</code></pre>
+<p>Total time: ~0.7 usec for <code>str</code> and <code>bytes</code>, abysmal for <code>datetime</code>, 0.35 usec for objects, ints, etc. Using a <code>dict</code> to map type to hash comparable, if one uses an explicit check on the <code>dict</code> keys (aka types) separately (i.e. not <code>obj.__class__ in hashkey.dict_types</code> but <code>obj.__class__ in hashkey.explicit_dict_types</code>).</p>
+<hr/>
+<p>Some additional notes:</p>
+<ul>
+<li><code>hash</code> is not stable across interpreter starts for any object using the default <code>__hash__</code> implementation, including <code>None</code></li>
+<li>It does not work properly for immutable containers (which define <code>__hash__</code>) containing a salted type, e.g. <code>(1, 2, 'three')</code></li>
+</ul>
+</div>
+<span class="comment-copy">The random hash only applies to <code>str</code>, <code>bytes</code> and <code>datetime</code> objects. You'd only need an alternative for those types.</span>
+<span class="comment-copy">@MartijnPieters Thanks! I guess str and bytes can be covered by zlib/hashlib. I'll see whether I can find something fast for datetime.</span>
+<span class="comment-copy">I'd still test thoroughly and look for alternatives if timezones are involved however; I suspect that timezone subtleties could lead to equal ISO8601 representations for otherwise different timezone objects, in ways that could matter.</span>
+<span class="comment-copy">For <code>None</code> the <code>__hash__</code> implementation is inherited from <code>type</code>, which produces the hash of the memory address of the object, since this varies from interpreter to interpreter process, the value can appear random. This means that setting <code>PYTHONHASHSEED</code> <b>will not affect the hash value of <code>None</code></b>, like it would for types to which the seed does apply.</span>
+<span class="comment-copy">So I guess I have to modify my first comment to include type objects (custom classes and built-in) and <code>None</code>.</span>
+<span class="comment-copy">As of python3.6 or so this is not working.  It is not stable across different interpreter executions.  E.g. try hashkey(None).</span>
+<span class="comment-copy">@NealYoung Thanks for checking. It seems <code>hash(None)</code> is salted at least since Python3.4 - I've added this case now. I also realised that hashable containers, such as Tuple, would require special casing as well.</span>

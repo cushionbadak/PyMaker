@@ -1,0 +1,100 @@
+<div class="post-text" itemprop="text">
+<p>I'm writing a program that creates a bunch of workers to call an API asynchronously using <code>aiohttp</code>. However this question is about shared-objects. I assume I would run into the same or a similar issue if I was multithreading.  </p>
+<p>I have a set of default URL params which all the workers share, however two of these params' values are changed from worker to worker:</p>
+<pre><code>DEFAULT_PARAMS = {
+    'q' : None,                         #&lt;==CHANGES per worker
+    'offset' : '0',                     #&lt;==CHANGES per worker
+    'mkt' : 'en-US',                    #&lt;==STATIC for all workers
+    'moreParams' : '&lt;most of the data&gt;' #&lt;==STATIC for all workers
+}  
+</code></pre>
+<p>Here's how I'm initializing my <code>Worker()</code> class:</p>
+<pre><code>class Worker(object):
+    def __init__(self, q):
+        # this copy iexpensive when &gt; 100 workers.
+        self.initial_params = DEFAULT_PARAMS.copy()
+        # but witout copying entire default params dict, the next line
+        # would add alter the 'q' value for all instances of Worker.
+        self.initial_params.update({'q' : q})
+</code></pre>
+<p>I'm looking for an alternative to calling <code>DEFAULT_PARAMS.copy()</code> for every new worker I create.</p>
+<p>Figuring out how to pose this question has been a challenge. I suspect my answer may lie somewhere in class via instance attributes. </p>
+<p>Here's an extremely barebones example of my program:</p>
+<pre><code>import aiohttp
+import asyncio
+
+DEFUALT_PARAMS = {
+    'q' : None, #&lt;==CHANGES per worker
+    'offset' : '0', #&lt;==CHANGES per worker
+    'mkt' : 'en-US', #&lt;==STATIC for all workers
+    'moreParams' : '&lt;most of the data&gt;' #&lt;==STATIC for all workers
+}
+
+class Worker(object):
+    def __init__(self, q):
+        self.initial_params = DEFUALT_PARAMS.copy() # &lt;==expensive
+        self.initial_params.update({'q' : q}) #&lt;==without copying, overwrites ref for all classes.
+
+    async def call_api(self):
+        async with aiohttp.ClientSession() as sesh:
+            async with sesh.get(
+                'https://somesearchengine.com/search?',
+                params=self.initial_params
+            ) as resp:
+                assert resp.status == 200
+                print(await resp.json())
+
+
+async def main(workers, *, loop=None):
+    tasks = (asyncio.ensure_future(i.call_api(), loop=loop) for i in workers)
+    await asyncio.gather(*tasks)
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    queries = ['foo', 'bar', 'baz']
+    workers = (Worker(i) for i in queries)
+    loop.run_until_complete(main(workers, loop=loop))
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Copying dictionaries, even for 100 workers, is <em>not that expensive</em>. You can create a copy of a 1000-key dictionary <em>and</em> update it, in 7 microseconds:</p>
+<pre><code>&gt;&gt;&gt; from timeit import Timer
+&gt;&gt;&gt; from secrets import token_urlsafe
+&gt;&gt;&gt; test_dict = {token_urlsafe(): token_urlsafe() for _ in range(1000)}
+&gt;&gt;&gt; len(test_dict)
+1000
+&gt;&gt;&gt; count, total = Timer("p = d.copy(); p.update({'q' : q})", "from __main__ import test_dict as d; q = 42").autorange()
+&gt;&gt;&gt; print(total/count*1000000)  # microseconds are 10**-6 seconds
+7.146239580000611
+</code></pre>
+<p>So I'd say that there isn't really a problem here.</p>
+<p>However, you are essentially <em>layering</em> dictionary contents; adjustments per worker to just one or two keys. Instead of creating a copy, you could use a <a href="https://docs.python.org/3/library/collections.html#collections.ChainMap" rel="nofollow noreferrer"><code>collections.ChainMap()</code> object</a> to handle the layering. A <code>ChainMap()</code> object takes more than one dictionary and will look up keys in these until a value is found. No copy is created, and the top-most dictionary is used to set values when you mutate the map:</p>
+<pre><code>from collections import ChainMap
+
+# ...
+self.initial_params = ChainMap({'q': q}, DEFAULT_PARAMS)
+</code></pre>
+<p>Creating <code>ChainMap()</code> objects is cheaper still:</p>
+<pre><code>&gt;&gt;&gt; count, total = Timer("p = ChainMap({'q': q}, d)", "from __main__ import test_dict as d; q = 42; from collections import ChainMap").autorange()
+&gt;&gt;&gt; print(total/count*1000000)
+0.5310121239999717
+</code></pre>
+<p>so only half a microsecond. That comes at a price of slower iteration and per-key access, of course. It'll depend on how <code>aiohttp</code> processes these, I recommend you do your own micro-benchmarks with the <code>timeit</code> module to measure performance of actual operations that your code is executing.</p>
+<p>But note that there is always a price to pay when trying to handle shared state like this, with any concurrency model, <em>and</em> sharing a dictionary between instances is always going to be problematic, even without concurrency.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If q is owned by the worker why not just make it an instance variable in the Worker itself. </p>
+<pre><code>class Worker(object):
+    def __init__(self, q):
+      self.q = q
+</code></pre>
+<p>And wherever you want <code>q</code> do <code>self.q</code> </p>
+</div>
+<span class="comment-copy">Why don't you want to use <code>.copy</code>, that does exactly what you want, no?</span>
+<span class="comment-copy">Are you sure copying a dict is really a meaningful part of your runtime? I would expect your runtime to be dominated by network requests. Avoiding dict copies is likely to be useless effort.</span>
+<span class="comment-copy">I'm not certain. I'll check.</span>
+<span class="comment-copy">@user2357112 - my rationale was akin to this analogy: If I <i>have</i> to make 20k trips to a art dealership to buy 20k expensive pieces of art, sure that's going to dwarf my transportation costs, but if I care about costs I should still try to take 20k bus rides instead of 20k taxi rides...analogies aside, this is all moot though bc I didnt get specific enough with measuring resource usage.</span>
+<span class="comment-copy">While this is a thing that can be done, it has its own costs. It will slow down lookup for any key that has to be found in the DEFAULT_PARAMS. It may not actually pay off, and either way, it's probably going to vanish under the time taken by the network requests, anyway.</span>
+<span class="comment-copy">@user2357112: then you are stuck with copying up front. You have to pay this price <i>somewhere</i>.</span>
+<span class="comment-copy">@user2357112: I added some timings, the OP essentially <i>does not have a problem</i> here. Creating a shallow copy of a dictionary is highly optimised in Python.</span>
+<span class="comment-copy">Confirmed that I shouldn't have made assumptions about which part of my script is slow! I need to follow one of my import statements to find the culprit. This was really helpful regardless.</span>

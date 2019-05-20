@@ -1,0 +1,142 @@
+<div class="post-text" itemprop="text">
+<pre><code>from os import environb as environ
+</code></pre>
+<p>On typing the above command in Windows <code>Anaconda</code> <code>python 3.6</code> installation, I get this error: </p>
+<p><code>ImportError: cannot import name 'environb'</code>. </p>
+<p>This seems to be because, </p>
+<p><code>environb is only available if supports_bytes_environ is True.</code></p>
+<p>and </p>
+<p><code>supports_bytes_environ</code> is False on Windows. </p>
+<p>Is there a way to get around this?</p>
+<p>ref: <a href="https://docs.python.org/3/library/os.html#os.environb" rel="noreferrer">https://docs.python.org/3/library/os.html#os.environb</a></p>
+<p>Specifically, I found this error in the <a href="https://grass.osgeo.org/grass77/manuals/libpython/script_intro.html" rel="noreferrer">GRASS GIS Python scripting library</a>.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>First of all: you <em>probably don't need <code>os.environb</code></em>, at all.</p>
+<p>I'll cover why not when you are developing Python software, and at the end, also cover GRASS GIS and how to fix that project properly.</p>
+<h1>Why you won't need this object</h1>
+<p>On non-Windows systems, the <code>os.environb</code> mapping is only needed if you ever need to access the raw binary data from an environment, without it having being decoded to Unicode according to the current locale. You could want to have that access because the locale could be wrong, or you wanted to pass in binary data from an environment variable to your program without having to re-encode it with the locale and the <code>surrogateescape</code> error handler, or to pass data in a different encoding to another program, again without having to forcefully create a <code>surrogateescape</code> decoded string first. (I'm glossing over the fact that in POSIX you <a href="https://unix.stackexchange.com/questions/347390/bash-cant-store-hexvalue-0x00-in-variable">can't use nulls in environment variables</a> but that's not relevant). </p>
+<p>On Windows, you don't need this because on that OS the environment variables are already passed to Python <em>as Unicode data</em>. This also means that the Windows environment <em>can't readily be used to pass binary data</em>; you can't pass in data with a different encoding for child processes and you can't accept binary data from the environment without first bundling that data in some kind of binary-to-text encoding such as Base64. <code>os.environb</code> would not serve any purpose on Windows!</p>
+<p>So, if you creating cross-platform software, you should use <code>os.environ</code> and require that the locale is correctly configured, and not worry about <code>os.environb</code>.</p>
+<h1>Code defensively instead</h1>
+<p>Sometimes need binary environment data access?  Then next option could be to defensively code for the attribute missing with an <code>ImportError</code> guard, and just accept that it is missing:</p>
+<pre><code>try:
+    from os import environb
+except ImportError:
+    environb = None
+
+# ...
+
+if environb is not None:
+    # ... it is available, use it
+</code></pre>
+<h1>Full os.environb replacement</h1>
+<p>A last option, for that case where some third party expects <code>os.environb</code> to be available anyway and you can't change that, or where you have a large codebase that is going to be hard to update, is to create the <code>os.environb</code> object just for Windows.</p>
+<p>This is not that hard; just encode the data from the original <code>os.environ</code> as needed, and decode it again on setting new keys or values. The <code>os.environ</code> object for POSIX already does the same thing, except in the other direction, so we can re-use the same infrastructure:</p>
+<pre><code>import os
+try:
+    os.environb
+except AttributeError:
+    # Windows has no os.environb, create one that maps to os.environ._data
+    import sys
+    _encoding = sys.getfilesystemencoding()  # echos POSIX
+    # note the inversion, we *decode* where encoding is expected, and vice versa
+    def _encode(value, _encoding=_encoding):
+        if not isinstance(value, bytes):
+            raise TypeError("bytes expected, not %s" % type(value).__name__)
+        return value.decode(_encoding, 'surrogateescape')
+    def _decode(value, _encoding=_encoding):
+        return value.encode(_encoding, 'surrogateescape')
+
+    # reuse the Unicode mapping, putenv and unsetenv references from os.environ
+    # but map binary data to unicode on setting, unicode to binary on getting
+    os.environb = os._Environ(
+        os.environ._data,
+        _encode, _decode, _encode, _decode,
+        os.environ.putenv, os.environ.unsetenv)
+
+    del _encoding, _encode, _decode
+</code></pre>
+<p>This creates the same type of mapping object, which fully supports getting and setting environment variables, and the changes to that object will be visible in <code>os.environ</code>, and vice versa:</p>
+<pre><code>&gt;&gt;&gt; os.environ
+environ({'FOO': 'bar baz', 'SPAM': 'håm'})
+&gt;&gt;&gt; os.environb
+environ({b'FOO': b'bar baz', b'SPAM': b'h\xc3\xa5m'})
+&gt;&gt;&gt; os.environb[b'eric'] = 'Îdlé'.encode('utf8')
+&gt;&gt;&gt; os.environ
+environ({'FOO': 'bar baz', 'SPAM': 'håm', 'eric': 'Îdlé'})
+&gt;&gt;&gt; del os.environ['FOO']
+&gt;&gt;&gt; os.environb
+environ({b'SPAM': b'h\xc3\xa5m', b'eric': b'\xc3\x8edl\xc3\xa9'})
+</code></pre>
+<hr/>
+<h1>GRASS GIS specifically</h1>
+<p>In the comments you mention you are trying to get GRASS GIS to work. That project is simply made an incorrect choice to set an environment variable as <code>bytes</code> on both Python 2 and Python 3, and has issues not just for Windows but for all platforms that need addressing.</p>
+<p>They <a href="http://trac.osgeo.org/grass/browser/grass/trunk/lib/python/script/core.py?rev=73269#L44" rel="nofollow noreferrer">try to use <code>os.environb</code> as a replacement for <code>os.environ</code></a>, and then use a naive quoting method to generate the value from <code>sys.argv</code>. At the same time, the same module uses <code>os.environ</code> for all other environment variable needs.</p>
+<p>At the top of the <code>lib/python/script/core.py</code> they use</p>
+<pre><code># python3
+# ...
+from os import environb as environ
+</code></pre>
+<p>and then store a single variable in that mapping (in the <code>def parser():</code> function definition):</p>
+<pre><code>cmdline = [basename(encode(sys.argv[0]))]
+cmdline += [b'"' + encode(arg) + b'"' for arg in sys.argv[1:]]
+environ[b'CMDLINE'] = b' '.join(cmdline)
+</code></pre>
+<p>The <code>b'"' + encode(arg) + b'"'</code> is a naive method for quoting values to avoid problems with subshells, but this won't handle embedded quotes. </p>
+<p>There is <em>no reason</em> for this to be a bytes value. <code>sys.argv</code> is a list of Unicode strings on Python 3, bytestrings on Python 2. This follows the <code>os.environ</code> data types on either Python version, so the data should just be handled as <code>str</code> types, on either Python version.</p>
+<p>For quoting values against shell interpretation, Python has the <a href="https://docs.python.org/dev/library/shlex.html#shlex.quote" rel="nofollow noreferrer"><code>shlex.quote()</code> function</a>, which happens to be available as <code>pipes.quotes()</code> on both Python 2 and Python 3 as well.</p>
+<p>So the issue can be avoided entirely with a few changes to that file (the traceback you have for the <code>os.environb</code> import error will tell you where it is located on your computer):</p>
+<pre><code># 1. at the top, add an import
+import pipes
+
+# 2. remove the `from os import environb as environ` line altogether
+
+# 3. in def parse(), use
+cmdline = [basename(sys.argv[0])]
+cmdline += (pipes.quote(a) for a in sys.argv[1:])
+os.environ['CMDLINE'] = ' '.join(cmdline)
+</code></pre>
+<p>I'm reporting this to the GRASS GIS project so that they can fix this for a future release.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>On Windows, the <code>os</code> module does not have the attribute <code>environb</code>, so you will not be able to load it. However, you can add it manually:</p>
+<p>First, load <code>os</code> into the global namespace:</p>
+<pre><code>import os
+</code></pre>
+<p>Overload it into the <code>os</code> module. This will modify the module that is already loaded:</p>
+<pre><code>os.environb = {bytes(k, encoding='utf-8'): bytes(env, encoding='utf8') for k, env in os.environ.items()}
+</code></pre>
+<p>Now, if you run <code>from os import environb as environ</code>, python will see that <code>os</code> is already imported and will not attempt to load it again.</p>
+<pre><code>environ[b'PATH']
+
+&gt;&gt;&gt; b'C:\\Windows\\System32'
+</code></pre>
+<p>If you also need to be able to set environment variables, you can provide a two-way mapping by using the following:</p>
+<pre><code>class Environb(object):
+    def __init__(self):
+        pass
+    def __getitem__(self, item):
+        return bytes(os.environ[item.decode('utf8')], encoding='utf-8')
+    def __setitem__(self, key, item):
+        os.environ[key.decode('utf8')] = item.decode('utf8')
+
+os.environb = Environb()
+
+os.environb[b'FOO'] = b'BAR'
+print(os.environ['FOO']
+
+&gt;&gt;&gt; 'BAR'
+</code></pre>
+</div>
+<span class="comment-copy">Why can't I find any references to environb? What is it ?</span>
+<span class="comment-copy"><a href="https://docs.python.org/3/library/os.html#os.environb" rel="nofollow noreferrer">docs.python.org/3/library/os.html#os.environb</a></span>
+<span class="comment-copy">Have you able to find a fix for this problem,   os.supports_bytes_environ = True  doesn't make it fixed. Any luck</span>
+<span class="comment-copy">unfortunately not :(</span>
+<span class="comment-copy">Can you elaborate where and what  exactly you were doing when you got this error. I was trying to configure grass gis from jupyter python notebook.</span>
+<span class="comment-copy">Thank you very much. GRASS seemed to be working flawlessly, thanks to you. I was so lost and you just saved my project. Thank you again.</span>
+<span class="comment-copy">This is a strictly one-way reflection of the environment. The OP could be expecting to <b>set</b> variables via <code>os.environb</code>, and see that reflected in child processes or in the <code>os.environ</code> mapping (on systems where <code>os.supports_bytes_environ</code> is true, the two objects use the same underlying mapping and updating the mapping triggers <code>os.putenv()</code> and <code>os.unsetenv</code> calls).</span>
+<span class="comment-copy">And I was correct. The software they use <b>sets</b> an environment variable for a subprocess. This solution would leave that variable to just disappear.</span>
+<span class="comment-copy">@Martin Thanks for pointing that out! I have modified my answer to support  variable setting as well</span>
+<span class="comment-copy">There is no need for <code>__init__</code>; that's not a requirement for classes. You don't have class methods, so use <code>self</code>, not <code>cls</code>. You want to specify an error handler here, <code>os.environ</code> uses <code>'surrogateescape'</code>. Any reason you mix <code>bytes(str, encoding=...)</code> and <code>bytes.decode(...)</code>? I'd stick with <code>str.encode()</code> instead.</span>
+<span class="comment-copy">And that latter method is exactly what my answer also offers, but using the core <code>os._Environ</code> class that <code>os.environ</code> and <code>os.environb</code> also use. I don't hardcode the codec, but use <code>sys.getfilesystemencoding()</code>.</span>

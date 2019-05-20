@@ -1,0 +1,82 @@
+<div class="post-text" itemprop="text">
+<p>I need to get the random hash seed used by python to replicate <strong>failing</strong> unittests.</p>
+<p>If <a href="https://docs.python.org/3/using/cmdline.html#envvar-PYTHONHASHSEED" rel="nofollow noreferrer">PYTHONHASHSEED</a> is set to a non-zero integer, <a href="https://docs.python.org/3/library/sys.html#sys.flags" rel="nofollow noreferrer"><code>sys.flags.hash_randomization</code></a> provides it reliably:</p>
+<pre><code>$ export PYTHONHASHSEED=12345
+$ python3 -c 'import sys, os;print(sys.flags.hash_randomization, os.environ.get("PYTHONHASHSEED"))'
+12345 12345
+</code></pre>
+<p>However, if hashing is randomised, it only states <strong>that</strong> a seed is used, not which:</p>
+<pre><code>$ export PYTHONHASHSEED=random
+$ python3 -c 'import sys, os;print(sys.flags.hash_randomization, os.environ.get("PYTHONHASHSEED"))'
+1 random
+</code></pre>
+<p>The information in <a href="https://docs.python.org/3/library/sys.html#sys.hash_info" rel="nofollow noreferrer"><code>sys.hash_info</code></a> never includes data depending on the seed. With the <a href="https://www.python.org/dev/peps/pep-0456/" rel="nofollow noreferrer">hash function since python3.4</a>, it seems also unfeasible to try and reconstruct the seed from given hashes.</p>
+<hr/>
+<p>Context: When fine tuning an algorithm, we've seen heisenbugs that depend on set/dict iteration order. Replicating them requires testing seeds, at worst all 4294967295, but even our average of ~100 tests is quite lengthy.</p>
+<p>We have considered always externally setting PYTHONHASHSEED to random but known values, but would like to avoid this extra layer.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>No, the random value is assigned to the <code>uc</code> field of the <a href="https://hg.python.org/cpython/file/3.5/Include/pyhash.h#l34" rel="nofollow noreferrer"><code>_Py_HashSecret</code> union</a>, but this is never exposed to Python code. That's because the number of possible values is far greater than what setting <code>PYTHONHASHSEED</code> can produce.</p>
+<p>When you don't set <code>PYTHONHASHSEED</code> or set it to <code>random</code>, Python generates a random 24-byte value to use as the seed.  If you set <code>PYTHONHASHSEED</code> to an integer then that number is passed through a <a href="https://en.wikipedia.org/wiki/Linear_congruential_generator" rel="nofollow noreferrer"><em>linear congruential generator</em></a> to produce the actual seed (see the <a href="https://hg.python.org/cpython/file/3.5/Python/random.c#l382" rel="nofollow noreferrer"><code>lcg_urandom()</code> function</a>). The problem is that <code>PYTHONHASHSEED</code> is limited to 4 bytes only. There are 256 ** 20 times more possible seed values than you could set via <code>PYTHONHASHSEED</code> alone. </p>
+<p>You <em>can</em> access the internal hash value in the <code>_Py_HashSecret</code> struct using <code>ctypes</code>:</p>
+<pre><code>from ctypes import (
+    c_size_t,
+    c_ubyte,
+    c_uint64,
+    pythonapi,
+    Structure,
+    Union,
+)
+
+
+class FNV(Structure):
+    _fields_ = [
+        ('prefix', c_size_t),
+        ('suffix', c_size_t)
+    ]
+
+
+class SIPHASH(Structure):
+    _fields_ = [
+        ('k0', c_uint64),
+        ('k1', c_uint64),
+    ]
+
+
+class DJBX33A(Structure):
+    _fields_ = [
+        ('padding', c_ubyte * 16),
+        ('suffix', c_size_t),
+    ]
+
+
+class EXPAT(Structure):
+    _fields_ = [
+        ('padding', c_ubyte * 16),
+        ('hashsalt', c_size_t),
+    ]
+
+
+class _Py_HashSecret_t(Union):
+    _fields_ = [
+        # ensure 24 bytes
+        ('uc', c_ubyte * 24),
+        # two Py_hash_t for FNV
+        ('fnv', FNV),
+        # two uint64 for SipHash24
+        ('siphash', SIPHASH),
+        # a different (!) Py_hash_t for small string optimization
+        ('djbx33a', DJBX33A),
+        ('expat', EXPAT),
+    ]
+
+
+hashsecret = _Py_HashSecret_t.in_dll(pythonapi, '_Py_HashSecret')
+hashseed = bytes(hashsecret.uc)
+</code></pre>
+<p>However, you can't actually <em>do</em> anything with this information.  You can't set <code>_Py_HashSecret.uc</code> in a new Python process as doing so would break most dictionary keys set before you could do so from Python code (Python internals rely heavily on dictionaries), and your chances of the hash being equal to one of the 256**4 possible LCG values is vanishingly small. </p>
+<p>Your idea to set <code>PYTHONHASHSEED</code> to a known value everywhere is a far more feasible approach. </p>
+</div>
+<span class="comment-copy">Looking at the code, I don't think all possible states of <code>uc</code> even correspond to <code>PYTHONHASHSEED</code> values. <code>uc</code> is 24 bytes, while <code>PYTHONHASHSEED</code> is only 4. With no <code>PYTHONHASHSEED</code>, Python initializes <code>uc</code> in such a way that it's unlikely any <code>PYTHONHASHSEED</code> could produce the same result.</span>
+<span class="comment-copy">@user2357112 very good point. And you can't set the <code>uc</code> value either, as by the time you could do so from a Python program plenty of dictionary keys would have been hashed already. Setting the <code>uc</code> hash seed would invalidate anything that is not an interned string.</span>
+<span class="comment-copy">Great answer! Special thanks for the extra information on how <code>PYTHONHASHSEED</code> is actually used.</span>

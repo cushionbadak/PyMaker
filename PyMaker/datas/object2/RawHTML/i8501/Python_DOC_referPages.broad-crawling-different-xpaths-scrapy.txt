@@ -1,0 +1,177 @@
+<div class="post-text" itemprop="text">
+<p>I'm new in Scrapy. I have thousands of url,xpath tuples and values in a database. 
+These urls are from different domains (not allways, there can be 100 urls from the same domain). </p>
+<pre><code>x.com/a //h1
+y.com/a //div[@class='1']
+z.com/a //div[@href='...']
+x.com/b //h1
+x.com/c //h1
+...
+</code></pre>
+<p>Now I want to get these values every 2 hours as fast as possible but to be sure that I don't overload any of these. </p>
+<p>Can't figure out how to do that. </p>
+<p>My thoughts:</p>
+<p>I could create one Spider for every different domain, set it's parsing rules and run them at once. </p>
+<p>Is it a good practice? </p>
+<p>EDIT: 
+I'm not sure how it would work with outputting data into database according to concurrency.</p>
+<p>EDIT2:</p>
+<p>I can do something like this - for every domain there is a new spider. But this is impossible to do having thousands of different urls and it's xpaths.</p>
+<pre><code>class WikiScraper(scrapy.Spider):
+    name = "wiki_headers"
+
+    def start_requests(self):
+        urls = [
+            'https://en.wikipedia.org/wiki/Spider',
+            'https://en.wikipedia.org/wiki/Data_scraping',
+        ]
+        for url in urls:
+            yield scrapy.Request(url=url, callback=self.parse)
+
+    def parse(self, response):
+        hxs = HtmlXPathSelector(response)
+        header = hxs.select('//h1/text()').extract()
+        print header
+        filename = 'result.txt'
+        with open(filename, 'a') as f:
+            f.write(header[0])
+        self.log('Saved file %s' % filename)
+
+class CraigslistScraper(scrapy.Spider):
+    name = "craigslist_headers"
+
+    def start_requests(self):
+        urls = [
+            'https://columbusga.craigslist.org/act/6062657418.html',
+            'https://columbusga.craigslist.org/acc/6060297390.html',
+        ]
+        for url in urls:
+            yield scrapy.Request(url=url, callback=self.parse)
+
+    def parse(self, response):
+        hxs = HtmlXPathSelector(response)
+        header = hxs.select('//span[@id="titletextonly"]/text()').extract()
+        filename = 'result.txt'
+        with open(filename, 'a') as f:
+            f.write(header[0])
+        self.log('Saved file %s' % filename)
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>From the example you posted in edit2, it looks like all your classes are easily abstractable by one more level. How about this:?  </p>
+<pre><code>from urllib.parse import urlparse
+
+class GenericScraper(scrapy.Spider):
+    def __init__(self, urls, xpath):
+        super().__init__()
+        self.name = self._create_scraper_name_from_url(urls[0])
+        self.urls = urls
+        self.xpath = xpath
+
+    def _create_scraper_name_from_url(url):
+        '''Generate scraper name from url
+           www.example.com/foobar/bar -&gt; www_example_com'''
+        netloc = urlparse(url).netloc
+        return netloc.replace('.','_')
+
+    def start_requests(self):
+        for url in self.urls:
+            yield scrapy.Request(url=url, callback=self.parse)
+
+    def parse(self, response):
+        hxs = HtmlXPathSelector(response)
+        header = hxs.select(self.xpath).extract()
+        filename = 'result.txt'
+        with open(filename, 'a') as f:
+            f.write(header[0])
+        self.log('Saved file %s' % filename)
+</code></pre>
+<p>Next, you could group the data from database by xpaths</p>
+<pre><code>for urls, xpath in grouped_data:
+    scraper = GenericScraper(urls, xpath)
+    # do whatever you need with scraper
+</code></pre>
+<p>AD concurency: your database should handle concurent writes so I do not see a problem there</p>
+<p>Edit: 
+Related to the timeouts: I Do not know how scrapy works under the hood i.e. if it uses some sort of paralelization and whether it runs asynchronously in the background. But from what you wrote I guess it does and when you fire up 1k scrapers each firing multiple requests at time your hardware cant handle that much traffic (disclaimer, this is just a guess!).</p>
+<p>There might be a native way to do this, but a possible workaround is to use <a href="https://docs.python.org/3/library/multiprocessing.html" rel="nofollow noreferrer">multiprocessing</a> + Queue:</p>
+<pre><code>from multiprocessing import JoinableQueue, Process
+NUMBER_OF_CPU = 4 # change this to your number.
+SENTINEL = None
+
+
+class Worker(Process):
+    def __init__(self, queue):
+        super().__init__()
+        self.queue = queue
+    def run(self):
+        # blocking wait !You have to use sentinels if you use blocking waits!
+        item = self.queue.get():
+        if item is SENTINEL:
+            # we got sentinel, there are no more scrapers to process
+            self.queue.task_done()
+            return
+        else:
+            # item is scraper, run it
+            item.run_spider() # or however you run your scrapers
+            # This assumes that each scraper is **not** running in background! 
+
+            # Tell the JoinableQueue we have processed one more item
+            # In the main thread the queue.join() waits untill for
+            # each item taken from queue a queue.task_done() is called
+            self.queue.task_done()
+
+
+def run():
+    queue = JoinableQueue()
+    # if putting that many things in the queue gets slow (I imagine
+    # it can) You can fire up a separate Thread/Process to fill the
+    # queue in the background while workers are already consuming it.
+    for urls, xpath in grouped_data:
+        scraper = GenericScraper(urls, xpath)
+        queue.put(scraper)
+    for sentinel in range(NUMBER_OF_CPU):
+        # None or sentinel of your choice to tell the workers there are 
+        # no more scrapers to process
+        queue.put(SENTINEL)
+    workers = []
+    for _ in range(NUMBER_OF_CPU):
+        worker = Worker(queue)
+        workers.append(worker)
+        worker.start()
+
+    # We have to wait until the queue is processed
+    queue.join()
+</code></pre>
+<p>But please bear in mind that this is a vanilla approach for paralell execution completely ignoring Scrapy abilities. I have found <a href="http://kirankoduru.github.io/python/multiple-scrapy-spiders.html" rel="nofollow noreferrer">This blogpost</a> which uses <code>twisted</code> to achieve (what I think is) the same thing. But since I've never used twisted I can't comment on that</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>if you are thinking about <code>scrapy</code> can't handle multiple domains at once because of the <code>allowed_domains</code> parameters, remember that it is optional.</p>
+<p>If no <code>allowed_domains</code> parameter is set in the spider, it can work with every domain it gets.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If I understand correctly you have map of domain to xpath values and you want to pull xpath depending on what domain you crawl?<br/>
+Try something like:</p>
+<pre><code>DOMAIN_DATA = [('domain.com', '//div')] 
+def get_domain(url):
+    for domain, xpath in DOMAIN_DATA:
+        if domain in url: 
+            return xp
+
+
+def parse(self, response):
+    xpath = get_domain(response.url)
+    if not xpath:
+        logging.error('no xpath for url: {}; unknown domain'.format(response.url))
+        return
+    item = dict()
+    item['some_field'] = repsonse.xpath(xpath).extract()
+    yield item
+</code></pre>
+</div>
+<span class="comment-copy">Pocin, thank you for this answer, it seems to be working but there is one problem. If I run all spiders at once, allmost all responses are timeout errors. If I do for example for urls, xpath in grouped_data[:50]:, it works correctly. But unfortunately, I didn't find a way how to scrape by (50 item) chunks. More in this question: <a href="http://stackoverflow.com/questions/43156920/process-start-in-for-loop-scrapy-twisted" title="process start in for loop scrapy twisted">stackoverflow.com/questions/43156920/…</a></span>
+<span class="comment-copy">@MilanoSlesarik The link is broken. I've edited my answer to provide some more info</span>
+<span class="comment-copy">Yes but every url with different domain has different xpath to get data.</span>
+<span class="comment-copy">mmmm I think it is better to share the spider code you are thinking, because I don't see a problem with using configurable xpaths per domain.</span>
+<span class="comment-copy">I've added my code at the bottom of the question. I'm very new in Scrapy. In fact, I use multithreading and lxml for now, but I want to start using Scrapy because of throttling and other advantages.</span>
+<span class="comment-copy">@MilanoSlesarik did you have a look at StormCrawler? It handles politeness, throttling and is distributed. It can also do scheduling i.e. refetch every 2 hours. You wouldn't have to have one crawler per domain, they'd all run within the same crawler. The only missing bit is the per URL Xpath but I've opened an issue for it [<a href="https://github.com/DigitalPebble/storm-crawler/issues/445]" rel="nofollow noreferrer">github.com/DigitalPebble/storm-crawler/issues/445]</a></span>

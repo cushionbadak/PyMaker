@@ -1,0 +1,249 @@
+<div class="post-text" itemprop="text">
+<p>Say there's a function <code>func</code></p>
+<pre><code>def func():
+    class a:
+        def method(self):
+            return 'method'
+    def a(): return 'function'
+    lambda x: 'lambda'
+</code></pre>
+<p>that I need to examine.</p>
+<p>As a part of the examination I want to "retrieve" source code or objects of all nested classes and functions (if any). However I do realize that they don't exist <em>yet</em> and there's <em>no</em> direct/clean way of accessing them without running <code>func</code> or defining
+them outside (before) <code>func</code>. Unfortunately, the most I can do is import a module containing <code>func</code> to obtain the <code>func</code> function object.</p>
+<p>I discovered that functions have the <code>__code__</code> attribute containing the <code>code</code> object, which has the <code>co_consts</code> attribute so I wrote this:</p>
+<pre><code>In [11]: [x for x in func.__code__.co_consts if iscode(x) and x.co_name == 'a']
+Out[11]: 
+[&lt;code object a at 0x7fe246aa9810, file "&lt;ipython-input-6-31c52097eb5f&gt;", line 2&gt;,
+ &lt;code object a at 0x7fe246aa9030, file "&lt;ipython-input-6-31c52097eb5f&gt;", line 4&gt;]
+</code></pre>
+<p>Those <code>code</code> objects look awfully similar and I don't think they contain data necessary to help me distinguish between types of objects they represent (e.g. <code>type</code> and <code>function</code>).</p>
+<p><strong>Q1:</strong> Am I right?</p>
+<p><strong>Q2:</strong> Is there <em>any</em> way to access classes/functions (ordinary and lambdas) defined within the function body?</p>
+</div>
+<div class="post-text" itemprop="text">
+<h2>A1: Things that can help you are -</h2>
+<h3>Constants of the code object</h3>
+<p>From the <a href="https://docs.python.org/3/reference/datamodel.html#the-standard-type-hierarchy" rel="nofollow">documentation</a>:</p>
+<blockquote>
+<p>If a code object represents a function, the first item in <em>co_consts</em> is
+  the documentation string of the function, or <em>None</em> if undefined.</p>
+</blockquote>
+<p>Also, if a code object represents a class, the first item of <code>co_consts</code> is always the qualified name of that class. You can try to use this information.</p>
+<p>The following solution will correctly work in <em>most</em> cases, but you'll have to skip code objects Python creates for list/set/dict comprehensions and generator expressions:</p>
+<pre><code>from inspect import iscode
+
+for x in func.__code__.co_consts:
+    if iscode(x):
+        # Skip &lt;setcomp&gt;, &lt;dictcomp&gt;, &lt;listcomp&gt; or &lt;genexp&gt;
+        if x.co_name.startswith('&lt;') and x.co_name != '&lt;lambda&gt;':
+            continue
+        firstconst = x.co_consts[0]
+        # Compute the qualified name for the current code object
+        # Note that we don't know its "type" yet
+        qualname = '{func_name}.&lt;locals&gt;.{code_name}'.format(
+                        func_name=func.__name__, code_name=x.co_name)
+        if firstconst is None or firstconst != qualname:
+            print(x, 'represents a function {!r}'.format(x.co_name))
+        else:
+            print(x, 'represents a class {!r}'.format(x.co_name))
+</code></pre>
+<p>prints</p>
+<pre class="lang-none prettyprint-override"><code>&lt;code object a at 0x7fd149d1a9c0, file "&lt;ipython-input&gt;", line 2&gt; represents a class 'a'
+&lt;code object a at 0x7fd149d1ab70, file "&lt;ipython-input&gt;", line 5&gt; represents a function 'a'
+&lt;code object &lt;lambda&gt; at 0x7fd149d1aae0, file "&lt;ipython-input&gt;", line 6&gt; represents a function '&lt;lambda&gt;'
+</code></pre>
+<h3>Code flags</h3>
+<p>There's a way to get the required information from <code>co_flags</code>. Citing the documentation I linked above:</p>
+<blockquote>
+<p>The following flag bits are defined for <em>co_flags</em>: bit 0x04 is set if
+  the function uses the <em>*arguments</em> syntax to accept an arbitrary number
+  of positional arguments; bit 0x08 is set if the function uses the
+  <em>**keywords</em> syntax to accept arbitrary keyword arguments; bit 0x20 is set if the function is a generator.</p>
+<p>Other bits in <em>co_flags</em> are reserved for internal use.</p>
+</blockquote>
+<p>Flags are manipulated in <code>compute_code_flags</code> (<a href="https://hg.python.org/cpython/file/cbf83f55d5f3/Python/compile.c#l4667" rel="nofollow"><em>Python/compile.c</em></a>):</p>
+<pre class="lang-c prettyprint-override"><code>static int
+compute_code_flags(struct compiler *c)
+{
+    PySTEntryObject *ste = c-&gt;u-&gt;u_ste;
+    ...
+    if (ste-&gt;ste_type == FunctionBlock) {
+        flags |= CO_NEWLOCALS | CO_OPTIMIZED;
+        if (ste-&gt;ste_nested)
+            flags |= CO_NESTED;
+        if (ste-&gt;ste_generator)
+            flags |= CO_GENERATOR;
+        if (ste-&gt;ste_varargs)
+            flags |= CO_VARARGS;
+        if (ste-&gt;ste_varkeywords)
+            flags |= CO_VARKEYWORDS;
+    }
+
+    /* (Only) inherit compilerflags in PyCF_MASK */
+    flags |= (c-&gt;c_flags-&gt;cf_flags &amp; PyCF_MASK);
+
+    n = PyDict_Size(c-&gt;u-&gt;u_freevars);
+    ...
+    if (n == 0) {
+        n = PyDict_Size(c-&gt;u-&gt;u_cellvars);
+        ...
+        if (n == 0) {
+            flags |= CO_NOFREE;
+        }
+    }
+    ...
+}
+</code></pre>
+<p>There're 2 code flags (<code>CO_NEWLOCALS</code> and <code>CO_OPTIMIZED</code>) that won't be set for classes. You <em>can</em> use them to check the type (doesn't mean you should - poorly documented implementation details may change in the future):</p>
+<pre><code>from inspect import iscode
+
+for x in complex_func.__code__.co_consts:
+    if iscode(x):
+        # Skip &lt;setcomp&gt;, &lt;dictcomp&gt;, &lt;listcomp&gt; or &lt;genexp&gt;
+        if x.co_name.startswith('&lt;') and x.co_name != '&lt;lambda&gt;':
+            continue
+        flags = x.co_flags
+        # CO_OPTIMIZED = 0x0001, CO_NEWLOCALS = 0x0002
+        if flags &amp; 0x0001 and flags &amp; 0x0002:
+            print(x, 'represents a function {!r}'.format(x.co_name))
+        else:
+            print(x, 'represents a class {!r}'.format(x.co_name))
+</code></pre>
+<p>The output is exactly the same.</p>
+<h3>Bytecode of the outer function</h3>
+<p>It's also possible to get object type by inspecting the bytecode of the outer function.</p>
+<p>Search bytecode instructions to find blocks with <code>LOAD_BUILD_CLASS</code>, it  signifies the creation of a class (<code>LOAD_BUILD_CLASS</code> - <a href="https://docs.python.org/3/library/dis.html" rel="nofollow"><em>Pushes builtins.__build_class__() onto the stack. It is later called by CALL_FUNCTION to construct a class.</em></a>)</p>
+<pre><code>from dis import Bytecode
+from inspect import iscode
+from itertools import groupby
+
+def _group(i):
+    if i.starts_line is not None: _group.starts = i
+    return _group.starts
+
+bytecode = Bytecode(func)
+
+for _, iset in groupby(bytecode, _group):
+    iset = list(iset)
+    try:
+        code = next(arg.argval for arg in iset if iscode(arg.argval))
+        # Skip &lt;setcomp&gt;, &lt;dictcomp&gt;, &lt;listcomp&gt; or &lt;genexp&gt;
+        if code.co_name.startswith('&lt;') and code.co_name != '&lt;lambda&gt;':
+            raise TypeError
+    except (StopIteration, TypeError):
+        continue
+    else:
+        if any(x.opname == 'LOAD_BUILD_CLASS' for x in iset):
+            print(code, 'represents a function {!r}'.format(code.co_name))
+        else:
+            print(code, 'represents a class {!r}'.format(code.co_name)) 
+</code></pre>
+<p>The output is the same (again).</p>
+<h2>A2: Sure.</h2>
+<h3>Source code</h3>
+<p>In order to get the source code for code objects, you'd use <a href="https://docs.python.org/3/library/inspect.html#inspect.getsource" rel="nofollow"><code>inspect.getsource</code></a> or equivalent:</p>
+<pre><code>from inspect import iscode, ismethod, getsource
+from textwrap import dedent
+
+
+def nested_sources(ob):
+    if ismethod(ob):
+        ob = ob.__func__
+    try:
+        code = ob.__code__
+    except AttributeError:
+        raise TypeError('Can\'t inspect {!r}'.format(ob)) from None
+    for c in code.co_consts:
+        if not iscode(c):
+            continue
+        name = c.co_name
+        # Skip &lt;setcomp&gt;, &lt;dictcomp&gt;, &lt;listcomp&gt; or &lt;genexp&gt;
+        if not name.startswith('&lt;') or name == '&lt;lambda&gt;':
+            yield dedent(getsource(c))
+</code></pre>
+<p>For instance <code>nested_sources(complex_func)</code> (see below)</p>
+<pre><code>def complex_func():
+    lambda x: 42
+
+    def decorator(cls):
+        return lambda: cls()
+
+    @decorator
+    class b():
+        def method():
+            pass
+
+    class c(int, metaclass=abc.ABCMeta):
+        def method():
+            pass
+
+    {x for x in ()}
+    {x: x for x in ()}
+    [x for x in ()]
+    (x for x in ())
+</code></pre>
+<p>must yield source code for the first <code>lambda</code>, <code>decorator</code>, <code>b</code> (including <code>@decorator</code>) and <code>c</code>:</p>
+<pre><code>In [41]: nested_sources(complex_func)
+Out[41]: &lt;generator object nested_sources at 0x7fd380781d58&gt;
+
+In [42]: for source in _:
+   ....:     print(source, end='=' * 30 + '\n')
+   ....:     
+lambda x: 42
+==============================
+def decorator(cls):
+    return lambda: cls()
+==============================
+@decorator
+class b():
+    def method():
+        pass
+==============================
+class c(int, metaclass=abc.ABCMeta):
+    def method():
+        pass
+==============================
+</code></pre>
+<h3>Function and type objects</h3>
+<p>If you still need a function/class object, you can <a href="https://docs.python.org/3/library/functions.html#eval" rel="nofollow"><code>eval</code></a>/<a href="https://docs.python.org/3/library/functions.html#exec" rel="nofollow"><code>exec</code></a> the source code. </p>
+<p>Example</p>
+<ul>
+<li><p>for <code>lambda</code> functions:</p>
+<pre><code>In [39]: source = sources[0]
+
+In [40]: eval(source, func.__globals__)
+Out[40]: &lt;function __main__.&lt;lambda&gt;&gt;
+</code></pre></li>
+<li><p>for regular functions</p>
+<pre><code>In [21]: source, local = sources[1], {}
+
+In [22]: exec(source, func.__globals__, local)
+
+In [23]: local.popitem()[1]
+Out[23]: &lt;function __main__.decorator&gt;
+</code></pre></li>
+<li><p>for classes</p>
+<pre><code>In [24]: source, local = sources[3], {}
+
+In [25]: exec(source, func.__globals__, local)
+
+In [26]: local.popitem()[1] 
+Out[26]: __main__.c
+</code></pre></li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>Disassemble the x object. x can denote either a module, a class, a method, a function, a generator, an asynchronous generator, a coroutine, a code object, a string of source code or a byte sequence of raw bytecode. For a module, it disassembles all functions. For a class, it disassembles all methods (including class and static methods). For a code object or sequence of raw bytecode, it prints one line per bytecode instruction. It also recursively disassembles nested code objects (the code of comprehensions, generator expressions and nested functions, and the code used for building nested classes). Strings are first compiled to code objects with the compile() built-in function before being disassembled. If no object is provided, this function disassembles the last traceback.
+
+The disassembly is written as text to the supplied file argument if provided and to sys.stdout otherwise.
+
+The maximal depth of recursion is limited by depth unless it is None. depth=0 means no recursion.
+
+Changed in version 3.4: Added file parameter.
+
+Changed in version 3.7: Implemented recursive disassembling and added depth parameter.
+
+Changed in version 3.7: This can now handle coroutine and asynchronous generator objects.
+</code></pre>
+<p><a href="https://docs.python.org/3/library/dis.html#dis.dis" rel="nofollow noreferrer">https://docs.python.org/3/library/dis.html#dis.dis</a></p>
+</div>

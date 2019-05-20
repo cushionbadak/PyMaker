@@ -1,0 +1,122 @@
+<div class="post-text" itemprop="text">
+<p>I'm implementing a program that needs to serialize and deserialize large objects, so I was making some tests with <code>pickle</code>, <code>cPickle</code> and <code>marshal</code> modules to choose the best module. Along the way I found something very interesting:</p>
+<p>I'm using <code>dumps</code> and then <code>loads</code> (for each module) on a list of dicts, tuples, ints, float and strings.</p>
+<p>This is the output of my benchmark:</p>
+<pre><code>DUMPING a list of length 7340032
+----------------------------------------------------------------------
+pickle =&gt; 14.675 seconds
+length of pickle serialized string: 31457430
+
+cPickle =&gt; 2.619 seconds
+length of cPickle serialized string: 31457457
+
+marshal =&gt; 0.991 seconds
+length of marshal serialized string: 117440540
+
+LOADING a list of length: 7340032
+----------------------------------------------------------------------
+pickle =&gt; 13.768 seconds
+(same length?) 7340032 == 7340032
+
+cPickle =&gt; 2.038 seconds
+(same length?) 7340032 == 7340032
+
+marshal =&gt; 6.378 seconds
+(same length?) 7340032 == 7340032
+</code></pre>
+<p>So, from these results we can see that <code>marshal</code> was extremely fast in the <strong>dumping</strong> part of the benchmark:</p>
+<blockquote>
+<p>14.8x times faster than <code>pickle</code> and 2.6x times faster than <code>cPickle</code>.</p>
+</blockquote>
+<p>But, for my big surprise, <code>marshal</code> was by far slower than <code>cPickle</code> in the <strong>loading</strong> part:</p>
+<blockquote>
+<p>2.2x times faster than <code>pickle</code>, but 3.1x times slower than <code>cPickle</code>.</p>
+</blockquote>
+<p>And as for RAM, <code>marshal</code> performance while <strong>loading</strong> was also very inefficient:</p>
+<p><img alt="Ubuntu System Monitor" src="https://i.stack.imgur.com/ZAFoV.png"/></p>
+<p>I'm guessing the reason why loading with <code>marshal</code> is so slow is somehow related with the length of the its serialized string (much longer than <code>pickle</code> and <code>cPickle</code>).</p>
+<ul>
+<li>Why <code>marshal</code> dumps faster and loads slower?</li>
+<li>Why <code>marshal</code> serialized string is so long?</li>
+<li>Why <code>marshal</code>'s loading is so inefficient in RAM?</li>
+<li>Is there a way to improve <code>marshal</code>'s loading performance?</li>
+<li>Is there a way to merge <code>marshal</code> fast dumping with <code>cPickle</code> fast loading?</li>
+</ul>
+</div>
+<div class="post-text" itemprop="text">
+<p><a href="http://docs.python.org/release/2.5/lib/module-cPickle.html"><code>cPickle</code></a> has a smarter algorithm than <a href="http://docs.python.org/library/marshal.html"><code>marshal</code></a> and is able to do tricks to reduce the space used  by large objects. That means it'll be slower to decode but faster to encode as the resulting output is smaller.
+<code>marshal</code> is simplistic and serializes the object straight as-is without doing any further analyze it. That also answers why the <code>marshal</code> loading is so inefficient, it simply has to do more work - as in reading more data from disk - to be able to do the same thing as <code>cPickle</code>.</p>
+<p><code>marshal</code> and <code>cPickle</code> are really different things in the end, you can't really get both fast saving and fast loading since fast saving implies analyzing the data structures less which implies saving a lot of data to disk.  </p>
+<p>Regarding the fact that <code>marshal</code> might be incompatible to other versions of Python, you should generally use <code>cPickle</code>:</p>
+<blockquote>
+<p>"This is not a general “persistence” module. For general persistence and transfer of Python objects through RPC calls, see the modules pickle and shelve. The marshal module exists mainly to support reading and writing the “pseudo-compiled” code for Python modules of .pyc files. Therefore, the Python maintainers reserve the right to modify the marshal format in backward incompatible ways should the need arise. If you’re serializing and de-serializing Python objects, use the pickle module instead – the performance is comparable, version independence is guaranteed, and pickle supports a substantially wider range of objects than marshal." (<a href="http://docs.python.org/library/marshal.html">the python docs about marshal</a>)</p>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<p>Some people might think this too much of a hack, but I've had great success by simply wrapping the pickle dump calls with gc.disable() and gc.enable().  For example, the the snips below writing a ~50MB list of dictionaries goes from 78 seconds to 4.</p>
+<pre><code>#  not a complete example....
+gc.disable()
+cPickle.dump(params,fout,cPickle.HIGHEST_PROTOCOL)         
+fout.close()               
+gc.enable()
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The difference between these benchmarks gives one idea for speeding up cPickle:</p>
+<pre><code>Input: ["This is a string of 33 characters" for _ in xrange(1000000)]
+cPickle dumps 0.199 s loads 0.099 s 2002041 bytes
+marshal dumps 0.368 s loads 0.138 s 38000005 bytes
+
+Input: ["This is a string of 33 "+"characters" for _ in xrange(1000000)]
+cPickle dumps 1.374 s loads 0.550 s 40001244 bytes
+marshal dumps 0.361 s loads 0.141 s 38000005 bytes
+</code></pre>
+<p>In the first case, the list repeats the same string. The second list is equivalent, but each string is a separate object, because it is the result of an expression. Now, if you are originally reading your data in from an external source, you could consider some kind of string deduplication.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can make cPickle cca. 50x (!) faster by creating instance of cPickle.Pickler and then setting undocumented option 'fast' to 1:</p>
+<pre><code>outfile = open('outfile.pickle')
+fastPickler = cPickle.Pickler(outfile, cPickle.HIGHEST_PROTOCOL)
+fastPickler.fast = 1
+fastPickler.dump(myHugeObject)
+outfile.close()
+</code></pre>
+<p>But if your myHugeObject has cyclic references, the dump method will never end.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>As you can see, the output produced by <code>cPickle.dump</code> has about 1/4 of the length of the output produced by <code>marshal.dump</code>. This means that <code>cPickle</code> must use a more complicated algorithm to dump the data as unneeded things are removed. When loading the dumped list, <code>marshal</code> has to work through much more data while <code>cPickle</code> can process its data quickly as there is less data that has to be analysed.</p>
+<p>Regarding the fact that <code>marshal</code> might be incompatible to other versions of Python, you should generally use <code>cPickle</code>:</p>
+<blockquote>
+<p>"This is not a general “persistence” module. For general persistence and transfer of Python objects through RPC calls, see the modules pickle and shelve. The marshal module exists mainly to support reading and writing the “pseudo-compiled” code for Python modules of .pyc files. Therefore, the Python maintainers reserve the right to modify the marshal format in backward incompatible ways should the need arise. If you’re serializing and de-serializing Python objects, use the pickle module instead – the performance is comparable, version independence is guaranteed, and pickle supports a substantially wider range of objects than marshal." (<a href="http://docs.python.org/library/marshal.html" rel="nofollow">the python docs about marshal</a>)</p>
+</blockquote>
+</div>
+<div class="post-text" itemprop="text">
+<p>You could improve the storage efficiency by compressing the serialize result.</p>
+<p>My hunch are that compressing data and feeding it into the unserialize would be faster than reading raw from disk via HDD.</p>
+<p>Test below was made to prove that compression would speed up the unserialize process.
+The result wasn't as expect since the machine were equip with SSD.
+On HHD equip machine compressing the data using lz4 would be faster since reading from disk average between 60-70mb/s.</p>
+<p>LZ4: At a speed reduction of 18%, the compression yield 77.6% of additional storage.</p>
+<pre><code>marshal - compression speed time
+Bz2 7.492605924606323  10363490
+Lz4 1.3733329772949219 46018121
+--- 1.126852035522461 205618472
+cPickle - compression speed time
+Bz2 15.488649845123291 10650522
+Lz4 9.192650079727173  55388264
+--- 8.839831113815308 204340701
+</code></pre>
+</div>
+<span class="comment-copy">Your question is a dead-end.  The <code>marshal</code> module is not meant to be used as an alternative to <code>pickle</code>.  There is no official documentation for the marshal file format and it might change from version to version, so your benchmark results might be false in the future.</span>
+<span class="comment-copy">possible duplicate of <a href="http://stackoverflow.com/questions/329249/why-is-marshal-so-much-faster-than-pickle">Why is marshal so much faster than pickle?</a></span>
+<span class="comment-copy">In the core, your question is <i>exactly</i> the same: Why is marshal faster?  Speed/memory usage is the usual tradeoff in computing.  And yes, your question is not useful.  But of course this is just my opinion.</span>
+<span class="comment-copy">It is not guaranteed that a file created by marshal now will be readable by all future versions of Python. Your research is pointless.</span>
+<span class="comment-copy"><a href="http://stackoverflow.com/q/329249/183066">Related question</a></span>
+<span class="comment-copy">Wow, this really works ... but What are the repercussions?</span>
+<span class="comment-copy">This works perfectly! Total time required dropped by 20x for me as well. Though @Chris, can you point us towards any repercussions (if any) of the same?</span>
+<span class="comment-copy">@tdc, Tejas, you won't be able to dump acyclic object anymore, e.g. <code>x</code> in <code>x = []; x.append(x)</code> will cause a ValueError if Pickler.fast is enabled.</span>
+<span class="comment-copy">what about the load?</span>
+<span class="comment-copy">Useful to know! Does it make <code>load</code> faster too?</span>
+<span class="comment-copy">I don't think so, the fast option only disables duplicity sub-object detection when pickling the data. You can find more in python 3 series documentation (<a href="http://docs.python.org/3/library/pickle.html?highlight=pickle#pickle.Pickler.fast" rel="nofollow noreferrer">docs.python.org/3/library/…</a>) or of course in the code</span>
+<span class="comment-copy">It is for Python3 only.</span>
+<span class="comment-copy">Interesting results! Are you implying that you somehow avoided having to decompress the data before unserializing? If so, how?</span>

@@ -1,0 +1,247 @@
+<div class="post-text" itemprop="text">
+<p>I'm working on a bot for a competition that receives its' input through sys.stdin and uses Python's print() for output. I have the following:</p>
+<pre><code>import sys
+
+def main():
+    while True:
+        line = sys.stdin.readline()
+        parts = line.split()
+        if len(parts) &gt; 0:
+            # do stuff
+</code></pre>
+<p>The problem is that the input comes in through a stream and using the above blocks me from printing anything back until the stream is closed. What can I do to make this work?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>By turning blocking off you can only read a character at a time. So, there is no way to get <code>readline()</code> to work in a non-blocking context. I assume you just want to read key presses to control the robot.</p>
+<p>I have had no luck using <code>select.select()</code> on Linux and created a way with tweaking <code>termios</code> settings. So, this is Linux specific but works for me:</p>
+<pre><code>old_settings=None
+
+def init_anykey():
+   global old_settings
+   old_settings = termios.tcgetattr(sys.stdin)
+   new_settings = termios.tcgetattr(sys.stdin)
+   new_settings[3] = new_settings[3] &amp; ~(termios.ECHO | termios.ICANON) # lflags
+   new_settings[6][termios.VMIN] = 0  # cc
+   new_settings[6][termios.VTIME] = 0 # cc
+   termios.tcsetattr(sys.stdin, termios.TCSADRAIN, new_settings)
+
+@atexit.register
+def term_anykey():
+   global old_settings
+   if old_settings:
+      termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+def anykey():
+   ch_set = []
+   ch = os.read(sys.stdin.fileno(), 1)
+   while ch != None and len(ch) &gt; 0:
+      ch_set.append( ord(ch[0]) )
+      ch = os.read(sys.stdin.fileno(), 1)
+   return ch_set;
+
+init_anykey()
+while True:
+   key = anykey()
+   if key != None:
+      print key
+   else:
+      time.sleep(0.1)
+</code></pre>
+<p>A better Windows or cross-platform answer is here: <a href="https://stackoverflow.com/questions/2408560/python-nonblocking-console-input">Python nonblocking console input</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<pre><code>#-----------------------------------------------------------------------
+# Get a character from the keyboard.  If Block is True wait for input,
+# else return any available character or throw an exception if none is
+# available.  Ctrl+C isn't handled and continues to generate the usual
+# SIGINT signal, but special keys like the arrows return the expected 
+# escape sequences.
+#
+# This requires:
+#
+#    import sys, select
+#
+# This was tested using python 2.7 on Mac OS X.  It will work on any
+# Linux system, but will likely fail on Windows due to select/stdin
+# limitations.
+#-----------------------------------------------------------------------
+
+def GetChar(Block=True):
+  if Block or select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
+    return sys.stdin.read(1)
+  raise error('NoChar')
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>You can use selectors for handle I/O multiplexing:</p>
+<p><a href="https://docs.python.org/3/library/selectors.html" rel="nofollow noreferrer">https://docs.python.org/3/library/selectors.html</a> </p>
+<p>Try this out:</p>
+<pre><code>#! /usr/bin/python3
+
+import sys
+import fcntl
+import os
+import selectors
+
+# set sys.stdin non-blocking
+orig_fl = fcntl.fcntl(sys.stdin, fcntl.F_GETFL)
+fcntl.fcntl(sys.stdin, fcntl.F_SETFL, orig_fl | os.O_NONBLOCK)
+
+# function to be called when enter is pressed
+def got_keyboard_data(stdin):
+    print('Keyboard input: {}'.format(stdin.read()))
+
+# register event
+m_selector = selectors.DefaultSelector()
+m_selector.register(sys.stdin, selectors.EVENT_READ, got_keyboard_data)
+
+while True:
+    sys.stdout.write('Type something and hit enter: ')
+    sys.stdout.flush()
+    for k, mask in m_selector.select():
+        callback = k.data
+        callback(k.fileobj)
+</code></pre>
+<p>The above code will hold on the line</p>
+<pre><code>for k, mask in m_selector.select():
+</code></pre>
+<p>until a registered event occurs, returning a selector_key instance (k) and a mask of monitored events. </p>
+<p>In the above example we registered only one event (<em>Enter key press</em>):</p>
+<pre><code>m_selector.register(sys.stdin, selectors.EVENT_READ, got_keyboard_data)
+</code></pre>
+<p>The selector key instance is defined as follows:</p>
+<pre><code>abstractmethod register(fileobj, events, data=None)
+</code></pre>
+<p>Therefore, the register method sets k.data as our callback function <em>got_keyboard_data</em>, and calls it when the <em>Enter</em> key is pressed :</p>
+<pre><code>    callback = k.data
+    callback(k.fileobj)
+</code></pre>
+<p>A more complete example (and hopefully more useful) would be to multiplex stdin data from user with incomming connections from network:</p>
+<pre><code>import selectors
+import socket
+import sys
+import os
+import fcntl
+
+m_selector = selectors.DefaultSelector()
+
+# set sys.stdin non-blocking
+def set_input_nonblocking():
+    orig_fl = fcntl.fcntl(sys.stdin, fcntl.F_GETFL)
+    fcntl.fcntl(sys.stdin, fcntl.F_SETFL, orig_fl | os.O_NONBLOCK)
+
+def create_socket(port, max_conn):
+    server_addr = ('localhost', port)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.setblocking(False)
+    server.bind(server_addr)
+    server.listen(max_conn)
+    return server
+
+def read(conn, mask):
+    global GO_ON
+    client_address = conn.getpeername()
+    data = conn.recv(1024)
+    print('Got {} from {}'.format(data, client_address))
+    if not data:
+         GO_ON = False
+
+def accept(sock, mask):
+    new_conn, addr = sock.accept()
+    new_conn.setblocking(False)
+    print('Accepting connection from {}'.format(addr))
+    m_selector.register(new_conn, selectors.EVENT_READ, read)
+
+def quit():
+    global GO_ON
+    print('Exiting...')
+    GO_ON = False
+
+
+def from_keyboard(arg1, arg2):
+    line = arg1.read()
+    if line == 'quit\n':
+        quit()
+    else:
+        print('User input: {}'.format(line))
+
+GO_ON = True
+set_input_nonblocking()
+
+# listen to port 10000, at most 10 connections
+server = create_socket(10000, 10)
+
+m_selector.register(server, selectors.EVENT_READ, accept)
+m_selector.register(sys.stdin, selectors.EVENT_READ, from_keyboard)
+
+while GO_ON:
+    sys.stdout.write('&gt;&gt;&gt; ')
+    sys.stdout.flush()
+    for k, mask in m_selector.select():
+        callback = k.data
+        callback(k.fileobj, mask)
+
+
+# unregister events
+m_selector.unregister(sys.stdin)
+
+# close connection
+server.shutdown()
+server.close()
+
+#  close select
+m_selector.close()
+</code></pre>
+<p>You can test using two terminals.
+first terminal:</p>
+<pre><code>$ python3 test.py 
+&gt;&gt;&gt; bla
+</code></pre>
+<p>open another terminal and run:</p>
+<pre><code> $ nc localhost 10000
+ hey!
+</code></pre>
+<p>back to the first</p>
+<pre><code>&gt;&gt;&gt; qwerqwer     
+</code></pre>
+<p>Result (seen on the main terminal):</p>
+<pre><code>$ python3 test.py 
+&gt;&gt;&gt; bla
+User input: bla
+
+&gt;&gt;&gt; Accepting connection from ('127.0.0.1', 39598)
+&gt;&gt;&gt; Got b'hey!\n' from ('127.0.0.1', 39598)
+&gt;&gt;&gt; qwerqwer     
+User input: qwerqwer
+
+&gt;&gt;&gt; 
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>Might I suggest <code>nobreak</code>? If'n you are willing to use curses.</p>
+<p><a href="https://docs.python.org/3/library/curses.html#curses.window.nodelay" rel="nofollow noreferrer">https://docs.python.org/3/library/curses.html#curses.window.nodelay</a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Use a generator - thankfully <code>sys.stdin</code> is already a generator! </p>
+<p>A generator enables you to work on an infinite stream. Always when you call it, it returns the next element. In order to build a generator you need the <code>yield</code> keyword.</p>
+<pre><code>for line in sys.stdin:
+    print line
+
+    if a_certain_situation_happens:
+        break        
+</code></pre>
+<p>Do not forget to place a <code>break</code> statement into the loop if a certain, wished situation happens.</p>
+<p>You can find more information about generators on:</p>
+<ul>
+<li><a href="http://www.dabeaz.com/generators/index.html" rel="nofollow">http://www.dabeaz.com/generators/index.html</a></li>
+<li><a href="http://linuxgazette.net/100/pramode.html" rel="nofollow">http://linuxgazette.net/100/pramode.html</a></li>
+</ul>
+</div>
+<span class="comment-copy"><a href="http://stackoverflow.com/questions/8416586/turn-off-buffering">maybe</a> a <a href="http://stackoverflow.com/questions/107705/python-output-buffering">duplicate</a></span>
+<span class="comment-copy">Non-blocking on stdin either doesn't work or doesn't work very reliably. Are you allowed to use threading/multiprocessing? Cause that should work</span>
+<span class="comment-copy">Note that this <i>also</i> makes the terminal "non-echoing": keypresses are not shown. Here is another elegant way of achieving the same: <a href="http://ballingt.com/nonblocking-stdin-in-python-3/" rel="nofollow noreferrer">ballingt.com/nonblocking-stdin-in-python-3</a></span>
+<span class="comment-copy">I believe I tried this on Linux a while back and I don't think it worked. However, on the Mac I am on right now, it definitely does not work. Whether block is true or false, it still blocks. Additionally, the user has to press enter to release the "flood" of chars that gets built up. Maybe try to set input mode to raw (<code>tty.setraw()</code>) but then you have to set it to cooked mode after that.</span>
+<span class="comment-copy">Please add an explanation with your post, so that it is clear and easy to understand for future visitors</span>
+<span class="comment-copy">Aren't there other factors at play, though? Such as if the stream is line- or block-buffered?</span>
+<span class="comment-copy">sys.stdin is already a generator, so you can just do <code>for line in sys.stdin: ...</code> or use the newer <code>fileinput</code> module. neither are non-blocking though.</span>

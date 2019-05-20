@@ -1,0 +1,191 @@
+<div class="post-text" itemprop="text">
+<p>I've played around with threading before in Python, but decided to give the <code>asyncio</code> module a try, especially since you can cancel a running task, which seemed like a nice detail. However, for some reason, I can't wrap my head around it.</p>
+<p>Here's what I wanted to implement (sorry if I'm using incorrect terminology):</p>
+<ul>
+<li>a <code>downloader</code> thread that downloads the same file every <em>x</em> seconds, checks its hash against the previous download and saves it if it's different.</li>
+<li>a <code>webserver</code> thread that runs in the background, allowing control (pause, list, stop) of the <code>downloader</code> thread.</li>
+</ul>
+<p>I used <code>aiohttp</code> for the webserver.</p>
+<p>This is what I have so far:</p>
+<pre><code>class aiotest():
+
+    def __init__(self):
+        self._dl = None     # downloader future
+        self._webapp = None # web server future
+        self.init_server()
+
+    def init_server(self):
+
+        print('Setting up web interface')
+        app = web.Application()
+        app.router.add_route('GET', '/stop', self.stop)
+        print('added urls')
+        self._webapp = app
+
+    @asyncio.coroutine
+    def _downloader(self):
+        while True:
+            try:
+                print('Downloading and verifying file...')
+                # Dummy sleep - to be replaced by actual code
+                yield from asyncio.sleep(random.randint(3,10))
+                # Wait a predefined nr of seconds between downloads
+                yield from asyncio.sleep(30)
+            except asyncio.CancelledError:
+                break
+
+    @asyncio.coroutine
+    def _supervisor(self):
+
+        print('Starting downloader')
+        self._dl = asyncio.async(self._downloader())
+
+    def start(self):
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(self._supervisor())
+        loop.close()
+
+    @asyncio.coroutine
+    def stop(self):
+        print('Received STOP')
+        self._dl.cancel()
+        return web.Response(body=b"Stopping... ")
+</code></pre>
+<p>This class is called by:</p>
+<pre><code>t = aiotest()
+t.start()
+</code></pre>
+<p>This doesn't work of course, and I feel that this is a horrible piece of code.</p>
+<p>What's unclear to me:</p>
+<ul>
+<li>I stop the <code>downloader</code> in the <code>stop()</code> method, but how would I go about stopping the webserver (e.g. in a <code>shutdown()</code> method)?</li>
+<li>Does the <code>downloader</code> need a new event loop, or can I use the loop returned by <code>asyncio.get_event_loop()</code>?</li>
+<li>Do I really need something like the <code>supervisor</code> for what I'm trying to implement? This seems so clunky. And how do I get <code>supervisor</code> to keep running instead of ending after a single execution as it does now?</li>
+</ul>
+<p>One last, more general question: is <code>asyncio</code> supposed to replace the <code>threading</code> module (in the future)? Or does each have its own application?</p>
+<p>I appreciate all the pointers, remarks and clarifications!</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Why current code is not working:</p>
+<ul>
+<li><p>You're running event loop until <code>self._supervisor()</code> is complete. <code>self._supervisor()</code> creates task (it happens immediately) and finishes immediately.</p></li>
+<li><p>You're trying to run event loop until <code>_supervisor</code> complete, but how and when are you going start server? I think event loop should be running until server stopped. <code>_supervisor</code> or other stuff can be added as task (to same event loop). <code>aiohttp</code> already has function to start server and event loop - <code>web.run_app</code>, but we can do it <a href="http://aiohttp.readthedocs.org/en/stable/web.html#graceful-shutdown" rel="nofollow noreferrer">manually</a>.</p></li>
+</ul>
+<p>Your questions:</p>
+<ol>
+<li><p>Your server will run until you stop it. You can start/stop different
+coroutines while your server working.</p></li>
+<li><p>You need only one event loop for different coroutines.</p></li>
+<li><p>I think you don't need <code>supervisor</code>.</p></li>
+<li><p>More general question: <code>asyncio</code> helps you to run different
+functions parallel in single thread in single process. That's why
+asyncio is so cool and fast. Some of your sync code with threads you
+can rewrite using asyncio and it's coroutines. Moreover: asyncio can
+<a href="https://docs.python.org/3/library/asyncio-subprocess.html#subprocess-and-threads" rel="nofollow noreferrer">interact</a> with threads and processes.
+It can be useful in case you still need threads and processes: here's <a href="https://stackoverflow.com/a/22414756/1113207">example</a>.</p></li>
+</ol>
+<p>Useful notes:</p>
+<ul>
+<li>It's better to use term <code>coroutine</code> instead of <code>thread</code> while we talk about asyncio coroutines that are not threads</li>
+<li>If you use Python 3.5, you can use <code>async</code>/<code>await</code> <a href="https://www.python.org/dev/peps/pep-0492/" rel="nofollow noreferrer">syntax</a>
+instead of <code>coroutine</code>/<code>yield from</code></li>
+</ul>
+<p>I rewrote your code to show you idea. How to check it: run program, see console, open <code>http://localhost:8080/stop</code>, see console, open <code>http://localhost:8080/start</code>, see console, type CTRL+C.</p>
+<pre><code>import asyncio
+import random
+from contextlib import suppress
+
+from aiohttp import web
+
+
+class aiotest():
+    def __init__(self):
+        self._webapp = None
+        self._d_task = None
+        self.init_server()
+
+    # SERVER:
+    def init_server(self):
+        app = web.Application()
+        app.router.add_route('GET', '/start', self.start)
+        app.router.add_route('GET', '/stop', self.stop)
+        app.router.add_route('GET', '/kill_server', self.kill_server)
+        self._webapp = app
+
+    def run_server(self):
+        # Create server:
+        loop = asyncio.get_event_loop()
+        handler = self._webapp.make_handler()
+        f = loop.create_server(handler, '0.0.0.0', 8080)
+        srv = loop.run_until_complete(f)
+        try:
+            # Start downloader at server start:
+            asyncio.async(self.start(None))  # I'm using controllers here and below to be short,
+                                             # but it's better to split controller and start func
+            # Start server:
+            loop.run_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            # Stop downloader when server stopped:
+            loop.run_until_complete(self.stop(None))
+            # Cleanup resources:
+            srv.close()
+            loop.run_until_complete(srv.wait_closed())
+            loop.run_until_complete(self._webapp.shutdown())
+            loop.run_until_complete(handler.finish_connections(60.0))
+            loop.run_until_complete(self._webapp.cleanup())
+        loop.close()
+
+    @asyncio.coroutine
+    def kill_server(self, request):
+        print('Server killing...')
+        loop = asyncio.get_event_loop()
+        loop.stop()
+        return web.Response(body=b"Server killed")
+
+    # DOWNLOADER
+    @asyncio.coroutine
+    def start(self, request):
+        if self._d_task is None:
+            print('Downloader starting...')
+            self._d_task = asyncio.async(self._downloader())
+            return web.Response(body=b"Downloader started")
+        else:
+            return web.Response(body=b"Downloader already started")
+
+    @asyncio.coroutine
+    def stop(self, request):
+        if (self._d_task is not None) and (not self._d_task.cancelled()):
+            print('Downloader stopping...')
+            self._d_task.cancel()            
+            # cancel() just say task it should be cancelled
+            # to able task handle CancelledError await for it
+            with suppress(asyncio.CancelledError):
+                yield from self._d_task
+            self._d_task = None
+            return web.Response(body=b"Downloader stopped")
+        else:
+            return web.Response(body=b"Downloader already stopped or stopping")
+
+    @asyncio.coroutine
+    def _downloader(self):
+        while True:
+            print('Downloading and verifying file...')
+            # Dummy sleep - to be replaced by actual code
+            yield from asyncio.sleep(random.randint(1, 2))
+            # Wait a predefined nr of seconds between downloads
+            yield from asyncio.sleep(1)
+
+
+if __name__ == '__main__':
+    t = aiotest()
+    t.run_server()
+</code></pre>
+</div>
+<span class="comment-copy">Does your <code>downloader</code> block like it would in a traditional thread? Or will it use all asynchronous calls?</span>
+<span class="comment-copy">@cpburnz I used <code>requests</code> initially (which is blocking if I read correctly), but could also use <code>aiohttp</code>. It won't download multiple files (just a single one) and the file itself is relatively small (&lt; 200KB).</span>
+<span class="comment-copy">@Kristof have you got any questions about answer? Feel free to ask.</span>
+<span class="comment-copy">@germn You really helped me out a lot and I've been doing a fair bit of reading on <code>asyncio</code>, slowly starting to get the hang of it. Thanks so much for taking the time to rewrite my code!</span>
+<span class="comment-copy">if I wanted the shutdown the server (and stop the script completely) through a HTTP call, as if I used <code>CTRL-C</code> to interrupted, what would I have to do? Every attempt of mine results in <code>RuntimeError: Event loop is running.</code></span>
+<span class="comment-copy">@Kristof your server is event loop that handles requests as they come. You run your server to work forever, but you can stop it with <code>KeyboardInterrupt</code>. If you want to stop it in another coroutine or function, you can also call <code>loop.close()</code> - it will do almost same thing as when you type CTRL+C. I fixed example, now you can stop server with <code>http://localhost:8080/kill_server</code>. One more note: I understood that it's better to place downloader stopping inside <code>finally</code> block (as soon as you're going to stop server different ways).</span>

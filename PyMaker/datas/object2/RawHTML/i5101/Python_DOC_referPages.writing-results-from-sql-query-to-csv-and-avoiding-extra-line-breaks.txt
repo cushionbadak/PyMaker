@@ -1,0 +1,138 @@
+<div class="post-text" itemprop="text">
+<p>I have to extract data from several different database engines. After this data is exported, I send the data to AWS S3 and copy that data to Redshift using a COPY command. Some of the tables contain lots of text, with line breaks and other characters present in the column fields. When I run the following code:</p>
+<pre><code>cursor.execute('''SELECT * FROM some_schema.some_message_log''')
+rows = cursor.fetchall()
+with open('data.csv', 'w', newline='') as fp:
+    a = csv.writer(fp, delimiter='|', quoting=csv.QUOTE_ALL, quotechar='"', doublequote=True, lineterminator='\n')
+    a.writerows(rows)
+</code></pre>
+<p>Some of the columns that have carriage returns/linebreaks will create new lines:</p>
+<pre><code>"2017-01-05 17:06:32.802700"|"SampleJob"|""|"Date"|"error"|"Job.py"|"syntax error at or near ""from"" LINE 34: select *, SYSDATE, from staging_tops.tkabsences;
+                                      ^
+-&lt;class 'psycopg2.ProgrammingError'&gt;"
+</code></pre>
+<p>which causes the import process to fail. I can work around this by hard-coding for exceptions:</p>
+<pre><code>cursor.execute('''SELECT * FROM some_schema.some_message_log''')
+rows = cursor.fetchall()
+with open('data.csv', 'w', newline='') as fp:
+    a = csv.writer(fp, delimiter='|', quoting=csv.QUOTE_ALL, quotechar='"', doublequote=True, lineterminator='\n')
+
+for row in rows:
+    list_of_rows = []
+    for c in row:
+        if isinstance(c, str):
+            c = c.replace("\n", "\\n")
+            c = c.replace("|", "\|")
+            c = c.replace("\\", "\\\\")
+            list_of_rows.append(c)
+        else:
+            list_of_rows.append(c)
+    a.writerow([x.encode('utf-8') if isinstance(x, str) else x for x in list_of_rows])
+</code></pre>
+<p>But this takes a long time to process larger files, and seems like bad practice in general. Is there a faster way to export data from a SQL cursor to CSV that will not break when faced with text columns that contain carriage returns/line breaks?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>I suspect the issue is as simple as making sure the Python CSV export library and Redshift's COPY import speak a common interface.  In short, check your delimiters and quoting characters and make sure both the Python output and the Redshift COPY command agree.</p>
+<p>With slightly more detail: the DB drivers will have already done the hard work of getting to Python in a well-understood form.  That is, each row from the DB is a list (or tuple, generator, etc.), and each cell is individually accessible.  And at the point you have a list-like structure, Python's CSV exporter can do the rest of the work and -- crucially -- Redshift will be able to COPY FROM the output, embedded newlines and all.  <strong>In particular, you should not need to do any manual escaping; the <code>.writerow()</code> or <code>.writerows()</code> functions should be all you need do.</strong></p>
+<p>Redshift's COPY implementation understands the most common dialect of CSV by default, which is to</p>
+<ul>
+<li>delimit cells by a comma (<code>,</code>),</li>
+<li>quote cells with double quotes (<code>"</code>),</li>
+<li>and to escape any embedded double quotes by doubling (<code>"</code> → <code>""</code>).</li>
+</ul>
+<p>To back that up with documentation from <a href="https://docs.aws.amazon.com/redshift/latest/dg/copy-parameters-data-format.html#copy-format" rel="nofollow noreferrer">Redshift <code>FORMAT AS CSV</code></a>:</p>
+<blockquote>
+<p>... The default quote character is a double quotation mark ( " ). When the quote character is used within a field, escape the character with an additional quote character. ...</p>
+</blockquote>
+<p>However, your Python CSV export code uses a pipe (<code>|</code>) as the <code>delimiter</code> and sets the <code>quotechar</code> to double quote (<code>"</code>).  That, too, can work, but why stray from <a href="https://docs.python.org/3/library/csv.html#dialects-and-formatting-parameters" rel="nofollow noreferrer">the defaults</a>?  Suggest using CSV's namesake and keeping your code simpler in the process:</p>
+<pre><code>cursor.execute('''SELECT * FROM some_schema.some_message_log''')
+rows = cursor.fetchall()
+with open('data.csv', 'w') as fp:
+    csvw = csv.writer( fp )
+    csvw.writerows(rows)
+</code></pre>
+<p>From there, tell COPY to use the CSV format (again with no need for non-default specifications):</p>
+<pre><code>COPY  your_table  FROM  your_csv_file  auth_code  FORMAT AS CSV;
+</code></pre>
+<p>That should do it.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>If you're doing <code>SELECT * FROM table</code> without a <code>WHERE</code> clause, you could use <code>COPY table TO STDOUT</code> instead, with the right options:</p>
+<pre class="lang-none prettyprint-override"><code>copy_command = """COPY some_schema.some_message_log TO STDOUT
+        CSV QUOTE '"' DELIMITER '|' FORCE QUOTE *"""
+
+with open('data.csv', 'w', newline='') as fp:
+    cursor.copy_expert(copy_command)
+</code></pre>
+<p>This, in my testing, results in literal '\n' instead of actual newlines, where writing through the csv writer gives broken lines.</p>
+<p>If you do need a <code>WHERE</code> clause in production you could create a temporary table and copy it instead:</p>
+<pre class="lang-none prettyprint-override"><code>cursor.execute("""CREATE TEMPORARY TABLE copy_me AS
+        SELECT this, that, the_other FROM table_name WHERE conditions""")
+</code></pre>
+<p>(edit) Looking at your question again I see you mention "ever all different database engines". The above works with psyopg2 and postgresql but could probably be adapted for other databases or libraries.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Why write to the database after every row?</p>
+<pre><code>cursor.execute('''SELECT * FROM some_schema.some_message_log''')
+rows = cursor.fetchall()
+with open('data.csv', 'w', newline='') as fp:
+    a = csv.writer(fp, delimiter='|', quoting=csv.QUOTE_ALL, quotechar='"', doublequote=True, lineterminator='\n')
+
+list_of_rows = []
+for row in rows:
+    for c in row:
+        if isinstance(c, basestring):
+            c = c.replace("\n", "\\n")
+            c = c.replace("|", "\|")
+            c = c.replace("\\", "\\\\")
+    list_of_rows.append(row)
+a.writerows([x.encode('utf-8') if isinstance(x, str) else x for x in list_of_rows])
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p>The problem is that you are using the Redshift <code>COPY</code> command with its default parameters, which use a pipe as a delimiter (see <a href="https://docs.aws.amazon.com/redshift/latest/dg/r_COPY.html#r_COPY-syntax-overview-data-format" rel="nofollow noreferrer">here</a> and <a href="https://docs.aws.amazon.com/redshift/latest/dg/copy-parameters-data-format.html#copy-delimiter" rel="nofollow noreferrer">here</a>) and require escaping of newlines and pipes within text fields (see <a href="https://docs.aws.amazon.com/redshift/latest/dg/copy-parameters-data-conversion.html#copy-escape" rel="nofollow noreferrer">here</a> and <a href="https://docs.aws.amazon.com/redshift/latest/dg/r_COPY_command_examples.html" rel="nofollow noreferrer">here</a>). However, the Python csv writer only knows how to do the standard thing with embedded newlines, which is to leave them as-is, inside a quoted string.</p>
+<p>Fortunately, the Redshift <code>COPY</code> command can also use the standard CSV format. Adding the <code>CSV</code> option to your <code>COPY</code> command <a href="https://docs.aws.amazon.com/redshift/latest/dg/copy-parameters-data-format.html#copy-csv" rel="nofollow noreferrer">gives you this behavior</a>:</p>
+<blockquote>
+<p>Enables use of CSV format in the input data. To automatically escape delimiters, newline characters, and carriage returns, enclose the field in the character specified by the QUOTE parameter. The default quote character is a double quotation mark ( " ). When the quote character is used within a field, escape the character with an additional quote character."</p>
+</blockquote>
+<p>This is exactly the approach used by the Python CSV writer, so it should take care of your problems. So my advice would be to create a standard csv file using code like this:</p>
+<pre><code>cursor.execute('''SELECT * FROM some_schema.some_message_log''')
+rows = cursor.fetchall()
+with open('data.csv', 'w', newline='') as fp:
+    a = csv.writer(fp)  # no need for special settings
+    a.writerows(rows)
+</code></pre>
+<p>Then in Redshift, change your <code>COPY</code> command to something <a href="https://docs.aws.amazon.com/redshift/latest/dg/r_COPY_command_examples.html#load-from-csv" rel="nofollow noreferrer">like this</a> (note the added <code>CSV</code> tag):</p>
+<pre><code>COPY logdata
+FROM 's3://mybucket/data/data.csv' 
+iam_role 'arn:aws:iam::0123456789012:role/MyRedshiftRole' 
+CSV;
+</code></pre>
+<p>Alternatively, you could continue manually converting your fields to match the default settings for Redshift's COPY command. Python's <code>csv.writer</code> won't do this for you on its own, but you may be able to speed up your code a bit, especially for big files, like this:</p>
+<pre><code>cursor.execute('''SELECT * FROM some_schema.some_message_log''')
+rows = cursor.fetchall()
+with open('data.csv', 'w', newline='') as fp:
+    a = csv.writer(
+        fp, 
+        delimiter='|', quoting=csv.QUOTE_ALL, 
+        quotechar='"', doublequote=True, lineterminator='\n'
+    )
+    a.writerows(
+        c.replace("\\", "\\\\").replace("\n", "\\\n").replace("|", "\\|").encode('utf-8')
+        if isinstance(c, str)
+        else c
+        for row in rows
+        for c in row
+    )
+</code></pre>
+<p>As another alternative, you could experiment with importing the query data into a <code>pandas</code> DataFrame with <code>.from_sql</code>, doing the replacements in the DataFrame (a whole column at a time), then writing the table out with <code>.to_csv</code>. Pandas has incredibly fast csv code, so this may give you a significant speedup.</p>
+<p><em>Update:</em> I just noticed that in the end I basically duplicated @hunteke's answer. The key point (which I missed the first time through) is that you probably haven't been using the <code>CSV</code> argument in your current Redshift <code>COPY</code> command; if you add that, this should get easy. </p>
+</div>
+<span class="comment-copy">Is it necessary to export using a piece of code? Why not use phpMyAdmin or Mysql Workbench.</span>
+<span class="comment-copy">@UdayrajDeshmukh: This is part of an ETL pipeline that we want to automate on remote servers. Does that make sense? I think code here is preferred to a manual process.</span>
+<span class="comment-copy">I'm somewhat surprised you can't just write strict CSV output, with standard quotes and comma delimiters.  Postgres handles properly quoted cells (e.g., containing newlines) just fine.  For example, read Postgres' <a href="https://www.postgresql.org/docs/10/static/sql-copy.html#id-1.9.3.52.9.3" rel="nofollow noreferrer">COPY FROM WITH FORMAT CSV</a>, specifically paragraph 3. Perhaps I'm not understanding your problem?</span>
+<span class="comment-copy">@hunteke Thanks for the reply! Maybe I wasn't clear enough in my example, but I need to extract data from multiple database types, not just Postgres. The COPY FROM WITH FORMAT CSV would work well for a Postgres data source, but are there similar functions for Oracle, SQL Server, etc?</span>
+<span class="comment-copy">@user2752159 I understand that you are copying to Redshift, and behind the scenes, Redshift is basically Postgres (based on an old, <i>old</i> version).  COPY FROM (writing <i>to</i> a DB table, which is the opposite of COPY TO) is what I'm getting at.  As long as you can have your CSV library output cells and rows that the Postgres v8 parser understands, you should be good to go.</span>
+<span class="comment-copy">Thank you! I was in fact using 'DELIMITER AS '|" in my COPY command. Replacing that with CSV fixed this issue. For reference, my final code is below. I forgot to mention that my query results can occasionally overwhelm the fetchall() statement, so I still resolve row by row. Also, I write to a gzip file.</span>
+<span class="comment-copy"><code>cursor.execute('''SELECT * FROM some.message_log''') with gzip.open('data.csv.gz', 'wt') as fp: csvw = csv.writer(fp) for row in cursor: csvw.writerow(row)</code></span>
+<span class="comment-copy">Thanks for the response! My current issue is extracting from an Oracle data source, so I wasn't able to the above answer to work unfortunately. But for Postgres I will try this solution in the future.</span>

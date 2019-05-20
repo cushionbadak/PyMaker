@@ -1,0 +1,118 @@
+<div class="post-text" itemprop="text">
+<p>I expected <code>array.array</code> to be faster than lists, as arrays seem to be unboxed.</p>
+<p>However, I get the following result:</p>
+<pre class="lang-none prettyprint-override"><code>In [1]: import array
+
+In [2]: L = list(range(100000000))
+
+In [3]: A = array.array('l', range(100000000))
+
+In [4]: %timeit sum(L)
+1 loop, best of 3: 667 ms per loop
+
+In [5]: %timeit sum(A)
+1 loop, best of 3: 1.41 s per loop
+
+In [6]: %timeit sum(L)
+1 loop, best of 3: 627 ms per loop
+
+In [7]: %timeit sum(A)
+1 loop, best of 3: 1.39 s per loop
+</code></pre>
+<p>What could be the cause of such a difference?</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <em>storage</em> is "unboxed", but every time you access an element Python has to "box" it (embed it in a regular Python object) in order to do anything with it.  For example, your <code>sum(A)</code> iterates over the array, and boxes each integer, one at a time, in a regular Python <code>int</code> object.  That costs time.  In your <code>sum(L)</code>, all the boxing was done at the time the list was created.</p>
+<p>So, in the end, an array is generally slower, but requires substantially less memory.</p>
+<hr/>
+<p>Here's the relevant code from a recent version of Python 3, but the same basic ideas apply to all CPython implementations since Python was first released.</p>
+<p>Here's the code to access a list item:</p>
+<pre><code>PyObject *
+PyList_GetItem(PyObject *op, Py_ssize_t i)
+{
+    /* error checking omitted */
+    return ((PyListObject *)op) -&gt; ob_item[i];
+}
+</code></pre>
+<p>There's very little to it:  <code>somelist[i]</code> just returns the <code>i</code>'th object in the list (and all Python objects in CPython are pointers to a struct whose initial segment conforms to the layout of a <code>struct PyObject</code>).</p>
+<p>And here's the <code>__getitem__</code> implementation for an <code>array</code> with type code <code>l</code>:</p>
+<pre><code>static PyObject *
+l_getitem(arrayobject *ap, Py_ssize_t i)
+{
+    return PyLong_FromLong(((long *)ap-&gt;ob_item)[i]);
+}
+</code></pre>
+<p>The raw memory is treated as a vector of platform-native <code>C</code> <code>long</code> integers; the <code>i</code>'th <code>C long</code> is read up; and then <code>PyLong_FromLong()</code> is called to wrap ("box") the native <code>C long</code> in a Python <code>long</code> object (which, in Python 3, which eliminates Python 2's distinction between <code>int</code> and <code>long</code>, is actually shown as type <code>int</code>).</p>
+<p>This boxing has to allocate new memory for a Python <code>int</code> object, and spray the native <code>C long</code>'s bits into it.  In the context of the original example, this object's lifetime is very brief (just long enough for <code>sum()</code> to add the contents into a running total), and then more time is required to deallocate the new <code>int</code> object.</p>
+<p>This is where the speed difference comes from, always has come from, and always will come from in the CPython implementation.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>To add to Tim Peters' excellent answer, arrays implement the <a href="https://docs.python.org/3/c-api/buffer.html">buffer protocol</a>, while lists do not.  This means that, <em>if you are writing a C extension</em> (or the moral equivalent, such as writing a <a href="http://cython.org">Cython</a> module), then you can access and work with the elements of an array much faster than anything Python can do.  This will give you considerable speed improvements, possibly well over an order of magnitude.  However, it has a number of downsides:</p>
+<ol>
+<li>You are now in the business of writing C instead of Python.  Cython is one way to ameliorate this, but it does not eliminate many fundamental differences between the languages; you need to be familiar with C semantics and understand what it is doing.</li>
+<li>PyPy's C API works <a href="http://morepypy.blogspot.ie/2010/04/using-cpython-extension-modules-with.html">to some extent</a>, but isn't very fast.  If you are targeting PyPy, you should probably just write simple code with regular lists, and then let the JITter optimize it for you.</li>
+<li>C extensions are harder to distribute than pure Python code because they need to be compiled.  Compilation tends to be architecture and operating-system dependent, so you will need to ensure you are compiling for your target platform.</li>
+</ol>
+<p>Going straight to C extensions may be using a sledgehammer to swat a fly, depending on your use case.  You should first investigate <a href="http://docs.scipy.org/doc/numpy/about.html">NumPy</a> and see if it is powerful enough to do whatever math you're trying to do.  It will also be much faster than native Python, if used correctly.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>Tim Peters answered <strong>why</strong> this is slow, but let's see <strong>how to improve</strong> it.</p>
+<p>Sticking to your example of <code>sum(range(...))</code> (factor 10 smaller than your example to fit into memory here):</p>
+<pre><code>import numpy
+import array
+L = list(range(10**7))
+A = array.array('l', L)
+N = numpy.array(L)
+
+%timeit sum(L)
+10 loops, best of 3: 101 ms per loop
+
+%timeit sum(A)
+1 loop, best of 3: 237 ms per loop
+
+%timeit sum(N)
+1 loop, best of 3: 743 ms per loop
+</code></pre>
+<p>This way also numpy needs to box/unbox, which has additional overhead. To make it fast one has to stay within the numpy c code:</p>
+<pre><code>%timeit N.sum()
+100 loops, best of 3: 6.27 ms per loop
+</code></pre>
+<p>So from the list solution to the numpy version this is a factor 16 in runtime.</p>
+<p>Let's also check how long creating those data structures takes</p>
+<pre><code>%timeit list(range(10**7))
+1 loop, best of 3: 283 ms per loop
+
+%timeit array.array('l', range(10**7))
+1 loop, best of 3: 884 ms per loop
+
+%timeit numpy.array(range(10**7))
+1 loop, best of 3: 1.49 s per loop
+
+%timeit numpy.arange(10**7)
+10 loops, best of 3: 21.7 ms per loop
+</code></pre>
+<p>Clear winner: Numpy</p>
+<p>Also note that creating the data structure takes about as much time as summing, if not more. Allocating memory is slow.</p>
+<p>Memory usage of those:</p>
+<pre><code>sys.getsizeof(L)
+90000112
+sys.getsizeof(A)
+81940352
+sys.getsizeof(N)
+80000096
+</code></pre>
+<p>So these take 8 bytes per number with varying overhead. For the range we use 32bit ints are sufficient, so we can safe some memory.</p>
+<pre><code>N=numpy.arange(10**7, dtype=numpy.int32)
+
+sys.getsizeof(N)
+40000096
+
+%timeit N.sum()
+100 loops, best of 3: 8.35 ms per loop
+</code></pre>
+<p>But it turns out that adding 64bit ints is faster than 32bit ints on my machine, so this is only worth it if you are limited by memory/bandwidth.</p>
+</div>
+<span class="comment-copy">numpy tools can exploit efficiently your array :  %timeit np.sum(A) : 100 loops, best of 3: 8.87 ms per loop</span>
+<span class="comment-copy">I've never come across a situation where I've needed to use the <code>array</code> package. If you want to do significant amounts of math, Numpy operates at light-speed (i.e. C), and usually better than naive implementations of things like <code>sum()</code>).</span>
+<span class="comment-copy">Close voters: Why exactly is this opinion-based?  OP appears to be asking a specific, technical question about a measurable and repeatable phenomenon.</span>
+<span class="comment-copy">@NickT Read <a href="http://legacy.python.org/doc/essays/list2str.html" rel="nofollow noreferrer">An optimization anecdote</a>. Turns out <code>array</code> is pretty fast in converting a string of integers (representing ASCII bytes) to a <code>str</code> object. Guido himself only came up with this after lots of other solution and was quite surprised at the performance.  Anyway this is the only place where I remember seeing it being useful. <code>numpy</code> is much better for dealing with arrays but it's a 3rd party dependency.</span>

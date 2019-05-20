@@ -1,0 +1,174 @@
+<div class="post-text" itemprop="text">
+<p>I have the following <a href="https://stackoverflow.com/help/mcve">mcve</a>:</p>
+<pre><code>import logging
+class MyGenIt(object):
+    def __init__(self, name, content):
+        self.name = name
+        self.content = content
+    def __iter__(self):
+        with self:
+            for o in self.content:
+                yield o
+    def __enter__(self):
+        return self
+    def __exit__(self,  exc_type, exc_value, traceback):
+        if exc_type:
+            logging.error("Aborted %s", self,
+                          exc_info=(exc_type, exc_value, traceback))
+</code></pre>
+<p>And here is sample use:</p>
+<pre><code>for x in MyGenIt("foo",range(10)):
+    if x == 5:
+        raise ValueError("got 5")
+</code></pre>
+<p>I would like <code>logging.error</code> to report the <code>ValueError</code>, but instead it reports <code>GeneratorExit</code>:</p>
+<pre><code>ERROR:root:Aborted &lt;__main__.MyGenIt object at 0x10ca8e350&gt;
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 8, in __iter__
+GeneratorExit
+</code></pre>
+<p>When I catch <code>GeneratorExit</code> in <code>__iter__</code>:</p>
+<pre><code>def __iter__(self):
+    with self:
+        try:
+            for o in self.content:
+                yield o
+        except GeneratorExit:
+            return
+</code></pre>
+<p>nothing is logged (of course) because <code>__exit__</code> is called with <code>exc_type=None</code>. </p>
+<ol>
+<li>Why do I see <code>GeneratorExit</code> instead of <code>ValueError</code> in <code>__exit__</code>?</li>
+<li>What do I do to get the desired behavior, i.e., <code>ValueError</code> in <code>__exit__</code>?</li>
+</ol>
+</div>
+<div class="post-text" itemprop="text">
+<p>Just a quick note that you could "bring the context manager out" of the generator, and by only changing 3 lines get:</p>
+<pre><code>import logging
+class MyGenIt(object):
+    def __init__(self, name, content):
+        self.name = name
+        self.content = content
+
+    def __iter__(self):
+        for o in self.content:
+            yield o
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self,  exc_type, exc_value, traceback):
+        if exc_type:
+            logging.error("Aborted %s", self,
+                          exc_info=(exc_type, exc_value, traceback))
+
+
+with MyGenIt("foo", range(10)) as gen:
+    for x in gen:
+        if x == 5:
+            raise ValueError("got 5")
+</code></pre>
+<p>A context manager that could also act as an iterator -- and would catch caller code exceptions like your ValueError.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The basic problem is that you are trying to use a <code>with</code> statement inside the generator to catch an exception that is raised outside the generator. You cannot get <code>__iter__</code> to see the ValueError, because <code>__iter__</code> is not executing at the time the ValueError is raised.</p>
+<p>The GeneratorExit exception is raised when the generator itself is deleted, which happens when it is garbage collected.  As soon as the exception occurs, the <code>for</code> loop terminates; since the only reference to the generator (the object obtained by calling <code>__iter__</code>) is in the loop expression, terminating the loop removes the only reference to the iterator and makes it available for garbage collection.  It appears that here it is being garbage collected immediately, meaning that the GeneratorExit exception happens <em>between</em> the raising of the ValueError and the propagation of that ValueError to the enclosing code.  The GeneratorExit is normally handled totally internally; you are only seeing it because your <code>with</code> statement is inside the generator itself.</p>
+<p>In other words, the flow goes something like this:</p>
+<ol>
+<li>Exception is raised outside the generator</li>
+<li><code>for</code> loop exits
+
+<ol>
+<li>Generator is now available for garbage collection</li>
+<li>Generator is garbage collected
+
+<ol>
+<li>Generator's <code>.close()</code> is called</li>
+<li>GeneratorExit is raised inside the generator</li>
+</ol></li>
+</ol></li>
+<li>ValueError propagates to calling code</li>
+</ol>
+<p>The last step does not occur until <em>after</em> your context manager has seen the GeneratorExit.  When I run your code, I see the ValueError raised <em>after</em> the log message is printed.</p>
+<p>You can see that the garbage collection is at work, because if you create another reference to the iterator itself, it will keep the iterator alive, so it won't be garbage collected, and so the GeneratorExit won't occur.  That is, this "works":</p>
+<pre><code>it = iter(MyGenIt("foo",range(10)))
+for x in it:
+    if x == 5:
+        raise ValueError("got 5")
+</code></pre>
+<p>The result is that the ValueError propagates and is visible; no GeneratorExit occurs and nothing is logged.  You seem to think that the GeneratorExit is somehow "masking" your ValueError, but it isn't really; it's just an artifact introduced by not keeping any other references to the iterator.  The fact that GeneratorExit occurs immediately in your example isn't even guaranteed behavior; it's possible that the iterator might not be garbage-collected until some unknown time in the future, and the GeneratorExit would then be logged at that time.</p>
+<p>Turning to your larger question of "why do I see GeneratorExit", the answer is that that is the only exception that actually occurs within the generator function.  The ValueError occurs outside the generator, so the generator can't catch it.  This means your code can't really work in the way you seem to intend it to.  Your <code>with</code> statement is <em>inside</em> the generator function.  Thus it can only catch exceptions that happen in the process of yielding items from the generator; there generator has no knowledge of what happens between the times when it advances.  But your ValueError is raised in the body of the loop over the generator contents.  The generator is not executing at this time; it's just sitting there suspended.</p>
+<p>You can't use a <code>with</code> statement in a generator to magically trap exceptions that occur in the code that iterates over the generator.  The generator does not "know" about the code that iterates over it and can't handle exceptions that occur there.  If you want to catch exceptions within the loop body, you need a separate <code>with</code> statement enclosing the loop itself.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>The <a href="https://docs.python.org/3/library/exceptions.html#GeneratorExit" rel="nofollow noreferrer"><code>GeneratorExit</code></a> is raised whenever a generator or coroutine is closed.  Even without the context manager, we can replicate the exact condition with a simple generator function that prints out the exception information when it errors (further reducing the provided code to show exactly how and where that exception is generated).</p>
+<pre><code>import sys
+def dummy_gen():
+    for idx in range(5): 
+        try:
+            yield idx 
+        except:
+            print(sys.exc_info())
+            raise
+
+for i in dummy_gen():
+    raise ValueError('foo')
+</code></pre>
+<p>Usage:</p>
+<pre><code>(&lt;class 'GeneratorExit'&gt;, GeneratorExit(), &lt;traceback object at 0x7f96b26b4cc8&gt;)
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 2, in &lt;module&gt;
+ValueError: foo
+</code></pre>
+<p>Note there was also an exception that was raised <em>inside</em> the generator itself, as noted that the <code>except</code> block was executed.  Note that the exception was also further <code>raise</code>'d after the print statement but note how that isn't actually shown anywhere, because it is handled internally.</p>
+<p>We can also abuse this fact to see if we can manipulate the flow by swallowing the <code>GeneratorExit</code> exception and see what happens.  This can be done by removing the <code>raise</code> statement inside the <code>dummy_gen</code> function to get the following output:</p>
+<pre><code>(&lt;class 'GeneratorExit'&gt;, GeneratorExit(), &lt;traceback object at 0x7fd1f0438dc8&gt;)
+Exception ignored in: &lt;generator object dummy_gen at 0x7fd1f0436518&gt;
+RuntimeError: generator ignored GeneratorExit
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 2, in &lt;module&gt;
+ValueError: foo
+</code></pre>
+<p>Note how there is an internal <code>RuntimeError</code> that was raised that complained about the generator ignoring the <code>GeneratorExit</code> function.  So we from this we can clearly see that this exception is produced by the generator itself inside the generator function, and the <code>ValueError</code> that is raised <em>outside</em> that scope is never present <em>inside</em> the generator function.</p>
+<p>Since a context manager will trap all exceptions as is, and the context manager is <em>inside</em> the generator function, whatever exception raised inside it will simply be passed to <code>__exit__</code> as is.  Consider the following:</p>
+<pre><code>class Context(object):
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type:
+            logging.error("Aborted %s", self,
+                          exc_info=(exc_type, exc_value, traceback))
+</code></pre>
+<p>Modify the <code>dummy_gen</code> to the following:</p>
+<pre><code>def dummy_gen():
+    with Context():
+        for idx in range(5):
+            try:
+                yield idx
+            except:
+                print(sys.exc_info())
+                raise
+</code></pre>
+<p>Running the resulting code:</p>
+<pre><code>(&lt;class 'GeneratorExit'&gt;, GeneratorExit(), &lt;traceback object at 0x7f44b8fb8908&gt;)
+ERROR:root:Aborted &lt;__main__.Context object at 0x7f44b9032d30&gt;
+Traceback (most recent call last):
+  File "foo.py", line 26, in dummy_gen
+    yield idx
+GeneratorExit
+Traceback (most recent call last):
+  File "foo.py", line 41, in &lt;module&gt;
+    raise ValueError('foo')
+ValueError: foo
+</code></pre>
+<p>The same <code>GeneratorExit</code> that is raised is now presented to the context manager, because this is the behavior that was defined.</p>
+</div>
+<span class="comment-copy">What exactly is the goal of the code provided? Are you trying to provide a context manager that is also an iterator? Why are you trying to use the instance itself as a context manager to get the iterator?  You don't need the <code>with self:</code> call inside <code>__iter__</code> if you are only doing iteration since by the definition of the class it's already inside.</span>
+<span class="comment-copy">@metatoaster: this is a <i>minimal</i> example - in reality both <code>__enter__</code> and <code>__exit__</code> do some important things.</span>
+<span class="comment-copy">Okay, to do this properly, you really want to separate the two things (context manager and iterator) into two separate things, since a context manager is also a generator of sort which can make things confusing.  However, if you are able to specify how this class is used something can be done.</span>
+<span class="comment-copy">@metatoaster: actually, I merged the two classes (context and iter) into one for brevity. the point is that I don't understand why I see <code>GeneratorExit</code> instead of <code>ValueError</code>.</span>
+<span class="comment-copy">While it seems you can find the offending line by inspecting current stack inside <code>__exit__</code>, <a href="https://stackoverflow.com/questions/44598548/catch-exception-thrown-in-generator-caller-in-python">this related</a> might be helpful.</span>
+<span class="comment-copy">Yeah I was going to also write this, but given that OP wants specific cleanups done without the user of the generator to worry about that, I didn't end up putting this in my answer also as it changes the intended API.  That said, <code>__iter__</code> can be implemented to check for a flag that <code>__enter__</code> might set to ensure that the iteration is executed within the context manager provided by the same instance.</span>
+<span class="comment-copy">It's a little hard to tell what the OP is aiming for, but this seems like it might be the closest thing.  Like you say, it is possible to use the same <i>object</i> as the iterator and the context manager.  But the actual syntaxes of the <code>with</code> and <code>for</code> statements both need to be explicit at the point of use, as in your example; you can't "hide" the <code>with</code> statement inside the innards of the iterator.</span>
+<span class="comment-copy">This is correct, but note that here too, the GeneratorExit is only occurring because you are not keeping a reference to the iterator.  If you do so, no GeneratorExit will occur (until you delete any extra references you've kept).</span>
+<span class="comment-copy">@BrenBarn Yeah I left out the explanation in the first sentence on what does it mean when "a generator closes", after I distracted myself with building the example showing OP exactly where it manifested.</span>

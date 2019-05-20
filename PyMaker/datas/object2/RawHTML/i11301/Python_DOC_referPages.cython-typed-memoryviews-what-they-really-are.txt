@@ -1,0 +1,71 @@
+<div class="post-text" itemprop="text">
+<p>The Cython <a href="http://docs.cython.org/src/userguide/memoryviews.html" rel="noreferrer">documentation</a> explains very well what they allow for, how you can declare them, and how to use them.</p>
+<p>However, it is still not clear to me what they really are. For example, a simple assignment from a numpy array like this:</p>
+<pre><code>my_arr = np.empty(10, np.int32)
+cdef int [:] new_arr = my_arr
+</code></pre>
+<p>can make the accessing/assignment of <code>my_arr</code> faster.</p>
+<p>What is it happening behind the scenes? Numpy should already allocate the elements in memory in a contiguous fashion, so what's the deal with memoryviews? Apparently not that much, in fact the memoryview assignment of the numpy array <code>new_arr</code> should be equivalent to </p>
+<pre><code>cdef np.ndarray[np.int32_t, ndim=1] new_arr = np.empty(10, np.int32)
+</code></pre>
+<p>in terms of speed. However, memoryviews are considered more general than numpy array buffer; could you make a simple example in which the added 'generalization' is important/interesting?  </p>
+<p>Furthermore, if I have already allocated a pointer in order to make things as fast as possible, what is the advantage of casting it to a typed memoryview? (the answer to this question might be the same of the one above)</p>
+<pre><code>cdef int *my_arr = &lt;int *&gt; malloc(N * sizeof(int))
+cdef int[:] new_arr = &lt;int[:N]&gt;my_arr
+</code></pre>
+</div>
+<div class="post-text" itemprop="text">
+<p><strong>What is a memoryview:</strong></p>
+<p>When you write in a function:</p>
+<pre><code>cdef double[:] a
+</code></pre>
+<p>you end up with a <code>__Pyx_memviewslice</code> object:</p>
+<pre><code>typedef struct {
+  struct __pyx_memoryview_obj *memview;
+  char *data;
+  Py_ssize_t shape[8];
+  Py_ssize_t strides[8];
+  Py_ssize_t suboffsets[8];
+} __Pyx_memviewslice;
+</code></pre>
+<p>The memoryview contains a C pointer some some data which it (usually) doesn't directly own. It also contains a pointer to an underlying Python object (<code>struct __pyx_memoryview_obj *memview;</code>). If the data is owned by a Python object then <code>memview</code> holds a reference to that and ensures the Python object that holds the data is kept alive as long as the memoryview is around.</p>
+<p>The combination of the pointer to the raw data, and information of how to index it (<code>shape</code>, <code>strides</code> and <code>suboffsets</code>) allows Cython to do indexing the using the raw data pointers and some simple C maths (which is very efficient). e.g.:</p>
+<pre><code>x=a[0]
+</code></pre>
+<p>gives something like:</p>
+<pre><code>(*((double *) ( /* dim=0 */ (__pyx_v_a.data + __pyx_t_2 * __pyx_v_a.strides[0]) )));
+</code></pre>
+<p>In contrast, if you work with untyped objects and write something like:</p>
+<pre><code>a = np.array([1,2,3]) # note no typedef
+x = x[0]
+</code></pre>
+<p>the indexing is done as:</p>
+<pre><code>__Pyx_GetItemInt(__pyx_v_a, 0, long, 1, __Pyx_PyInt_From_long, 0, 0, 1);
+</code></pre>
+<p>which itself expands to a whole bunch of Python C-api calls (so is slow). Ultimately it calls <code>a</code>'s <code>__getitem__</code> method.</p>
+<hr/>
+<p><strong>Compared to typed numpy arrays:</strong> there really isn't a huge difference.
+If you do something like:</p>
+<pre><code>cdef np.ndarray[np.int32_t, ndim=1] new_arr
+</code></pre>
+<p>it works practically very like a memoryview, with access to raw pointers and the speed should be very similar.</p>
+<p>The advantage to using memoryviews is that you can use a wider range of array types with them (such as the <a href="https://docs.python.org/3/library/array.html" rel="noreferrer">standard library array</a>), so you're more flexible about the types your functions can be called with. This fits in with the general Python idea of "duck-typing" - that your code should work with any parameter that behaves the right way (rather than checking the type). </p>
+<p>A second (small) advantage is that you don't need the numpy headers to build your module.</p>
+<p>A third (possibly larger) advantage is that memoryviews can be initialised without the GIL while <code>cdef np.ndarray</code>s can't (<a href="http://docs.cython.org/src/userguide/memoryviews.html#comparison-to-the-old-buffer-support" rel="noreferrer">http://docs.cython.org/src/userguide/memoryviews.html#comparison-to-the-old-buffer-support</a>)</p>
+<p>A slight disadvantage to memoryviews is that they seem to be slightly slower to set up.</p>
+<hr/>
+<p><strong>Compared to just using <code>malloc</code>ed int pointers:</strong></p>
+<p>You won't get any speed advantage (but neither will you get too much speed loss). The minor advantages of converting using a memoryview are:</p>
+<ol>
+<li><p>You can write functions that can be used either from Python or internally within Cython:</p>
+<pre><code>cpdef do_something_useful(double[:] x):
+    # can be called from Python with any array type or from Cython
+    # with something that's already a memoryview
+    ....
+</code></pre></li>
+<li><p>You can let Cython handle the freeing of memory for this type of array, which could simplify your life for things that have an unknown lifetime. See <a href="http://docs.cython.org/src/userguide/memoryviews.html#cython-arrays" rel="noreferrer">http://docs.cython.org/src/userguide/memoryviews.html#cython-arrays</a> and especially <code>.callback_free_data</code>.</p></li>
+<li><p>You can pass your data back to python python code (it'll get the underlying <code>__pyx_memoryview_obj</code> or something similar). Be very careful of memory management here (i.e. see point 2!).</p></li>
+<li><p>The other thing you can do is handle things like 2D arrays defined as pointer to pointer (e.g. <code>double**</code>). See <a href="http://docs.cython.org/src/userguide/memoryviews.html#specifying-more-general-memory-layouts" rel="noreferrer">http://docs.cython.org/src/userguide/memoryviews.html#specifying-more-general-memory-layouts</a>. I generally don't like this type of array, but if you have existing C code that already uses if then you can interface with that (and pass it back to Python so your Python code can also use it).</p></li>
+</ol>
+</div>
+<span class="comment-copy">The first line of the documentation, <code>Typed memoryviews allow efficient access to memory buffers, such as those underlying NumPy arrays, without incurring any Python overhead. </code>  It looks to me like <code>memoryview</code> is just <code>cython's</code> own set of <code>c</code> functions for accessing a buffer, bypassing the <code>numpy</code> functions.  It won't be faster than direct <code>c</code> style access, but may be easier to use.</span>

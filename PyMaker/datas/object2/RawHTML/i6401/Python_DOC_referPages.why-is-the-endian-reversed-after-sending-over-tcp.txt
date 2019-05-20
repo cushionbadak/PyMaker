@@ -1,0 +1,298 @@
+<div class="post-text" itemprop="text">
+<p>I have a client written in C#, and a server written in python. The messages that I send over the socket are 8 bytes followed by the data, the 8 bytes are the data length.</p>
+<p>In C# before sending, I convert the 8-byte data length too big endian as shown:</p>
+<pre><code>public void Send(SSLMsg m)
+{
+    string json = m.Serialize();
+    byte[] data = Encoding.ASCII.GetBytes(json);
+    ulong dataLen = (ulong)data.Length;
+    byte[] dataLenPacked = packIt(dataLen);
+
+    Log("Sending " + dataLen + " " + json);
+
+    sslStream.Write(dataLenPacked);
+    sslStream.Write(data);
+    sslStream.Flush();
+
+}
+
+private byte[] packIt(ulong n)
+{
+    byte[] bArr = BitConverter.GetBytes(n);
+    if (BitConverter.IsLittleEndian)
+        Array.Reverse(bArr, 0, 8);
+    return bArr;
+}
+</code></pre>
+<p>The message is sent successfully and I am getting tied up in the python server code since the unpack format should be correct here shouldn't it?</p>
+<pre><code>(length,) = unpack('&gt;Q', data)
+# len(data) is 8 here
+# length is 1658170187863248538
+</code></pre>
+<p>Isn't the big-endian character '&gt;'? Why is my length so long?</p>
+<h2>UPDATE:</h2>
+<p>There was a bug where I was unpacking the wrong 8 bytes, that has been fixed, now that I am unpacking the correct data I still have the same question.</p>
+<pre><code>(length,) = unpack('&gt;Q', data)
+# len(data) is 8 here
+# length is 13330654897016668160L
+</code></pre>
+<p>The correct length is given only if I unpack using little endian even though I sent the bytes to the server using big-endian... so I am expecting &gt;Q to work, but instead 
+
+<pre><code>(length,) = unpack('&lt;Q', data)
+# len(data) is 8 here
+# length is 185
+</code></pre>
+<p>Here is how I am receiving the bytes in python:</p>
+<pre><code>while (True):
+    r,w,e = select.select(...)
+    for c in r:
+        if (c == socket):
+            connection_accept(c)
+        else
+           # c is SSL wrapped  at this point
+           read = 0
+           data = []
+           while (read != 8):
+               bytes = c.recv(min(8-read, 8))
+               read += len(bytes)
+               data.append(bytes)
+           joinedData = ''.join(data)
+
+           # the below length is 13330654897016668160L
+           # I am expecting it to be 185
+           (length,) = unpack('&gt;Q', joinedData)
+
+           # the below length is 185, it should not be however
+           # since the bytes were sent in big-endian
+           (length,) = unpack('&lt;Q', joinedData)
+</code></pre>
+</p></div>
+<div class="post-text" itemprop="text">
+<p>Something is wrong with your code:</p>
+<blockquote>
+<p>length is 1658170187863248538</p>
+</blockquote>
+<p>This is in hex 1703010020BB4E9A. This has nothing to do with a length of 8, no matter which endianess is involved. Instead it looks suspiciously like a TLS record:</p>
+<pre><code> 17    - record type application data (decimal 23)
+ 03 01 - protocol version TLS 1.0 (aka SSL 3.1)
+ 00 20 - length of the following encrypted data (32 byte)
+ .. 
+</code></pre>
+<p>Since according to your code your are doing SSL there is probably something wrong in your receiver. My guess is that you read from the plain socket instead of the SSL socket and thus read the encrypted data instead of the decrypted ones.</p>
+</div>
+<div class="post-text" itemprop="text">
+<p>On client side, when you write data to stream, you're doing two Write calls:</p>
+<pre><code>sslStream.Write(dataLenPacked);
+sslStream.Write(data);
+sslStream.Flush();
+</code></pre>
+<p>MSDN says about <a href="https://msdn.microsoft.com/en-us/library/system.net.sockets.networkstream.write(v=vs.110).aspx" rel="nofollow noreferrer">NetworkStream.Write</a>: <em>The Write method blocks until the requested number of bytes are sent or a SocketException is thrown.</em> On the server side, there is no guarantee that you will receive all bytes in  one receive call - it depends on OS, eth driver/config and etc. So, you have to handle this scenario. As I can see in you're handling it by reading 8 or less bytes, but <a href="https://docs.python.org/2/library/socket.html#socket.socket.recv" rel="nofollow noreferrer">socket.recv</a> says, it's better to receive by bigger portions. Here is my implementation of the server on Python. It creates binary file in the current folder with received bytes - might be helpful to analyze what's wrong. To set listening port need to use -p/--port argument:</p>
+<pre><code>#!/usr/bin/env python
+
+import sys, socket, io
+import argparse
+import struct
+
+CHUNK_SIZE = 4096
+
+def read_payload(connection, payload_len):
+    recv_bytes = 0
+    total_data = ""
+    while (recv_bytes &lt; payload_len):
+        data = connection.recv(CHUNK_SIZE)
+        if not data:
+            break
+        total_data += data
+        recv_bytes += len(data)
+    if len(total_data) != payload_len:
+        print &gt;&gt; sys.stderr, "-ERROR. Expected to read {0} bytes, but have read {0} bytes\n".format(payload_len, len(total_data))
+    return total_data
+
+def handle_connection(connection, addr):
+    total_received = 0
+    addrAsStr = "{0}:{1}".format(addr[0], addr[1])
+
+    # write receved bytes to file for analyzis
+    filename = "{0}_{1}.bin".format(addr[0], addr[1])
+    file = io.FileIO(filename, "w")
+    print "Connection from {0}".format(addrAsStr)
+
+    try:
+        # loop for handling data transfering for particular connection
+        while True:
+            header = connection.recv(CHUNK_SIZE)
+            header_len = len(header)
+            total_received += header_len
+            if header_len == 0:
+                break
+            if header_len &lt; 8:
+                print &gt;&gt; sys.stderr, "-ERROR. Received header with len {0} less than 8 bytes!\n".format(header_len)
+                break
+
+            print("Header len is {0} bytes".format(len(header)))
+
+            # extract payload length - it's first 8 bytes
+            real_header = header[0:8]
+            file.write(real_header)
+
+            # more about unpack - https://docs.python.org/3/library/struct.html#module-struct
+            # Byte order - network (= big-endian), type - unsigned long long (8 bytes)
+            payload_len = struct.unpack("!Q", real_header)[0]
+            print("Payload len is {0} bytes".format(payload_len))
+
+            # extract payload from header
+            payload_in_header = header[8:] if header_len &gt; 8 else ""
+            if len(payload_in_header) &gt; 0:
+                print "Payload len in header is {0} bytes".format(len(payload_in_header))
+                file.write(payload_in_header)
+
+            # calculate remains
+            remains_payload_len = payload_len - len(payload_in_header)
+            remains_payload = read_payload(connection, remains_payload_len)
+            payload = payload_in_header + remains_payload
+            print("Payload is '{0}'".format(payload))
+
+            if remains_payload:
+                file.write(remains_payload)
+            else:
+                break
+            total_received += len(remains_payload)
+    finally:
+            file.close()
+
+    return total_received
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-p', '--port', required=True)
+    args = parser.parse_args()
+
+    # listen tcp socket on all interfaces
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("0.0.0.0", int(args.port)))
+    s.listen(1)
+
+    # loop for handling incoming connection
+    while True:
+        print "Waiting for a connection..."
+        (connection, addr) = s.accept()
+        addrAsStr = "{0}:{1}".format(addr[0], addr[1])
+
+        try:
+            total_received = handle_connection(connection, addr)
+            print "Handled connection from {0}. Received: {1} bytes\n".format(addrAsStr, total_received)
+        finally:
+            # Clean up the connection
+            connection.close()
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<p>To make this example full, here is C# client. It uses one external library - <a href="https://www.nuget.org/packages/Newtonsoft.Json/" rel="nofollow noreferrer">Newtonsoft.Json</a> for serialization:</p>
+<pre><code>using Newtonsoft.Json;
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+
+namespace SimpleTcpClient
+{
+    class SimpleTcpClient : IDisposable
+    {
+        readonly TcpClient _client;
+
+        public SimpleTcpClient(string host, int port)
+        {
+            _client = new TcpClient(host, port);
+        }
+        public void Send(byte[] payload)
+        {
+            // Get network order of array length
+            ulong length = (ulong)IPAddress.HostToNetworkOrder(payload.LongLength);
+            var stream = _client.GetStream();
+            // Write length
+            stream.Write(BitConverter.GetBytes(length), 0, sizeof(long));
+            // Write payload
+            stream.Write(payload, 0, payload.Length);
+            stream.Flush();
+            Console.WriteLine("Have sent {0} bytes", sizeof(long) + payload.Length);
+        }
+        public void Dispose()
+        {
+            try { _client.Close(); }
+            catch { }
+        }
+    }
+    class Program
+    {
+        class DTO
+        {
+            public string Name { get; set; }
+            public int Age { get; set; }
+            public double Weight { get; set; }
+            public double Height { get; set; }
+            public string RawBase64 { get; set; }
+        }
+
+        static void Main(string[] args)
+        {
+            // Set server name/ip-address
+            string server = "192.168.1.101";
+            // Set server port
+            int port = 8080;
+            string[] someNames = new string[]
+            {
+                "James", "David",    "Christopher",  "George",   "Ronald",
+                "John", "Richard",  "Daniel",   "Kennet",  "Anthony",
+                "Robert","Charles", "Paul", "Steven",   "Kevin",
+                "Michae", "Joseph", "Mark", "Edward",   "Jason",
+                "Willia", "Thomas", "Donald",   "Brian",    "Jeff"
+            };
+            // Init random generator
+            Random rnd = new Random(Environment.TickCount);
+            int i = 1;
+            while (true) {
+                try {
+                    using (var c = new SimpleTcpClient(server, port)) {
+                        byte[] rawData = new byte[rnd.Next(16, 129)];
+                        rnd.NextBytes(rawData);
+
+                        // Create random data transfer object
+                        var d = new DTO() {
+                            Name = someNames[rnd.Next(0, someNames.Length)],
+                            Age = rnd.Next(10, 101),
+                            Weight = rnd.Next(70, 101),
+                            Height = rnd.Next(165, 200),
+                            RawBase64 = Convert.ToBase64String(rawData)
+                        };
+
+                        // UTF-8 doesn't have endianness - so we can convert it to byte array and send it
+                        // More about it - https://stackoverflow.com/questions/3833693/isn-t-on-big-endian-machines-utf-8s-byte-order-different-than-on-little-endian 
+                        var bytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(d));
+                        c.Send(bytes);
+                    }
+                }
+                catch (Exception ex) {
+                    Console.WriteLine("Get exception when send: {0}\n", ex);
+                }
+                Thread.Sleep(200);
+                i++;
+            }
+        }
+    }
+}
+</code></pre>
+<p><a href="https://i.stack.imgur.com/9hDb6.png" rel="nofollow noreferrer"><img alt="Example" src="https://i.stack.imgur.com/9hDb6.png"/></a></p>
+</div>
+<div class="post-text" itemprop="text">
+<p>According to <a href="https://msdn.microsoft.com/en-us/library/z78xtwts(v=vs.110).aspx" rel="nofollow noreferrer">https://msdn.microsoft.com/en-us/library/z78xtwts(v=vs.110).aspx</a> you are reversing 9 bytes when you invoke:</p>
+<pre><code>if (BitConverter.IsLittleEndian)
+    Array.Reverse(bArr, 0, 8);
+</code></pre>
+<p>and according to <a href="https://www.displayfusion.com/Discussions/View/converting-c-data-types-to-c/?ID=38db6001-45e5-41a3-ab39-8004450204b3" rel="nofollow noreferrer">https://www.displayfusion.com/Discussions/View/converting-c-data-types-to-c/?ID=38db6001-45e5-41a3-ab39-8004450204b3</a> a ulong in C# is only 8 bytes.</p>
+<p>I don't think that this is necessarily an answer, but maybe it's a clue?</p>
+</div>
+<span class="comment-copy">It is necessary to get information on application stack your are using on client side and server side to create a working repro of the problem and then solve it. From my perspective it could be a double conversion of endianess somewhere in the networking/application app stack.</span>
+<span class="comment-copy">yes there was a bug like that, fixed now. the length is now 13330654897016668160 when using &gt;Q, but when I use &lt;Q it gives the correct value of 185 which is the length of the string I am sending</span>
+<span class="comment-copy">@user740521: please don't make your question a moving target. The initial problem of reading the wrong data was found. Now you've just changed the question to give different - and inconsistent - values where you claim that you've got 13330654897016668160 for a real length of 8 even though the real length for this was 185 as you correctly show in your comment but not in the question.</span>
