@@ -12,8 +12,6 @@ from time import sleep
 from lt2.obj3_datasearch import *
 
 
-f = open("PyMaker/test/accuracy.txt", 'w')
-
 googleurl = "https://www.google.com/search?q=site:docs.python.org/3/+"
 pydocurl = "https://docs.python.org/3/"
 
