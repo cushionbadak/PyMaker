@@ -26,7 +26,6 @@ output_path = '../datas/object3/1st/'
 
 for i in range(len(raw_list)):
     output_list = os.listdir(raw_list[i])
-    
     for item in output_list:
         txtFile = open(raw_list[i] + '/' + item, mode = 'r', encoding = 'utf-8')
         line = txtFile.readlines()

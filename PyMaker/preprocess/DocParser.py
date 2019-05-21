@@ -43,8 +43,7 @@ for idx, docslink in docsList.items():
             cnt += 1
         elif target_bs.name == 'dt':
             f.write('link:\n' + docslink + '\n\n' + 'docs:' + '\n')
-            for item in target_bs.find_parent():
-                f.write(str(item))
+            f.write(target_bs.find_parent().get_text())
             f.close()
             cnt += 1
     printProgress(cnt, len(docsList), 'Progress:', 'Complete', 1, 50)
