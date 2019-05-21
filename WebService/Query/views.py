@@ -13,7 +13,8 @@ def query(request):
 
 def answer(request):
     queryText = request.POST['QueryText']
-    answerList = pymaker_service.evaluate_query(queryText)
+    upperdoc = True if request.POST['type'] == 'upperdoc' else False
+    answerList = pymaker_service.evaluate_query(queryText, upperdoc=upperdoc)
 
     context = {}
     context['queryText'] = queryText
