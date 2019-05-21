@@ -6,6 +6,7 @@ sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 import requests
 from bs4 import BeautifulSoup as bs
 
+from random import randint
 from time import sleep
 
 from lt2.obj3_datasearch import *
@@ -54,7 +55,9 @@ for i in range(len(allfilelist)):
     print('ANSWERS:')
     for a in answerlist:
         print('\t' + a)
-    sleep(0.05)
+
+    rand_value = randint(1, 5)
+    sleep(rand_value)
 
 print('TOTAL CORRECT: ' + str(sum(correctcount)) + ' / ' + str(sum(answercount)) + '\n')
 print()
