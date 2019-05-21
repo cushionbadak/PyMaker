@@ -1,6 +1,5 @@
 import requests
 from bs4 import BeautifulSoup as bs
-import json
 
 response = requests.get("https://docs.python.org/3/contents.html") # Python Complete Page list
 html = response.content
@@ -22,7 +21,7 @@ for refer in contents.find_all('a', {"class" : "reference internal"}):
         response = requests.get("https://docs.python.org/3/" + href) # Contents Page
         html = response.content
         doc = bs(html, "html.parser")
-        
+
         # Link to content title
         for header in doc.find_all('a', {"class" : "headerlink"}):
             link = header["href"]

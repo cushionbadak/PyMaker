@@ -1,5 +1,3 @@
-import json
-
 with open("./Pymaker/datas/pythonDocToNumber.txt", 'r') as f:
     data = f.read()
     links = eval(data)
