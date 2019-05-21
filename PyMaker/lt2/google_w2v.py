@@ -19,7 +19,6 @@ def unigram_sentence_wordvecsum(ws):
     # make initv zero value.
     initv = np.zeros(modellength)
 
-    print(len(model['car']))
     for w in ws:
         if w in model:
             initv += model[w]
