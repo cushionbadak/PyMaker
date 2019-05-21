@@ -15,7 +15,7 @@ def printProgress (iteration, total, prefix = '', suffix = '', decimals = 1, bar
     sys.stdout.flush()
 
 docsList =[]
-dataPath = "../datas/object4/1st/"
+dataPath = "../datas/object4/2nd/"
 with open("../datas/numberToPythonDoc.txt", 'r') as f:
     data = f.read()
     docsList = eval(data)
@@ -25,6 +25,10 @@ for idx, docslink in docsList.items():
     if '#' in docslink:
         s_idx = docslink.index('#')
     bs = BeautifulSoup(urlopen('https://docs.python.org/3/' + docslink), 'html.parser')
+    for pre in bs("pre"):
+        pre.decompose()
+    for code in bs("code"):
+        code.decompose()
     if s_idx == 0:
         f = open(dataPath + str(idx) + '.txt', mode = 'w', encoding = 'utf-8')
         f.write('link:\n' + docslink + '\n\n' + 'docs:' + '\n')
