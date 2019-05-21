@@ -1,3 +1,3 @@
 from engine_search import search
 
-search("google")
+search("duckduckgo")
