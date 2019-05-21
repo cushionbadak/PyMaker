@@ -6,7 +6,7 @@ import numpy as np
 print('google_w2v.py: import google w2v model...')
 print('google_w2v.py: it will take about 2 minutes and over 2GB of memory needed to load.')
 model = gensim.models.KeyedVectors.load_word2vec_format(
-    '../datas/GoogleNews/GoogleNews-vectors-negative300.bin', binary=True)
+    'PyMaker/datas/GoogleNews/GoogleNews-vectors-negative300.bin', binary=True)
 print('google_w2v.py: finish importing google w2v model.')
 
 modellength = len(model['car'])
@@ -18,7 +18,7 @@ def unigram_sentence_wordvecsum(ws):
 
     # make initv zero value.
     initv = np.zeros(modellength)
-    
+
     print(len(model['car']))
     for w in ws:
         if w in model:
