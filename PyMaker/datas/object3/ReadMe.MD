@@ -8,3 +8,9 @@ which means, it contains code block 'code' tags.
 Beyond [Answer URL], it will show all existing urls which starting with "https://docs.python.org/3/"
 
 ### 1st
+Data of this version include all kind of code
+Like pre, code tags
+
+### 2nd
+Data of this version is only include natural text
+Except pre, code tags
