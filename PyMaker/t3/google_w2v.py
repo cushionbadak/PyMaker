@@ -4,6 +4,7 @@ import gensim
 import numpy as np
 
 from . import t3_global
+from . import string_util
 
 # initialize
 model = 0
@@ -39,7 +40,7 @@ def make_nzv(v):
 def unigram_sentence_wordvecsum(ws):
     # ws : string list.
     # OUTPUT : numpy array
-    initv = zerovector
+    initv = zerovector()
     for w in ws:
         if w in model:
             initv += model[w]
@@ -53,5 +54,19 @@ def unigram_sentence_wordvecsum(ws):
 
 def subword_sentence_wordvecsum(ws):
     # ws : string list.
-    # slicing word into subwords (subword length is defined at t3_global)
-    initv
+    # slicing word into subwords and sum their vector representations. (subword length is defined at t3_global)
+    initv = zerovector()
+    low = t3_global.GOOGLE_W2V_SUBWORD_LENGTH_LOW
+    high = t3_global.GOOGLE_W2V_SUBWORD_LENGTH_HIGH
+    for w in ws:
+        subwords = string_util.make_subword(w, low, high)
+        if len(w) < low or len(w) > high:
+            subwords.append(w)
+        for wp in subwords:
+            if w in model:
+                initv += model[w]
+
+    if not np.any(initv):
+        make_nzv(initv)
+
+    return initv
