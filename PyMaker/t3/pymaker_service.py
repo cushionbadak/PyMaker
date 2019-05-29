@@ -43,7 +43,7 @@ def evaluate_query(query, longURL=t3_global.PYMAKER_SERVICE_LONGURL, upperdoc=t3
     # query : string
     # longURL : bool
     # upperdoc : bool
-    # output : string list
+    # output : string list (string example: 'https://docs.python.org/3/library/csv.html')
     try:
         if(upperdoc):
             candidates = classify_query_upperdoc(query)

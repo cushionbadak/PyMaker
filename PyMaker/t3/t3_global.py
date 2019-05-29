@@ -12,6 +12,11 @@ PYTHONDOCTONUM = DATAPATH + 'pythonDocToNumber.txt'
 NUMTOPYTHONDOC = DATAPATH + 'numberToPythonDoc.txt'
 GOOGLE_W2V_PATH = DATAPATH + 'GoogleNews/GoogleNews-vectors-negative300.bin'
 
+## obj3_test.py specific
+OBJ3_TEST_RESULT_FILENAME = 'PyMkaer/t3/r1.txt'
+OBJ3_TEST_FILENAME_PREFIX = 'Python_DOC_referPages.'
+OBJ3_TEST_UPPERDOC = True
+
 ## obj3_read.py specific
 OBJ3_READ_SET_GLOBAL_VARIABLES = True
 OBJ3_READ_SET_GLOBAL_VARIABLES_PRINT_LOG = True
