@@ -8,6 +8,7 @@ from . import t3_global
 # initialize
 pydoc2num = {}
 num2pydoc = {}
+upperpydocset = set()
 upperpydoc2num = {}
 num2upperpydoc = {}
 pydoc2upperpydocnum = {}
@@ -21,7 +22,8 @@ def getupperpydoc(s):
 
 
 if t3_global.OBJ3_READ_SET_GLOBAL:
-    if t3_global.OBJ3_READ_SET_GLOBAL_VARIABLES_PRINT_LOG:
+    _printlog = t3_global.OBJ3_READ_SET_GLOBAL_VARIABLES_PRINT_LOG
+    if _printlog:
         print('obj3_read.py: start writing dictionaries')
     with open(t3_global.PYTHONDOCTONUM, 'r') as f:
         _temp_data = f.read()
@@ -35,7 +37,7 @@ if t3_global.OBJ3_READ_SET_GLOBAL:
     upperpydoc2num = dict(zip(upperpydocset, range(len(upperpydocset))))
     num2upperpydoc = dict((v, k) for k, v in upperpydoc2num.items())
     pydoc2upperpydocnum = dict((k, upperpydoc2num[getupperpydoc(k)]) for k, v in pydoc2num.items())
-    if t3_global.OBJ3_READ_SET_GLOBAL_VARIABLES_PRINT_LOG:
+    if _printlog:
         print('obj3_read.py: end writing dictionaries')
 
 

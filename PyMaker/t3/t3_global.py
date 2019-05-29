@@ -1,9 +1,9 @@
-# Literals
+## Literals
 PYDOCURL = 'https://docs.python.org/3/'
 OBJ3_FOLDER_COUNT = 266
 OBJ4_SIZE = 10655
 
-# Data File Paths
+## Data File Paths
 DATAPATH = 'PyMaker/datas/'
 OBJ3_DATAPATH = DATAPATH + 'object3/'
 OBJ4_DATAPATH = DATAPATH + 'object4/1st/'
@@ -12,21 +12,29 @@ PYTHONDOCTONUM = DATAPATH + 'pythonDocToNumber.txt'
 NUMTOPYTHONDOC = DATAPATH + 'numberToPythonDoc.txt'
 GOOGLE_W2V_PATH = DATAPATH + 'GoogleNews/GoogleNews-vectors-negative300.bin'
 
-# obj3_read.py specific
+## obj3_read.py specific
 OBJ3_READ_SET_GLOBAL_VARIABLES = True
 OBJ3_READ_SET_GLOBAL_VARIABLES_PRINT_LOG = True
 OBJ3_READ_ANSWERURL_DELIM = 'Answer URL'
 OBJ3_READ_NATTEXT_DELIM = 'Natural Text'
 
-# google_w2v.py specific
+## google_w2v.py specific
 GOOGLE_W2V_SET_GLOBAL_VARIABLES = True
 GOOGLE_W2V_SET_GLOBAL_VARIABLES_PRINT_LOG = True
 GOOGLE_W2V_NEAR_ZERO = 1e-8
 GOOGLE_W2V_SUBWORD_LENGTH_LOW = 2
 GOOGLE_W2V_SUBWORD_LENGTH_HIGH = 6
 
+## obj4_vecrep_calc.py specific
+OBJ4_VECREP_CALC_SAVE_DOCVEC_PRINT_LOG = True
+# turn it to False when there are no existing 'document vector representations .npy' files.
+OBJ4_VECREP_CALC_SET_GLOBAL_VARIABLES = True
+OBJ4_VECREP_CALC_SET_GLOBAL_VARIABLES_PRINT_LOG = True
+OBJ4_VECREP_CALC_ALLOW_PICKLE = False
+#OBJ4_VECREP_CALC_CHECK_UPPERDOC_ONLY = True
 
-N_FOR_TOP_N_VALUES = 5
+
+
 N_FOR_TESTCASE_NUM = 20
 
 OBJ4_VECREP_CALC_TEST = False

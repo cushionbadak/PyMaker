@@ -10,16 +10,16 @@ from . import string_util
 model = 0
 vecrepLength = 0
 
-
 if t3_global.GOOGLE_W2V_SET_GLOBAL_VARIABLES:
-    if t3_global.GOOGLE_W2V_SET_GLOBAL_VARIABLES_PRINT_LOG:
+    _printlog = t3_global.GOOGLE_W2V_SET_GLOBAL_VARIABLES_PRINT_LOG
+    if _printlog:
         print('google_w2v.py: import google w2v model...')
         print('google_w2v.py: it will take about 2 minutes and over 2GB of memory needed to load.')
 
     model = gensim.models.KeyedVectors.load_word2vec_format(t3_global.GOOGLE_W2V_PATH, binary=True)
     vecrepLength = len(model['car'])
 
-    if t3_global.GOOGLE_W2V_SET_GLOBAL_VARIABLES_PRINT_LOG:
+    if _printlog:
         print('google_w2v.py: finish importing google w2v model.')
 
 
@@ -63,7 +63,7 @@ def subword_sentence_wordvecsum(ws):
         if len(w) < low or len(w) > high:
             subwords.append(w)
         for wp in subwords:
-            if w in model:
+            if wp in model:
                 initv += model[w]
 
     if not np.any(initv):
