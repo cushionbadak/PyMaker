@@ -55,6 +55,8 @@ if t3_global.OBJ4_VECREP_CALC_SET_GLOBAL_VARIABLES:
     obj4_urllist = obj4_read.obj4_linklist()
     obj4_url2num = dict(zip(obj4_urllist, range(len(obj4_urllist))))
     obj4_docvec = load_all_obj4_docvec(t3_global.OBJ4_VECREP_CALC_ALLOW_PICKLE)
+    if _printlog:
+        print('obj4_vecrep_calc.py: finish set obj4_docvec and obj4_urllist')
 
 
 def get_cosine(av, bv, avs, bvs):
@@ -98,6 +100,25 @@ def cosine_filter(d, cos_lowlimit):
     # cos_lowlimit : float.
     # output : dict(int, float). dict(obj4-index, cosinevalue).
     return dict((k, v) for k, v in d.items() if v > cos_lowlimit)
+
+
+def binary_classification_alldoc(answers, candidates):
+    # answers : string set (pydoc urls)
+    # candidates : string set (pydoc urls)
+    # answers are (false negative or true positive)
+    # candidates are Positive. (len(obj3_read.pydoc2num) - len(candidates)) are the # of Negative.
+    # OUTPUT
+    # all output values are integer.
+    # tp : # of True Positive
+    # fp : # of False Positive
+    # fn : # of False Negative
+    # tn : # of True Negative
+    tp = sum(1 for url in candidates if url in answers)
+    fp = len(candidates) - tp
+    fn = len(answers) - tp
+    tn = len(obj3_read.pydoc2num) - tp - fp - fn
+    return tp, fp, fn, tn
+
 
 
 def binary_classification_upperdoc(answers, candidates):
