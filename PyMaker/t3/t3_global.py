@@ -6,6 +6,7 @@ OBJ4_SIZE = 10655
 ## Data File Paths
 DATAPATH = 'PyMaker/datas/'
 OBJ3_DATAPATH = DATAPATH + 'object3/'
+OBJ3_SPECIFIC_DATAPATH_MID = '1st/'
 OBJ4_DATAPATH = DATAPATH + 'object4/1st/'
 OBJ4_VECREP_PATH = DATAPATH + 'object4_subword_vecrep/'
 PYTHONDOCTONUM = DATAPATH + 'pythonDocToNumber.txt'

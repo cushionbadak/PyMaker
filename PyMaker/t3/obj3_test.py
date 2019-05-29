@@ -65,10 +65,10 @@ with open(t3_global.OBJ3_TEST_RESULT_FILENAME, 'w') as resultfile:
             resultfile.write('ANSWERS:\n')
             for a in answers:
                 resultfile.write('\t' + a + '\n')
-            resultfile.write('true positive: ' + tp + '\n')
-            resultfile.write('false positive: ' + fp + '\n')
-            resultfile.write('false negative: ' + fn + '\n')
-            resultfile.write('true negative: ' + tn + '\n')
+            resultfile.write('true positive: ' + str(tp) + '\n')
+            resultfile.write('false positive: ' + str(fp) + '\n')
+            resultfile.write('false negative: ' + str(fn) + '\n')
+            resultfile.write('true negative: ' + str(tn) + '\n')
             resultfile.flush()
             
     else:
@@ -97,10 +97,10 @@ with open(t3_global.OBJ3_TEST_RESULT_FILENAME, 'w') as resultfile:
             resultfile.write('ANSWERS:\n')
             for a in answers:
                 resultfile.write('\t' + a + '\n')
-            resultfile.write('true positive: ' + tp + '\n')
-            resultfile.write('false positive: ' + fp + '\n')
-            resultfile.write('false negative: ' + fn + '\n')
-            resultfile.write('true negative: ' + tn + '\n')
+            resultfile.write('true positive: ' + str(tp) + '\n')
+            resultfile.write('false positive: ' + str(fp) + '\n')
+            resultfile.write('false negative: ' + str(fn) + '\n')
+            resultfile.write('true negative: ' + str(tn) + '\n')
             resultfile.flush()
 
     precisions = [(tp/(tp + fp)) if (tp + fp != 0) else 0 for tp, fp in zip(tps, fps)]

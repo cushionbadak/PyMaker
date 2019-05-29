@@ -71,7 +71,7 @@ def obj3_readfile(filename, return_upperpydocnum=False):
                 else:
                     contentstr += line
             elif status == 0:
-                if t3_global.OBJ3_READ_ANSWERURL_DELIM in line:
+                if t3_global.OBJ3_READ_NATTEXT_DELIM in line:
                     status = 1
             elif status == 2:
                 try:
@@ -90,7 +90,7 @@ def obj3_getfilelist(foldernumber):
     #   e.g. 'datas/object3/1st/i501/hello.txt' => OUTPUT : ['1st/i501/hello.txt', ...]
 
     # https://stackoverflow.com/questions/3207219/how-do-i-list-all-files-of-a-directory
-    foldernametail = '1st/i' + str(foldernumber * 100 + 1) + '/'
+    foldernametail = t3_global.OBJ3_SPECIFIC_DATAPATH_MID + 'i' + str(foldernumber * 100 + 1) + '/'
     pathname = t3_global.OBJ3_DATAPATH + foldernametail
     return [(foldernametail + f) for f in listdir(pathname) if isfile(join(pathname, f))]
 
