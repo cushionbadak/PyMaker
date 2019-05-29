@@ -105,23 +105,27 @@ with open(t3_global.OBJ3_TEST_RESULT_FILENAME, 'w') as resultfile:
 
     precisions = [(tp/(tp + fp)) if (tp + fp != 0) else 0 for tp, fp in zip(tps, fps)]
     recalls = [(tp/(tp + fn)) if (tp + fn != 0) else 0 for tp, fn in zip(tps, fns)]
+    accuracies = [((tp + tn)/(tp + fp + fn + tn)) if (tp + fp + fn + tn != 0) else 0 for tp, fp, fn, tn in zip(tps, fps, fns, tns)]
     average_precision = sum(precisions)/len(precisions)
     average_recall = sum(recalls)/len(recalls)
+    average_accuracy = sum(accuracies)/len(accuracies)
     resultfile.write('\nAVERAGE RESULT\n')
     resultfile.write('Average Precision: ' + str(average_precision) + '\n')
     resultfile.write('Average Recall: ' + str(average_recall) + '\n')
+    resultfile.write('Average Accuracy: ' + str(average_accuracy) + '\n')
 
     tpssum = sum(tps)
     fpssum = sum(fps)
     fnssum = sum(fns)
     tnssum = sum(tns)
-    resultfile.write('\nTOTAL SUM RESULT:\n')
+    resultfile.write('\nTOTAL SUM RESULT\n')
     resultfile.write('True Positive Sum: ' + str(tpssum) + '\n')
     resultfile.write('False Positive Sum: ' + str(fpssum) + '\n')
     resultfile.write('False Negative Sum: ' + str(fnssum) + '\n')
     resultfile.write('True Negatie Sum: ' + str(tnssum) + '\n')
     resultfile.write('Precision from sum values: ' + str(tpssum / (tpssum + fpssum)) + '\n')
     resultfile.write('Recall from sum values: ' + str(tpssum / (tpssum + fnssum)) + '\n')
+    resultfile.write('Accuracy from sum values: ' + str((tpssum + tnssum) / (tpssum + fpssum + fnssum + tnssum)) + '\n')
     
     resultfile.write('\nobj3_test.py: test finish\n')
     resultfile.flush()
