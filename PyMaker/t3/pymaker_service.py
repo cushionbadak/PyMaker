@@ -23,7 +23,7 @@ def classify_query_alldoc(query):
 
     cosine_similarities = obj4_vecrep_calc.get_cosine_values_alldoc(string_util.formatsplit(query), _docvec_func)
     candidates = obj4_vecrep_calc.cosine_filter(cosine_similarities, t3_global.PYMAKER_SERVICE_COS_LOWLIMIT)
-    candidates = set([obj4_vecrep_calc.obj4_urllist[k] for k, v in candidates])
+    candidates = set([obj4_vecrep_calc.obj4_urllist[k] for k, v in candidates.items()])
 
     return list(candidates)
 
@@ -34,7 +34,7 @@ def classify_query_upperdoc(query):
 
     cosine_similarities = obj4_vecrep_calc.get_cosine_values_upperdoc(string_util.formatsplit(query), _docvec_func)
     candidates = obj4_vecrep_calc.cosine_filter(cosine_similarities, t3_global.PYMAKER_SERVICE_COS_LOWLIMIT)
-    candidates = set([obj4_vecrep_calc.obj4_urllist[k] for k, v in candidates])
+    candidates = set([obj4_vecrep_calc.obj4_urllist[k] for k, v in candidates.items()])
 
     return list(candidates)
 
@@ -49,7 +49,7 @@ def evaluate_query(query, longURL=t3_global.PYMAKER_SERVICE_LONGURL, upperdoc=t3
             candidates = classify_query_upperdoc(query)
         else:
             candidates = classify_query_alldoc(query)
-            return [t3_global.PYDOCURL + c for c in candidates]
+        return [t3_global.PYDOCURL + c for c in candidates]
     except:
         return []
     
