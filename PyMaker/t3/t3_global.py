@@ -1,6 +1,6 @@
 ## Literals
 PYDOCURL = 'https://docs.python.org/3/'
-OBJ3_FOLDER_COUNT = 266
+OBJ3_FOLDER_COUNT = 226
 OBJ4_SIZE = 10655
 
 ## Data File Paths
@@ -13,7 +13,7 @@ NUMTOPYTHONDOC = DATAPATH + 'numberToPythonDoc.txt'
 GOOGLE_W2V_PATH = DATAPATH + 'GoogleNews/GoogleNews-vectors-negative300.bin'
 
 ## obj3_test.py specific
-OBJ3_TEST_RESULT_FILENAME = 'PyMkaer/t3/r1.txt'
+OBJ3_TEST_RESULT_FILENAME = 'PyMaker/t3/r1.txt'
 OBJ3_TEST_FILENAME_PREFIX = 'Python_DOC_referPages.'
 OBJ3_TEST_UPPERDOC = True
 

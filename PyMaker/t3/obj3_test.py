@@ -5,6 +5,7 @@ from . import obj3_read
 from . import obj4_vecrep_calc
 from . import pymaker_service
 
+# When Import,
 # SIDE EFFECT: make a test result file at t3_global.OBJ3_TEST_RESULT_FILENAME
 
 
@@ -102,8 +103,8 @@ with open(t3_global.OBJ3_TEST_RESULT_FILENAME, 'w') as resultfile:
             resultfile.write('true negative: ' + tn + '\n')
             resultfile.flush()
 
-    precisions = [(tp/(tp + fp)) for tp, fp in zip(tps, fps)]
-    recalls = [(tp/(tp + fn)) for tp, fn in zip(tps, fns)]
+    precisions = [(tp/(tp + fp)) if (tp + fp != 0) else 0 for tp, fp in zip(tps, fps)]
+    recalls = [(tp/(tp + fn)) if (tp + fn != 0) else 0 for tp, fn in zip(tps, fns)]
     average_precision = sum(precisions)/len(precisions)
     average_recall = sum(recalls)/len(recalls)
     resultfile.write('\nAVERAGE RESULT\n')

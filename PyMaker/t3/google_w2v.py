@@ -60,11 +60,11 @@ def subword_sentence_wordvecsum(ws):
     high = t3_global.GOOGLE_W2V_SUBWORD_LENGTH_HIGH
     for w in ws:
         subwords = string_util.make_subword(w, low, high)
-        if len(w) < low or len(w) > high:
+        if (w in model) and (len(w) < low or len(w) > high):
             subwords.append(w)
         for wp in subwords:
             if wp in model:
-                initv += model[w]
+                initv += model[wp]
 
     if not np.any(initv):
         make_nzv(initv)

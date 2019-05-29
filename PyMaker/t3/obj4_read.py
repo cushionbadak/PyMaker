@@ -1,5 +1,5 @@
 
-import string_util
+from . import string_util
 from . import t3_global
 
 

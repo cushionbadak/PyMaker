@@ -21,7 +21,7 @@ def getupperpydoc(s):
     return re.sub('#.*', '', s)
 
 
-if t3_global.OBJ3_READ_SET_GLOBAL:
+if t3_global.OBJ3_READ_SET_GLOBAL_VARIABLES:
     _printlog = t3_global.OBJ3_READ_SET_GLOBAL_VARIABLES_PRINT_LOG
     if _printlog:
         print('obj3_read.py: start writing dictionaries')
@@ -96,7 +96,7 @@ def obj3_getfilelist(foldernumber):
 
 
 def obj3_allfilelist():
-    # output : string list.
+    # output : string list. e.g. 'PyMaker/datas/object3/1st/i501/hello.txt'
     #   specific output list element string format is written at obj3_getfilelist function's comment.
     r = []
     for i in range(t3_global.OBJ3_FOLDER_COUNT):
