@@ -1,0 +1,46 @@
+## Literals
+PYDOCURL = 'https://docs.python.org/3/'
+OBJ3_FOLDER_COUNT = 226
+OBJ4_SIZE = 10655
+
+## Data File Paths
+DATAPATH = 'PyMaker/datas/'
+OBJ3_DATAPATH = DATAPATH + 'object3/'
+OBJ3_SPECIFIC_DATAPATH_MID = '1st/'
+OBJ4_DATAPATH = DATAPATH + 'object4/1st/'
+OBJ4_VECREP_PATH = DATAPATH + 'object4_subword_vecrep/'
+PYTHONDOCTONUM = DATAPATH + 'pythonDocToNumber.txt'
+NUMTOPYTHONDOC = DATAPATH + 'numberToPythonDoc.txt'
+GOOGLE_W2V_PATH = DATAPATH + 'GoogleNews/GoogleNews-vectors-negative300.bin'
+
+## obj3_test.py specific
+OBJ3_TEST_RESULT_FILENAME = 'PyMaker/t3/r1.txt'
+OBJ3_TEST_FILENAME_PREFIX = 'Python_DOC_referPages.'
+OBJ3_TEST_UPPERDOC = True
+
+## obj3_read.py specific
+OBJ3_READ_SET_GLOBAL_VARIABLES = True
+OBJ3_READ_SET_GLOBAL_VARIABLES_PRINT_LOG = True
+OBJ3_READ_ANSWERURL_DELIM = 'Answer URL'
+OBJ3_READ_NATTEXT_DELIM = 'Natural Text'
+
+## google_w2v.py specific
+GOOGLE_W2V_SET_GLOBAL_VARIABLES = True
+GOOGLE_W2V_SET_GLOBAL_VARIABLES_PRINT_LOG = True
+GOOGLE_W2V_NEAR_ZERO = 1e-8
+GOOGLE_W2V_SUBWORD_LENGTH_LOW = 2
+GOOGLE_W2V_SUBWORD_LENGTH_HIGH = 6
+
+## obj4_vecrep_calc.py specific
+OBJ4_VECREP_CALC_SAVE_DOCVEC_PRINT_LOG = True
+# turn it to False when there are no existing 'document vector representations .npy' files.
+OBJ4_VECREP_CALC_SET_GLOBAL_VARIABLES = True
+OBJ4_VECREP_CALC_SET_GLOBAL_VARIABLES_PRINT_LOG = True
+OBJ4_VECREP_CALC_ALLOW_PICKLE = False
+
+## This must be at the bottom of t3_global.py
+## pymaker_service.py specific
+PYMAKER_SERVICE_AVAILABLE = OBJ3_READ_SET_GLOBAL_VARIABLES and GOOGLE_W2V_SET_GLOBAL_VARIABLES and OBJ4_VECREP_CALC_SET_GLOBAL_VARIABLES
+PYMAKER_SERVICE_COS_LOWLIMIT = 0.8
+PYMAKER_SERVICE_UPPERDOC = True
+PYMAKER_SERVICE_LONGURL = True
