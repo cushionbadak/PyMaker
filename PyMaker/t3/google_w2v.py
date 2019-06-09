@@ -86,9 +86,9 @@ def unigram_sentence_wordvecsum_with_doc_freq(ws):
     initv = zerovector()
     for w in ws:
         if w in model:
-            inv_freq = 0
+            inv_freq = 1
             if w in df:
-                inv_freq = df[w]
+                inv_freq = 1 / df[w]
             initv += model[w] * inv_freq
     
     # https://stackoverflow.com/a/23567941/10353572
