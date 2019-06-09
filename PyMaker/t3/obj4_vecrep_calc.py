@@ -95,12 +95,20 @@ def get_cosine_values_upperdoc(ws, docvec_func):
     return l
 
 
-def cosine_filter(d, cos_lowlimit):
-    # d : dict(int, float). dict(obj4-index, cosinevalue)
-    # cos_lowlimit : float.
-    # output : dict(int, float). dict(obj4-index, cosinevalue).
-    return dict((k, v) for k, v in d.items() if v > cos_lowlimit)
+#def cosine_filter(d, cos_lowlimit):
+#    # d : dict(int, float). dict(obj4-index, cosinevalue)
+#    # cos_lowlimit : float.
+#    # output : dict(int, float). dict(obj4-index, cosinevalue).
+#    return dict((k, v) for k, v in d.items() if v > cos_lowlimit)
 
+
+def cosine_filter(d, cos_width):
+    # d : dict(int, float). dict(obj4-index, cosinevalue)
+    # cos_width : float.
+    # output : dict(int, float). dict(obj4_index, cosinevalue).
+    cos_maxvalue = max(d.values())
+    cos_lowlimit = cos_maxvalue - cos_width
+    return dict((k, v) for k, v in d.items() if v > cos_lowlimit)
 
 def binary_classification_alldoc(answers, candidates):
     # answers : string set (pydoc urls)

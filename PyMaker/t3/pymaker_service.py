@@ -22,7 +22,7 @@ def classify_query_alldoc(query):
     # output : string list. (urls)
 
     cosine_similarities = obj4_vecrep_calc.get_cosine_values_alldoc(string_util.formatsplit(query), _docvec_func)
-    candidates = obj4_vecrep_calc.cosine_filter(cosine_similarities, t3_global.PYMAKER_SERVICE_COS_LOWLIMIT)
+    candidates = obj4_vecrep_calc.cosine_filter(cosine_similarities, t3_global.PYMAKER_SERVICE_COS_SPECTRUM_WIDTH)
     candidates = set([obj4_vecrep_calc.obj4_urllist[k] for k, v in candidates.items()])
 
     return list(candidates)
@@ -33,7 +33,7 @@ def classify_query_upperdoc(query):
     # output : string list. (upperdoc urls)
 
     cosine_similarities = obj4_vecrep_calc.get_cosine_values_upperdoc(string_util.formatsplit(query), _docvec_func)
-    candidates = obj4_vecrep_calc.cosine_filter(cosine_similarities, t3_global.PYMAKER_SERVICE_COS_LOWLIMIT)
+    candidates = obj4_vecrep_calc.cosine_filter(cosine_similarities, t3_global.PYMAKER_SERVICE_COS_SPECTRUM_WIDTH)
     candidates = set([obj4_vecrep_calc.obj4_urllist[k] for k, v in candidates.items()])
 
     return list(candidates)
