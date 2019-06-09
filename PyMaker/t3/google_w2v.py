@@ -2,6 +2,7 @@
 
 import gensim
 import numpy as np
+import pickle
 
 from . import t3_global
 from . import string_util
@@ -66,6 +67,31 @@ def subword_sentence_wordvecsum(ws):
             if wp in model:
                 initv += model[wp]
 
+    if not np.any(initv):
+        make_nzv(initv)
+
+    return initv
+
+
+
+obj4_dfc = dict()
+with open(t3_global.OBJ4_WC_TOTALCOUNT_DICT_FILENAME, 'rb') as tcf:
+    obj4_dfc = pickle.load(tcf)
+dfcsum = sum(obj4_dfc.values())
+df = {k : (v / dfcsum) for k, v in obj4_dfc.items()}
+
+def unigram_sentence_wordvecsum_with_doc_freq(ws):
+    # ws : string list.
+    # OUTPUT : numpy array
+    initv = zerovector()
+    for w in ws:
+        if w in model:
+            inv_freq = 0
+            if w in df:
+                inv_freq = df[w]
+            initv += model[w] * inv_freq
+    
+    # https://stackoverflow.com/a/23567941/10353572
     if not np.any(initv):
         make_nzv(initv)
 

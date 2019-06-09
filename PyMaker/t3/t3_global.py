@@ -7,11 +7,14 @@ OBJ4_SIZE = 10655
 DATAPATH = 'PyMaker/datas/'
 OBJ3_DATAPATH = DATAPATH + 'object3/'
 OBJ3_SPECIFIC_DATAPATH_MID = '1st/'
-OBJ4_DATAPATH = DATAPATH + 'object4/1st/'
+OBJ4_SPECIFIC_DATAPATH_MID = '1st/'
+OBJ4_DATAPATH = DATAPATH + 'object4/' + OBJ4_SPECIFIC_DATAPATH_MID
 OBJ4_VECREP_PATH = DATAPATH + 'object4_subword_vecrep/'
 PYTHONDOCTONUM = DATAPATH + 'pythonDocToNumber.txt'
 NUMTOPYTHONDOC = DATAPATH + 'numberToPythonDoc.txt'
 GOOGLE_W2V_PATH = DATAPATH + 'GoogleNews/GoogleNews-vectors-negative300.bin'
+OBJ4_WC_PATH = DATAPATH + 'obj4_wc/'
+OBJ4_WC_TOTALCOUNT_DICT_FILENAME = OBJ4_WC_PATH + 'totaldict.txt'
 
 ## obj3_test.py specific
 OBJ3_TEST_RESULT_FILENAME = 'PyMaker/t3/r1.txt'
