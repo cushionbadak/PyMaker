@@ -84,6 +84,13 @@ def unigram_sentence_wordvecsum_with_doc_freq(ws):
     # ws : string list.
     # OUTPUT : numpy array
     initv = zerovector()
+    
+    # 1st
+    #for w in ws:
+    #    if w in model:
+    #        initv += model[w]
+    
+    # 2nd, 3rd
     for w in ws:
         if w in model:
             inv_freq = 1
