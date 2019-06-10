@@ -70,10 +70,17 @@ def document_rep(n):
     tf = get_tf(n)
     initv = t3.google_w2v.zerovector()
     for w, tfidf_v in tf.items():
+        # 1st
+        #initv += word_rep(w)
+        
+        # 2nd
+        #if tfidf_v < 0:
+        #    continue
+        #initv += word_rep(w) * tfidf_v
+        
+        # 3rd
         if tfidf_v < 0:
             continue
-        #initv += subword_rep(w) * tfidf_v
-        #initv += subword_rep(w) * tfidf_v / df[w]
         initv += word_rep(w) * tfidf_v / df[w]
 
     if not np.any(initv):
